@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/mapping/radix"
+	"github.com/akzj/ridstore/internal/segment"
 )
 
 type Record struct {
@@ -142,7 +143,9 @@ func (a batchAppender) AppendPut(ctx context.Context, batchID base.BatchID, id b
 		return addr, seq, written, err
 	}
 	if err := a.batch.pin(addr.SegmentID()); err != nil {
-		a.batch.store.setFault(err)
+		if !errors.Is(err, segment.ErrRetired) {
+			a.batch.store.setFault(err)
+		}
 		return 0, 0, written, err
 	}
 	return addr, seq, written, nil
@@ -233,24 +236,56 @@ func (s *Store) GetRecord(ctx context.Context, id ID) (Record, error) {
 	if err := s.checkAvailable(); err != nil {
 		return Record{}, err
 	}
-	addr, ok, err := s.mapping.Lookup(id)
-	if err != nil {
-		return Record{}, err
+	for {
+		if err := ctx.Err(); err != nil {
+			return Record{}, err
+		}
+		addr, ok, err := s.mapping.Lookup(id)
+		if err != nil {
+			return Record{}, err
+		}
+		if !ok {
+			return Record{}, base.ErrNotFound
+		}
+		pin, err := s.segments.Acquire(addr.SegmentID())
+		if errors.Is(err, segment.ErrRetired) {
+			current, exists, lookupErr := s.mapping.Lookup(id)
+			if lookupErr != nil {
+				return Record{}, lookupErr
+			}
+			if exists && current == addr {
+				err := fmt.Errorf("mapping points to retired segment: %w", base.ErrCorrupt)
+				s.setFault(err)
+				return Record{}, err
+			}
+			continue
+		}
+		if err != nil {
+			s.setFault(err)
+			return Record{}, err
+		}
+		current, exists, lookupErr := s.mapping.Lookup(id)
+		if lookupErr != nil {
+			_ = pin.Release()
+			return Record{}, lookupErr
+		}
+		if !exists || current != addr {
+			_ = pin.Release()
+			continue
+		}
+		frame, readErr := pin.ReadFrame(addr)
+		releaseErr := pin.Release()
+		if err := errors.Join(readErr, releaseErr); err != nil {
+			s.setFault(err)
+			return Record{}, err
+		}
+		if frame.Type != storeformat.FrameTypePutRecord || frame.RecordID != id || frame.BatchID == 0 {
+			err := fmt.Errorf("mapping points to wrong record: %w", base.ErrCorrupt)
+			s.setFault(err)
+			return Record{}, err
+		}
+		return Record{Value: append([]byte(nil), frame.Payload...), Revision: Revision(frame.BatchID)}, nil
 	}
-	if !ok {
-		return Record{}, base.ErrNotFound
-	}
-	frame, err := s.segments.ReadFrame(addr)
-	if err != nil {
-		s.setFault(err)
-		return Record{}, err
-	}
-	if frame.Type != storeformat.FrameTypePutRecord || frame.RecordID != id || frame.BatchID == 0 {
-		err := fmt.Errorf("mapping points to wrong record: %w", base.ErrCorrupt)
-		s.setFault(err)
-		return Record{}, err
-	}
-	return Record{Value: append([]byte(nil), frame.Payload...), Revision: Revision(frame.BatchID)}, nil
 }
 
 func (s *Store) Status(ctx context.Context, id BatchID) (BatchStatus, error) {

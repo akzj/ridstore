@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
+
+var ErrRetired = errors.New("ridstore: data segment retired")
 
 // SealedData is an immutable, strictly validated Data Segment.
 type SealedData struct {
@@ -102,21 +105,37 @@ func (s *SealedData) Close() error {
 	return s.file.Close()
 }
 
-// Registry resolves a VAddr without exposing Segment lifecycle to Mapping.
-// Removal is added by the GC phase; until then sealed entries are immutable.
+// Registry resolves a VAddr and serializes reader/open-batch references with
+// sealed-segment retirement. Sealed data itself remains immutable.
 type Registry struct {
-	mu       sync.RWMutex
+	mu         sync.RWMutex
+	active     *ActiveData
+	sealed     map[base.DataSegmentID]*SealedData
+	openRefs   map[base.DataSegmentID]uint64
+	readerRefs map[base.DataSegmentID]uint64
+	retired    map[base.DataSegmentID]struct{}
+	notify     chan struct{}
+	closed     bool
+}
+
+type ReadPin struct {
+	mu       sync.Mutex
+	registry *Registry
+	id       base.DataSegmentID
 	active   *ActiveData
-	sealed   map[base.DataSegmentID]*SealedData
-	openRefs map[base.DataSegmentID]uint64
-	closed   bool
+	sealed   *SealedData
+	released bool
 }
 
 func NewRegistry(active *ActiveData, sealed []*SealedData) (*Registry, error) {
 	if active == nil {
 		return nil, base.ErrInvalidConfig
 	}
-	r := &Registry{active: active, sealed: make(map[base.DataSegmentID]*SealedData, len(sealed)), openRefs: make(map[base.DataSegmentID]uint64)}
+	r := &Registry{
+		active: active, sealed: make(map[base.DataSegmentID]*SealedData, len(sealed)),
+		openRefs: make(map[base.DataSegmentID]uint64), readerRefs: make(map[base.DataSegmentID]uint64),
+		retired: make(map[base.DataSegmentID]struct{}), notify: make(chan struct{}),
+	}
 	for _, item := range sealed {
 		if item == nil || item.segmentID == active.SegmentID() {
 			return nil, base.ErrInvalidConfig
@@ -138,6 +157,9 @@ func (r *Registry) PinOpenBatch(id base.DataSegmentID) error {
 	if r.closed {
 		return base.ErrClosed
 	}
+	if _, retired := r.retired[id]; retired {
+		return ErrRetired
+	}
 	if (r.active == nil || r.active.SegmentID() != id) && r.sealed[id] == nil {
 		return base.ErrInvalidAddress
 	}
@@ -157,6 +179,7 @@ func (r *Registry) UnpinOpenBatch(id base.DataSegmentID) error {
 	} else {
 		r.openRefs[id] = count - 1
 	}
+	r.signalLocked()
 	return nil
 }
 
@@ -166,40 +189,183 @@ func (r *Registry) OpenBatchRefs(id base.DataSegmentID) uint64 {
 	return r.openRefs[id]
 }
 
-func (r *Registry) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
-	r.mu.RLock()
+func (r *Registry) Acquire(id base.DataSegmentID) (*ReadPin, error) {
+	if id == 0 {
+		return nil, base.ErrInvalidAddress
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
-		r.mu.RUnlock()
+		return nil, base.ErrClosed
+	}
+	if _, retired := r.retired[id]; retired {
+		return nil, ErrRetired
+	}
+	pin := &ReadPin{registry: r, id: id}
+	if r.active != nil && r.active.SegmentID() == id {
+		pin.active = r.active
+	} else if sealed := r.sealed[id]; sealed != nil {
+		pin.sealed = sealed
+	} else {
+		return nil, base.ErrInvalidAddress
+	}
+	r.readerRefs[id]++
+	return pin, nil
+}
+
+func (p *ReadPin) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.released || p.registry == nil {
 		return storeformat.Frame{}, base.ErrClosed
 	}
-	active := r.active
-	sealed := r.sealed[addr.SegmentID()]
-	r.mu.RUnlock()
-	if active != nil && addr.SegmentID() == active.SegmentID() {
-		return active.ReadFrame(addr)
-	}
-	if sealed == nil {
+	if addr.SegmentID() != p.id {
 		return storeformat.Frame{}, base.ErrInvalidAddress
 	}
-	return sealed.ReadFrame(addr)
+	if p.active != nil {
+		return p.active.ReadFrame(addr)
+	}
+	return p.sealed.ReadFrame(addr)
+}
+
+func (p *ReadPin) ReadFrameHeader(addr base.VAddr) (storeformat.FrameHeader, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.released || p.registry == nil {
+		return storeformat.FrameHeader{}, base.ErrClosed
+	}
+	if addr.SegmentID() != p.id {
+		return storeformat.FrameHeader{}, base.ErrInvalidAddress
+	}
+	if p.active != nil {
+		return p.active.ReadFrameHeader(addr)
+	}
+	return p.sealed.ReadFrameHeader(addr)
+}
+
+func (p *ReadPin) Release() error {
+	if p == nil {
+		return base.ErrInvalidConfig
+	}
+	p.mu.Lock()
+	if p.released || p.registry == nil {
+		p.mu.Unlock()
+		return base.ErrClosed
+	}
+	p.released = true
+	registry, id := p.registry, p.id
+	p.registry, p.active, p.sealed = nil, nil, nil
+	p.mu.Unlock()
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	count := registry.readerRefs[id]
+	if count == 0 {
+		return fmt.Errorf("reader segment ref underflow: %w", base.ErrCorrupt)
+	}
+	if count == 1 {
+		delete(registry.readerRefs, id)
+	} else {
+		registry.readerRefs[id] = count - 1
+	}
+	registry.signalLocked()
+	return nil
+}
+
+func (r *Registry) ReaderRefs(id base.DataSegmentID) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readerRefs[id]
+}
+
+// Retire atomically prevents new readers from acquiring a sealed segment.
+// Existing ReadPins remain valid until released.
+func (r *Registry) Retire(id base.DataSegmentID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return base.ErrClosed
+	}
+	if r.sealed[id] == nil {
+		if _, retired := r.retired[id]; retired {
+			return ErrRetired
+		}
+		return base.ErrInvalidAddress
+	}
+	if r.openRefs[id] != 0 {
+		return fmt.Errorf("retire segment with open batch refs: %w", base.ErrInvalidConfig)
+	}
+	r.retired[id] = struct{}{}
+	r.signalLocked()
+	return nil
+}
+
+func (r *Registry) WaitForNoReaders(ctx context.Context, id base.DataSegmentID) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return base.ErrClosed
+		}
+		if _, retired := r.retired[id]; !retired {
+			r.mu.Unlock()
+			return base.ErrInvalidConfig
+		}
+		if r.readerRefs[id] == 0 {
+			r.mu.Unlock()
+			return nil
+		}
+		notify := r.notify
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-notify:
+		}
+	}
+}
+
+// DetachRetired removes a reader-free segment from the live Registry. The
+// retired ID tombstone remains forever because DataSegmentIDs are never reused.
+func (r *Registry) DetachRetired(id base.DataSegmentID) (*SealedData, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, base.ErrClosed
+	}
+	if _, retired := r.retired[id]; !retired {
+		return nil, base.ErrInvalidConfig
+	}
+	if r.readerRefs[id] != 0 || r.openRefs[id] != 0 {
+		return nil, base.ErrInvalidConfig
+	}
+	sealed := r.sealed[id]
+	if sealed == nil {
+		return nil, ErrRetired
+	}
+	delete(r.sealed, id)
+	r.signalLocked()
+	return sealed, nil
+}
+
+func (r *Registry) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
+	pin, err := r.Acquire(addr.SegmentID())
+	if err != nil {
+		return storeformat.Frame{}, err
+	}
+	defer pin.Release()
+	return pin.ReadFrame(addr)
 }
 
 func (r *Registry) ReadFrameHeader(addr base.VAddr) (storeformat.FrameHeader, error) {
-	r.mu.RLock()
-	if r.closed {
-		r.mu.RUnlock()
-		return storeformat.FrameHeader{}, base.ErrClosed
+	pin, err := r.Acquire(addr.SegmentID())
+	if err != nil {
+		return storeformat.FrameHeader{}, err
 	}
-	active := r.active
-	sealed := r.sealed[addr.SegmentID()]
-	r.mu.RUnlock()
-	if active != nil && addr.SegmentID() == active.SegmentID() {
-		return active.ReadFrameHeader(addr)
-	}
-	if sealed == nil {
-		return storeformat.FrameHeader{}, base.ErrInvalidAddress
-	}
-	return sealed.ReadFrameHeader(addr)
+	defer pin.Release()
+	return pin.ReadFrameHeader(addr)
 }
 
 func (r *Registry) ReplaceActive(oldID base.DataSegmentID, sealed *SealedData, active *ActiveData) error {
@@ -219,6 +385,7 @@ func (r *Registry) ReplaceActive(oldID base.DataSegmentID, sealed *SealedData, a
 	}
 	r.sealed[oldID] = sealed
 	r.active = active
+	r.signalLocked()
 	return nil
 }
 
@@ -235,6 +402,7 @@ func (r *Registry) Close() error {
 		return base.ErrClosed
 	}
 	r.closed = true
+	r.signalLocked()
 	active := r.active
 	sealed := make([]*SealedData, 0, len(r.sealed))
 	for _, item := range r.sealed {
@@ -249,6 +417,11 @@ func (r *Registry) Close() error {
 		result = errors.Join(result, item.Close())
 	}
 	return result
+}
+
+func (r *Registry) signalLocked() {
+	close(r.notify)
+	r.notify = make(chan struct{})
 }
 
 func readFrameAt(file *os.File, offset, end, maxPayloadSize uint64) (storeformat.Frame, error) {
