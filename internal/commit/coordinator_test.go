@@ -1,0 +1,236 @@
+package commit
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/akzj/ridstore/internal/appendlog"
+	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/batch"
+	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/mapping/memory"
+	"github.com/akzj/ridstore/internal/segment"
+)
+
+type incrementAllocator struct{ next uint64 }
+
+func (a *incrementAllocator) Allocate(context.Context) (uint64, error) { a.next++; return a.next, nil }
+
+type activeReader struct{ active *segment.ActiveData }
+
+func (r activeReader) ReadPutHeader(addr base.VAddr) (RecordHeader, error) {
+	frame, err := r.active.ReadFrame(addr)
+	if err != nil {
+		return RecordHeader{}, err
+	}
+	if frame.Type != storeformat.FrameTypePutRecord {
+		return RecordHeader{}, base.ErrCorrupt
+	}
+	physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
+	if err != nil {
+		return RecordHeader{}, err
+	}
+	return RecordHeader{RecordID: frame.RecordID, OriginBatch: frame.BatchID, ValueBytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize}, nil
+}
+
+func coordinatorFixture(t *testing.T) (*Coordinator, *appendlog.Log, *segment.ActiveData, *memory.Mapping) {
+	t.Helper()
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header, _ := storeformat.EncodeSegmentHeader(storeformat.SegmentHeader{Kind: storeformat.SegmentKindData, StoreUUID: uuid, FileID: 1, FirstSeq: 1})
+	if err := os.WriteFile(filepath.Join(root, "data", segment.ActiveDataFileName(1)), header[:], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	active, err := segment.OpenActiveData(root, uuid, 1, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := appendlog.New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapping := memory.NewEmpty()
+	coordinator, err := New(1, log, mapping, activeReader{active})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return coordinator, log, active, mapping
+}
+
+func makeBatch(t *testing.T, id base.BatchID, log *appendlog.Log) *batch.Batch {
+	t.Helper()
+	b, err := batch.New(id, batch.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16}, log, &incrementAllocator{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestDurableCommitPublishesMappingAndConditions(t *testing.T) {
+	coordinator, log, active, mapping := coordinatorFixture(t)
+	defer active.Close()
+	b1 := makeBatch(t, 7, log)
+	if err := b1.Put(context.Background(), 1, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.Commit(context.Background(), b1)
+	if err != nil || result.CommitSeq != 1 || result.BatchID != 7 {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	addr1, ok, err := mapping.Lookup(1)
+	if err != nil || !ok {
+		t.Fatalf("lookup addr=%x ok=%v error=%v", addr1, ok, err)
+	}
+	b2 := makeBatch(t, 8, log)
+	if err := b2.ExpectRevision(1, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := b2.Put(context.Background(), 1, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), b2); err != nil {
+		t.Fatal(err)
+	}
+	addr2, ok, _ := mapping.Lookup(1)
+	if !ok || addr2 == addr1 {
+		t.Fatalf("new addr=%x old=%x", addr2, addr1)
+	}
+	b3 := makeBatch(t, 9, log)
+	if err := b3.ExpectRevision(1, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := b3.Put(context.Background(), 1, []byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), b3); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("conflict error=%v", err)
+	}
+	if got, _, _ := mapping.Lookup(1); got != addr2 {
+		t.Fatalf("conflict changed mapping: %x", got)
+	}
+	state, _ := b3.State()
+	if state != batch.StateAborted || coordinator.NextCommitSeq() != 3 {
+		t.Fatalf("state=%d next=%d", state, coordinator.NextCommitSeq())
+	}
+}
+
+func TestDeleteAndEmptyCommit(t *testing.T) {
+	coordinator, log, active, mapping := coordinatorFixture(t)
+	defer active.Close()
+	b1 := makeBatch(t, 1, log)
+	if err := b1.Put(context.Background(), 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), b1); err != nil {
+		t.Fatal(err)
+	}
+	b2 := makeBatch(t, 2, log)
+	if err := b2.Delete(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), b2); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := mapping.Lookup(1); ok {
+		t.Fatal("delete remained visible")
+	}
+	empty := makeBatch(t, 3, log)
+	if result, err := coordinator.Commit(context.Background(), empty); err != nil || result.CommitSeq != 3 {
+		t.Fatalf("empty result=%+v error=%v", result, err)
+	}
+}
+
+type fakeCommitLog struct {
+	result appendlog.CommitAppendResult
+	err    error
+}
+
+func (l fakeCommitLog) AppendCommit(batch.Prepared, base.CommitSeq) (appendlog.CommitAppendResult, error) {
+	return l.result, l.err
+}
+
+type fakeReader struct{ records map[base.VAddr]RecordHeader }
+
+func (r fakeReader) ReadPutHeader(addr base.VAddr) (RecordHeader, error) {
+	header, ok := r.records[addr]
+	if !ok {
+		return RecordHeader{}, base.ErrCorrupt
+	}
+	return header, nil
+}
+
+type fakeBatchAppender struct{ addr base.VAddr }
+
+func (a fakeBatchAppender) AppendPut(context.Context, base.BatchID, base.ID, []byte) (base.VAddr, base.FrameSeq, uint64, error) {
+	return a.addr, 1, 64, nil
+}
+func (fakeBatchAppender) AppendAbort(context.Context, base.BatchID, storeformat.BatchAbortPayload) error {
+	return nil
+}
+
+func TestCommitErrorClassificationAndCancellation(t *testing.T) {
+	addr, _ := base.NewVAddr(1, 4096)
+	newBatch := func(t *testing.T) *batch.Batch {
+		b, err := batch.New(1, batch.Limits{MaxValueSize: 16, MaxBatchBytes: 16, MaxBatchMutations: 1, MaxBatchConditions: 1}, fakeBatchAppender{addr}, &incrementAllocator{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put(context.Background(), 1, nil); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	reader := fakeReader{records: map[base.VAddr]RecordHeader{addr: {RecordID: 1, OriginBatch: 1, PhysicalSize: 64}}}
+	for _, tc := range []struct {
+		name  string
+		log   fakeCommitLog
+		want  error
+		state batch.State
+		fault bool
+	}{
+		{"no-space", fakeCommitLog{err: segment.ErrFull}, segment.ErrFull, batch.StateAborted, false},
+		{"part-write", fakeCommitLog{err: errors.New("write")}, nil, batch.StateAborted, true},
+		{"seal-write", fakeCommitLog{result: appendlog.CommitAppendResult{SealStarted: true}, err: errors.New("sync")}, base.ErrCommitUnknown, batch.StateCommitUnknown, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mapping := memory.NewEmpty()
+			coordinator, err := New(1, tc.log, mapping, reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := newBatch(t)
+			_, gotErr := coordinator.Commit(context.Background(), b)
+			if tc.want != nil && !errors.Is(gotErr, tc.want) {
+				t.Fatalf("error=%v want=%v", gotErr, tc.want)
+			}
+			if tc.want == nil && gotErr == nil {
+				t.Fatal("expected write error")
+			}
+			state, _ := b.State()
+			if state != tc.state || (coordinator.Fault() != nil) != tc.fault {
+				t.Fatalf("state=%d fault=%v error=%v", state, coordinator.Fault(), gotErr)
+			}
+		})
+	}
+	mapping := memory.NewEmpty()
+	coordinator, err := New(1, fakeCommitLog{}, mapping, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := newBatch(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := coordinator.Commit(ctx, b); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel error=%v", err)
+	}
+	state, _ := b.State()
+	if state != batch.StateAborted {
+		t.Fatalf("cancel state=%d", state)
+	}
+}
