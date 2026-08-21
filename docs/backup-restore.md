@@ -97,6 +97,13 @@ Restore 完成条件：artifact hashes 全部通过、payload Verify clean、目
 选择的策略一致。最后才删除并同步 marker；此前任何失败都保留 `RESTORING`，
 目标不能被正常 Open。
 
+SIGKILL subprocess matrix 覆盖 Backup prepared/files-copied/payload-verified/
+metadata-synced/marker-removed/published，以及 Restore prepared/files-copied/
+UUID-rewritten/payload-verified/payload-published/layout-verified/marker-removed/
+published。marker 前崩溃必须保持明确 incomplete；marker 删除后必须得到可完整
+Verify/Open 的 artifact 或 Store。该证据属于 process-crash，不等价于存储设备
+忽略 flush 的 power-loss 证明。
+
 ## 5. 不提供的保证
 
 - 不做在线增量备份、hardlink/reflink snapshot、压缩、加密或远端传输；

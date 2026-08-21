@@ -1,4 +1,4 @@
-.PHONY: fmt test test-race vet check tool
+.PHONY: fmt test test-race test-crash vet check tool
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -type f)
@@ -8,6 +8,9 @@ test:
 
 test-race:
 	go test -race ./...
+
+test-crash:
+	go test ./... -run 'ProcessCrashMatrix' -count=1 -timeout=10m
 
 vet:
 	go vet ./...

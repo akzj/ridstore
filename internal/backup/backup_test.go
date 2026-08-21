@@ -10,6 +10,7 @@ import (
 	"github.com/akzj/ridstore"
 	"github.com/akzj/ridstore/internal/backup"
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/initialize"
 	"github.com/akzj/ridstore/internal/verify"
 )
@@ -166,6 +167,25 @@ func TestCreateNeverOverwritesExistingDestination(t *testing.T) {
 	}
 }
 
+func TestBackupMarkerRemovalHookErrorRestoresIncompleteMarker(t *testing.T) {
+	ctx := context.Background()
+	source, _, _ := createStoreWithRecord(t, ctx)
+	destination := filepath.Join(t.TempDir(), "backup")
+	stop := errors.New("stop")
+	_, err := backup.CreateWithOptions(ctx, source, destination, backup.CreateOptions{Hook: failpoint.Func(func(point failpoint.Point) error {
+		if point == backup.PointBackupMarkerRemoved {
+			return stop
+		}
+		return nil
+	})})
+	if !errors.Is(err, stop) {
+		t.Fatalf("error=%v", err)
+	}
+	if _, err := backup.Inspect(ctx, destination); !errors.Is(err, base.ErrRecoveryRequired) {
+		t.Fatalf("artifact error=%v", err)
+	}
+}
+
 func TestRestoreCloneRewritesUUIDAndPreservesRecords(t *testing.T) {
 	ctx := context.Background()
 	source, artifact, id, record := createBackupWithRecord(t, ctx)
@@ -208,6 +228,25 @@ func TestRestoreCanExplicitlyPreserveUUID(t *testing.T) {
 	}
 	if !report.PreservedUUID || report.SourceStoreUUID != report.RestoredStoreUUID {
 		t.Fatalf("report=%+v", report)
+	}
+}
+
+func TestRestoreMarkerRemovalHookErrorRestoresFailClosedMarker(t *testing.T) {
+	ctx := context.Background()
+	_, artifact, _, _ := createBackupWithRecord(t, ctx)
+	destination := filepath.Join(t.TempDir(), "restored")
+	stop := errors.New("stop")
+	_, err := backup.Restore(ctx, artifact, destination, backup.RestoreOptions{Hook: failpoint.Func(func(point failpoint.Point) error {
+		if point == backup.PointRestoreMarkerRemoved {
+			return stop
+		}
+		return nil
+	})})
+	if !errors.Is(err, stop) {
+		t.Fatalf("error=%v", err)
+	}
+	if _, err := ridstore.Open(testConfig(destination)); !errors.Is(err, base.ErrRecoveryRequired) {
+		t.Fatalf("open error=%v", err)
 	}
 }
 
@@ -307,6 +346,16 @@ func TestRestoreNeverOverwritesExistingDestination(t *testing.T) {
 
 func createBackupWithRecord(t *testing.T, ctx context.Context) (source, artifact string, id ridstore.ID, record ridstore.Record) {
 	t.Helper()
+	source, id, record = createStoreWithRecord(t, ctx)
+	artifact = filepath.Join(t.TempDir(), "backup")
+	if _, err := backup.Create(ctx, source, artifact); err != nil {
+		t.Fatal(err)
+	}
+	return source, artifact, id, record
+}
+
+func createStoreWithRecord(t *testing.T, ctx context.Context) (source string, id ridstore.ID, record ridstore.Record) {
+	t.Helper()
 	source = filepath.Join(t.TempDir(), "source")
 	store, err := ridstore.Create(testConfig(source))
 	if err != nil {
@@ -336,11 +385,7 @@ func createBackupWithRecord(t *testing.T, ctx context.Context) (source, artifact
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	artifact = filepath.Join(t.TempDir(), "backup")
-	if _, err := backup.Create(ctx, source, artifact); err != nil {
-		t.Fatal(err)
-	}
-	return source, artifact, id, record
+	return source, id, record
 }
 
 func testConfig(dir string) ridstore.Config {
