@@ -25,7 +25,7 @@ type BatchStatus struct {
 }
 
 type Result struct {
-	Mapping                      *memory.Mapping
+	Mapping                      api.Mapping
 	NextFrameSeq                 base.FrameSeq
 	NextCommitSeq                base.CommitSeq
 	ReservedIDHighExclusive      uint64
@@ -40,12 +40,27 @@ type putRecord struct {
 }
 
 func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (Result, error) {
-	return Recover(manifest, nil, active)
+	if active == nil || manifest.MappingRoot != 0 || len(manifest.SealedDataSegments) != 0 || manifest.ReplayStart.SegmentID() != active.SegmentID() {
+		return Result{}, fmt.Errorf("phase 1 recovery topology: %w", base.ErrUnsupported)
+	}
+	mapping, err := memory.New(api.Snapshot{CoveredCommitSeq: manifest.CoveredCommitSeq})
+	if err != nil {
+		return Result{}, err
+	}
+	return RecoverInto(manifest, nil, active, mapping)
 }
 
 func Recover(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData) (Result, error) {
-	if active == nil || manifest.MappingRoot != 0 || len(sealed) != len(manifest.SealedDataSegments) {
-		return Result{}, fmt.Errorf("memory mapping recovery configuration: %w", base.ErrUnsupported)
+	mapping, err := memory.New(api.Snapshot{CoveredCommitSeq: manifest.CoveredCommitSeq})
+	if err != nil {
+		return Result{}, err
+	}
+	return RecoverInto(manifest, sealed, active, mapping)
+}
+
+func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData, mapping api.Mapping) (Result, error) {
+	if active == nil || mapping == nil || mapping.CoveredCommitSeq() != manifest.CoveredCommitSeq || len(sealed) != len(manifest.SealedDataSegments) {
+		return Result{}, fmt.Errorf("mapping recovery configuration: %w", base.ErrInvalidConfig)
 	}
 	for i := range sealed {
 		if sealed[i] == nil || uint32(sealed[i].SegmentID()) != manifest.SealedDataSegments[i].FileID {
@@ -55,10 +70,6 @@ func Recover(manifest storeformat.Manifest, sealed []*segment.SealedData, active
 	replaySegment := manifest.ReplayStart.SegmentID()
 	if replaySegment > active.SegmentID() {
 		return Result{}, fmt.Errorf("replay start after active segment: %w", base.ErrCorrupt)
-	}
-	mapping, err := memory.New(api.Snapshot{CoveredCommitSeq: manifest.CoveredCommitSeq})
-	if err != nil {
-		return Result{}, err
 	}
 	result := Result{
 		Mapping: mapping, NextFrameSeq: manifest.NextFrameSeq, NextCommitSeq: manifest.NextCommitSeq,
