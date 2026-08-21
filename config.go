@@ -35,6 +35,7 @@ type Config struct {
 	MaxGroupDelay         time.Duration
 	GCBatchBytes          int64
 	GCBatchMutations      int
+	GCMinFreeBytes        int64
 }
 
 func normalizeCreateConfig(cfg Config) (Config, storeformat.HardLimits, error) {
@@ -119,6 +120,9 @@ func applyRuntimeDefaults(cfg *Config) {
 	if cfg.GCBatchMutations == 0 {
 		cfg.GCBatchMutations = 4096
 	}
+	if cfg.GCMinFreeBytes == 0 {
+		cfg.GCMinFreeBytes = cfg.SegmentSize
+	}
 }
 
 func normalizeDir(cfg *Config) error {
@@ -156,7 +160,7 @@ func hardLimits(cfg Config) (storeformat.HardLimits, error) {
 func validateRuntime(cfg Config, hard storeformat.HardLimits) error {
 	if cfg.MappingCacheBytes <= 0 || cfg.DeltaSoftLimitBytes <= 0 || cfg.DeltaHardLimitBytes <= cfg.DeltaSoftLimitBytes ||
 		cfg.CheckpointMemoryBytes < 64<<10 || cfg.MaxGroupBytes <= 0 || cfg.MaxGroupBatches <= 0 || cfg.MaxGroupDelay < 0 ||
-		cfg.GCBatchBytes <= 0 || uint64(cfg.GCBatchBytes) > hard.MaxBatchBytes || cfg.GCBatchMutations <= 0 || uint64(cfg.GCBatchMutations) > hard.MaxBatchMutations {
+		cfg.GCBatchBytes <= 0 || uint64(cfg.GCBatchBytes) > hard.MaxBatchBytes || cfg.GCBatchMutations <= 0 || uint64(cfg.GCBatchMutations) > hard.MaxBatchMutations || cfg.GCMinFreeBytes < 0 {
 		return fmt.Errorf("invalid runtime budget: %w", base.ErrInvalidConfig)
 	}
 	return nil

@@ -37,6 +37,7 @@ type Config struct {
     MaxGroupDelay         time.Duration
     GCBatchBytes          int64
     GCBatchMutations      int
+    GCMinFreeBytes        int64
 }
 ```
 
@@ -61,6 +62,7 @@ type Config struct {
 | MaxGroupDelay | 0 |
 | GCBatchBytes | 16 MiB |
 | GCBatchMutations | 4,096 |
+| GCMinFreeBytes | SegmentSize |
 
 这些是可运行的安全起点，不是性能承诺；基准可以改变后续默认值，但持久化 hard limits 的改变必须遵守 Open 兼容规则。
 
@@ -78,6 +80,7 @@ Create 先填充零值、再验证、最后把 8 个 FormatHardLimits 写入 INI
 - `CheckpointMemoryBytes` 至少容纳一个最大编码 Node、排序块和 Header 批读窗口，但不要求容纳整个 Delta；
 - `MaxGroupBytes > 0` 并限制多请求 group buffer；若单 Descriptor 更大，则该请求单独成组，不能拒绝一个已由 FormatHardLimits 允许的 Batch；
 - `GCBatchBytes <= MaxBatchBytes` 且 `GCBatchMutations <= MaxBatchMutations`；
+- `GCMinFreeBytes >= 0`；零值采用一个 Segment 的保留空间，不能用零值关闭预检；
 - 任何 runtime budget 不能解释为允许绕过持久化 hard limit。
 
 ## 4. Delta 计费
@@ -111,6 +114,8 @@ Header validation 按 `(SegmentID, offset)` 排序并使用有界窗口；生成
 `MaxGroupBytes` 只计算待写 Commit/Relocation Descriptor 编码字节和 coordinator buffer，不重复计算 Put 阶段已 append 的 Value。`MaxGroupDelay=0` 表示不主动 sleep；大于 0 时从首个排队请求开始计时，Context deadline 更早时不得为了凑组延迟。
 
 GC 受 `GCBatchBytes/GCBatchMutations`、Delta reservation、前台队列优先级和可用磁盘共同限制。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
+
+Data GC 在安装 Maintenance Journal 前读取目标文件系统的可用空间，并按 exact live bytes、每个 live ID 最坏八层 Dense Mapping COW、Relocation Descriptor、两个 rotation Segment 以及 `GCMinFreeBytes` 计算保守临时空间上界。低于上界返回 `ErrInsufficientSpace`，保留源 Segment 且不留下 Journal。该检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
 
 ## 7. 可观测性与验收
 

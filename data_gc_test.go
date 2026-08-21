@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -135,6 +136,293 @@ func TestBeginDataGCReportsNoSafeCandidate(t *testing.T) {
 	}
 }
 
+func TestCompactDataRejectsInsufficientTemporarySpaceBeforeJournal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, revision := prepareDataGCStore(t, cfg)
+	defer store.Close()
+	store.availableBytes = func(string) (uint64, error) { return 0, nil }
+	if _, err := store.CompactData(context.Background()); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("error=%v", err)
+	}
+	metrics := store.Metrics()
+	if metrics.GCStarted != 1 || metrics.GCFailed != 1 || metrics.GCInsufficientSpace != 1 || metrics.GCCompleted != 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+	if _, found, err := maintenance.Load(dir); err != nil || found {
+		t.Fatalf("journal found=%v error=%v", found, err)
+	}
+	if record, err := store.GetRecord(context.Background(), stableID); err != nil || record.Revision != revision || string(record.Value) != "stable" {
+		t.Fatalf("record=%+v error=%v", record, err)
+	}
+	for _, summary := range store.catalog.Snapshot().SealedDataSegments {
+		if _, err := os.Stat(dataGCSealedPath(dir, base.DataSegmentID(summary.FileID))); err != nil {
+			t.Fatalf("sealed source missing: %v", err)
+		}
+	}
+}
+
+func TestDataGCTemporarySpaceUpperIncludesLiveMappingAndReserve(t *testing.T) {
+	cfg := smallTestConfig(t.TempDir())
+	cfg.SegmentSize = 16 << 10
+	cfg.GCMinFreeBytes = 4096
+	manifest := storeformat.Manifest{SegmentStats: []storeformat.SegmentStatsEntry{{SegmentID: 1, ExactLiveBytes: 128, ExactLiveRecords: 2}}}
+	required, err := dataGCTemporarySpaceUpper(manifest, storeformat.FileSummary{FileID: 1}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := uint64(cfg.GCMinFreeBytes) + 128 + 2*uint64(storeformat.MappingNodeHeaderSize+storeformat.MappingNodeSlots*8)*8 + 2*storeformat.MutationEntrySize + 2*uint64(cfg.SegmentSize)
+	if required != want {
+		t.Fatalf("required=%d want=%d", required, want)
+	}
+}
+
+func TestCompactDataCancellationBeforeDurableCheckpointRollsBackCleaning(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, revision := prepareDataGCStore(t, cfg)
+	defer store.Close()
+	before := store.catalog.Snapshot().SealedDataSegments
+	store.hook = failpoint.Func(func(point failpoint.Point) error {
+		if point == pointDataGCCopying {
+			return context.Canceled
+		}
+		return nil
+	})
+	if _, err := store.CompactData(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	if store.fault != nil {
+		t.Fatalf("store faulted before durable checkpoint: %v", store.fault)
+	}
+	if _, found, err := maintenance.Load(dir); err != nil || found {
+		t.Fatalf("journal found=%v error=%v", found, err)
+	}
+	for _, summary := range before {
+		if _, err := os.Stat(dataGCSealedPath(dir, base.DataSegmentID(summary.FileID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if record, err := store.GetRecord(context.Background(), stableID); err != nil || record.Revision != revision || string(record.Value) != "stable" {
+		t.Fatalf("record=%+v error=%v", record, err)
+	}
+}
+
+func TestCompactDataPropagatesENOSPCBeforeDurableCheckpoint(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, revision := prepareDataGCStore(t, cfg)
+	defer store.Close()
+	store.hook = failpoint.Func(func(point failpoint.Point) error {
+		if point == pointDataGCCopying {
+			return syscall.ENOSPC
+		}
+		return nil
+	})
+	if _, err := store.CompactData(context.Background()); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("error=%v", err)
+	}
+	if store.fault != nil {
+		t.Fatalf("store faulted before durable checkpoint: %v", store.fault)
+	}
+	if _, found, err := maintenance.Load(dir); err != nil || found {
+		t.Fatalf("journal found=%v error=%v", found, err)
+	}
+	if record, err := store.GetRecord(context.Background(), stableID); err != nil || record.Revision != revision || string(record.Value) != "stable" {
+		t.Fatalf("record=%+v error=%v", record, err)
+	}
+}
+
+func TestCompactDataCancellationAfterDurableCheckpointRecoversOnOpen(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, revision := prepareDataGCStore(t, cfg)
+	store.hook = failpoint.Func(func(point failpoint.Point) error {
+		if point == pointDataGCCheckpoint {
+			return context.Canceled
+		}
+		return nil
+	})
+	if _, err := store.CompactData(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	if store.fault == nil {
+		t.Fatal("store did not fault after durable GC checkpoint")
+	}
+	journal, found, err := maintenance.Load(dir)
+	if err != nil || !found || journal.Phase != 4 {
+		t.Fatalf("journal=%+v found=%v error=%v", journal, found, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if record, err := store.GetRecord(context.Background(), stableID); err != nil || record.Revision != revision || string(record.Value) != "stable" {
+		t.Fatalf("record=%+v error=%v", record, err)
+	}
+	if _, found, err := maintenance.Load(dir); err != nil || found {
+		t.Fatalf("journal found=%v error=%v", found, err)
+	}
+}
+
+func TestCompactDataConcurrentUserPutWinsOverRelocation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, _ := prepareDataGCStore(t, cfg)
+	defer store.Close()
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	store.hook = failpoint.Func(func(point failpoint.Point) error {
+		if point == pointDataGCCopying {
+			close(reached)
+			<-release
+		}
+		return nil
+	})
+	type gcResult struct {
+		result DataGCResult
+		err    error
+	}
+	done := make(chan gcResult, 1)
+	go func() {
+		result, err := store.CompactData(context.Background())
+		done <- gcResult{result: result, err: err}
+	}()
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GC did not reach copying phase")
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(context.Background(), stableID, []byte("latest")); err != nil {
+		t.Fatal(err)
+	}
+	commit, err := batch.Commit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	got := <-done
+	if got.err != nil || got.result.SourceSegmentID == 0 {
+		t.Fatalf("result=%+v error=%v", got.result, got.err)
+	}
+	record, err := store.GetRecord(context.Background(), stableID)
+	if err != nil || record.Revision != Revision(commit.BatchID) || string(record.Value) != "latest" {
+		t.Fatalf("record=%+v error=%v", record, err)
+	}
+}
+
+func TestCompactDataRepeatedlyConvergesSealedSegments(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, revision := prepareDataGCStore(t, cfg)
+	defer store.Close()
+	ctx := context.Background()
+	churn := ID(2)
+	for i := 0; i < 80; i++ {
+		batch, err := store.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := make([]byte, 900)
+		value[0] = byte(i)
+		if err := batch.Put(ctx, churn, value); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(store.catalog.Snapshot().SealedDataSegments)
+	if before < 2 {
+		t.Fatalf("sealed segments=%d", before)
+	}
+	cleaned := 0
+	for i := 0; i < before+2; i++ {
+		result, err := store.CompactData(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.SourceSegmentID == 0 {
+			break
+		}
+		cleaned++
+	}
+	after := len(store.catalog.Snapshot().SealedDataSegments)
+	if cleaned == 0 || after >= before {
+		t.Fatalf("cleaned=%d sealed before=%d after=%d", cleaned, before, after)
+	}
+	if record, err := store.GetRecord(ctx, stableID); err != nil || record.Revision != revision || string(record.Value) != "stable" {
+		t.Fatalf("stable=%+v error=%v", record, err)
+	}
+	if value, err := store.Get(ctx, churn); err != nil || len(value) != 900 || value[0] != 79 {
+		t.Fatalf("churn length=%d first=%d error=%v", len(value), value[0], err)
+	}
+}
+
+func TestCloseWaitsForDataGCRecoverableCompletion(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, _, _ := prepareDataGCStore(t, cfg)
+	sourceID := base.DataSegmentID(store.catalog.Snapshot().SealedDataSegments[0].FileID)
+	pin, err := store.segments.Acquire(sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := make(chan struct{})
+	store.hook = failpoint.Func(func(point failpoint.Point) error {
+		if point == pointDataGCRetired {
+			close(retired)
+		}
+		return nil
+	})
+	gcDone := make(chan error, 1)
+	go func() {
+		_, err := store.CompactData(context.Background())
+		gcDone <- err
+	}()
+	select {
+	case <-retired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GC did not retire source")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- store.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before GC completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := pin.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-gcDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+}
+
 func TestCompactDataWaitsForReaderDeletesSourceAndReopens(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	cfg := smallTestConfig(dir)
@@ -237,6 +525,10 @@ func TestCompactDataCheckpointCanRotateMappingInsideParentJournal(t *testing.T) 
 	}
 	if result.SourceSegmentID == 0 || rotations == 0 {
 		t.Fatalf("result=%+v nested rotations=%d", result, rotations)
+	}
+	metrics := store.Metrics()
+	if metrics.GCStarted != 1 || metrics.GCCompleted != 1 || metrics.GCFailed != 0 || metrics.GCCopiedBytes != result.CopiedBytes || metrics.GCRelocated != result.Relocated {
+		t.Fatalf("metrics=%+v result=%+v", metrics, result)
 	}
 	record, err := store.GetRecord(ctx, stableID)
 	if err != nil || record.Revision != revision || string(record.Value) != "stable" {

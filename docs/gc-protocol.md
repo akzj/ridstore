@@ -261,10 +261,13 @@ score = reclaimableBytes / (copyBytes + fixedCost)
 - 新写停止水位；
 - 最小保留空闲空间；
 - 单次 Relocation Batch 上限；
+- Data GC 临时空间保留 `GCMinFreeBytes`；
 - GC 带宽/并发限制；
 - trash 最大停留时间告警。
 
 当可用空间不足以同时保存 live copy 和旧 Segment 时，不能开始无法完成的 GC。返回明确 `ENOSPC`/资源错误并保持旧数据可读。
+
+第一版在 Journal `Prepared` 前按 exact live bytes、live Record 数对应的八层 Dense Mapping COW 上界、Relocation Descriptor、两个 rotation Segment 和 `GCMinFreeBytes` 做保守 admission。返回 `ErrInsufficientSpace` 时只撤销内存 Cleaning 状态。文件系统可用空间不是可锁定资源，因此 admission 通过后仍必须处理真实 `ENOSPC`；在 MappingCheckpointDurable 之前保留源文件，之后则 fault closed 并由 Open 完成既定删除协议。
 
 ## 15. Scrub
 

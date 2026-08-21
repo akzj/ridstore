@@ -121,6 +121,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		issuedBatchHigh:      recovered.ReservedBatchIDHighExclusive,
 		recoveryAbortedStart: manifest.IssuedBatchIDHighExclusiveAtCut,
 		recoveryAbortedEnd:   recovered.ReservedBatchIDHighExclusive,
+		availableBytes:       defaultAvailableBytes,
 	}
 	requestSoftCheckpoint = store.requestCheckpoint
 	for id, status := range recovered.Statuses {

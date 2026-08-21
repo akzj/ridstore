@@ -15,6 +15,7 @@ import (
 	batchimpl "github.com/akzj/ridstore/internal/batch"
 	"github.com/akzj/ridstore/internal/catalog"
 	"github.com/akzj/ridstore/internal/commit"
+	"github.com/akzj/ridstore/internal/diskspace"
 	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
@@ -69,7 +70,10 @@ type Store struct {
 	fault             error
 	checkpointPending bool
 	checkpointErr     error
+	availableBytes    func(string) (uint64, error)
 }
+
+var defaultAvailableBytes = diskspace.Available
 
 // Create initializes and exclusively opens a new Store. Interrupted
 // initialization is resumed from INITIALIZING using the original Store UUID.
