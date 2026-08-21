@@ -1,6 +1,7 @@
 package radix
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -19,8 +20,11 @@ type deltaEntry struct {
 }
 
 type Mapping struct {
-	mu     sync.RWMutex
-	budget *deltaBudget
+	mu         sync.RWMutex
+	budget     *deltaBudget
+	readerMu   sync.Mutex
+	readers    map[base.MapAddr]uint64
+	readerCond *sync.Cond
 
 	store             *nodeStore
 	cache             *nodeCache
@@ -65,7 +69,9 @@ func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs
 		store: store, cache: newNodeCache(cacheBytes), root: manifest.MappingRoot,
 		rootCovered: manifest.CoveredCommitSeq, runtimeSeq: manifest.CoveredCommitSeq,
 		active: make(map[base.ID]deltaEntry), budget: newDeltaBudget(), checkpointEntries: math.MaxInt,
+		readers: make(map[base.MapAddr]uint64),
 	}
+	mapping.readerCond = sync.NewCond(&mapping.readerMu)
 	if mapping.root != 0 {
 		if _, err := mapping.loadNode(mapping.root, 7, 0, mapping.rootCovered); err != nil {
 			_ = store.Close()
@@ -91,7 +97,15 @@ func (m *Mapping) Lookup(id base.ID) (base.VAddr, bool, error) {
 		}
 	}
 	root, covered := m.root, m.rootCovered
+	if root != 0 {
+		m.readerMu.Lock()
+		m.readers[root]++
+		m.readerMu.Unlock()
+	}
 	m.mu.RUnlock()
+	if root != 0 {
+		defer m.releaseRoot(root)
+	}
 	return m.lookupRoot(root, covered, id)
 }
 
@@ -184,9 +198,17 @@ func (m *Mapping) CoveredCommitSeq() base.CommitSeq {
 func (m *Mapping) Snapshot() api.Snapshot {
 	m.mu.RLock()
 	root, covered, runtime := m.root, m.rootCovered, m.runtimeSeq
+	if root != 0 {
+		m.readerMu.Lock()
+		m.readers[root]++
+		m.readerMu.Unlock()
+	}
 	layers := append([]map[base.ID]deltaEntry(nil), m.frozen...)
 	active := cloneDelta(m.active)
 	m.mu.RUnlock()
+	if root != 0 {
+		defer m.releaseRoot(root)
+	}
 	entries, err := m.materializeRoot(root, covered)
 	if err != nil {
 		return api.Snapshot{CoveredCommitSeq: runtime}
@@ -195,6 +217,103 @@ func (m *Mapping) Snapshot() api.Snapshot {
 		applyLayer(entries, layer)
 	}
 	return api.Snapshot{CoveredCommitSeq: runtime, Entries: entries}
+}
+
+func (m *Mapping) releaseRoot(root base.MapAddr) {
+	m.readerMu.Lock()
+	if count := m.readers[root]; count <= 1 {
+		delete(m.readers, root)
+		m.readerCond.Broadcast()
+	} else {
+		m.readers[root] = count - 1
+	}
+	m.readerMu.Unlock()
+}
+
+func (m *Mapping) waitRootReaders(root base.MapAddr) {
+	if root == 0 {
+		return
+	}
+	m.readerMu.Lock()
+	for m.readers[root] != 0 {
+		m.readerCond.Wait()
+	}
+	m.readerMu.Unlock()
+}
+
+func (m *Mapping) SpaceUsage(ctx context.Context) (total, reachable uint64, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	m.mu.RLock()
+	root, covered := m.root, m.rootCovered
+	if root != 0 {
+		m.readerMu.Lock()
+		m.readers[root]++
+		m.readerMu.Unlock()
+	}
+	m.mu.RUnlock()
+	if root != 0 {
+		defer m.releaseRoot(root)
+	}
+	total, err = m.store.totalNodeBytes()
+	if err != nil {
+		return 0, 0, err
+	}
+	if root == 0 {
+		return total, 0, nil
+	}
+	reachable, err = m.reachableNodeBytes(ctx, root, 7, 0, covered)
+	return total, reachable, err
+}
+
+func (m *Mapping) reachableNodeBytes(ctx context.Context, addr base.MapAddr, level uint8, prefix uint64, covered base.CommitSeq) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	node, err := m.loadNode(addr, level, prefix, covered)
+	if err != nil {
+		return 0, err
+	}
+	bytes := uint64(storeformat.MappingNodeHeaderSize + storeformat.MappingNodeSlots*8)
+	if node.Encoding == storeformat.NodeEncodingSparseBitmap {
+		bytes = uint64(storeformat.MappingNodeHeaderSize + 64 + int(node.EntryCount)*8)
+	}
+	if level == 0 {
+		return bytes, nil
+	}
+	for slot := uint16(0); slot < storeformat.MappingNodeSlots; slot++ {
+		value, ok := node.Lookup(slot)
+		if !ok {
+			continue
+		}
+		childPrefix := uint64(slot)
+		if level != 7 {
+			childPrefix = (prefix << 9) | uint64(slot)
+		}
+		childBytes, err := m.reachableNodeBytes(ctx, base.MapAddr(value), level-1, childPrefix, covered)
+		if err != nil {
+			return 0, err
+		}
+		bytes, err = base.AddUint64(bytes, childBytes)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return bytes, nil
+}
+
+func (m *Mapping) installCompactedRoot(oldRoot base.MapAddr, covered base.CommitSeq, newRoot base.MapAddr, manifest storeformat.Manifest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.checkpoint || m.root != oldRoot || m.rootCovered != covered || manifest.MappingRoot != newRoot || manifest.CoveredCommitSeq != covered {
+		return base.ErrCorrupt
+	}
+	if err := m.store.adoptCompacted(manifest); err != nil {
+		return err
+	}
+	m.root = newRoot
+	return nil
 }
 
 func (m *Mapping) BeginCheckpoint() (*Checkpoint, error) {

@@ -10,6 +10,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/akzj/ridstore/internal/failpoint"
+	"github.com/akzj/ridstore/internal/mapping/radix"
 )
 
 func TestCreateOpenLockAndConfig(t *testing.T) {
@@ -416,6 +419,182 @@ func TestCheckpointRotatesMappingSegments(t *testing.T) {
 		if err != nil || string(value) != fmt.Sprintf("sparse-%d", i+1) {
 			t.Fatalf("id=%d value=%q error=%v", id, value, err)
 		}
+	}
+}
+
+func TestCompactMappingReclaimsOldGenerationAndReopens(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	cfg.MaxOpenBatches = 128
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]ID, 0, 80)
+	for i := 0; i < 80; i++ {
+		b, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := b.Allocate(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put(context.Background(), id, []byte("generation-0")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for generation := 1; generation <= 3; generation++ {
+		for _, id := range ids {
+			b, err := store.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Put(context.Background(), id, []byte(fmt.Sprintf("generation-%d", generation))); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.Commit(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.Checkpoint(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := store.catalog.Snapshot()
+	spaceBefore, err := store.MappingSpaceUsage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spaceBefore.UnreachableBytes == 0 {
+		t.Fatalf("expected COW garbage before compaction: %+v", spaceBefore)
+	}
+	oldIDs := make(map[uint32]struct{}, len(before.SealedMappingSegments)+1)
+	oldIDs[uint32(before.ActiveMapSegmentID)] = struct{}{}
+	for _, summary := range before.SealedMappingSegments {
+		oldIDs[summary.FileID] = struct{}{}
+	}
+	if err := store.CompactMapping(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after := store.catalog.Snapshot()
+	spaceAfter, err := store.MappingSpaceUsage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spaceAfter.UnreachableBytes != 0 || spaceAfter.TotalBytes != spaceAfter.ReachableBytes {
+		t.Fatalf("mapping space did not converge: before=%+v after=%+v", spaceBefore, spaceAfter)
+	}
+	if after.MaintenanceGeneration <= before.MaintenanceGeneration || after.MappingRoot == 0 || after.CoveredCommitSeq != before.CoveredCommitSeq {
+		t.Fatalf("before=%+v after=%+v", before, after)
+	}
+	for id := range oldIDs {
+		if id == uint32(after.ActiveMapSegmentID) {
+			t.Fatalf("old active mapping ID %d was reused", id)
+		}
+		for _, summary := range after.SealedMappingSegments {
+			if summary.FileID == id {
+				t.Fatalf("old sealed mapping ID %d remained", id)
+			}
+		}
+		for _, name := range []string{fmt.Sprintf("MAP-%08d.active", id), fmt.Sprintf("MAP-%08d.seg", id)} {
+			if _, err := os.Stat(filepath.Join(dir, "mapping", name)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("old mapping file %s still exists: %v", name, err)
+			}
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, id := range ids {
+		value, err := store.Get(context.Background(), id)
+		if err != nil || string(value) != "generation-3" {
+			t.Fatalf("id=%d value=%q error=%v", id, value, err)
+		}
+	}
+}
+
+func TestCompactMappingPreservesConcurrentCommitDelta(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := b.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put(context.Background(), id, []byte("before-gc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	store.mapping.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		if point == radix.PointMappingGCFilesDurable {
+			close(entered)
+			<-release
+		}
+		return nil
+	}))
+	compactResult := make(chan error, 1)
+	go func() { compactResult <- store.CompactMapping(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mapping GC did not reach files-durable boundary")
+	}
+	b, err = store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put(context.Background(), id, []byte("during-gc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-compactResult; err != nil {
+		t.Fatal(err)
+	}
+	if value, err := store.Get(context.Background(), id); err != nil || string(value) != "during-gc" {
+		t.Fatalf("runtime value=%q error=%v", value, err)
+	}
+	store.mapping.SetHook(nil)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if value, err := store.Get(context.Background(), id); err != nil || string(value) != "during-gc" {
+		t.Fatalf("recovered value=%q error=%v", value, err)
 	}
 }
 

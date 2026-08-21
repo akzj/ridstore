@@ -29,6 +29,7 @@ type nodeStore struct {
 	activeEnd   uint64
 	nextNodeSeq base.NodeSeq
 	sealed      map[base.MapSegmentID]sealedMapFile
+	retired     map[base.MapSegmentID]retiredMapFile
 	closed      bool
 	catalog     *catalog.Manager
 	activeFirst base.NodeSeq
@@ -45,10 +46,15 @@ type sealedMapFile struct {
 	summary storeformat.FileSummary
 }
 
+type retiredMapFile struct {
+	file *os.File
+	end  uint64
+}
+
 func openNodeStore(root string, manifest storeformat.Manifest, catalog *catalog.Manager) (*nodeStore, error) {
 	store := &nodeStore{
 		root: root, uuid: manifest.StoreUUID, segmentSize: manifest.HardLimits.SegmentSize,
-		activeID: manifest.ActiveMapSegmentID, nextNodeSeq: 1, sealed: make(map[base.MapSegmentID]sealedMapFile), catalog: catalog,
+		activeID: manifest.ActiveMapSegmentID, nextNodeSeq: 1, sealed: make(map[base.MapSegmentID]sealedMapFile), retired: make(map[base.MapSegmentID]retiredMapFile), catalog: catalog,
 	}
 	for _, summary := range manifest.SealedMappingSegments {
 		file, err := openMappingFile(root, manifest.StoreUUID, summary, true, manifest.HardLimits.SegmentSize)
@@ -164,6 +170,8 @@ func (s *nodeStore) read(addr base.MapAddr) (storeformat.MappingNode, int, error
 		file, end = s.active, s.activeEnd
 	} else if sealed, ok := s.sealed[addr.SegmentID()]; ok {
 		file, end = sealed.file, sealed.end
+	} else if retired, ok := s.retired[addr.SegmentID()]; ok {
+		file, end = retired.file, retired.end
 	}
 	s.mu.RUnlock()
 	if file == nil || uint64(addr.Offset())+storeformat.MappingNodeHeaderSize > end {
@@ -200,6 +208,113 @@ func (s *nodeStore) state() (base.MapSegmentID, base.MapSegmentID, []storeformat
 	return s.activeID, s.activeID + 1, sealed
 }
 
+func (s *nodeStore) totalNodeBytes() (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total := s.activeEnd - storeformat.SegmentHeaderSize
+	for _, item := range s.sealed {
+		var err error
+		total, err = base.AddUint64(total, item.end-storeformat.SegmentHeaderSize)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
+}
+
+func (s *nodeStore) mappingGCSourceRefs(current storeformat.Manifest) ([]storeformat.JournalFileRef, base.NodeSeq, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed || s.activeID != current.ActiveMapSegmentID || !sameFileSummaries(current.SealedMappingSegments, summariesOf(s.sealed)) {
+		return nil, 0, base.ErrConflict
+	}
+	refs := make([]storeformat.JournalFileRef, 0, len(s.sealed)+1)
+	for id, item := range s.sealed {
+		refs = append(refs, storeformat.JournalFileRef{Kind: storeformat.FileKindMapping, State: storeformat.FileStateSealed, FileID: uint32(id), ValidEnd: item.end, FirstSeq: item.summary.FirstSeq, LastSeq: item.summary.LastSeq})
+	}
+	last := s.activeLast
+	if last == 0 {
+		last = s.activeFirst
+	}
+	refs = append(refs, storeformat.JournalFileRef{Kind: storeformat.FileKindMapping, State: storeformat.FileStateActive, FileID: uint32(s.activeID), ValidEnd: s.activeEnd, FirstSeq: uint64(s.activeFirst), LastSeq: uint64(last)})
+	sortJournalRefs(refs)
+	return refs, s.nextNodeSeq, nil
+}
+
+func summariesOf(files map[base.MapSegmentID]sealedMapFile) []storeformat.FileSummary {
+	result := make([]storeformat.FileSummary, 0, len(files))
+	for _, item := range files {
+		result = append(result, item.summary)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].FileID < result[j].FileID })
+	return result
+}
+
+func (s *nodeStore) adoptCompacted(manifest storeformat.Manifest) error {
+	fresh, err := openNodeStore(s.root, manifest, s.catalog)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.Join(base.ErrClosed, fresh.Close())
+	}
+	if len(s.retired) != 0 {
+		s.mu.Unlock()
+		return errors.Join(base.ErrConflict, fresh.Close())
+	}
+	s.retired[s.activeID] = retiredMapFile{file: s.active, end: s.activeEnd}
+	for id, item := range s.sealed {
+		s.retired[id] = retiredMapFile{file: item.file, end: item.end}
+	}
+	fresh.mu.Lock()
+	s.activeID, s.active, s.activeEnd = fresh.activeID, fresh.active, fresh.activeEnd
+	s.nextNodeSeq, s.sealed = fresh.nextNodeSeq, fresh.sealed
+	s.activeFirst, s.activeLast, s.activeCount = fresh.activeFirst, fresh.activeLast, fresh.activeCount
+	fresh.active = nil
+	fresh.sealed = nil
+	fresh.closed = true
+	fresh.mu.Unlock()
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *nodeStore) trashRetired(refs []storeformat.JournalFileRef, operationID [16]byte) ([]string, error) {
+	trash := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		id := base.MapSegmentID(ref.FileID)
+		s.mu.RLock()
+		item, ok := s.retired[id]
+		s.mu.RUnlock()
+		if !ok {
+			return trash, fmt.Errorf("retired mapping file %d missing: %w", id, base.ErrCorrupt)
+		}
+		if err := item.file.Close(); err != nil {
+			return trash, err
+		}
+		source := filepath.Join(s.root, "mapping", activeMapFileName(id))
+		if ref.State == storeformat.FileStateSealed {
+			source = filepath.Join(s.root, "mapping", sealedMapFileName(id))
+		}
+		target := mappingGCTrashPath(s.root, operationID, id)
+		if err := os.Rename(source, target); err != nil {
+			return trash, err
+		}
+		s.mu.Lock()
+		delete(s.retired, id)
+		s.mu.Unlock()
+		trash = append(trash, target)
+	}
+	if err := syncDirectory(filepath.Join(s.root, "mapping")); err != nil {
+		return trash, err
+	}
+	if err := syncDirectory(filepath.Join(s.root, "trash")); err != nil {
+		return trash, err
+	}
+	return trash, nil
+}
+
 func (s *nodeStore) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -209,12 +324,16 @@ func (s *nodeStore) Close() error {
 	s.closed = true
 	active := s.active
 	sealed := s.sealed
+	retired := s.retired
 	s.mu.Unlock()
 	var result error
 	if active != nil {
 		result = errors.Join(result, active.Close())
 	}
 	for _, item := range sealed {
+		result = errors.Join(result, item.file.Close())
+	}
+	for _, item := range retired {
 		result = errors.Join(result, item.file.Close())
 	}
 	return result

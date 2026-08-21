@@ -201,6 +201,12 @@ Batch 不提供跨 Store 原子性。
 
 未来需要 B-Tree 多 Record 一致遍历时，单独设计 `ReadView`；不能把多个独立 Get 默认为 Snapshot。
 
+### 7.1 Mapping 维护
+
+`Checkpoint(ctx)` 将当前 durable Data Log cut、Persistent Mapping Root、allocator high watermark 与精确 SegmentStats 同代安装。`CompactMapping(ctx)` 先推进 Checkpoint，再把可达 Mapping Node 复制到全新的文件 generation，安装新 Root，等待旧 Root reader 退出后通过 trash 协议回收全部旧 Mapping 文件。两者都与 Close 协调，但 Mapping copy 期间用户 Commit 可以继续进入新 active Delta。
+
+`MappingSpaceUsage(ctx)` 显式遍历 durable Root，返回 Mapping Node 的 Total/Reachable/Unreachable encoded bytes；它是可能执行冷 I/O 的维护查询，不属于廉价 Metrics snapshot。
+
 ## 8. 并发覆盖
 
 默认 Blind Put 对同一 ID 采用 commit-order last-writer-wins：
