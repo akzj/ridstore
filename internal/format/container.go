@@ -37,6 +37,45 @@ type Container struct {
 	TLVs       []TLV
 }
 
+type ContainerHeader struct {
+	MajorVersion uint16
+	MinorVersion uint16
+	Generation   uint64
+	StoreUUID    base.StoreUUID
+	PayloadSize  uint64
+}
+
+// InspectContainerHeader validates the fixed header and declared file size but
+// deliberately does not reject an unknown format version. Offline migration
+// planning uses it to identify formats that the current decoder cannot open.
+func InspectContainerHeader(src []byte, expectedMagic ContainerMagic, fileSize, maxPayloadSize uint64) (ContainerHeader, error) {
+	var header ContainerHeader
+	if len(src) < ContainerHeaderSize || fileSize < ContainerHeaderSize {
+		return header, corruptf("container header truncated")
+	}
+	if !equalMagic(src[0:8], [8]byte(expectedMagic)) {
+		return header, corruptf("container magic")
+	}
+	if binary.LittleEndian.Uint32(src[12:16]) != ContainerHeaderSize || !validChecksum(src[:ContainerHeaderSize], 52) {
+		return header, corruptf("container header size or checksum")
+	}
+	if binary.LittleEndian.Uint32(src[56:60]) != 0 || binary.LittleEndian.Uint32(src[60:64]) != 0 {
+		return header, corruptf("container flags or reserved bytes")
+	}
+	header = ContainerHeader{
+		MajorVersion: binary.LittleEndian.Uint16(src[8:10]), MinorVersion: binary.LittleEndian.Uint16(src[10:12]),
+		Generation: binary.LittleEndian.Uint64(src[16:24]), PayloadSize: binary.LittleEndian.Uint64(src[40:48]),
+	}
+	copy(header.StoreUUID[:], src[24:40])
+	if header.Generation == 0 || header.StoreUUID == (base.StoreUUID{}) {
+		return ContainerHeader{}, corruptf("container identity")
+	}
+	if maxPayloadSize == 0 || header.PayloadSize > maxPayloadSize || header.PayloadSize != fileSize-ContainerHeaderSize {
+		return ContainerHeader{}, corruptf("container payload length")
+	}
+	return header, nil
+}
+
 func EncodeContainer(container Container) ([]byte, error) {
 	if container.Generation == 0 || container.StoreUUID == (base.StoreUUID{}) {
 		return nil, fmt.Errorf("container identity: %w", base.ErrInvalidConfig)
@@ -92,35 +131,19 @@ func EncodeContainer(container Container) ([]byte, error) {
 
 func DecodeContainer(src []byte, expectedMagic ContainerMagic, maxPayloadSize uint64) (Container, error) {
 	var container Container
-	if len(src) < ContainerHeaderSize {
-		return container, corruptf("container header truncated")
+	header, err := InspectContainerHeader(src, expectedMagic, uint64(len(src)), maxPayloadSize)
+	if err != nil {
+		return container, err
 	}
-	if !equalMagic(src[0:8], [8]byte(expectedMagic)) {
-		return container, corruptf("container magic")
-	}
-	if binary.LittleEndian.Uint32(src[12:16]) != ContainerHeaderSize || !validChecksum(src[:ContainerHeaderSize], 52) {
-		return container, corruptf("container header size or checksum")
-	}
-	major, minor := binary.LittleEndian.Uint16(src[8:10]), binary.LittleEndian.Uint16(src[10:12])
+	major, minor := header.MajorVersion, header.MinorVersion
 	if major != FormatMajorVersion || minor > FormatMinorVersion {
 		return container, fmt.Errorf("container version %d.%d: %w", major, minor, base.ErrUnsupported)
-	}
-	if binary.LittleEndian.Uint32(src[56:60]) != 0 || binary.LittleEndian.Uint32(src[60:64]) != 0 {
-		return container, corruptf("container flags or reserved bytes")
-	}
-	payloadSize := binary.LittleEndian.Uint64(src[40:48])
-	if maxPayloadSize == 0 || payloadSize > maxPayloadSize || payloadSize > uint64(len(src)-ContainerHeaderSize) || payloadSize != uint64(len(src)-ContainerHeaderSize) {
-		return container, corruptf("container payload length")
 	}
 	if crc32.Checksum(src[ContainerHeaderSize:], castagnoliTable) != binary.LittleEndian.Uint32(src[48:52]) {
 		return container, corruptf("container payload checksum")
 	}
 	container = Container{
-		Magic: expectedMagic, Generation: binary.LittleEndian.Uint64(src[16:24]),
-	}
-	copy(container.StoreUUID[:], src[24:40])
-	if container.Generation == 0 || container.StoreUUID == (base.StoreUUID{}) {
-		return Container{}, corruptf("container identity")
+		Magic: expectedMagic, Generation: header.Generation, StoreUUID: header.StoreUUID,
 	}
 
 	seen := make(map[uint16]struct{})

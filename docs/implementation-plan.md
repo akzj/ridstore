@@ -2,7 +2,7 @@
 
 状态：Execution plan v1
 
-当前进度（2026-08-22）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1–4 分别通过 [Phase 1 Review](phase-1-review.md)、[Phase 2 Review](phase-2-review.md)、[Phase 3 Review](phase-3-review.md) 与 [Phase 4 Review](phase-4-review.md)。Phase 5 Verify/Scrub、[Backup/Restore](backup-restore.md) 和 [Metrics Export](metrics-export.md) 已实现；migration skeleton、完整 fault/长期验证与 production checklist 仍未完成，项目未达到 production-ready。
+当前进度（2026-08-22）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1–4 分别通过 [Phase 1 Review](phase-1-review.md)、[Phase 2 Review](phase-2-review.md)、[Phase 3 Review](phase-3-review.md) 与 [Phase 4 Review](phase-4-review.md)。Phase 5 Verify/Scrub、[Backup/Restore](backup-restore.md)、[Metrics Export](metrics-export.md) 与 [Migration Skeleton](format-migration.md) 已实现；完整 fault/长期验证、benchmark 与 production checklist 仍未完成，项目未达到 production-ready。
 
 ## 1. 开发原则
 
