@@ -400,7 +400,9 @@ func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint
 	root, err := s.mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		s.mapping.AbortCheckpoint()
-		s.setFault(err)
+		if !errors.Is(err, base.ErrConflict) {
+			s.setFault(err)
+		}
 		return err
 	}
 	if err := failpoint.Hit(s.hook, pointCheckpointMappingSynced); err != nil {

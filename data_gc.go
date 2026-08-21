@@ -2,14 +2,38 @@ package ridstore
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/maintenance"
 	"github.com/akzj/ridstore/internal/mapping/api"
 	"github.com/akzj/ridstore/internal/segment"
+)
+
+type DataGCResult struct {
+	SourceSegmentID base.DataSegmentID
+	SourceBytes     uint64
+	CopiedBytes     uint64
+	Relocated       uint64
+	Skipped         uint64
+}
+
+const (
+	pointDataGCPrepared        failpoint.Point = "data-gc.prepared"
+	pointDataGCCopying         failpoint.Point = "data-gc.copying"
+	pointDataGCRelocations     failpoint.Point = "data-gc.relocations-durable"
+	pointDataGCCheckpoint      failpoint.Point = "data-gc.checkpoint-durable"
+	pointDataGCRetired         failpoint.Point = "data-gc.retired"
+	pointDataGCManifestRemoved failpoint.Point = "data-gc.manifest-removed"
+	pointDataGCTrashed         failpoint.Point = "data-gc.trashed"
+	pointDataGCDeleted         failpoint.Point = "data-gc.deleted"
 )
 
 type dataGCSession struct {
@@ -162,7 +186,13 @@ func (g *dataGCSession) relocate(ctx context.Context) error {
 	// SegmentStats selected the candidate; this second exact scan is the first
 	// deletion proof. The later GC-required Checkpoint validates every Mapping
 	// target again before the source can leave the Manifest.
-	if err := s.segments.ScanCleaning(sourceID, func(addr base.VAddr, frame storeformat.Frame) error {
+	return g.validateSourceEmpty(ctx)
+}
+
+func (g *dataGCSession) validateSourceEmpty(ctx context.Context) error {
+	s := g.store
+	sourceID := base.DataSegmentID(g.source.FileID)
+	return s.segments.ScanCleaning(sourceID, func(addr base.VAddr, frame storeformat.Frame) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -177,10 +207,7 @@ func (g *dataGCSession) relocate(ctx context.Context) error {
 			return fmt.Errorf("source segment still contains live mapping for ID %d: %w", frame.RecordID, base.ErrConflict)
 		}
 		return nil
-	}); err != nil {
-		return err
-	}
-	return nil
+	})
 }
 
 func (g *dataGCSession) cancel() error {
@@ -192,4 +219,425 @@ func (g *dataGCSession) cancel() error {
 		g.cleaning = false
 	}
 	return err
+}
+
+// CompactData cleans at most one checkpoint-safe sealed Data Segment. A zero
+// result with nil error means no sealed Segment currently has reclaimable
+// space below the durable replay boundary.
+func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr error) {
+	if s == nil {
+		return DataGCResult{}, base.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return DataGCResult{}, err
+	}
+	// Establish exact SegmentStats and a replay boundary before choosing a
+	// candidate. The operation then owns checkpointMu through final deletion.
+	if err := s.Checkpoint(ctx); err != nil {
+		return DataGCResult{}, err
+	}
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	s.ops.RLock()
+	defer s.ops.RUnlock()
+	if err := s.checkAvailable(); err != nil {
+		return DataGCResult{}, err
+	}
+	session, err := s.beginDataGC()
+	if errors.Is(err, base.ErrNotFound) {
+		return DataGCResult{}, nil
+	}
+	if err != nil {
+		return DataGCResult{}, err
+	}
+	journalInstalled := false
+	checkpointDurable := false
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		if !checkpointDurable {
+			_ = session.cancel()
+			if journalInstalled {
+				_ = maintenance.Remove(s.config.Dir)
+			}
+			return
+		}
+		// Once the checkpoint proving no source mappings is durable, recovery
+		// must finish the journal rather than silently roll the operation back.
+		s.setFault(resultErr)
+	}()
+	current := s.catalog.Snapshot()
+	if current.MaintenanceGeneration == ^uint64(0) {
+		return DataGCResult{}, base.ErrGenerationExhausted
+	}
+	var operationID [16]byte
+	if _, err := rand.Read(operationID[:]); err != nil {
+		return DataGCResult{}, err
+	}
+	journal := storeformat.MaintenanceJournal{
+		Generation: current.MaintenanceGeneration + 1, StoreUUID: current.StoreUUID, OperationID: operationID,
+		OperationType: storeformat.MaintenanceDataGC, Phase: 1, OldManifestGeneration: current.Generation,
+		SourceFiles: []storeformat.JournalFileRef{{
+			Kind: storeformat.FileKindData, State: storeformat.FileStateSealed, FileID: session.source.FileID,
+			ValidEnd: session.source.ValidEnd, FirstSeq: session.source.FirstSeq, LastSeq: session.source.LastSeq,
+		}},
+	}
+	if err := maintenance.Install(s.config.Dir, journal); err != nil {
+		return DataGCResult{}, err
+	}
+	journalInstalled = true
+	if err := failpoint.Hit(s.hook, pointDataGCPrepared); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 2, 0); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := failpoint.Hit(s.hook, pointDataGCCopying); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := session.relocate(ctx); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 3, 0); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := failpoint.Hit(s.hook, pointDataGCRelocations); err != nil {
+		return DataGCResult{}, err
+	}
+	var checkpointManifest storeformat.Manifest
+	if err := s.checkpointLocked(ctx, journal.Generation, &checkpointManifest); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := validateDataGCCheckpoint(checkpointManifest, session); err != nil {
+		return DataGCResult{}, err
+	}
+	if checkpointManifest.MaintenanceGeneration != journal.Generation {
+		return DataGCResult{}, fmt.Errorf("data GC checkpoint maintenance generation: %w", base.ErrCorrupt)
+	}
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 4, checkpointManifest.Generation); err != nil {
+		return DataGCResult{}, err
+	}
+	checkpointDurable = true
+	if err := failpoint.Hit(s.hook, pointDataGCCheckpoint); err != nil {
+		return DataGCResult{}, err
+	}
+	sourceID := base.DataSegmentID(session.source.FileID)
+	if err := s.segments.RetireCleaning(sourceID); err != nil {
+		return DataGCResult{}, err
+	}
+	session.cleaning = false
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := failpoint.Hit(s.hook, pointDataGCRetired); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := s.segments.WaitForNoReaders(ctx, sourceID); err != nil {
+		return DataGCResult{}, err
+	}
+	removedManifest, err := s.removeDataGCSourceFromManifest(session, journal.Generation)
+	if err != nil {
+		return DataGCResult{}, err
+	}
+	s.mu.Lock()
+	s.manifest = removedManifest
+	s.mu.Unlock()
+	if err := failpoint.Hit(s.hook, pointDataGCManifestRemoved); err != nil {
+		return DataGCResult{}, err
+	}
+	sealed, err := s.segments.DetachRetired(sourceID)
+	if err != nil {
+		return DataGCResult{}, err
+	}
+	if err := sealed.Close(); err != nil {
+		return DataGCResult{}, err
+	}
+	trashPath := dataGCTrashPath(s.config.Dir, operationID, sourceID)
+	if err := os.Rename(dataGCSealedPath(s.config.Dir, sourceID), trashPath); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "data")); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := failpoint.Hit(s.hook, pointDataGCTrashed); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := os.Remove(trashPath); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := failpoint.Hit(s.hook, pointDataGCDeleted); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := maintenance.Remove(s.config.Dir); err != nil {
+		return DataGCResult{}, err
+	}
+	sourceBytes, err := base.AddUint64(session.source.ValidEnd, storeformat.SegmentFooterSize)
+	if err != nil {
+		return DataGCResult{}, err
+	}
+	return DataGCResult{
+		SourceSegmentID: sourceID, SourceBytes: sourceBytes, CopiedBytes: session.copiedBytes,
+		Relocated: session.relocated, Skipped: session.skipped,
+	}, nil
+}
+
+func advanceDataGCJournal(root string, journal *storeformat.MaintenanceJournal, phase uint16, newManifestGeneration uint64) error {
+	next := *journal
+	next.SourceFiles = append([]storeformat.JournalFileRef(nil), journal.SourceFiles...)
+	next.DestinationFiles = append([]storeformat.JournalFileRef(nil), journal.DestinationFiles...)
+	next.Phase = phase
+	if newManifestGeneration != 0 {
+		next.NewManifestGeneration = newManifestGeneration
+	}
+	if err := storeformat.ValidateMaintenanceTransition(*journal, next); err != nil {
+		return err
+	}
+	if err := maintenance.Install(root, next); err != nil {
+		return err
+	}
+	*journal = next
+	return nil
+}
+
+func validateDataGCCheckpoint(manifest storeformat.Manifest, session *dataGCSession) error {
+	sourceID := base.DataSegmentID(session.source.FileID)
+	if manifest.MaintenanceGeneration == 0 || manifest.CoveredCommitSeq < session.lastCommit || manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq {
+		return fmt.Errorf("data GC checkpoint boundary: %w", base.ErrCorrupt)
+	}
+	if manifest.ReplayStart.SegmentID() < sourceID ||
+		(manifest.ReplayStart.SegmentID() == sourceID && uint64(manifest.ReplayStart.Offset()) < session.source.ValidEnd) {
+		return fmt.Errorf("data GC replay boundary before source end: %w", base.ErrCorrupt)
+	}
+	for _, stat := range manifest.SegmentStats {
+		if stat.SegmentID == sourceID {
+			return fmt.Errorf("data GC checkpoint still reports source live data: %w", base.ErrConflict)
+		}
+	}
+	return nil
+}
+
+func (s *Store) removeDataGCSourceFromManifest(session *dataGCSession, maintenanceGeneration uint64) (storeformat.Manifest, error) {
+	sourceID := base.DataSegmentID(session.source.FileID)
+	return s.catalog.Install(0, func(next *storeformat.Manifest) error {
+		if next.MaintenanceGeneration != maintenanceGeneration || next.CoveredCommitSeq < session.lastCommit {
+			return base.ErrConflict
+		}
+		found := false
+		kept := next.SealedDataSegments[:0]
+		for _, summary := range next.SealedDataSegments {
+			if base.DataSegmentID(summary.FileID) == sourceID {
+				if summary != session.source {
+					return fmt.Errorf("data GC source summary changed: %w", base.ErrCorrupt)
+				}
+				found = true
+				continue
+			}
+			kept = append(kept, summary)
+		}
+		if !found {
+			return fmt.Errorf("data GC source missing before manifest removal: %w", base.ErrCorrupt)
+		}
+		next.SealedDataSegments = append([]storeformat.FileSummary(nil), kept...)
+		for _, stat := range next.SegmentStats {
+			if stat.SegmentID == sourceID {
+				return fmt.Errorf("data GC source remains live at deletion: %w", base.ErrCorrupt)
+			}
+		}
+		return nil
+	})
+}
+
+func dataGCSealedPath(root string, id base.DataSegmentID) string {
+	return filepath.Join(root, "data", segment.SealedDataFileName(id))
+}
+
+func dataGCTrashPath(root string, operationID [16]byte, id base.DataSegmentID) string {
+	return filepath.Join(root, "trash", fmt.Sprintf("DATA-%08d.%x.trash", id, operationID))
+}
+
+func (s *Store) resumeDataGC() error {
+	journal, found, err := maintenance.Load(s.config.Dir)
+	if err != nil || !found {
+		return err
+	}
+	if journal.OperationType != storeformat.MaintenanceDataGC {
+		return nil
+	}
+	if journal.StoreUUID != s.catalog.Snapshot().StoreUUID || len(journal.SourceFiles) != 1 || journal.SourceFiles[0].Kind != storeformat.FileKindData {
+		return fmt.Errorf("data GC recovery journal identity: %w", base.ErrCorrupt)
+	}
+	// Prepared/Copying/RelocationsDurable have not removed the source from the
+	// Manifest. Replayed relocation seals are safe, so abandoning and retrying
+	// the cleaning work is deterministic and keeps Open available even if the
+	// nested checkpoint previously ran out of Mapping space.
+	if journal.Phase <= 3 {
+		return maintenance.Remove(s.config.Dir)
+	}
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	s.ops.RLock()
+	defer s.ops.RUnlock()
+	return s.resumeDataGCLocked(context.Background(), journal)
+}
+
+func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.MaintenanceJournal) error {
+	ref := journal.SourceFiles[0]
+	source := storeformat.FileSummary{FileID: ref.FileID, ValidEnd: ref.ValidEnd, FirstSeq: ref.FirstSeq, LastSeq: ref.LastSeq}
+	sourceID := base.DataSegmentID(source.FileID)
+	session := &dataGCSession{store: s, source: source}
+	retiredInRuntime := false
+	current := s.catalog.Snapshot()
+	if current.MaintenanceGeneration != journal.Generation || current.Generation < journal.NewManifestGeneration {
+		return fmt.Errorf("data GC recovery manifest generation: %w", base.ErrCorrupt)
+	}
+	if err := validateRecoveredDataGCCheckpoint(current, journal, sourceID); err != nil {
+		return err
+	}
+	if journal.Phase == 4 {
+		if !manifestHasDataSegment(current, sourceID) {
+			return fmt.Errorf("data GC source missing at checkpoint phase: %w", base.ErrCorrupt)
+		}
+		if err := s.segments.BeginCleaning(sourceID); err != nil {
+			return err
+		}
+		session.cleaning = true
+		if err := session.validateSourceEmpty(ctx); err != nil {
+			_ = session.cancel()
+			return err
+		}
+		if err := s.segments.RetireCleaning(sourceID); err != nil {
+			return err
+		}
+		session.cleaning = false
+		retiredInRuntime = true
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration); err != nil {
+			return err
+		}
+	}
+	if journal.Phase == 5 {
+		current = s.catalog.Snapshot()
+		if manifestHasDataSegment(current, sourceID) {
+			if !retiredInRuntime {
+				if err := s.segments.BeginCleaning(sourceID); err != nil {
+					return err
+				}
+				session.cleaning = true
+				if err := session.validateSourceEmpty(ctx); err != nil {
+					_ = session.cancel()
+					return err
+				}
+				if err := s.segments.RetireCleaning(sourceID); err != nil {
+					return err
+				}
+				session.cleaning = false
+				retiredInRuntime = true
+			}
+			if err := s.segments.WaitForNoReaders(ctx, sourceID); err != nil {
+				return err
+			}
+			removed, err := s.removeDataGCSourceFromManifest(session, journal.Generation)
+			if err != nil {
+				return err
+			}
+			s.mu.Lock()
+			s.manifest = removed
+			s.mu.Unlock()
+			sealed, err := s.segments.DetachRetired(sourceID)
+			if err != nil {
+				return err
+			}
+			if err := sealed.Close(); err != nil {
+				return err
+			}
+		}
+		if err := ensureDataGCTrashed(s.config.Dir, journal.OperationID, sourceID); err != nil {
+			return err
+		}
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration); err != nil {
+			return err
+		}
+	}
+	if journal.Phase == 6 {
+		if manifestHasDataSegment(s.catalog.Snapshot(), sourceID) {
+			return fmt.Errorf("data GC source remains in manifest at trash phase: %w", base.ErrCorrupt)
+		}
+		trashPath := dataGCTrashPath(s.config.Dir, journal.OperationID, sourceID)
+		if err := os.Remove(trashPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
+			return err
+		}
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration); err != nil {
+			return err
+		}
+	}
+	if journal.Phase != 7 {
+		return fmt.Errorf("data GC recovery phase %d: %w", journal.Phase, base.ErrCorrupt)
+	}
+	return maintenance.Remove(s.config.Dir)
+}
+
+func validateRecoveredDataGCCheckpoint(manifest storeformat.Manifest, journal storeformat.MaintenanceJournal, sourceID base.DataSegmentID) error {
+	if manifest.MaintenanceGeneration != journal.Generation || manifest.Generation < journal.NewManifestGeneration || manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq {
+		return fmt.Errorf("recovered data GC checkpoint identity: %w", base.ErrCorrupt)
+	}
+	source := journal.SourceFiles[0]
+	if manifest.ReplayStart.SegmentID() < sourceID ||
+		(manifest.ReplayStart.SegmentID() == sourceID && uint64(manifest.ReplayStart.Offset()) < source.ValidEnd) {
+		return fmt.Errorf("recovered data GC replay boundary before source: %w", base.ErrCorrupt)
+	}
+	for _, stat := range manifest.SegmentStats {
+		if stat.SegmentID == sourceID {
+			return fmt.Errorf("recovered data GC source is still live: %w", base.ErrCorrupt)
+		}
+	}
+	return nil
+}
+
+func manifestHasDataSegment(manifest storeformat.Manifest, id base.DataSegmentID) bool {
+	for _, summary := range manifest.SealedDataSegments {
+		if base.DataSegmentID(summary.FileID) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureDataGCTrashed(root string, operationID [16]byte, id base.DataSegmentID) error {
+	source, trash := dataGCSealedPath(root, id), dataGCTrashPath(root, operationID, id)
+	_, sourceErr := os.Lstat(source)
+	_, trashErr := os.Lstat(trash)
+	if sourceErr == nil && trashErr == nil {
+		return fmt.Errorf("data GC source and trash both exist: %w", base.ErrCorrupt)
+	}
+	if sourceErr == nil {
+		if err := os.Rename(source, trash); err != nil {
+			return err
+		}
+	} else if !errors.Is(sourceErr, os.ErrNotExist) {
+		return sourceErr
+	} else if trashErr != nil {
+		if errors.Is(trashErr, os.ErrNotExist) {
+			return fmt.Errorf("data GC source and trash both missing: %w", base.ErrCorrupt)
+		}
+		return trashErr
+	}
+	if err := maintenance.SyncDirectory(filepath.Join(root, "data")); err != nil {
+		return err
+	}
+	return maintenance.SyncDirectory(filepath.Join(root, "trash"))
 }
