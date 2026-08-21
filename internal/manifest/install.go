@@ -35,6 +35,17 @@ const (
 
 type Hook func(Step) error
 
+const (
+	PointBeforeManifestWrite    failpoint.Point = "manifest.before-manifest-write"
+	PointBeforeManifestFileSync failpoint.Point = "manifest.before-manifest-file-sync"
+	PointBeforeManifestRename   failpoint.Point = "manifest.before-manifest-rename"
+	PointBeforeManifestDirSync  failpoint.Point = "manifest.before-manifest-dir-sync"
+	PointBeforeCurrentWrite     failpoint.Point = "manifest.before-current-write"
+	PointBeforeCurrentFileSync  failpoint.Point = "manifest.before-current-file-sync"
+	PointBeforeCurrentRename    failpoint.Point = "manifest.before-current-rename"
+	PointBeforeRootDirSync      failpoint.Point = "manifest.before-root-dir-sync"
+)
+
 type Installer struct {
 	Dir           string
 	Hook          Hook
@@ -90,7 +101,11 @@ func (i Installer) Install(m storeformat.Manifest) error {
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return readErr
 	} else {
-		if err := writeSyncedFile(tempPath, encoded, 0o600, i.hit, StepManifestWritten, StepManifestFileSynced); err != nil {
+		if err := writeSyncedFile(tempPath, encoded, 0o600, i.before, i.hit,
+			PointBeforeManifestWrite, StepManifestWritten, PointBeforeManifestFileSync, StepManifestFileSynced); err != nil {
+			return err
+		}
+		if err := i.before(PointBeforeManifestRename); err != nil {
 			return err
 		}
 		if err := os.Rename(tempPath, finalPath); err != nil {
@@ -102,6 +117,9 @@ func (i Installer) Install(m storeformat.Manifest) error {
 	}
 	// Always sync the directory, including idempotent recovery after a crash
 	// between rename and directory fsync.
+	if err := i.before(PointBeforeManifestDirSync); err != nil {
+		return err
+	}
 	if err := syncDirectory(manifestDir); err != nil {
 		return err
 	}
@@ -111,13 +129,20 @@ func (i Installer) Install(m storeformat.Manifest) error {
 
 	current := []byte(name + "\n")
 	currentTemp := filepath.Join(i.Dir, ".CURRENT.tmp")
-	if err := writeSyncedFile(currentTemp, current, 0o600, i.hit, StepCurrentWritten, StepCurrentFileSynced); err != nil {
+	if err := writeSyncedFile(currentTemp, current, 0o600, i.before, i.hit,
+		PointBeforeCurrentWrite, StepCurrentWritten, PointBeforeCurrentFileSync, StepCurrentFileSynced); err != nil {
+		return err
+	}
+	if err := i.before(PointBeforeCurrentRename); err != nil {
 		return err
 	}
 	if err := os.Rename(currentTemp, filepath.Join(i.Dir, CurrentFileName)); err != nil {
 		return err
 	}
 	if err := i.hit(StepCurrentRenamed); err != nil {
+		return err
+	}
+	if err := i.before(PointBeforeRootDirSync); err != nil {
 		return err
 	}
 	if err := syncDirectory(i.Dir); err != nil {
@@ -245,7 +270,9 @@ func ParseManifestFileName(name string) (uint64, error) {
 	return generation, nil
 }
 
-func writeSyncedFile(path string, data []byte, mode os.FileMode, hook Hook, written, synced Step) (retErr error) {
+func writeSyncedFile(path string, data []byte, mode os.FileMode, before func(failpoint.Point) error, after Hook,
+	beforeWrite failpoint.Point, written Step, beforeSync failpoint.Point, synced Step,
+) (retErr error) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -258,16 +285,22 @@ func writeSyncedFile(path string, data []byte, mode os.FileMode, hook Hook, writ
 			retErr = closeErr
 		}
 	}()
+	if err := before(beforeWrite); err != nil {
+		return err
+	}
 	if _, err := io.Copy(file, bytes.NewReader(data)); err != nil {
 		return err
 	}
-	if err := runHook(hook, written); err != nil {
+	if err := runHook(after, written); err != nil {
+		return err
+	}
+	if err := before(beforeSync); err != nil {
 		return err
 	}
 	if err := file.Sync(); err != nil {
 		return err
 	}
-	return runHook(hook, synced)
+	return runHook(after, synced)
 }
 
 func readRegularFile(path string, maxSize int64) ([]byte, error) {
@@ -340,4 +373,8 @@ func (i Installer) hit(step Step) error {
 		return err
 	}
 	return runHook(i.Hook, step)
+}
+
+func (i Installer) before(point failpoint.Point) error {
+	return failpoint.Hit(i.FailpointHook, point)
 }
