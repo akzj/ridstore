@@ -147,6 +147,7 @@ func (s *Store) Close() error {
 			b.finish(BatchStatus{BatchID: b.ID(), State: BatchStateAborted})
 		}
 	}
+	result = errors.Join(result, s.coordinator.Close())
 	result = errors.Join(result, s.log.Close())
 	result = errors.Join(result, s.active.Close())
 	result = errors.Join(result, s.lock.Close())
