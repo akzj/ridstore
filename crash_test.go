@@ -47,9 +47,243 @@ const (
 	reserveCrashDirEnv      = "RIDSTORE_RESERVE_CRASH_DIR"
 	reserveCrashKindEnv     = "RIDSTORE_RESERVE_CRASH_KIND"
 	reserveCrashPointEnv    = "RIDSTORE_RESERVE_CRASH_POINT"
+	abortCrashChildEnv      = "RIDSTORE_ABORT_CRASH_CHILD"
+	abortCrashDirEnv        = "RIDSTORE_ABORT_CRASH_DIR"
+	abortCrashPointEnv      = "RIDSTORE_ABORT_CRASH_POINT"
 )
 
 const reserveIssuedPoint failpoint.Point = "allocator.id-issued"
+const abortReturnedPoint failpoint.Point = "batch.abort-returned"
+
+func TestAbortProcessCrashMatrix(t *testing.T) {
+	for _, point := range []failpoint.Point{
+		appendlog.PointAbortPrepared,
+		appendlog.PointAbortWritten,
+		abortReturnedPoint,
+	} {
+		point := point
+		t.Run(string(point), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "store")
+			killAbortChildAt(t, dir, point)
+			store, err := Open(smallTestConfig(dir))
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			if _, err := store.Get(context.Background(), 1); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("aborted Put became visible: %v", err)
+			}
+			status, err := store.Status(context.Background(), 1)
+			if err != nil || status.State != BatchStateAborted || status.CommitSeq != 0 {
+				t.Fatalf("old status=%+v error=%v", status, err)
+			}
+			batch, err := store.Begin(context.Background())
+			if err != nil || batch.ID() != 5 {
+				t.Fatalf("new batch=%v error=%v", batchIDOf(batch), err)
+			}
+			id, err := batch.Allocate(context.Background())
+			if err != nil || id != 5 {
+				t.Fatalf("new record ID=%d error=%v", id, err)
+			}
+			if err := batch.Abort(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAbortPreWriteFailureReleasesResourcesAndRemainsRecoverable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, *Batch) error
+		want error
+	}{
+		{
+			name: "cancelled-context",
+			run: func(_ context.Context, batch *Batch) error {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return batch.Abort(ctx)
+			},
+			want: context.Canceled,
+		},
+		{
+			name: "prepared-hook-error",
+			run:  func(ctx context.Context, batch *Batch) error { return batch.Abort(ctx) },
+			want: errAbortPrepared,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "store")
+			var armed atomic.Bool
+			hook := failpoint.Func(func(point failpoint.Point) error {
+				if armed.Load() && point == appendlog.PointAbortPrepared {
+					return errAbortPrepared
+				}
+				return nil
+			})
+			store, err := createWithOptions(smallTestConfig(dir), initialize.Options{Hook: hook})
+			if err != nil {
+				t.Fatal(err)
+			}
+			batch, err := store.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := batch.Allocate(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := batch.Put(context.Background(), id, []byte("orphan")); err != nil {
+				t.Fatal(err)
+			}
+			segmentID := store.segments.Active().SegmentID()
+			if refs := store.segments.OpenBatchRefs(segmentID); refs != 1 {
+				t.Fatalf("open refs before abort=%d", refs)
+			}
+			armed.Store(true)
+			if err := tc.run(context.Background(), batch); !errors.Is(err, tc.want) {
+				t.Fatalf("abort error=%v want=%v", err, tc.want)
+			}
+			armed.Store(false)
+			if refs := store.segments.OpenBatchRefs(segmentID); refs != 0 {
+				t.Fatalf("open refs after abort=%d", refs)
+			}
+			status, err := store.Status(context.Background(), batch.ID())
+			if err != nil || status.State != BatchStateAborted {
+				t.Fatalf("status=%+v error=%v", status, err)
+			}
+
+			live, err := store.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			liveID, err := live.Allocate(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := live.Put(context.Background(), liveID, []byte("live")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := live.Commit(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err = Open(smallTestConfig(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Get(context.Background(), id); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("orphan get error=%v", err)
+			}
+			if value, err := store.Get(context.Background(), liveID); err != nil || string(value) != "live" {
+				t.Fatalf("live value=%q error=%v", value, err)
+			}
+			status, err = store.Status(context.Background(), batch.ID())
+			if err != nil || status.State != BatchStateAborted {
+				t.Fatalf("recovered status=%+v error=%v", status, err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+var errAbortPrepared = errors.New("abort prepared test error")
+
+func batchIDOf(batch *Batch) BatchID {
+	if batch == nil {
+		return 0
+	}
+	return batch.ID()
+}
+
+func killAbortChildAt(t *testing.T, dir string, point failpoint.Point) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAbortCrashChild$", "-test.count=1")
+	cmd.Env = append(os.Environ(), abortCrashChildEnv+"=1", abortCrashDirEnv+"="+dir, abortCrashPointEnv+"="+string(point))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			ready <- scanner.Text()
+			return
+		}
+		ready <- ""
+	}()
+	want := "RIDSTORE_FAILPOINT_READY " + string(point)
+	select {
+	case line := <-ready:
+		if line != want {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("child did not reach failpoint: line=%q stderr=%s", line, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("timeout waiting for %s: stderr=%s", point, stderr.String())
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("SIGKILL child exited successfully")
+	}
+}
+
+func TestAbortCrashChild(t *testing.T) {
+	if os.Getenv(abortCrashChildEnv) != "1" {
+		t.Skip("subprocess helper")
+	}
+	target := failpoint.Point(os.Getenv(abortCrashPointEnv))
+	var armed atomic.Bool
+	hook := failpoint.Func(func(point failpoint.Point) error {
+		if armed.Load() && point == target {
+			blockAtCrashPoint(point)
+		}
+		return nil
+	})
+	store, err := createWithOptions(smallTestConfig(os.Getenv(abortCrashDirEnv)), initialize.Options{Hook: hook})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(context.Background(), id, []byte("must-stay-invisible")); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	if err := batch.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if target == abortReturnedPoint {
+		blockAtCrashPoint(target)
+	}
+	t.Fatalf("abort failpoint %s was not reached", target)
+}
 
 func TestReserveProcessCrashMatrix(t *testing.T) {
 	points := []failpoint.Point{

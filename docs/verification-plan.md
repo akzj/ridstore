@@ -119,6 +119,8 @@ Failpoint 必须位于真实 write/fsync/rename/dir sync/publish 操作两侧。
 | Publish 后、Reply 前 | 必须 Committed，Status 可确认 |
 | 条件检查前/中取消或冲突 | 确定 Aborted，无 CommitSeal，Mapping 零变化 |
 
+Abort 独立覆盖 marker append 前、完整 write 后未 sync、API 已返回后三个 SIGKILL 边界。三者恢复后 Put 都不可见、Status 都为 Aborted，且旧 BatchID/Record ID 均不得再次发放；这证明正确性不依赖 best-effort Abort marker durable。
+
 若硬件/文件系统不能模拟真实 power loss，报告只能称为 process-crash evidence。
 
 初始化另有独立 crash matrix：INITIALIZING marker、子目录、两个初始 Segment Header、generation-1 Manifest、CURRENT 和 marker 删除的每个 write/fsync/rename 前后强制退出；恢复结果只能是可继续完成的同一 UUID Store 或明确错误，不能静默创建第二个空 Store。
