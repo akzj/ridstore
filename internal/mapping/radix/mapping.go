@@ -2,6 +2,7 @@ package radix
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 
@@ -21,14 +22,15 @@ type Mapping struct {
 	mu     sync.RWMutex
 	budget *deltaBudget
 
-	store       *nodeStore
-	cache       *nodeCache
-	root        base.MapAddr
-	rootCovered base.CommitSeq
-	runtimeSeq  base.CommitSeq
-	active      map[base.ID]deltaEntry
-	frozen      []map[base.ID]deltaEntry // oldest to newest
-	checkpoint  bool
+	store             *nodeStore
+	cache             *nodeCache
+	root              base.MapAddr
+	rootCovered       base.CommitSeq
+	runtimeSeq        base.CommitSeq
+	active            map[base.ID]deltaEntry
+	frozen            []map[base.ID]deltaEntry // oldest to newest
+	checkpoint        bool
+	checkpointEntries int
 }
 
 type Checkpoint struct {
@@ -62,7 +64,7 @@ func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs
 	mapping := &Mapping{
 		store: store, cache: newNodeCache(cacheBytes), root: manifest.MappingRoot,
 		rootCovered: manifest.CoveredCommitSeq, runtimeSeq: manifest.CoveredCommitSeq,
-		active: make(map[base.ID]deltaEntry), budget: newDeltaBudget(),
+		active: make(map[base.ID]deltaEntry), budget: newDeltaBudget(), checkpointEntries: math.MaxInt,
 	}
 	if mapping.root != 0 {
 		if _, err := mapping.loadNode(mapping.root, 7, 0, mapping.rootCovered); err != nil {
@@ -210,28 +212,56 @@ func (m *Mapping) BeginCheckpoint() (*Checkpoint, error) {
 	return &Checkpoint{root: m.root, rootCovered: m.rootCovered, covered: m.runtimeSeq, layers: layers}, nil
 }
 
-func (m *Mapping) BuildCheckpoint(checkpoint *Checkpoint) (base.MapAddr, map[base.ID]base.VAddr, error) {
-	if checkpoint == nil {
-		return 0, nil, base.ErrInvalidConfig
+func (m *Mapping) SetCheckpointMemory(bytes int64) error {
+	const estimatedEntryWorkingBytes = int64(2048)
+	if bytes < 64<<10 {
+		return base.ErrInvalidConfig
 	}
-	dirty := make(map[base.ID]deltaEntry)
+	entries := bytes / estimatedEntryWorkingBytes
+	if entries > int64(math.MaxInt) {
+		entries = int64(math.MaxInt)
+	}
+	m.mu.Lock()
+	m.checkpointEntries = int(entries)
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Mapping) BuildCheckpoint(checkpoint *Checkpoint) (base.MapAddr, error) {
+	if checkpoint == nil {
+		return 0, base.ErrInvalidConfig
+	}
+	m.mu.RLock()
+	chunkEntries := m.checkpointEntries
+	m.mu.RUnlock()
+	root, rootCovered := checkpoint.root, checkpoint.rootCovered
 	for _, layer := range checkpoint.layers {
+		dirty := make(map[base.ID]deltaEntry, min(len(layer), chunkEntries))
 		for id, entry := range layer {
 			dirty[id] = entry
+			if len(dirty) == chunkEntries {
+				var err error
+				root, err = m.buildCOW(root, rootCovered, checkpoint.covered, dirty)
+				if err != nil {
+					return 0, err
+				}
+				rootCovered = checkpoint.covered
+				dirty = make(map[base.ID]deltaEntry, min(len(layer), chunkEntries))
+			}
+		}
+		if len(dirty) != 0 {
+			var err error
+			root, err = m.buildCOW(root, rootCovered, checkpoint.covered, dirty)
+			if err != nil {
+				return 0, err
+			}
+			rootCovered = checkpoint.covered
 		}
 	}
-	root, err := m.buildCOW(checkpoint.root, checkpoint.rootCovered, checkpoint.covered, dirty)
-	if err != nil {
-		return 0, nil, err
-	}
 	if err := m.store.sync(); err != nil {
-		return 0, nil, err
+		return 0, err
 	}
-	entries, err := m.materializeRoot(root, checkpoint.covered)
-	if err != nil {
-		return 0, nil, err
-	}
-	return root, entries, nil
+	return root, nil
 }
 
 func (m *Mapping) CompleteCheckpoint(checkpoint *Checkpoint, root base.MapAddr) error {
@@ -449,8 +479,19 @@ func slotsOccupied(slots [storeformat.MappingNodeSlots]uint64) bool {
 
 func (m *Mapping) materializeRoot(root base.MapAddr, covered base.CommitSeq) (map[base.ID]base.VAddr, error) {
 	entries := make(map[base.ID]base.VAddr)
+	err := m.WalkRoot(root, covered, func(id base.ID, addr base.VAddr) error {
+		entries[id] = addr
+		return nil
+	})
+	return entries, err
+}
+
+func (m *Mapping) WalkRoot(root base.MapAddr, covered base.CommitSeq, visit func(base.ID, base.VAddr) error) error {
+	if visit == nil {
+		return base.ErrInvalidConfig
+	}
 	if root == 0 {
-		return entries, nil
+		return nil
 	}
 	var walk func(base.MapAddr, uint8, uint64) error
 	walk = func(addr base.MapAddr, level uint8, prefix uint64) error {
@@ -464,7 +505,9 @@ func (m *Mapping) materializeRoot(root base.MapAddr, covered base.CommitSeq) (ma
 				continue
 			}
 			if level == 0 {
-				entries[base.ID((prefix<<9)|uint64(slot))] = base.VAddr(value)
+				if err := visit(base.ID((prefix<<9)|uint64(slot)), base.VAddr(value)); err != nil {
+					return err
+				}
 				continue
 			}
 			childPrefix := uint64(slot)
@@ -477,7 +520,7 @@ func (m *Mapping) materializeRoot(root base.MapAddr, covered base.CommitSeq) (ma
 		}
 		return nil
 	}
-	return entries, walk(root, 7, 0)
+	return walk(root, 7, 0)
 }
 
 func (m *Mapping) buildTree(entries map[base.ID]base.VAddr, covered base.CommitSeq) (base.MapAddr, error) {

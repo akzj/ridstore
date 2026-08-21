@@ -57,7 +57,7 @@ func TestRadixMatchesMemoryMappingRandomModel(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			root, _, err := persistent.BuildCheckpoint(checkpoint)
+			root, err := persistent.BuildCheckpoint(checkpoint)
 			if err != nil {
 				t.Fatal(err)
 			}

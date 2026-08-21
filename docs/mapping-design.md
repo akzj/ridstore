@@ -305,6 +305,8 @@ Lookup 在安装期间始终通过 `active + frozen + root` 得到正确结果�
 
 Checkpoint 的写放大同时按“受影响 Node 数”和编码后 bytes 衡量。必须记录：dirty IDs、dirty leaves、rewritten internal nodes、Sparse/Dense Node 数、occupancy histogram、bytes written、dense-equivalent bytes 和节省比例。
 
+Builder 按 `CheckpointMemoryBytes` 把 frozen layer 切成有界 ID chunk，逐 chunk 在上一轮新 Root 上继续 COW；不会再 materialize 全量 Mapping。精确 SegmentStats 通过顺序遍历新 Root、逐条校验 Data Header 构建。第一版 SegmentStats 聚合表若超过预算会明确拒绝本次 Checkpoint 并保留 frozen layers，后续可替换为外部 run merge，不能退回无界内存。
+
 ## 12. Checkpoint 失败
 
 - 构建/写入失败：旧 Root + frozen/active Overlay 继续提供服务；

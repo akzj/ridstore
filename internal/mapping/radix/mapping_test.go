@@ -52,7 +52,7 @@ func TestRadixCheckpointLookupDeleteAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, _, err := mapping.BuildCheckpoint(checkpoint)
+	root, err := mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestCheckpointRewritesOnlyDirtyRadixPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, _, err := mapping.BuildCheckpoint(checkpoint)
+	root, err := mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestCheckpointRewritesOnlyDirtyRadixPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, _, err = mapping.BuildCheckpoint(checkpoint)
+	root, err = mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestCheckpointPrunesEmptyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkpoint, _ := mapping.BeginCheckpoint()
-	root, _, err := mapping.BuildCheckpoint(checkpoint)
+	root, err := mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,12 +176,12 @@ func TestCheckpointPrunesEmptyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkpoint, _ = mapping.BeginCheckpoint()
-	root, entries, err := mapping.BuildCheckpoint(checkpoint)
+	root, err = mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if root != 0 || len(entries) != 0 {
-		t.Fatalf("root=%x entries=%v", root, entries)
+	if root != 0 {
+		t.Fatalf("root=%x", root)
 	}
 	if err := mapping.CompleteCheckpoint(checkpoint, root); err != nil {
 		t.Fatal(err)

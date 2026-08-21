@@ -51,7 +51,7 @@ func TestDeltaBudgetWaitsUntilCheckpointReleasesFrozenCharge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, _, err := mapping.BuildCheckpoint(checkpoint)
+	root, err := mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}

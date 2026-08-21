@@ -53,6 +53,18 @@ func (s *SealedData) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
 	return readFrameAt(s.file, uint64(addr.Offset()), s.validEnd, s.maxPayloadSize)
 }
 
+func (s *SealedData) ReadFrameHeader(addr base.VAddr) (storeformat.FrameHeader, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return storeformat.FrameHeader{}, base.ErrClosed
+	}
+	if addr.SegmentID() != s.segmentID || addr.Offset() < storeformat.SegmentHeaderSize || uint64(addr.Offset()) >= s.validEnd {
+		return storeformat.FrameHeader{}, fmt.Errorf("read address outside sealed segment: %w", base.ErrInvalidAddress)
+	}
+	return readFrameHeaderAt(s.file, uint64(addr.Offset()), s.validEnd, s.maxPayloadSize)
+}
+
 func (s *SealedData) Scan(visit func(base.VAddr, storeformat.Frame) error) error {
 	if visit == nil {
 		return fmt.Errorf("nil scan visitor: %w", base.ErrInvalidConfig)
@@ -172,6 +184,24 @@ func (r *Registry) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
 	return sealed.ReadFrame(addr)
 }
 
+func (r *Registry) ReadFrameHeader(addr base.VAddr) (storeformat.FrameHeader, error) {
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return storeformat.FrameHeader{}, base.ErrClosed
+	}
+	active := r.active
+	sealed := r.sealed[addr.SegmentID()]
+	r.mu.RUnlock()
+	if active != nil && addr.SegmentID() == active.SegmentID() {
+		return active.ReadFrameHeader(addr)
+	}
+	if sealed == nil {
+		return storeformat.FrameHeader{}, base.ErrInvalidAddress
+	}
+	return sealed.ReadFrameHeader(addr)
+}
+
 func (r *Registry) ReplaceActive(oldID base.DataSegmentID, sealed *SealedData, active *ActiveData) error {
 	if sealed == nil || active == nil || sealed.segmentID != oldID || active.SegmentID() == oldID {
 		return base.ErrInvalidConfig
@@ -222,12 +252,7 @@ func (r *Registry) Close() error {
 }
 
 func readFrameAt(file *os.File, offset, end, maxPayloadSize uint64) (storeformat.Frame, error) {
-	headerBytes := make([]byte, storeformat.FrameHeaderSize)
-	if _, err := file.ReadAt(headerBytes, int64(offset)); err != nil {
-		return storeformat.Frame{}, err
-	}
-	limits := storeformat.FrameLimits{MaxPayloadSize: maxPayloadSize, RemainingSegmentSize: end - offset}
-	header, err := storeformat.DecodeFrameHeader(headerBytes, limits)
+	header, err := readFrameHeaderAt(file, offset, end, maxPayloadSize)
 	if err != nil {
 		return storeformat.Frame{}, err
 	}
@@ -239,6 +264,7 @@ func readFrameAt(file *os.File, offset, end, maxPayloadSize uint64) (storeformat
 	if _, err := file.ReadAt(encoded, int64(offset)); err != nil {
 		return storeformat.Frame{}, err
 	}
+	limits := storeformat.FrameLimits{MaxPayloadSize: maxPayloadSize, RemainingSegmentSize: end - offset}
 	frame, consumed, err := storeformat.DecodeFrame(encoded, limits)
 	if err != nil {
 		return storeformat.Frame{}, err
@@ -247,4 +273,17 @@ func readFrameAt(file *os.File, offset, end, maxPayloadSize uint64) (storeformat
 		return storeformat.Frame{}, fmt.Errorf("frame consumed size: %w", base.ErrCorrupt)
 	}
 	return frame, nil
+}
+
+func readFrameHeaderAt(file *os.File, offset, end, maxPayloadSize uint64) (storeformat.FrameHeader, error) {
+	headerBytes := make([]byte, storeformat.FrameHeaderSize)
+	if _, err := file.ReadAt(headerBytes, int64(offset)); err != nil {
+		return storeformat.FrameHeader{}, err
+	}
+	limits := storeformat.FrameLimits{MaxPayloadSize: maxPayloadSize, RemainingSegmentSize: end - offset}
+	header, err := storeformat.DecodeFrameHeader(headerBytes, limits)
+	if err != nil {
+		return storeformat.FrameHeader{}, err
+	}
+	return header, nil
 }
