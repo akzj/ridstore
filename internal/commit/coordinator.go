@@ -1,6 +1,7 @@
 package commit
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,8 +25,17 @@ type RecordHeader struct {
 	PhysicalSize uint64
 }
 
+type PutRecord struct {
+	Header RecordHeader
+	Value  []byte
+}
+
 type RecordReader interface {
 	ReadPutHeader(base.VAddr) (RecordHeader, error)
+}
+
+type RelocationRecordReader interface {
+	ReadPutRecord(base.VAddr) (PutRecord, error)
 }
 
 type CommitLog interface {
@@ -36,9 +46,20 @@ type GroupCommitLog interface {
 	AppendCommitGroup([]batch.Prepared, []base.CommitSeq) ([]appendlog.CommitAppendResult, error)
 }
 
+type RelocationLog interface {
+	AppendRelocation(appendlog.RelocationPrepared, base.CommitSeq) (appendlog.CommitAppendResult, error)
+}
+
 type Result struct {
 	BatchID   base.BatchID
 	CommitSeq base.CommitSeq
+}
+
+type RelocationResult struct {
+	BatchID   base.BatchID
+	CommitSeq base.CommitSeq
+	Applied   uint32
+	Skipped   uint32
 }
 
 type Config struct {
@@ -76,11 +97,18 @@ type request struct {
 	barrier     func() error
 	reservation api.DeltaReservation
 	softLimit   bool
+	relocation  *relocationRequest
+}
+
+type relocationRequest struct {
+	batchID base.BatchID
+	changes []api.Change
 }
 
 type response struct {
-	result Result
-	err    error
+	result     Result
+	relocation RelocationResult
+	err        error
 }
 
 type admittedRequest struct {
@@ -172,6 +200,62 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 	return response.result, response.err
 }
 
+// Relocate submits one internal GC descriptor to the same serialization point
+// as user commits. Once queued, the caller joins the result because a durable
+// RelocationSeal may appear even if its context is cancelled concurrently.
+func (c *Coordinator) Relocate(ctx context.Context, batchID base.BatchID, changes []api.Change) (RelocationResult, error) {
+	if batchID == 0 || len(changes) == 0 {
+		return RelocationResult{}, base.ErrInvalidConfig
+	}
+	if _, ok := c.log.(RelocationLog); !ok {
+		return RelocationResult{}, base.ErrUnsupported
+	}
+	if _, ok := c.reader.(RelocationRecordReader); !ok {
+		return RelocationResult{}, base.ErrUnsupported
+	}
+	if err := validateRelocationChanges(changes); err != nil {
+		return RelocationResult{}, err
+	}
+	if fault := c.Fault(); fault != nil {
+		return RelocationResult{}, errors.Join(base.ErrReadOnly, fault)
+	}
+	if err := ctx.Err(); err != nil {
+		return RelocationResult{}, err
+	}
+	var reservation api.DeltaReservation
+	var soft bool
+	var err error
+	if budget, ok := c.mapping.(api.DeltaBudget); ok {
+		reservation, soft, err = budget.ReserveDelta(ctx, uint64(len(changes)))
+		if err != nil {
+			return RelocationResult{}, err
+		}
+	}
+	request := request{
+		ctx: ctx, result: make(chan response, 1), queuedAt: time.Now(), reservation: reservation, softLimit: soft,
+		relocation: &relocationRequest{batchID: batchID, changes: append([]api.Change(nil), changes...)},
+	}
+	c.submitMu.Lock()
+	if c.closed {
+		c.submitMu.Unlock()
+		releaseReservation(request)
+		return RelocationResult{}, base.ErrClosed
+	}
+	select {
+	case c.requests <- request:
+		c.submitMu.Unlock()
+		if request.softLimit && c.config.OnDeltaSoftLimit != nil {
+			c.config.OnDeltaSoftLimit()
+		}
+	case <-ctx.Done():
+		c.submitMu.Unlock()
+		releaseReservation(request)
+		return RelocationResult{}, ctx.Err()
+	}
+	response := <-request.result
+	return response.relocation, response.err
+}
+
 func (c *Coordinator) run() {
 	defer close(c.done)
 	var pending *request
@@ -194,6 +278,10 @@ func (c *Coordinator) run() {
 			first.result <- response{err: err}
 			continue
 		}
+		if first.relocation != nil {
+			c.processRelocation(first)
+			continue
+		}
 		group := []request{first}
 		groupBytes := requestBytes(first.prepared)
 		if c.config.MaxBatches > 1 {
@@ -211,7 +299,7 @@ func (c *Coordinator) collect(group []request, groupBytes *uint64) ([]request, *
 			if !ok {
 				return group, nil
 			}
-			if request.barrier != nil {
+			if request.barrier != nil || request.relocation != nil {
 				return group, &request
 			}
 			bytes := requestBytes(request.prepared)
@@ -237,7 +325,7 @@ func (c *Coordinator) collect(group []request, groupBytes *uint64) ([]request, *
 				if !ok {
 					return group, nil
 				}
-				if request.barrier != nil {
+				if request.barrier != nil || request.relocation != nil {
 					return group, &request
 				}
 				bytes := requestBytes(request.prepared)
@@ -403,6 +491,123 @@ func (c *Coordinator) process(group []request) {
 			c.config.Metrics.AddPublish(uint64(time.Since(publishStarted)))
 		}
 	}
+}
+
+func (c *Coordinator) processRelocation(request request) {
+	failBeforeSeal := func(err error, fault bool) {
+		releaseReservation(request)
+		if fault {
+			c.fail(err)
+		}
+		request.result <- response{err: err}
+	}
+	if fault := c.Fault(); fault != nil {
+		failBeforeSeal(errors.Join(base.ErrReadOnly, fault), false)
+		return
+	}
+	if err := request.ctx.Err(); err != nil {
+		failBeforeSeal(err, false)
+		return
+	}
+	c.mu.Lock()
+	seq := c.next
+	c.mu.Unlock()
+	if seq == base.CommitSeq(math.MaxUint64) {
+		failBeforeSeal(base.ErrGenerationExhausted, false)
+		return
+	}
+	prepared, changes, err := c.prepareRelocation(*request.relocation)
+	if err != nil {
+		failBeforeSeal(err, true)
+		return
+	}
+	plan, err := c.mapping.Resolve(api.ApplyRelocation, changes)
+	if err != nil {
+		failBeforeSeal(err, true)
+		return
+	}
+	appendResult, err := c.log.(RelocationLog).AppendRelocation(prepared, seq)
+	if err != nil {
+		releaseReservation(request)
+		if appendResult.SealStarted {
+			c.fail(err)
+			request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
+			return
+		}
+		if !errors.Is(err, segment.ErrFull) {
+			c.fail(err)
+		}
+		request.result <- response{err: err}
+		return
+	}
+	c.mu.Lock()
+	c.next = seq + 1
+	c.mu.Unlock()
+	var applied api.ApplyResult
+	if budget, ok := c.mapping.(api.DeltaBudget); ok {
+		applied, err = budget.ApplyResolvedReserved(request.reservation, seq, plan)
+		request.reservation = nil
+	} else {
+		applied, err = c.mapping.ApplyResolved(seq, plan)
+	}
+	var wantApplied uint32
+	for _, change := range plan.Changes {
+		if change.Apply {
+			wantApplied++
+		}
+	}
+	wantSkipped := uint32(len(plan.Changes)) - wantApplied
+	if err != nil || applied.Applied != wantApplied || applied.Skipped != wantSkipped {
+		if err == nil {
+			err = fmt.Errorf("relocation mapping result applied=%d/%d skipped=%d/%d: %w", applied.Applied, wantApplied, applied.Skipped, wantSkipped, base.ErrCorrupt)
+		}
+		c.fail(err)
+		request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
+		return
+	}
+	request.result <- response{relocation: RelocationResult{
+		BatchID: request.relocation.batchID, CommitSeq: seq, Applied: applied.Applied, Skipped: applied.Skipped,
+	}}
+}
+
+func (c *Coordinator) prepareRelocation(request relocationRequest) (appendlog.RelocationPrepared, []api.Change, error) {
+	reader := c.reader.(RelocationRecordReader)
+	prepared := appendlog.RelocationPrepared{BatchID: request.batchID, Entries: make([]appendlog.RelocationEntry, len(request.changes))}
+	changes := append([]api.Change(nil), request.changes...)
+	for i, change := range changes {
+		oldRecord, err := reader.ReadPutRecord(change.ExpectedOldAddr)
+		if err != nil {
+			return appendlog.RelocationPrepared{}, nil, err
+		}
+		newRecord, err := reader.ReadPutRecord(change.NewAddr)
+		if err != nil {
+			return appendlog.RelocationPrepared{}, nil, err
+		}
+		if oldRecord.Header.RecordID != change.RecordID || newRecord.Header.RecordID != change.RecordID ||
+			oldRecord.Header.OriginBatch == 0 || oldRecord.Header.OriginBatch != newRecord.Header.OriginBatch ||
+			request.batchID == oldRecord.Header.OriginBatch || oldRecord.Header.ValueBytes != newRecord.Header.ValueBytes ||
+			oldRecord.Header.ValueBytes != uint64(len(oldRecord.Value)) || newRecord.Header.ValueBytes != uint64(len(newRecord.Value)) ||
+			oldRecord.Header.PhysicalSize != newRecord.Header.PhysicalSize || !bytes.Equal(oldRecord.Value, newRecord.Value) {
+			return appendlog.RelocationPrepared{}, nil, fmt.Errorf("relocation record identity mismatch: %w", base.ErrCorrupt)
+		}
+		prepared.LogicalPayloadBytes, err = base.AddUint64(prepared.LogicalPayloadBytes, newRecord.Header.ValueBytes)
+		if err != nil {
+			return appendlog.RelocationPrepared{}, nil, fmt.Errorf("relocation logical bytes: %w", base.ErrCorrupt)
+		}
+		prepared.Entries[i] = appendlog.RelocationEntry{RecordID: change.RecordID, ExpectedOldAddr: change.ExpectedOldAddr, NewAddr: change.NewAddr}
+	}
+	return prepared, changes, nil
+}
+
+func validateRelocationChanges(changes []api.Change) error {
+	var previous base.ID
+	for _, change := range changes {
+		if change.RecordID == 0 || (previous != 0 && change.RecordID <= previous) || change.ExpectedOldAddr == 0 || change.NewAddr == 0 {
+			return base.ErrInvalidConfig
+		}
+		previous = change.RecordID
+	}
+	return nil
 }
 
 func (c *Coordinator) appendGroup(prepared []batch.Prepared, seqs []base.CommitSeq) ([]appendlog.CommitAppendResult, error) {

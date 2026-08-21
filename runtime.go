@@ -189,6 +189,24 @@ func (r segmentRecordReader) ReadPutHeader(addr base.VAddr) (commit.RecordHeader
 	}, nil
 }
 
+func (r segmentRecordReader) ReadPutRecord(addr base.VAddr) (commit.PutRecord, error) {
+	frame, err := r.segments.ReadFrame(addr)
+	if err != nil {
+		return commit.PutRecord{}, err
+	}
+	if frame.Type != storeformat.FrameTypePutRecord {
+		return commit.PutRecord{}, fmt.Errorf("mapping target is not PutRecord: %w", base.ErrCorrupt)
+	}
+	physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
+	if err != nil {
+		return commit.PutRecord{}, err
+	}
+	return commit.PutRecord{Header: commit.RecordHeader{
+		RecordID: frame.RecordID, OriginBatch: frame.BatchID,
+		ValueBytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize,
+	}, Value: frame.Payload}, nil
+}
+
 func (s *Store) setFault(err error) {
 	if err == nil {
 		return
