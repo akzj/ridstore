@@ -302,7 +302,7 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		return err
 	}
 
-	root, entries, err := s.mapping.BuildCheckpoint(checkpoint)
+	root, err := s.mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		s.mapping.AbortCheckpoint()
 		s.setFault(err)
@@ -316,7 +316,7 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		s.mapping.AbortCheckpoint()
 		return err
 	}
-	stats, err := s.buildSegmentStats(entries)
+	stats, err := s.buildSegmentStats(root, cutCommitSeq)
 	if err != nil {
 		s.mapping.AbortCheckpoint()
 		s.setFault(err)
@@ -387,28 +387,36 @@ func (s *Store) requestCheckpoint() {
 	}()
 }
 
-func (s *Store) buildSegmentStats(entries map[base.ID]base.VAddr) ([]storeformat.SegmentStatsEntry, error) {
+func (s *Store) buildSegmentStats(root base.MapAddr, covered base.CommitSeq) ([]storeformat.SegmentStatsEntry, error) {
 	bySegment := make(map[base.DataSegmentID]storeformat.SegmentStatsEntry)
-	for id, addr := range entries {
-		frame, err := s.segments.ReadFrame(addr)
+	maxSegments := int(s.config.CheckpointMemoryBytes / 128)
+	err := s.mapping.WalkRoot(root, covered, func(id base.ID, addr base.VAddr) error {
+		header, err := s.segments.ReadFrameHeader(addr)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if frame.Type != storeformat.FrameTypePutRecord || frame.RecordID != id || frame.BatchID == 0 {
-			return nil, fmt.Errorf("checkpoint mapping target: %w", base.ErrCorrupt)
+		if header.Type != storeformat.FrameTypePutRecord || header.RecordID != id || header.BatchID == 0 {
+			return fmt.Errorf("checkpoint mapping target: %w", base.ErrCorrupt)
 		}
-		physical, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
-		if err != nil {
-			return nil, err
-		}
+		physical := header.TotalSize
 		entry := bySegment[addr.SegmentID()]
+		if entry.SegmentID == 0 && len(bySegment) >= maxSegments {
+			return fmt.Errorf("segment stats exceed checkpoint memory budget: %w", base.ErrInvalidConfig)
+		}
 		entry.SegmentID = addr.SegmentID()
 		entry.ExactLiveBytes, err = base.AddUint64(entry.ExactLiveBytes, physical)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		entry.ExactLiveRecords++
+		entry.ExactLiveRecords, err = base.AddUint64(entry.ExactLiveRecords, 1)
+		if err != nil {
+			return err
+		}
 		bySegment[addr.SegmentID()] = entry
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	stats := make([]storeformat.SegmentStatsEntry, 0, len(bySegment))
 	for _, entry := range bySegment {

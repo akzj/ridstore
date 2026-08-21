@@ -598,6 +598,7 @@ func TestConfigValidation(t *testing.T) {
 		{Dir: t.TempDir(), SegmentSize: -1},
 		{Dir: t.TempDir(), SegmentSize: 8 << 20, MaxValueSize: 16 << 20},
 		{Dir: t.TempDir(), DeltaSoftLimitBytes: 2, DeltaHardLimitBytes: 1},
+		{Dir: t.TempDir(), CheckpointMemoryBytes: 32 << 10},
 		{Dir: t.TempDir(), MaxBatchBytes: 1 << 20, GCBatchBytes: 2 << 20},
 		{Dir: t.TempDir(), MaxGroupDelay: -1},
 	}

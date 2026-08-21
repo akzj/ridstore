@@ -285,6 +285,22 @@ func (s *ActiveData) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
 	return readFrameAt(file, uint64(addr.Offset()), end, s.maxPayloadSize)
 }
 
+func (s *ActiveData) ReadFrameHeader(addr base.VAddr) (storeformat.FrameHeader, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return storeformat.FrameHeader{}, base.ErrClosed
+	}
+	if addr.SegmentID() != s.segmentID || addr.Offset() < storeformat.SegmentHeaderSize || uint64(addr.Offset()) >= s.end {
+		s.mu.Unlock()
+		return storeformat.FrameHeader{}, fmt.Errorf("read address outside active segment: %w", base.ErrInvalidAddress)
+	}
+	end := s.end
+	file := s.file
+	s.mu.Unlock()
+	return readFrameHeaderAt(file, uint64(addr.Offset()), end, s.maxPayloadSize)
+}
+
 func (s *ActiveData) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

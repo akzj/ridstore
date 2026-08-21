@@ -67,6 +67,9 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err := persistentMapping.SetDeltaLimits(cfg.DeltaSoftLimitBytes, cfg.DeltaHardLimitBytes); err != nil {
 		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
 	}
+	if err := persistentMapping.SetCheckpointMemory(cfg.CheckpointMemoryBytes); err != nil {
+		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
+	}
 	persistentMapping.SetHook(hook)
 	fail := func(err error) (*Store, error) {
 		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
@@ -173,20 +176,16 @@ func framePayloadLimits(h storeformat.HardLimits) (uint64, uint64, error) {
 type segmentRecordReader struct{ segments *segment.Registry }
 
 func (r segmentRecordReader) ReadPutHeader(addr base.VAddr) (commit.RecordHeader, error) {
-	frame, err := r.segments.ReadFrame(addr)
+	header, err := r.segments.ReadFrameHeader(addr)
 	if err != nil {
 		return commit.RecordHeader{}, err
 	}
-	if frame.Type != storeformat.FrameTypePutRecord {
+	if header.Type != storeformat.FrameTypePutRecord {
 		return commit.RecordHeader{}, fmt.Errorf("mapping target is not PutRecord: %w", base.ErrCorrupt)
 	}
-	physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
-	if err != nil {
-		return commit.RecordHeader{}, err
-	}
 	return commit.RecordHeader{
-		RecordID: frame.RecordID, OriginBatch: frame.BatchID,
-		ValueBytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize,
+		RecordID: header.RecordID, OriginBatch: header.BatchID,
+		ValueBytes: header.PayloadSize, PhysicalSize: header.TotalSize,
 	}, nil
 }
 
