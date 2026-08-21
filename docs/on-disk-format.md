@@ -359,6 +359,8 @@ Persistent Mapping 使用 9-bit stride、最多 8 层的 copy-on-write radix。�
 
 空 Node 不落盘，由父 Slot=0 表示。
 
+`CoveredCommitSeq` 是该 Node 最后一次被 COW 重写时的 checkpoint cut，不要求等于当前 Manifest 的 `CoveredCommitSeq`。Root 与可达的未修改子树可以保留更早的值，但不得大于 Manifest cut；空 Commit 推进 cut 时甚至不需要重写 Root。这样增量 Checkpoint 才能复用 immutable 旧 Node；读取仍须逐层验证 Level、Prefix、地址边界和 `Node.CoveredCommitSeq <= Manifest.CoveredCommitSeq`。
+
 ### 11.1 SparseBitmap 编码
 
 Payload：

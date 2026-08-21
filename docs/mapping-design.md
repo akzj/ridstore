@@ -301,6 +301,8 @@ Lookup 在安装期间始终通过 `active + frozen + root` 得到正确结果�
 8. 所有 Node append 后 fsync Mapping Segment；
 9. Manifest 原子安装 Root。
 
+新 Root 可以引用未修改的旧代 immutable 子树。Node Header 的 `CoveredCommitSeq` 表示该 Node 自身最后一次重写的 cut，因此 Root 和可达子 Node 只要求不晚于 Manifest cut；空 Commit 后的 Checkpoint 可以原样复用 Root。若强制所有可达 Node 与新 Root 同代，就会退化为每次全树重写。
+
 Checkpoint 的写放大同时按“受影响 Node 数”和编码后 bytes 衡量。必须记录：dirty IDs、dirty leaves、rewritten internal nodes、Sparse/Dense Node 数、occupancy histogram、bytes written、dense-equivalent bytes 和节省比例。
 
 ## 12. Checkpoint 失败

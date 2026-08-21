@@ -214,18 +214,21 @@ func (m *Mapping) BuildCheckpoint(checkpoint *Checkpoint) (base.MapAddr, map[bas
 	if checkpoint == nil {
 		return 0, nil, base.ErrInvalidConfig
 	}
-	entries, err := m.materializeRoot(checkpoint.root, checkpoint.rootCovered)
-	if err != nil {
-		return 0, nil, err
-	}
+	dirty := make(map[base.ID]deltaEntry)
 	for _, layer := range checkpoint.layers {
-		applyLayer(entries, layer)
+		for id, entry := range layer {
+			dirty[id] = entry
+		}
 	}
-	root, err := m.buildTree(entries, checkpoint.covered)
+	root, err := m.buildCOW(checkpoint.root, checkpoint.rootCovered, checkpoint.covered, dirty)
 	if err != nil {
 		return 0, nil, err
 	}
 	if err := m.store.sync(); err != nil {
+		return 0, nil, err
+	}
+	entries, err := m.materializeRoot(root, checkpoint.covered)
+	if err != nil {
 		return 0, nil, err
 	}
 	return root, entries, nil
@@ -325,10 +328,123 @@ func (m *Mapping) loadNode(addr base.MapAddr, level uint8, prefix uint64, covere
 	if err != nil {
 		return storeformat.MappingNode{}, err
 	}
-	if node.Level != level || node.Prefix != prefix || node.CoveredCommitSeq != covered {
+	if node.Level != level || node.Prefix != prefix || node.CoveredCommitSeq > covered {
 		return storeformat.MappingNode{}, fmt.Errorf("mapping node path identity: %w", base.ErrCorrupt)
 	}
 	return node, nil
+}
+
+func (m *Mapping) buildCOW(root base.MapAddr, rootCovered, covered base.CommitSeq, dirty map[base.ID]deltaEntry) (base.MapAddr, error) {
+	if len(dirty) == 0 {
+		return root, nil
+	}
+	changes := make(map[uint64]map[uint16]uint64)
+	for id, entry := range dirty {
+		prefix := uint64(id) >> 9
+		slots := changes[prefix]
+		if slots == nil {
+			slots = make(map[uint16]uint64)
+			changes[prefix] = slots
+		}
+		slots[uint16(uint64(id)&0x1ff)] = uint64(entry.addr)
+	}
+	for level := uint8(0); level <= 7; level++ {
+		prefixes := make([]uint64, 0, len(changes))
+		for prefix := range changes {
+			prefixes = append(prefixes, prefix)
+		}
+		sort.Slice(prefixes, func(i, j int) bool { return prefixes[i] < prefixes[j] })
+		parents := make(map[uint64]map[uint16]uint64)
+		var result base.MapAddr
+		for _, prefix := range prefixes {
+			_, oldNode, exists, err := m.existingNode(root, rootCovered, level, prefix)
+			if err != nil {
+				return 0, err
+			}
+			var slots [storeformat.MappingNodeSlots]uint64
+			if exists {
+				for slot := uint16(0); slot < storeformat.MappingNodeSlots; slot++ {
+					if value, ok := oldNode.Lookup(slot); ok {
+						slots[slot] = value
+					}
+				}
+			}
+			for slot, value := range changes[prefix] {
+				slots[slot] = value
+			}
+			var newAddr base.MapAddr
+			if slotsOccupied(slots) {
+				newAddr, err = m.store.append(storeformat.MappingNodeBuild{
+					Level: level, Encoding: storeformat.NodeEncodingAuto, Prefix: prefix,
+					CoveredCommitSeq: covered, Slots: slots,
+				})
+				if err != nil {
+					return 0, err
+				}
+			}
+			if level == 7 {
+				result = newAddr
+				continue
+			}
+			parentPrefix := prefix >> 9
+			if level == 6 {
+				parentPrefix = 0
+			}
+			parentSlots := parents[parentPrefix]
+			if parentSlots == nil {
+				parentSlots = make(map[uint16]uint64)
+				parents[parentPrefix] = parentSlots
+			}
+			parentSlots[uint16(prefix&0x1ff)] = uint64(newAddr)
+		}
+		if level == 7 {
+			return result, nil
+		}
+		changes = parents
+	}
+	return 0, base.ErrCorrupt
+}
+
+func (m *Mapping) existingNode(root base.MapAddr, covered base.CommitSeq, targetLevel uint8, targetPrefix uint64) (base.MapAddr, storeformat.MappingNode, bool, error) {
+	if root == 0 {
+		return 0, storeformat.MappingNode{}, false, nil
+	}
+	if targetLevel > 7 || targetLevel == 7 && targetPrefix != 0 {
+		return 0, storeformat.MappingNode{}, false, base.ErrInvalidConfig
+	}
+	id := targetPrefix << (9 * uint(targetLevel+1))
+	addr := root
+	for level := uint8(7); ; level-- {
+		prefix := uint64(0)
+		if level != 7 {
+			prefix = id >> (9 * uint(level+1))
+		}
+		node, err := m.loadNode(addr, level, prefix, covered)
+		if err != nil {
+			return 0, storeformat.MappingNode{}, false, err
+		}
+		if level == targetLevel {
+			if prefix != targetPrefix {
+				return 0, storeformat.MappingNode{}, false, base.ErrCorrupt
+			}
+			return addr, node, true, nil
+		}
+		slot := uint16((id >> (9 * uint(level))) & 0x1ff)
+		value, ok := node.Lookup(slot)
+		if !ok {
+			return 0, storeformat.MappingNode{}, false, nil
+		}
+		addr = base.MapAddr(value)
+	}
+}
+
+func slotsOccupied(slots [storeformat.MappingNodeSlots]uint64) bool {
+	for _, value := range slots {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Mapping) materializeRoot(root base.MapAddr, covered base.CommitSeq) (map[base.ID]base.VAddr, error) {

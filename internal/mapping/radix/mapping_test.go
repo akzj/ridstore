@@ -90,3 +90,100 @@ func TestRadixCheckpointLookupDeleteAndReopen(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckpointRewritesOnlyDirtyRadixPath(t *testing.T) {
+	dir, manifest := radixFixture(t)
+	mapping, err := Open(dir, manifest, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mapping.Close()
+	changes := make([]api.Change, 64)
+	for i := range changes {
+		changes[i].RecordID = base.ID((i + 1) << 9)
+		changes[i].NewAddr, _ = base.NewVAddr(1, uint32(4096+i*8))
+	}
+	if _, err := mapping.Apply(1, api.ApplyUserCommit, changes); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := mapping.BeginCheckpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _, err := mapping.BuildCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mapping.CompleteCheckpoint(checkpoint, root); err != nil {
+		t.Fatal(err)
+	}
+	mapping.store.mu.RLock()
+	before := mapping.store.nextNodeSeq
+	mapping.store.mu.RUnlock()
+	updated, _ := base.NewVAddr(2, 4096)
+	if _, err := mapping.Apply(2, api.ApplyUserCommit, []api.Change{{RecordID: changes[17].RecordID, NewAddr: updated}}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err = mapping.BeginCheckpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _, err = mapping.BuildCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mapping.CompleteCheckpoint(checkpoint, root); err != nil {
+		t.Fatal(err)
+	}
+	mapping.store.mu.RLock()
+	after := mapping.store.nextNodeSeq
+	mapping.store.mu.RUnlock()
+	if written := after - before; written != 8 {
+		t.Fatalf("incremental checkpoint wrote %d nodes, want one eight-level path", written)
+	}
+	for i, change := range changes {
+		addr, ok, err := mapping.Lookup(change.RecordID)
+		want := change.NewAddr
+		if i == 17 {
+			want = updated
+		}
+		if err != nil || !ok || addr != want {
+			t.Fatalf("id=%d addr=%x want=%x ok=%v error=%v", change.RecordID, addr, want, ok, err)
+		}
+	}
+}
+
+func TestCheckpointPrunesEmptyPath(t *testing.T) {
+	dir, manifest := radixFixture(t)
+	mapping, err := Open(dir, manifest, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mapping.Close()
+	addr, _ := base.NewVAddr(1, 4096)
+	if _, err := mapping.Apply(1, api.ApplyUserCommit, []api.Change{{RecordID: 42, NewAddr: addr}}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, _ := mapping.BeginCheckpoint()
+	root, _, err := mapping.BuildCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mapping.CompleteCheckpoint(checkpoint, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mapping.Apply(2, api.ApplyUserCommit, []api.Change{{RecordID: 42}}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, _ = mapping.BeginCheckpoint()
+	root, entries, err := mapping.BuildCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != 0 || len(entries) != 0 {
+		t.Fatalf("root=%x entries=%v", root, entries)
+	}
+	if err := mapping.CompleteCheckpoint(checkpoint, root); err != nil {
+		t.Fatal(err)
+	}
+}
