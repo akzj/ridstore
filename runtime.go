@@ -56,7 +56,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return fail(err)
 	}
-	rotator, err := rotation.NewManager(cfg.Dir, manifest, segments, maxFramePayload)
+	rotator, err := rotation.NewManager(cfg.Dir, manifest, segments, maxFramePayload, hook)
 	if err != nil {
 		return fail(err)
 	}
