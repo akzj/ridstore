@@ -19,20 +19,135 @@ import (
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
 	"github.com/akzj/ridstore/internal/manifest"
+	"github.com/akzj/ridstore/internal/mapping/radix"
 	"github.com/akzj/ridstore/internal/rotation"
 )
 
 const (
-	crashChildEnv         = "RIDSTORE_INITIALIZE_CRASH_CHILD"
-	crashDirEnv           = "RIDSTORE_INITIALIZE_CRASH_DIR"
-	crashPointEnv         = "RIDSTORE_INITIALIZE_CRASH_POINT"
-	commitCrashChildEnv   = "RIDSTORE_COMMIT_CRASH_CHILD"
-	commitCrashDirEnv     = "RIDSTORE_COMMIT_CRASH_DIR"
-	commitCrashPointEnv   = "RIDSTORE_COMMIT_CRASH_POINT"
-	rotationCrashChildEnv = "RIDSTORE_ROTATION_CRASH_CHILD"
-	rotationCrashDirEnv   = "RIDSTORE_ROTATION_CRASH_DIR"
-	rotationCrashPointEnv = "RIDSTORE_ROTATION_CRASH_POINT"
+	crashChildEnv           = "RIDSTORE_INITIALIZE_CRASH_CHILD"
+	crashDirEnv             = "RIDSTORE_INITIALIZE_CRASH_DIR"
+	crashPointEnv           = "RIDSTORE_INITIALIZE_CRASH_POINT"
+	commitCrashChildEnv     = "RIDSTORE_COMMIT_CRASH_CHILD"
+	commitCrashDirEnv       = "RIDSTORE_COMMIT_CRASH_DIR"
+	commitCrashPointEnv     = "RIDSTORE_COMMIT_CRASH_POINT"
+	rotationCrashChildEnv   = "RIDSTORE_ROTATION_CRASH_CHILD"
+	rotationCrashDirEnv     = "RIDSTORE_ROTATION_CRASH_DIR"
+	rotationCrashPointEnv   = "RIDSTORE_ROTATION_CRASH_POINT"
+	checkpointCrashChildEnv = "RIDSTORE_CHECKPOINT_CRASH_CHILD"
+	checkpointCrashDirEnv   = "RIDSTORE_CHECKPOINT_CRASH_DIR"
+	checkpointCrashPointEnv = "RIDSTORE_CHECKPOINT_CRASH_POINT"
 )
+
+func TestCheckpointProcessCrashMatrix(t *testing.T) {
+	points := []failpoint.Point{
+		radix.PointRotationPrepared, radix.PointRotationOldSealed, radix.PointRotationNewCreated, radix.PointRotationManifestInstalled,
+		pointCheckpointMappingSynced, pointCheckpointManifestInstalled, pointCheckpointRuntimePublished,
+	}
+	for _, point := range points {
+		point := point
+		t.Run(string(point), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "store")
+			killCheckpointChildAt(t, dir, point)
+			cfg := smallTestConfig(dir)
+			cfg.SegmentSize = 16 << 10
+			cfg.MaxOpenBatches = 128
+			store, err := Open(cfg)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer store.Close()
+			for i := 1; i <= 80; i++ {
+				id := ID(uint64(i) << 20)
+				value, err := store.Get(context.Background(), id)
+				if err != nil || string(value) != fmt.Sprintf("sparse-%d", i) {
+					t.Fatalf("id=%d value=%q error=%v", id, value, err)
+				}
+			}
+		})
+	}
+}
+
+func killCheckpointChildAt(t *testing.T, dir string, point failpoint.Point) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCheckpointCrashChild$", "-test.count=1")
+	cmd.Env = append(os.Environ(), checkpointCrashChildEnv+"=1", checkpointCrashDirEnv+"="+dir, checkpointCrashPointEnv+"="+string(point))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			ready <- scanner.Text()
+			return
+		}
+		ready <- ""
+	}()
+	want := "RIDSTORE_FAILPOINT_READY " + string(point)
+	select {
+	case line := <-ready:
+		if line != want {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("child did not reach failpoint: line=%q stderr=%s", line, stderr.String())
+		}
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("timeout waiting for %s: stderr=%s", point, stderr.String())
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("SIGKILL child exited successfully")
+	}
+}
+
+func TestCheckpointCrashChild(t *testing.T) {
+	if os.Getenv(checkpointCrashChildEnv) != "1" {
+		t.Skip("subprocess helper")
+	}
+	target := failpoint.Point(os.Getenv(checkpointCrashPointEnv))
+	hook := failpoint.Func(func(point failpoint.Point) error {
+		if point != target {
+			return nil
+		}
+		fmt.Printf("RIDSTORE_FAILPOINT_READY %s\n", point)
+		_ = os.Stdout.Sync()
+		select {}
+	})
+	cfg := smallTestConfig(os.Getenv(checkpointCrashDirEnv))
+	cfg.SegmentSize = 16 << 10
+	cfg.MaxOpenBatches = 128
+	store, err := createWithOptions(cfg, initialize.Options{Hook: hook})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 80; i++ {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := ID(uint64(i) << 20)
+		if err := batch.Put(context.Background(), id, []byte(fmt.Sprintf("sparse-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("checkpoint failpoint %s was not reached", target)
+}
 
 func TestRotationProcessCrashMatrix(t *testing.T) {
 	points := []failpoint.Point{
