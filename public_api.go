@@ -8,10 +8,12 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/akzj/ridstore/internal/appendlog"
 	"github.com/akzj/ridstore/internal/base"
 	batchimpl "github.com/akzj/ridstore/internal/batch"
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/mapping/radix"
 )
 
 type Record struct {
@@ -239,49 +241,59 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	}
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
-	s.ops.Lock()
+	s.ops.RLock()
+	defer s.ops.RUnlock()
 	if err := s.checkAvailable(); err != nil {
-		s.ops.Unlock()
 		return err
 	}
-	s.maintenance.Add(1)
-	barrier, err := s.log.Barrier(ctx)
+	var (
+		barrier           appendlog.Barrier
+		checkpoint        *radix.Checkpoint
+		cutCommitSeq      base.CommitSeq
+		nextCommitSeq     base.CommitSeq
+		openBatchIDs      []base.BatchID
+		issuedBatchHigh   uint64
+		reservedIDHigh    uint64
+		reservedBatchHigh uint64
+	)
+	err := s.coordinator.Barrier(ctx, func() error {
+		var err error
+		barrier, err = s.log.Barrier(ctx)
+		if err != nil {
+			return err
+		}
+		checkpoint, err = s.mapping.BeginCheckpoint()
+		if err != nil {
+			return err
+		}
+		cutCommitSeq = checkpoint.CoveredCommitSeq()
+		nextCommitSeq = s.coordinator.NextCommitSeq()
+		if cutCommitSeq == base.CommitSeq(math.MaxUint64) || cutCommitSeq+1 != nextCommitSeq {
+			s.mapping.AbortCheckpoint()
+			checkpoint = nil
+			return fmt.Errorf("checkpoint commit boundary mismatch: %w", base.ErrCorrupt)
+		}
+		s.mu.Lock()
+		openBatchIDs = make([]base.BatchID, 0, len(s.batches))
+		for id := range s.batches {
+			openBatchIDs = append(openBatchIDs, id)
+		}
+		issuedBatchHigh = s.issuedBatchHigh
+		s.mu.Unlock()
+		sort.Slice(openBatchIDs, func(i, j int) bool { return openBatchIDs[i] < openBatchIDs[j] })
+		reservedIDHigh = s.idAllocator.DurableHigh()
+		reservedBatchHigh = s.batchAllocator.DurableHigh()
+		return nil
+	})
 	if err != nil {
-		s.maintenance.Done()
-		s.ops.Unlock()
 		if s.log.Faulted() {
+			s.setFault(err)
+		}
+		if errors.Is(err, base.ErrCorrupt) {
 			s.setFault(err)
 		}
 		return err
 	}
-	checkpoint, err := s.mapping.BeginCheckpoint()
-	if err != nil {
-		s.maintenance.Done()
-		s.ops.Unlock()
-		return err
-	}
-	cutCommitSeq := checkpoint.CoveredCommitSeq()
-	nextCommitSeq := s.coordinator.NextCommitSeq()
-	if cutCommitSeq+1 != nextCommitSeq {
-		s.mapping.AbortCheckpoint()
-		s.maintenance.Done()
-		s.ops.Unlock()
-		err := fmt.Errorf("checkpoint commit boundary mismatch: %w", base.ErrCorrupt)
-		s.setFault(err)
-		return err
-	}
-	s.mu.Lock()
-	openBatchIDs := make([]base.BatchID, 0, len(s.batches))
-	for id := range s.batches {
-		openBatchIDs = append(openBatchIDs, id)
-	}
-	issuedBatchHigh := s.issuedBatchHigh
-	s.mu.Unlock()
-	sort.Slice(openBatchIDs, func(i, j int) bool { return openBatchIDs[i] < openBatchIDs[j] })
-	reservedIDHigh := s.idAllocator.DurableHigh()
-	reservedBatchHigh := s.batchAllocator.DurableHigh()
-	s.ops.Unlock()
-	defer s.maintenance.Done()
 
 	root, entries, err := s.mapping.BuildCheckpoint(checkpoint)
 	if err != nil {

@@ -3,6 +3,7 @@ package commit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -227,6 +228,105 @@ func TestGroupCommitUsesVirtualMappingAndSharedAppend(t *testing.T) {
 	}
 	if seen[7] == 0 || seen[8] == 0 || seen[7] >= seen[8] {
 		t.Fatalf("results=%v", seen)
+	}
+}
+
+func TestBarrierOrdersPublishedCommits(t *testing.T) {
+	addr1, _ := base.NewVAddr(1, 4096)
+	addr2, _ := base.NewVAddr(1, 8192)
+	log := &recordingGroupLog{}
+	mapping := memory.NewEmpty()
+	reader := fakeReader{records: map[base.VAddr]RecordHeader{
+		addr1: {RecordID: 1, OriginBatch: 7, PhysicalSize: 64},
+		addr2: {RecordID: 2, OriginBatch: 8, PhysicalSize: 64},
+	}}
+	coordinator, err := NewGrouped(1, log, mapping, reader, Config{
+		QueueDepth: 8, MaxBatches: 8, MaxBytes: 4096, MaxDelay: time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coordinator.Close()
+	newBatch := func(id base.BatchID, recordID base.ID, addr base.VAddr) *batch.Batch {
+		b, err := batch.New(id, batch.Limits{MaxValueSize: 16, MaxBatchBytes: 16, MaxBatchMutations: 2, MaxBatchConditions: 2}, fakeBatchAppender{addr}, &incrementAllocator{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put(context.Background(), recordID, nil); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := coordinator.Commit(context.Background(), newBatch(7, 1, addr1))
+		firstResult <- err
+	}()
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first commit did not publish")
+	}
+	barrierEntered := make(chan struct{})
+	releaseBarrier := make(chan struct{})
+	barrierResult := make(chan error, 1)
+	go func() {
+		barrierResult <- coordinator.Barrier(context.Background(), func() error {
+			if _, exists, err := mapping.Lookup(1); err != nil || !exists {
+				return fmt.Errorf("first commit not published at barrier: exists=%v: %w", exists, err)
+			}
+			if _, exists, err := mapping.Lookup(2); err != nil || exists {
+				return fmt.Errorf("later commit crossed barrier: exists=%v: %w", exists, err)
+			}
+			close(barrierEntered)
+			<-releaseBarrier
+			return nil
+		})
+	}()
+	select {
+	case <-barrierEntered:
+	case <-time.After(time.Second):
+		t.Fatal("barrier did not execute")
+	}
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := coordinator.Commit(context.Background(), newBatch(8, 2, addr2))
+		secondResult <- err
+	}()
+	select {
+	case err := <-secondResult:
+		t.Fatalf("later commit completed during barrier: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseBarrier)
+	if err := <-barrierResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBarrierCancellationAndClose(t *testing.T) {
+	coordinator, _, active, _ := coordinatorFixture(t)
+	defer active.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	if err := coordinator.Barrier(ctx, func() error { called = true; return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("barrier error=%v", err)
+	}
+	if called {
+		t.Fatal("cancelled barrier callback executed")
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Barrier(context.Background(), func() error { return nil }); !errors.Is(err, base.ErrClosed) {
+		t.Fatalf("closed barrier error=%v", err)
 	}
 }
 
