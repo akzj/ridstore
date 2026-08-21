@@ -32,6 +32,7 @@ type Rotator interface {
 const (
 	PointPutWritten        failpoint.Point = "appendlog.put-written"
 	PointAbortWritten      failpoint.Point = "appendlog.abort-written"
+	PointReservePrepared   failpoint.Point = "appendlog.reserve-prepared"
 	PointReserveWritten    failpoint.Point = "appendlog.reserve-written"
 	PointReserveSynced     failpoint.Point = "appendlog.reserve-synced"
 	PointCommitPartWritten failpoint.Point = "appendlog.commit-part-written"
@@ -169,6 +170,9 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 		return err
 	}
 	if err := l.ensureCapacityLocked(uint64(len(frameBytes))); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(l.hook, PointReservePrepared); err != nil {
 		return err
 	}
 	frame.FrameSeq = l.nextFrameSeq

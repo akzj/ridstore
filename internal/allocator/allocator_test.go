@@ -3,6 +3,7 @@ package allocator
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"sync"
 	"testing"
@@ -135,5 +136,20 @@ func TestRejectsBrokenRecoveryChainAndConfig(t *testing.T) {
 	}
 	if _, err := AdvanceRecovered(RecordID, 4, 9, storeformat.ReservePayload{PreviousHighExclusive: 5, NewHighExclusive: 9, Generation: 2}); !errors.Is(err, base.ErrCorrupt) {
 		t.Fatalf("chain error=%v", err)
+	}
+}
+
+func TestRecordAndBatchAllocatorRejectUint64Wrap(t *testing.T) {
+	for _, kind := range []Kind{RecordID, BatchID} {
+		allocator, err := New(kind, 2, math.MaxUint64, &fakeWriter{})
+		if err != nil {
+			t.Fatalf("kind=%d new: %v", kind, err)
+		}
+		if _, err := allocator.Allocate(context.Background()); !errors.Is(err, base.ErrIDExhausted) {
+			t.Fatalf("kind=%d allocate error=%v", kind, err)
+		}
+		if allocator.DurableHigh() != math.MaxUint64 {
+			t.Fatalf("kind=%d durable high=%d", kind, allocator.DurableHigh())
+		}
 	}
 }

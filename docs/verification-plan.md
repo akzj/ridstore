@@ -133,6 +133,8 @@ Failpoint 必须位于真实 write/fsync/rename/dir sync/publish 操作两侧。
 
 同一矩阵分别作用于 IDReserve 和 BatchIDReserve。额外验证：崩溃前已返回的 BatchID 不会在重启后重新分配；`Status` 不会把旧 BatchID 关联到新 Batch；uint64 边界返回 `ErrIDExhausted` 而不是回绕。
 
+当前自动化 SIGKILL matrix 覆盖 reserve append 前、完整 write 后 sync 前、sync 后 allocator 内存 publish 前，以及 ID/BatchID 已返回四个边界。write 后 sync 前允许 fresh process 观察旧或新 durable high；sync 后只能采用新 high。另有多轮 ID/BatchID reserve 跨 Data Segment rotation、Checkpoint 和重新 Open 的单调性测试。该矩阵是 process-crash 证据，不替代设备忽略 flush 的 power-loss 验证。
+
 ## 6. Mapping Checkpoint Matrix
 
 - captured/fresh Overlay 切换时并发 Commit；

@@ -43,7 +43,251 @@ const (
 	dataGCCrashDirEnv       = "RIDSTORE_DATA_GC_CRASH_DIR"
 	dataGCCrashPointEnv     = "RIDSTORE_DATA_GC_CRASH_POINT"
 	dataGCForceMapRotateEnv = "RIDSTORE_DATA_GC_FORCE_MAP_ROTATION"
+	reserveCrashChildEnv    = "RIDSTORE_RESERVE_CRASH_CHILD"
+	reserveCrashDirEnv      = "RIDSTORE_RESERVE_CRASH_DIR"
+	reserveCrashKindEnv     = "RIDSTORE_RESERVE_CRASH_KIND"
+	reserveCrashPointEnv    = "RIDSTORE_RESERVE_CRASH_POINT"
 )
+
+const reserveIssuedPoint failpoint.Point = "allocator.id-issued"
+
+func TestReserveProcessCrashMatrix(t *testing.T) {
+	points := []failpoint.Point{
+		appendlog.PointReservePrepared,
+		appendlog.PointReserveWritten,
+		appendlog.PointReserveSynced,
+		reserveIssuedPoint,
+	}
+	for _, kind := range []string{"record", "batch"} {
+		kind := kind
+		for _, point := range points {
+			point := point
+			t.Run(kind+"/"+string(point), func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), "store")
+				killReserveChildAt(t, dir, kind, point)
+				store, err := Open(smallTestConfig(dir))
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+
+				batch, err := store.Begin(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := uint64(batch.ID())
+				if kind == "record" {
+					id, allocateErr := batch.Allocate(context.Background())
+					if allocateErr != nil {
+						t.Fatal(allocateErr)
+					}
+					got = uint64(id)
+				}
+				assertRecoveredReserveID(t, point, got)
+
+				// Record reserve cases always issued BatchID 1 before arming the
+				// record allocator failpoint. The explicit issued case does so for
+				// both allocator kinds. Recovery must preserve that old identity as
+				// Aborted while the new Batch remains a distinct Open identity.
+				if kind == "record" || point == reserveIssuedPoint {
+					status, statusErr := store.Status(context.Background(), 1)
+					if statusErr != nil || status.State != BatchStateAborted {
+						t.Fatalf("old batch status=%+v error=%v", status, statusErr)
+					}
+					newStatus, statusErr := store.Status(context.Background(), batch.ID())
+					if statusErr != nil || newStatus.State != BatchStateOpen {
+						t.Fatalf("new batch status=%+v error=%v", newStatus, statusErr)
+					}
+				}
+				if err := batch.Abort(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestReserveMonotonicAcrossRotationCheckpointAndRecovery(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxBatch BatchID
+	var maxRecord ID
+	for i := 1; i <= 240; i++ {
+		batch, beginErr := store.Begin(context.Background())
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		id, allocateErr := batch.Allocate(context.Background())
+		if allocateErr != nil {
+			t.Fatal(allocateErr)
+		}
+		if batch.ID() <= maxBatch || id <= maxRecord {
+			t.Fatalf("non-monotonic allocation batch=%d after=%d record=%d after=%d", batch.ID(), maxBatch, id, maxRecord)
+		}
+		maxBatch, maxRecord = batch.ID(), id
+		if err := batch.Abort(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if i%40 == 0 {
+			if err := store.Checkpoint(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(store.catalog.Snapshot().SealedDataSegments) == 0 {
+		t.Fatal("workload did not cross a Data Segment rotation")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.ID() <= maxBatch || id <= maxRecord {
+		t.Fatalf("recovery reused ID batch=%d previous=%d record=%d previous=%d", batch.ID(), maxBatch, id, maxRecord)
+	}
+	if err := batch.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertRecoveredReserveID(t *testing.T, point failpoint.Point, got uint64) {
+	t.Helper()
+	switch point {
+	case appendlog.PointReservePrepared:
+		if got != 1 {
+			t.Fatalf("pre-write recovered ID=%d, want 1", got)
+		}
+	case appendlog.PointReserveWritten:
+		if got != 1 && got != 5 {
+			t.Fatalf("pre-sync recovered ID=%d, want old 1 or durable 5", got)
+		}
+	case appendlog.PointReserveSynced, reserveIssuedPoint:
+		if got != 5 {
+			t.Fatalf("durable reserve recovered ID=%d, want 5", got)
+		}
+	default:
+		t.Fatalf("unknown reserve point %q", point)
+	}
+}
+
+func killReserveChildAt(t *testing.T, dir, kind string, point failpoint.Point) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReserveCrashChild$", "-test.count=1")
+	cmd.Env = append(os.Environ(),
+		reserveCrashChildEnv+"=1", reserveCrashDirEnv+"="+dir,
+		reserveCrashKindEnv+"="+kind, reserveCrashPointEnv+"="+string(point),
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			ready <- scanner.Text()
+			return
+		}
+		ready <- ""
+	}()
+	want := "RIDSTORE_FAILPOINT_READY " + string(point)
+	select {
+	case line := <-ready:
+		if line != want {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("child did not reach failpoint: line=%q stderr=%s", line, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("timeout waiting for %s/%s: stderr=%s", kind, point, stderr.String())
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("SIGKILL child exited successfully")
+	}
+}
+
+func TestReserveCrashChild(t *testing.T) {
+	if os.Getenv(reserveCrashChildEnv) != "1" {
+		t.Skip("subprocess helper")
+	}
+	kind := os.Getenv(reserveCrashKindEnv)
+	target := failpoint.Point(os.Getenv(reserveCrashPointEnv))
+	var armed atomic.Bool
+	hook := failpoint.Func(func(point failpoint.Point) error {
+		if !armed.Load() || point != target {
+			return nil
+		}
+		blockAtCrashPoint(point)
+		return nil
+	})
+	store, err := createWithOptions(smallTestConfig(os.Getenv(reserveCrashDirEnv)), initialize.Options{Hook: hook})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind == "batch" {
+		armed.Store(true)
+		batch, beginErr := store.Begin(context.Background())
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if target == reserveIssuedPoint {
+			blockAtCrashPoint(target)
+		}
+		_ = batch
+	} else if kind == "record" {
+		batch, beginErr := store.Begin(context.Background())
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		armed.Store(true)
+		if _, allocateErr := batch.Allocate(context.Background()); allocateErr != nil {
+			t.Fatal(allocateErr)
+		}
+		if target == reserveIssuedPoint {
+			blockAtCrashPoint(target)
+		}
+	} else {
+		t.Fatalf("unknown reserve kind %q", kind)
+	}
+	t.Fatalf("reserve failpoint %s was not reached", target)
+}
+
+func blockAtCrashPoint(point failpoint.Point) {
+	fmt.Printf("RIDSTORE_FAILPOINT_READY %s\n", point)
+	_ = os.Stdout.Sync()
+	select {}
+}
 
 func TestDataGCProcessCrashMatrix(t *testing.T) {
 	points := []failpoint.Point{
