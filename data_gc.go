@@ -222,9 +222,15 @@ func (g *dataGCSession) relocate(ctx context.Context) error {
 			return nil
 		}
 		sort.Slice(changes, func(i, j int) bool { return changes[i].RecordID < changes[j].RecordID })
+		if err := s.reserveInternalStatusSlot(); err != nil {
+			if errors.Is(err, base.ErrStatusCapacity) {
+				s.requestCheckpoint()
+			}
+			return err
+		}
 		rawBatchID, err := s.batchAllocator.Allocate(ctx)
 		if err != nil {
-			return err
+			return errors.Join(err, s.releaseInternalStatusSlot(nil))
 		}
 		batchID := base.BatchID(rawBatchID)
 		s.mu.Lock()
@@ -234,6 +240,16 @@ func (g *dataGCSession) relocate(ctx context.Context) error {
 		s.mu.Unlock()
 		result, err := s.coordinator.Relocate(ctx, batchID, changes)
 		if err != nil {
+			var status *BatchStatus
+			if errors.Is(err, base.ErrCommitUnknown) {
+				unknown := BatchStatus{BatchID: batchID, State: BatchStateCommitUnknown}
+				status = &unknown
+			}
+			return errors.Join(err, s.releaseInternalStatusSlot(status))
+		}
+		committed := BatchStatus{BatchID: batchID, State: BatchStateCommitted, CommitSeq: result.CommitSeq}
+		if err := s.releaseInternalStatusSlot(&committed); err != nil {
+			s.setFault(err)
 			return err
 		}
 		g.relocated += uint64(result.Applied)

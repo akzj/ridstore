@@ -85,7 +85,7 @@ func TestRecoverCommitReserveAbortAndOrphanPut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := RecoverPhase1(manifest, active)
+	result, err := RecoverPhase1(manifest, active, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,8 +115,63 @@ func TestRecoverRejectsDescriptorLogicalMismatch(t *testing.T) {
 	if _, err := log.AppendCommit(prepared, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RecoverPhase1(manifest, active); !errors.Is(err, base.ErrCorrupt) {
+	if _, err := RecoverPhase1(manifest, active, 1<<16); !errors.Is(err, base.ErrCorrupt) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestRecoveryBoundsTerminalStatusesAndStillRejectsDuplicates(t *testing.T) {
+	active, log, manifest := recoveryFixture(t)
+	defer active.Close()
+	for id := base.BatchID(1); id <= 3; id++ {
+		if err := log.AppendAbort(context.Background(), id, storeformat.BatchAbortPayload{Reason: storeformat.AbortReasonCaller}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := RecoverPhase1(manifest, active, 2); !errors.Is(err, base.ErrStatusCapacity) {
+		t.Fatalf("bounded recovery error=%v", err)
+	}
+	result, err := RecoverPhase1(manifest, active, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TerminalStatusCount != 3 || len(result.Statuses) != 3 || len(result.StatusOrder) != 3 {
+		t.Fatalf("result=%+v", result)
+	}
+
+	duplicateActive, duplicateLog, duplicateManifest := recoveryFixture(t)
+	defer duplicateActive.Close()
+	for range 2 {
+		if err := duplicateLog.AppendAbort(context.Background(), 1, storeformat.BatchAbortPayload{Reason: storeformat.AbortReasonCaller}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := RecoverPhase1(duplicateManifest, duplicateActive, 1); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("duplicate terminal error=%v", err)
+	}
+}
+
+func TestRecoveryRejectsInterleavedDescriptorFrames(t *testing.T) {
+	active, _, manifest := recoveryFixture(t)
+	defer active.Close()
+	payload, err := storeformat.EncodeMutationEntries(storeformat.DescriptorCommit, []storeformat.MutationEntry{{
+		RecordID: 1, Operation: storeformat.MutationDelete,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypeCommitPart, FrameSeq: 1, BatchID: 1, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	abortPayload, err := storeformat.EncodeBatchAbortPayload(storeformat.BatchAbortPayload{Reason: storeformat.AbortReasonCaller})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypeBatchAbort, FrameSeq: 2, BatchID: 2, Payload: abortPayload[:]}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecoverPhase1(manifest, active, 2); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("interleaved descriptor error=%v", err)
 	}
 }
 
@@ -124,7 +179,7 @@ func TestRecoverRejectsUnsupportedFileTopology(t *testing.T) {
 	active, _, manifest := recoveryFixture(t)
 	defer active.Close()
 	manifest.SealedDataSegments = []storeformat.FileSummary{{FileID: 2, ValidEnd: 8192, FirstSeq: 1, LastSeq: 1}}
-	if _, err := RecoverPhase1(manifest, active); !errors.Is(err, base.ErrUnsupported) {
+	if _, err := RecoverPhase1(manifest, active, 1<<16); !errors.Is(err, base.ErrUnsupported) {
 		t.Fatalf("error=%v", err)
 	}
 }
@@ -168,7 +223,7 @@ func TestRecoverRelocationApplyAndCASSkip(t *testing.T) {
 	}}}, 4); err != nil {
 		t.Fatal(err)
 	}
-	result, err := RecoverPhase1(manifest, active)
+	result, err := RecoverPhase1(manifest, active, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +256,7 @@ func TestRecoverRejectsRelocationValueMismatch(t *testing.T) {
 	}}}, 2); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RecoverPhase1(manifest, active); !errors.Is(err, base.ErrCorrupt) {
+	if _, err := RecoverPhase1(manifest, active, 1<<16); !errors.Is(err, base.ErrCorrupt) {
 		t.Fatalf("error=%v", err)
 	}
 }
@@ -289,7 +344,7 @@ func TestRecoverySkipsPreReplaySegmentsAndRandomReadsReferencedPut(t *testing.T)
 	old := &countingScanner{DataScanner: firstSealed}
 	replayScanner := &countingScanner{DataScanner: secondSealed}
 	active := &countingScanner{DataScanner: third}
-	result, err := RecoverIntoScanners(manifest, []DataScanner{old, replayScanner}, active, mapping)
+	result, err := RecoverIntoScanners(manifest, []DataScanner{old, replayScanner}, active, mapping, 1<<16)
 	if err != nil {
 		t.Fatal(err)
 	}

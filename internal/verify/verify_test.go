@@ -60,6 +60,33 @@ func TestVerifyRefusesOpenStore(t *testing.T) {
 	}
 }
 
+func TestVerifyStatusReplayLimitIsExplicit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	store, err := ridstore.Create(testConfig(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Abort(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	report, err := verify.RunWithOptions(context.Background(), dir, verify.Options{StatusLimit: 1})
+	if !errors.Is(err, base.ErrStatusCapacity) || report.Clean || len(report.Issues) == 0 {
+		t.Fatalf("report=%+v error=%v", report, err)
+	}
+	if report, err = verify.RunWithOptions(context.Background(), dir, verify.Options{StatusLimit: 2}); err != nil || !report.Clean {
+		t.Fatalf("report=%+v error=%v", report, err)
+	}
+}
+
 func TestVerifyMissingLockDoesNotCreateIt(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	store, err := ridstore.Create(testConfig(dir))

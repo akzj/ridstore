@@ -33,11 +33,11 @@
 
 当前实现已改为 lazy sealed envelope open，只顺序扫描 ReplayStart 所在 Segment及其后；切点时 Open Batch 的 Commit Descriptor 或 Relocation 引用更早 PutRecord 时，通过受校验的随机 VAddr reader 读取完整 Frame。自动化测试证明 pre-replay Segment 的 `Scan` 次数为 0、被引用 Record 精确随机读取一次，offline Verify 仍严格全扫。恢复不再保存全历史 Put 元数据。
 
-### P0：Batch Status retention 无界
+### 已修复：Batch Status retention 无界
 
-运行时 `Store.statuses` 当前是只增不减的 map；`Batch.finish` 对每个终态写入，尚未实现设计文档要求的有界近期状态表。Recovery 的 `Result.Statuses` 同样会保存 ReplayStart 后全部终态。长时间运行或大量空 Batch 可以绕过 Delta bytes 限制，持续增长内存。
+基线审计发现运行时 `Store.statuses` 只增不减，Recovery 的 `Result.Statuses` 同样保存 ReplayStart 后全部终态；大量空 Batch 可以绕过 Delta bytes 限制持续增长内存。
 
-修复必须同时定义：近期状态容量、`ErrStatusExpired` 边界、CommitUnknown 不被提前逐出、Checkpoint cut 前后 Status 语义，以及 Recovery 重复终态检测不能因简单 eviction 被削弱。
+当前实现增加 runtime `StatusRetention`（默认 65,536，且不小于 `MaxOpenBatches`）：resolved 状态按完成顺序有界保留，旧 ID 返回 `ErrStatusExpired`，CommitUnknown 钉住。每个 Open Batch/内部 Relocation 预留 terminal slot，75% 请求 Checkpoint，硬上限 backpressure；Checkpoint 使用 barrier 前保守计数，只在 Manifest durable 后释放覆盖容量。Recovery 以相同上限精确保留 terminal BatchID，超过返回 `ErrStatusCapacity`，重复 Commit/Abort 仍判 corruption；Descriptor Part 也改为单个连续且有界集合。测试覆盖缓存逐出、Unknown 钉住、容量推进 Checkpoint、GC 达限撤销后重试收敛、恢复上限、重复终态以及 Close 广播唤醒。
 
 ### P0：系统化 syscall fault coverage 未闭合
 
@@ -73,7 +73,7 @@ make verify
 - [x] Offline Verify、Backup/Restore、Metrics、Migration planner 已实现；
 - [x] 本机 `make verify` 通过；
 - [x] Open recovery 不再全量扫描/保存历史 PutRecord；
-- [ ] Status retention 与 recovery transient memory 有明确上界；
+- [x] Status retention 与 recovery transient memory 有明确上界；
 - [ ] 所有 durable writer 完成 syscall error matrix；
 - [ ] write-stop/运维磁盘水位策略完成或由明确部署契约承接；
 - [ ] long fuzz/nightly 自然结束且无未解释 failure；

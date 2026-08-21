@@ -74,7 +74,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	fail := func(err error) (*Store, error) {
 		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
 	}
-	recovered, err := recovery.RecoverInto(manifest, sealed, active, persistentMapping)
+	recovered, err := recovery.RecoverInto(manifest, sealed, active, persistentMapping, uint64(cfg.StatusRetention))
 	if err != nil {
 		return fail(err)
 	}
@@ -117,31 +117,34 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	store := &Store{
 		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, catalog: catalogManager, metrics: runtimeMetrics, hook: hook, log: log,
 		mapping: persistentMapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
-		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]BatchStatus), slotNotify: make(chan struct{}, 1),
+		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]statusEntry), slotNotify: make(chan struct{}),
 		issuedBatchHigh:      recovered.ReservedBatchIDHighExclusive,
 		recoveryAbortedStart: manifest.IssuedBatchIDHighExclusiveAtCut,
 		recoveryAbortedEnd:   recovered.ReservedBatchIDHighExclusive,
+		terminalStatusTotal:  recovered.TerminalStatusCount,
 		availableBytes:       defaultAvailableBytes,
 	}
 	requestSoftCheckpoint = store.requestCheckpoint
-	for id, status := range recovered.Statuses {
+	for _, id := range manifest.OpenBatchIDsAtCut {
+		store.addStatusLocked(BatchStatus{BatchID: id, State: BatchStateAborted})
+	}
+	for _, id := range recovered.StatusOrder {
+		status := recovered.Statuses[id]
 		converted := BatchStatus{BatchID: id}
 		if status.State == recovery.BatchCommitted {
 			converted.State, converted.CommitSeq = BatchStateCommitted, status.CommitSeq
 		} else {
 			converted.State = BatchStateAborted
 		}
-		store.statuses[id] = converted
-	}
-	for _, id := range manifest.OpenBatchIDsAtCut {
-		if _, exists := store.statuses[id]; !exists {
-			store.statuses[id] = BatchStatus{BatchID: id, State: BatchStateAborted}
-		}
+		store.addStatusLocked(converted)
 	}
 	if err := store.resumeDataGC(); err != nil {
 		return nil, errors.Join(err, store.Close())
 	}
 	if charged, _ := persistentMapping.DeltaBytes(); charged >= uint64(cfg.DeltaSoftLimitBytes) {
+		store.requestCheckpoint()
+	}
+	if store.statusCheckpointNeededLocked() {
 		store.requestCheckpoint()
 	}
 	return store, nil
@@ -235,8 +238,9 @@ func (s *Store) checkAvailable() error {
 }
 
 func (s *Store) signalSlotLocked() {
-	select {
-	case s.slotNotify <- struct{}{}:
-	default:
+	if s.slotWaiters == 0 {
+		return
 	}
+	close(s.slotNotify)
+	s.slotNotify = make(chan struct{})
 }

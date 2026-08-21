@@ -45,13 +45,14 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dir := flags.String("dir", "", "ridstore directory to verify offline")
+	statusLimit := flags.Uint64("status-limit", verify.DefaultStatusLimit, "maximum replay-window terminal batch states")
 	if err := flags.Parse(args); err != nil || *dir == "" || flags.NArg() != 0 {
 		if err == nil {
-			fmt.Fprintln(stderr, "usage: ridstore-tool verify --dir <store-directory>")
+			fmt.Fprintln(stderr, "usage: ridstore-tool verify --dir <store-directory> [--status-limit <count>]")
 		}
 		return 2
 	}
-	report, err := verify.Run(ctx, *dir)
+	report, err := verify.RunWithOptions(ctx, *dir, verify.Options{StatusLimit: *statusLimit})
 	if encodeErr := writeJSON(stdout, report); encodeErr != nil {
 		fmt.Fprintf(stderr, "encode report: %v\n", encodeErr)
 		return 1

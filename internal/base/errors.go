@@ -23,6 +23,7 @@ var (
 	ErrGenerationExhausted = errors.New("ridstore: metadata generation exhausted")
 	ErrCommitUnknown       = errors.New("ridstore: commit outcome unknown")
 	ErrStatusExpired       = errors.New("ridstore: batch status expired")
+	ErrStatusCapacity      = errors.New("ridstore: batch status replay capacity reached")
 	ErrCorrupt             = errors.New("ridstore: corruption detected")
 	ErrUnsupported         = errors.New("ridstore: unsupported format")
 	ErrInsufficientSpace   = errors.New("ridstore: insufficient free space")

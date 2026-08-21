@@ -285,6 +285,8 @@ make verify
 
 `test-fuzz-smoke` 对每个 Format decoder fuzz target 分别运行短时 fuzz（默认 `FUZZ_TIME=2s`、`FUZZ_PARALLEL=4`，CI/nightly 可覆盖）；`test-integration` 执行 Create→Commit→Checkpoint→离线 Verify→Backup→新 UUID Restore→Open 的跨模块生命周期；`bench` 只生成原始 benchmark，不是正确性门禁；`verify` 聚合普通、race、vet、fuzz smoke、process-crash 和 integration，仍不包含长期 fuzz、72h soak、power-loss 或跨引擎性能结论。
 
+离线命令默认使用与运行时相同的 65,536 terminal replay 上限：`ridstore-tool verify --dir <dir> --status-limit <n>`。超过上限明确返回 `ErrStatusCapacity`；操作者可以给一次离线诊断提高预算，但零值和静默无界扫描均不允许。
+
 最低合并门禁：
 
 - `go test ./... -count=1`；
@@ -310,6 +312,7 @@ make verify
 - 单线程 Put/Delete/Get/Batch；
 - GetRecord Revision、ExpectRevision/ExpectAbsent 与确定冲突；
 - Commit/Abort/Unknown 矩阵；
+- StatusRetention 逐出/`ErrStatusExpired`、CommitUnknown 钉住、replay terminal hard limit、Checkpoint 释放容量和重复终态 corruption；
 - ID Reserve 不复用；
 - 扫描恢复与参考模型一致。
 

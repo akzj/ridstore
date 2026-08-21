@@ -33,6 +33,8 @@ type Result struct {
 	ReservedIDHighExclusive      uint64
 	ReservedBatchIDHighExclusive uint64
 	Statuses                     map[base.BatchID]BatchStatus
+	StatusOrder                  []base.BatchID
+	TerminalStatusCount          uint64
 }
 
 type DataScanner interface {
@@ -50,7 +52,7 @@ type putRecord struct {
 	ValueDigest  [sha256.Size]byte
 }
 
-func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (Result, error) {
+func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData, statusLimit uint64) (Result, error) {
 	if active == nil || manifest.MappingRoot != 0 || len(manifest.SealedDataSegments) != 0 || manifest.ReplayStart.SegmentID() != active.SegmentID() {
 		return Result{}, fmt.Errorf("phase 1 recovery topology: %w", base.ErrUnsupported)
 	}
@@ -58,18 +60,18 @@ func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (R
 	if err != nil {
 		return Result{}, err
 	}
-	return RecoverInto(manifest, nil, active, mapping)
+	return RecoverInto(manifest, nil, active, mapping, statusLimit)
 }
 
-func Recover(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData) (Result, error) {
+func Recover(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData, statusLimit uint64) (Result, error) {
 	mapping, err := memory.New(api.Snapshot{CoveredCommitSeq: manifest.CoveredCommitSeq})
 	if err != nil {
 		return Result{}, err
 	}
-	return RecoverInto(manifest, sealed, active, mapping)
+	return RecoverInto(manifest, sealed, active, mapping, statusLimit)
 }
 
-func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData, mapping api.Mapping) (Result, error) {
+func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData, mapping api.Mapping, statusLimit uint64) (Result, error) {
 	if active == nil {
 		return Result{}, fmt.Errorf("mapping recovery active scanner: %w", base.ErrInvalidConfig)
 	}
@@ -80,13 +82,13 @@ func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, ac
 		}
 		scanners[i] = sealed[i]
 	}
-	return RecoverIntoScanners(manifest, scanners, active, mapping)
+	return RecoverIntoScanners(manifest, scanners, active, mapping, statusLimit)
 }
 
 // RecoverIntoScanners replays validated read-only scanners into Mapping. It is
 // shared by normal recovery and the offline verifier; it never mutates files.
-func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, active DataScanner, mapping api.Mapping) (Result, error) {
-	if active == nil || mapping == nil || mapping.CoveredCommitSeq() != manifest.CoveredCommitSeq || len(sealed) != len(manifest.SealedDataSegments) {
+func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, active DataScanner, mapping api.Mapping, statusLimit uint64) (Result, error) {
+	if active == nil || mapping == nil || statusLimit == 0 || mapping.CoveredCommitSeq() != manifest.CoveredCommitSeq || len(sealed) != len(manifest.SealedDataSegments) {
 		return Result{}, fmt.Errorf("mapping recovery configuration: %w", base.ErrInvalidConfig)
 	}
 	for i := range sealed {
@@ -104,7 +106,22 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 		ReservedBatchIDHighExclusive: manifest.ReservedBatchIDHighExclusive,
 		Statuses:                     make(map[base.BatchID]BatchStatus),
 	}
-	parts := make(map[base.BatchID][]storeformat.Frame)
+	var (
+		partBatchID base.BatchID
+		parts       []storeformat.Frame
+	)
+	recordTerminal := func(id base.BatchID, status BatchStatus) error {
+		if _, exists := result.Statuses[id]; exists {
+			return fmt.Errorf("duplicate terminal batch state: %w", base.ErrCorrupt)
+		}
+		if result.TerminalStatusCount >= statusLimit {
+			return fmt.Errorf("replay contains more than %d terminal batch states: %w", statusLimit, base.ErrStatusCapacity)
+		}
+		result.TerminalStatusCount++
+		result.Statuses[id] = status
+		result.StatusOrder = append(result.StatusOrder, id)
+		return nil
+	}
 	readers := make(map[base.DataSegmentID]DataScanner, len(sealed)+1)
 	for _, scanner := range sealed {
 		readers[scanner.SegmentID()] = scanner
@@ -143,18 +160,29 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 			}
 			result.NextFrameSeq = frame.FrameSeq + 1
 		}
+		if len(parts) != 0 {
+			continuesDescriptor := (frame.Type == storeformat.FrameTypeCommitPart || frame.Type == storeformat.FrameTypeRelocationPart ||
+				frame.Type == storeformat.FrameTypeCommitSeal || frame.Type == storeformat.FrameTypeRelocationSeal) && frame.BatchID == partBatchID
+			if !continuesDescriptor {
+				return fmt.Errorf("non-contiguous descriptor frames: %w", base.ErrCorrupt)
+			}
+		}
 		switch frame.Type {
 		case storeformat.FrameTypeCommitPart, storeformat.FrameTypeRelocationPart:
-			parts[frame.BatchID] = append(parts[frame.BatchID], frame)
-		case storeformat.FrameTypeCommitSeal:
-			if _, exists := result.Statuses[frame.BatchID]; exists {
-				return fmt.Errorf("duplicate terminal batch state: %w", base.ErrCorrupt)
+			if len(parts) != 0 && frame.BatchID != partBatchID {
+				return fmt.Errorf("interleaved descriptor batches: %w", base.ErrCorrupt)
 			}
-			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorCommit, parts[frame.BatchID], frame, uint32(manifest.HardLimits.MaxBatchMutations))
+			if uint64(len(parts)) >= manifest.HardLimits.MaxBatchMutations {
+				return fmt.Errorf("descriptor part count exceeds mutation limit: %w", base.ErrCorrupt)
+			}
+			partBatchID = frame.BatchID
+			parts = append(parts, frame)
+		case storeformat.FrameTypeCommitSeal:
+			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorCommit, parts, frame, uint32(manifest.HardLimits.MaxBatchMutations))
 			if err != nil {
 				return err
 			}
-			delete(parts, frame.BatchID)
+			parts, partBatchID = parts[:0], 0
 			if decoded.Seal.CommitSeq <= lastCommit || decoded.Seal.CommitSeq == base.CommitSeq(math.MaxUint64) {
 				return fmt.Errorf("commit sequence regression or exhaustion: %w", base.ErrCorrupt)
 			}
@@ -188,16 +216,15 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 			if decoded.Seal.CommitSeq >= result.NextCommitSeq {
 				result.NextCommitSeq = decoded.Seal.CommitSeq + 1
 			}
-			result.Statuses[frame.BatchID] = BatchStatus{State: BatchCommitted, CommitSeq: decoded.Seal.CommitSeq}
-		case storeformat.FrameTypeRelocationSeal:
-			if _, exists := result.Statuses[frame.BatchID]; exists {
-				return fmt.Errorf("duplicate terminal batch state: %w", base.ErrCorrupt)
+			if err := recordTerminal(frame.BatchID, BatchStatus{State: BatchCommitted, CommitSeq: decoded.Seal.CommitSeq}); err != nil {
+				return err
 			}
-			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorRelocation, parts[frame.BatchID], frame, uint32(manifest.HardLimits.MaxBatchMutations))
+		case storeformat.FrameTypeRelocationSeal:
+			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorRelocation, parts, frame, uint32(manifest.HardLimits.MaxBatchMutations))
 			if err != nil {
 				return err
 			}
-			delete(parts, frame.BatchID)
+			parts, partBatchID = parts[:0], 0
 			if decoded.Seal.CommitSeq <= lastCommit || decoded.Seal.CommitSeq == base.CommitSeq(math.MaxUint64) {
 				return fmt.Errorf("relocation sequence regression or exhaustion: %w", base.ErrCorrupt)
 			}
@@ -235,12 +262,13 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 			if decoded.Seal.CommitSeq >= result.NextCommitSeq {
 				result.NextCommitSeq = decoded.Seal.CommitSeq + 1
 			}
-			result.Statuses[frame.BatchID] = BatchStatus{State: BatchCommitted, CommitSeq: decoded.Seal.CommitSeq}
-		case storeformat.FrameTypeBatchAbort:
-			if _, exists := result.Statuses[frame.BatchID]; exists {
-				return fmt.Errorf("abort and commit for same batch: %w", base.ErrCorrupt)
+			if err := recordTerminal(frame.BatchID, BatchStatus{State: BatchCommitted, CommitSeq: decoded.Seal.CommitSeq}); err != nil {
+				return err
 			}
-			result.Statuses[frame.BatchID] = BatchStatus{State: BatchAborted}
+		case storeformat.FrameTypeBatchAbort:
+			if err := recordTerminal(frame.BatchID, BatchStatus{State: BatchAborted}); err != nil {
+				return err
+			}
 		case storeformat.FrameTypeIDReserve, storeformat.FrameTypeBatchIDReserve:
 			payload, err := storeformat.DecodeReservePayload(frame.Payload)
 			if err != nil {

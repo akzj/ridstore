@@ -166,35 +166,11 @@ func (a batchAppender) AppendAbort(ctx context.Context, batchID base.BatchID, pa
 }
 
 func (s *Store) Begin(ctx context.Context) (*Batch, error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		s.ops.RLock()
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
-			s.ops.RUnlock()
-			return nil, base.ErrClosed
-		}
-		if s.fault != nil {
-			err := errors.Join(base.ErrReadOnly, s.fault)
-			s.mu.Unlock()
-			s.ops.RUnlock()
-			return nil, err
-		}
-		if s.openCount < s.config.MaxOpenBatches {
-			s.openCount++
-			s.mu.Unlock()
-			break
-		}
-		s.mu.Unlock()
-		s.ops.RUnlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-s.slotNotify:
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.waitForBatchSlot(ctx); err != nil {
+		return nil, err
 	}
 	id, err := s.batchAllocator.Allocate(ctx)
 	if err != nil {
@@ -317,7 +293,7 @@ func (s *Store) Status(ctx context.Context, id BatchID) (BatchStatus, error) {
 		return BatchStatus{BatchID: id, State: publicBatchState(state), CommitSeq: seq}, nil
 	}
 	if status, ok := s.statuses[id]; ok {
-		return status, nil
+		return status.status, nil
 	}
 	raw := uint64(id)
 	if raw >= s.recoveryAbortedStart && raw < s.recoveryAbortedEnd {
@@ -359,16 +335,25 @@ func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
 // maintenanceGeneration is non-zero only for the checkpoint nested in Data GC.
 func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint64, installedOut *storeformat.Manifest, beforeBuild ...func(*radix.Checkpoint) error) error {
 	var (
-		barrier           appendlog.Barrier
-		checkpoint        *radix.Checkpoint
-		cutCommitSeq      base.CommitSeq
-		nextCommitSeq     base.CommitSeq
-		openBatchIDs      []base.BatchID
-		issuedBatchHigh   uint64
-		reservedIDHigh    uint64
-		reservedBatchHigh uint64
+		barrier             appendlog.Barrier
+		checkpoint          *radix.Checkpoint
+		cutCommitSeq        base.CommitSeq
+		nextCommitSeq       base.CommitSeq
+		openBatchIDs        []base.BatchID
+		issuedBatchHigh     uint64
+		reservedIDHigh      uint64
+		reservedBatchHigh   uint64
+		terminalStatusAtCut uint64
 	)
 	err := s.coordinator.Barrier(ctx, func() error {
+		// Snapshot before the log barrier. Every terminal already counted has
+		// either completed its required append or deterministically needs no
+		// terminal frame, so the following barrier covers its recovery effect.
+		// A terminal that races after this snapshot remains conservatively in
+		// the next replay window even if its frame precedes the barrier.
+		s.mu.Lock()
+		terminalStatusAtCut = s.terminalStatusTotal
+		s.mu.Unlock()
 		var err error
 		barrier, err = s.log.Barrier(ctx)
 		if err != nil {
@@ -490,6 +475,10 @@ func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint
 	s.mu.Lock()
 	s.manifest = installed
 	s.recoveryAbortedStart = installed.IssuedBatchIDHighExclusiveAtCut
+	if terminalStatusAtCut > s.terminalStatusBase {
+		s.terminalStatusBase = terminalStatusAtCut
+	}
+	s.signalSlotLocked()
 	s.mu.Unlock()
 	if installedOut != nil {
 		*installedOut = installed
@@ -539,6 +528,7 @@ func (s *Store) requestCheckpoint() {
 		_ = s.Checkpoint(context.Background())
 		s.mu.Lock()
 		s.checkpointPending = false
+		s.signalSlotLocked()
 		s.mu.Unlock()
 	}()
 }
@@ -708,12 +698,20 @@ func (b *Batch) finish(status BatchStatus) {
 		}
 		s.mu.Lock()
 		delete(s.batches, b.ID())
-		s.statuses[b.ID()] = status
+		if err := s.recordTerminalStatusLocked(status); err != nil {
+			if s.fault == nil {
+				s.fault = err
+			}
+		}
 		if s.openCount > 0 {
 			s.openCount--
 		}
 		s.signalSlotLocked()
+		needCheckpoint := s.statusCheckpointNeededLocked()
 		s.mu.Unlock()
+		if needCheckpoint {
+			s.requestCheckpoint()
+		}
 	})
 }
 

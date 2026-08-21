@@ -125,6 +125,86 @@ func TestDataGCRelocatesLiveRecordsAndRecoveryReplaysCAS(t *testing.T) {
 	}
 }
 
+func TestDataGCStatusCapacityAbortsCleaningAndConvergesAfterCheckpoint(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	cfg.MaxOpenBatches = 1
+	cfg.StatusRetention = 1
+	cfg.GCBatchMutations = 1
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	first, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable1, err := first.Allocate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable2, err := first.Allocate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	churn, err := first.Allocate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Put(ctx, stable1, []byte("stable-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Put(ctx, stable2, []byte("stable-2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Put(ctx, churn, make([]byte, 900)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; len(store.catalog.Snapshot().SealedDataSegments) == 0 && i < 64; i++ {
+		batch, err := store.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := make([]byte, 900)
+		value[0] = byte(i + 1)
+		if err := batch.Put(ctx, churn, value); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(store.catalog.Snapshot().SealedDataSegments) == 0 {
+		t.Fatal("test did not rotate data")
+	}
+	if _, err := store.CompactData(ctx); !errors.Is(err, ErrStatusCapacity) {
+		t.Fatalf("first CompactData error=%v", err)
+	}
+	if _, found, err := maintenance.Load(dir); err != nil || found {
+		t.Fatalf("journal found=%v error=%v", found, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for store.MaintenanceStatus().CheckpointPending && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	result, err := store.CompactData(ctx)
+	if err != nil || result.SourceSegmentID == 0 {
+		t.Fatalf("retry result=%+v error=%v", result, err)
+	}
+	for id, want := range map[ID]string{stable1: "stable-1", stable2: "stable-2"} {
+		value, err := store.Get(ctx, id)
+		if err != nil || string(value) != want {
+			t.Fatalf("id=%d value=%q error=%v", id, value, err)
+		}
+	}
+}
+
 func TestBeginDataGCReportsNoSafeCandidate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	store, err := Create(smallTestConfig(dir))
