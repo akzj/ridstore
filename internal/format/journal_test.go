@@ -91,6 +91,29 @@ func TestMaintenancePhaseManifestRules(t *testing.T) {
 	}
 }
 
+func TestMaintenanceFileRefLifecycleTransition(t *testing.T) {
+	t.Parallel()
+	old := MaintenanceJournal{
+		Generation: 2, StoreUUID: testStoreUUID, OperationID: [16]byte{1}, OperationType: MaintenanceDataGC, Phase: 3, OldManifestGeneration: 1,
+		SourceFiles:      []JournalFileRef{{Kind: FileKindMapping, State: FileStateActive, FileID: 1, ValidEnd: 8192, FirstSeq: 1, LastSeq: 2}},
+		DestinationFiles: []JournalFileRef{{Kind: FileKindMapping, State: FileStateTemporary, FileID: 2, ValidEnd: 4096, FirstSeq: 3, LastSeq: 3}},
+	}
+	next := old
+	next.SourceFiles = append([]JournalFileRef(nil), old.SourceFiles...)
+	next.DestinationFiles = append([]JournalFileRef(nil), old.DestinationFiles...)
+	next.SourceFiles[0].State = FileStateSealed
+	next.DestinationFiles[0].State = FileStateActive
+	if err := ValidateMaintenanceTransition(old, next); err != nil {
+		t.Fatal(err)
+	}
+	regressed := next
+	regressed.SourceFiles = append([]JournalFileRef(nil), next.SourceFiles...)
+	regressed.SourceFiles[0].State = FileStateActive
+	if err := ValidateMaintenanceTransition(next, regressed); !errors.Is(err, base.ErrInvalidConfig) {
+		t.Fatalf("state regression error=%v", err)
+	}
+}
+
 func TestRotationJournalRoundTrip(t *testing.T) {
 	t.Parallel()
 	j := RotationJournal{StoreUUID: testStoreUUID, OldSegmentID: 1, NewSegmentID: 2, BaseManifestGeneration: 5, Phase: 4}

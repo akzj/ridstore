@@ -3,6 +3,7 @@ package ridstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,8 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/maintenance"
+	"github.com/akzj/ridstore/internal/mapping/radix"
 )
 
 func TestDataGCCandidatesRequireCheckpointSafeSealedSegment(t *testing.T) {
@@ -210,6 +213,83 @@ func TestCompactDataWaitsForReaderDeletesSourceAndReopens(t *testing.T) {
 	record, err = store.GetRecord(context.Background(), stableID)
 	if err != nil || record.Revision != revision || string(record.Value) != "stable" {
 		t.Fatalf("reopened record=%+v error=%v", record, err)
+	}
+}
+
+func TestCompactDataCheckpointCanRotateMappingInsideParentJournal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, revision := prepareDataGCStore(t, cfg)
+	defer store.Close()
+	ctx := context.Background()
+	fillActiveMappingForNestedDataGC(t, store, cfg)
+	rotations := 0
+	store.mapping.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		if point == radix.PointRotationPrepared {
+			rotations++
+		}
+		return nil
+	}))
+	result, err := store.CompactData(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SourceSegmentID == 0 || rotations == 0 {
+		t.Fatalf("result=%+v nested rotations=%d", result, rotations)
+	}
+	record, err := store.GetRecord(ctx, stableID)
+	if err != nil || record.Revision != revision || string(record.Value) != "stable" {
+		t.Fatalf("record=%+v error=%v", record, err)
+	}
+	if _, found, err := maintenance.Load(dir); err != nil || found {
+		t.Fatalf("journal found=%v error=%v", found, err)
+	}
+}
+
+func fillActiveMappingForNestedDataGC(t *testing.T, store *Store, cfg Config) {
+	t.Helper()
+	ctx := context.Background()
+	filler, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillerID, err := filler.Allocate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := filler.Put(ctx, fillerID, []byte("fill")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filler.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 64; i++ {
+		if err := store.Checkpoint(ctx); err != nil {
+			t.Fatal(err)
+		}
+		manifest := store.catalog.Snapshot()
+		path := filepath.Join(store.config.Dir, "mapping", fmt.Sprintf("MAP-%08d.active", manifest.ActiveMapSegmentID))
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() > cfg.SegmentSize-int64(storeformat.SegmentFooterSize)-1200 {
+			break
+		}
+		batch, err := store.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Put(ctx, fillerID, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if i == 63 {
+			t.Fatal("failed to fill active mapping segment")
+		}
 	}
 }
 

@@ -309,10 +309,7 @@ func refLess(a, b JournalFileRef) bool {
 	if a.Kind != b.Kind {
 		return a.Kind < b.Kind
 	}
-	if a.FileID != b.FileID {
-		return a.FileID < b.FileID
-	}
-	return a.State < b.State
+	return a.FileID < b.FileID
 }
 func refsExtend(old, next []JournalFileRef) bool {
 	j := 0
@@ -320,7 +317,7 @@ func refsExtend(old, next []JournalFileRef) bool {
 		for j < len(next) && refIdentityLess(next[j], o) {
 			j++
 		}
-		if j == len(next) || !sameRefIdentity(next[j], o) || next[j].ValidEnd < o.ValidEnd ||
+		if j == len(next) || !sameRefIdentity(next[j], o) || !validRefStateTransition(o.State, next[j].State) || next[j].ValidEnd < o.ValidEnd ||
 			next[j].FirstSeq != o.FirstSeq || next[j].LastSeq < o.LastSeq {
 			return false
 		}
@@ -333,14 +330,27 @@ func refIdentityLess(a, b JournalFileRef) bool {
 	if a.Kind != b.Kind {
 		return a.Kind < b.Kind
 	}
-	if a.FileID != b.FileID {
-		return a.FileID < b.FileID
-	}
-	return a.State < b.State
+	return a.FileID < b.FileID
 }
 
 func sameRefIdentity(a, b JournalFileRef) bool {
-	return a.Kind == b.Kind && a.FileID == b.FileID && a.State == b.State
+	return a.Kind == b.Kind && a.FileID == b.FileID
+}
+
+func validRefStateTransition(old, next FileState) bool {
+	if old == next {
+		return true
+	}
+	switch old {
+	case FileStateTemporary:
+		return next == FileStateActive || next == FileStateSealed || next == FileStateTrash
+	case FileStateActive:
+		return next == FileStateSealed || next == FileStateTrash
+	case FileStateSealed:
+		return next == FileStateTrash
+	default:
+		return false
+	}
 }
 func encodeJournalFileRefs(refs []JournalFileRef) []byte {
 	out := make([]byte, 8+len(refs)*40)

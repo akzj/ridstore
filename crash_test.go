@@ -40,6 +40,7 @@ const (
 	dataGCCrashChildEnv     = "RIDSTORE_DATA_GC_CRASH_CHILD"
 	dataGCCrashDirEnv       = "RIDSTORE_DATA_GC_CRASH_DIR"
 	dataGCCrashPointEnv     = "RIDSTORE_DATA_GC_CRASH_POINT"
+	dataGCForceMapRotateEnv = "RIDSTORE_DATA_GC_FORCE_MAP_ROTATION"
 )
 
 func TestDataGCProcessCrashMatrix(t *testing.T) {
@@ -70,10 +71,41 @@ func TestDataGCProcessCrashMatrix(t *testing.T) {
 	}
 }
 
-func killDataGCChildAt(t *testing.T, dir string, point failpoint.Point) {
+func TestDataGCNestedMappingRotationProcessCrashMatrix(t *testing.T) {
+	points := []failpoint.Point{
+		radix.PointRotationPrepared, radix.PointRotationOldSealed,
+		radix.PointRotationNewCreated, radix.PointRotationManifestInstalled,
+	}
+	for _, point := range points {
+		point := point
+		t.Run(string(point), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "store")
+			killDataGCChildAt(t, dir, point, true)
+			cfg := smallTestConfig(dir)
+			cfg.SegmentSize = 16 << 10
+			store, err := Open(cfg)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer store.Close()
+			record, err := store.GetRecord(context.Background(), 1)
+			if err != nil || string(record.Value) != "stable" || record.Revision != 1 {
+				t.Fatalf("record=%+v error=%v", record, err)
+			}
+			if _, found, err := maintenance.Load(dir); err != nil || found {
+				t.Fatalf("maintenance journal found=%v error=%v", found, err)
+			}
+		})
+	}
+}
+
+func killDataGCChildAt(t *testing.T, dir string, point failpoint.Point, forceMapRotation ...bool) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDataGCCrashChild$", "-test.count=1")
 	cmd.Env = append(os.Environ(), dataGCCrashChildEnv+"=1", dataGCCrashDirEnv+"="+dir, dataGCCrashPointEnv+"="+string(point))
+	if len(forceMapRotation) != 0 && forceMapRotation[0] {
+		cmd.Env = append(cmd.Env, dataGCForceMapRotateEnv+"=1")
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -121,8 +153,11 @@ func TestDataGCCrashChild(t *testing.T) {
 	cfg := smallTestConfig(dir)
 	cfg.SegmentSize = 16 << 10
 	store, _, _ := prepareDataGCStore(t, cfg)
+	if os.Getenv(dataGCForceMapRotateEnv) == "1" {
+		fillActiveMappingForNestedDataGC(t, store, cfg)
+	}
 	target := failpoint.Point(os.Getenv(dataGCCrashPointEnv))
-	store.hook = failpoint.Func(func(point failpoint.Point) error {
+	hook := failpoint.Func(func(point failpoint.Point) error {
 		if point != target {
 			return nil
 		}
@@ -130,6 +165,8 @@ func TestDataGCCrashChild(t *testing.T) {
 		_ = os.Stdout.Sync()
 		select {}
 	})
+	store.hook = hook
+	store.mapping.SetHook(hook)
 	if _, err := store.CompactData(context.Background()); err != nil {
 		t.Fatal(err)
 	}
