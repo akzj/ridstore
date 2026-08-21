@@ -55,7 +55,7 @@ func OpenActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, seg
 	if err != nil {
 		return fail(err)
 	}
-	if !info.Mode().IsRegular() || info.Size() < storeformat.SegmentHeaderSize || uint64(info.Size()) > segmentSize-storeformat.SegmentFooterSize || info.Size()%8 != 0 {
+	if !info.Mode().IsRegular() || info.Size() < storeformat.SegmentHeaderSize || uint64(info.Size()) > segmentSize-storeformat.SegmentFooterSize {
 		return fail(fmt.Errorf("active data size: %w", base.ErrCorrupt))
 	}
 	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
@@ -69,10 +69,24 @@ func OpenActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, seg
 	if header.Kind != storeformat.SegmentKindData || header.StoreUUID != uuid || header.FileID != uint32(id) {
 		return fail(fmt.Errorf("active data header identity: %w", base.ErrCorrupt))
 	}
-	return &ActiveData{
+	active := &ActiveData{
 		file: file, storeUUID: uuid, segmentID: id, segmentSize: segmentSize,
 		maxPayloadSize: maxPayloadSize, end: uint64(info.Size()),
-	}, nil
+	}
+	validEnd, _, err := scanDataFrames(file, uint64(info.Size()), segmentSize-storeformat.SegmentFooterSize, maxPayloadSize, base.FrameSeq(header.FirstSeq), false, nil)
+	if err != nil {
+		return fail(err)
+	}
+	if validEnd != uint64(info.Size()) {
+		if err := file.Truncate(int64(validEnd)); err != nil {
+			return fail(err)
+		}
+		if err := file.Sync(); err != nil {
+			return fail(err)
+		}
+		active.end = validEnd
+	}
+	return active, nil
 }
 
 func (s *ActiveData) Append(frame storeformat.Frame) (base.VAddr, uint64, error) {
@@ -169,6 +183,35 @@ func (s *ActiveData) End() uint64 {
 }
 
 func (s *ActiveData) SegmentID() base.DataSegmentID { return s.segmentID }
+
+// Scan visits every complete frame currently present in the Active segment.
+// The callback must not call methods on this ActiveData.
+func (s *ActiveData) Scan(visit func(base.VAddr, storeformat.Frame) error) error {
+	if visit == nil {
+		return fmt.Errorf("nil scan visitor: %w", base.ErrInvalidConfig)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return base.ErrClosed
+	}
+	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
+	if _, err := s.file.ReadAt(headerBytes, 0); err != nil {
+		return err
+	}
+	header, err := storeformat.DecodeSegmentHeader(headerBytes)
+	if err != nil {
+		return err
+	}
+	_, _, err = scanDataFrames(s.file, s.end, s.segmentSize-storeformat.SegmentFooterSize, s.maxPayloadSize, base.FrameSeq(header.FirstSeq), true, func(offset uint64, frame storeformat.Frame) error {
+		addr, err := base.NewVAddr(s.segmentID, uint32(offset))
+		if err != nil {
+			return err
+		}
+		return visit(addr, frame)
+	})
+	return err
+}
 
 func (s *ActiveData) Close() error {
 	s.mu.Lock()
