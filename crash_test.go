@@ -23,6 +23,7 @@ import (
 	"github.com/akzj/ridstore/internal/manifest"
 	"github.com/akzj/ridstore/internal/mapping/radix"
 	"github.com/akzj/ridstore/internal/rotation"
+	"github.com/akzj/ridstore/internal/verify"
 )
 
 const (
@@ -184,6 +185,8 @@ func TestCheckpointProcessCrashMatrix(t *testing.T) {
 	points := []failpoint.Point{
 		radix.PointRotationPrepared, radix.PointRotationOldSealed, radix.PointRotationNewCreated, radix.PointRotationManifestInstalled,
 		pointCheckpointMappingSynced, pointCheckpointManifestInstalled, pointCheckpointRuntimePublished,
+		"manifest.manifest-written", "manifest.manifest-file-synced", "manifest.manifest-renamed", "manifest.manifest-dir-synced",
+		"manifest.current-written", "manifest.current-file-synced", "manifest.current-renamed", "manifest.root-dir-synced",
 		radix.PointMappingGCPrepared, radix.PointMappingGCCopying, radix.PointMappingGCCopied, radix.PointMappingGCFilesDurable,
 		radix.PointMappingGCManifestInstalled, radix.PointMappingGCRuntimeInstalled, radix.PointMappingGCTrashed,
 	}
@@ -199,13 +202,19 @@ func TestCheckpointProcessCrashMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatalf("reopen: %v", err)
 			}
-			defer store.Close()
 			for i := 1; i <= 80; i++ {
 				id := ID(uint64(i) << 20)
 				value, err := store.Get(context.Background(), id)
 				if err != nil || string(value) != fmt.Sprintf("sparse-%d", i) {
 					t.Fatalf("id=%d value=%q error=%v", id, value, err)
 				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			report, err := verify.Run(context.Background(), dir)
+			if err != nil || !report.Clean {
+				t.Fatalf("post-recovery verify=%+v error=%v", report, err)
 			}
 		})
 	}
@@ -259,8 +268,9 @@ func TestCheckpointCrashChild(t *testing.T) {
 		t.Skip("subprocess helper")
 	}
 	target := failpoint.Point(os.Getenv(checkpointCrashPointEnv))
+	var armed atomic.Bool
 	hook := failpoint.Func(func(point failpoint.Point) error {
-		if point != target {
+		if !armed.Load() || point != target {
 			return nil
 		}
 		fmt.Printf("RIDSTORE_FAILPOINT_READY %s\n", point)
@@ -287,6 +297,7 @@ func TestCheckpointCrashChild(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	armed.Store(true)
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}

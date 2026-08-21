@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/manifest"
 )
@@ -16,13 +17,18 @@ type Manager struct {
 	mu      sync.Mutex
 	root    string
 	current storeformat.Manifest
+	hook    failpoint.Hook
 }
 
 func New(root string, current storeformat.Manifest) (*Manager, error) {
+	return NewWithHook(root, current, nil)
+}
+
+func NewWithHook(root string, current storeformat.Manifest, hook failpoint.Hook) (*Manager, error) {
 	if root == "" || current.Generation == 0 {
 		return nil, base.ErrInvalidConfig
 	}
-	return &Manager{root: root, current: clone(current)}, nil
+	return &Manager{root: root, current: clone(current), hook: hook}, nil
 }
 
 func (m *Manager) Snapshot() storeformat.Manifest {
@@ -48,7 +54,7 @@ func (m *Manager) Install(expectGeneration uint64, mutate func(*storeformat.Mani
 	if err := mutate(&next); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := (manifest.Installer{Dir: m.root}).Install(next); err != nil {
+	if err := (manifest.Installer{Dir: m.root, FailpointHook: m.hook}).Install(next); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	m.current = clone(next)

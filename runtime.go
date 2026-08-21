@@ -33,7 +33,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, err
 	}
-	catalogManager, err := catalog.New(cfg.Dir, manifest)
+	catalogManager, err := catalog.NewWithHook(cfg.Dir, manifest, hook)
 	if err != nil {
 		return nil, err
 	}
