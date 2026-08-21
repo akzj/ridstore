@@ -50,6 +50,7 @@ type Metrics struct {
 	WriteSyncNanos, PublishNanos                 uint64
 	DeltaChargedBytes, DeltaReservedBytes        uint64
 	DeltaSoftLimitBytes, DeltaHardLimitBytes     uint64
+	MappingCacheBytes                            uint64
 	GCStarted, GCCompleted, GCFailed             uint64
 	GCNoCandidate, GCInsufficientSpace           uint64
 	GCCopiedBytes, GCReclaimedBytes              uint64
@@ -82,6 +83,7 @@ func (s *Store) Metrics() Metrics {
 	}
 	if s.mapping != nil {
 		result.DeltaChargedBytes, result.DeltaReservedBytes = s.mapping.DeltaBytes()
+		result.MappingCacheBytes = s.mapping.CacheBytes()
 	}
 	return result
 }

@@ -10,7 +10,7 @@ const (
 	MetricGauge
 )
 
-const MetricSampleCount = 26
+const MetricSampleCount = 27
 
 // MetricSample is an allocation-free adapter format for Store.Metrics(). Names
 // are stable public identifiers and already include the ridstore namespace and
@@ -42,6 +42,7 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_delta_reserved_bytes", MetricGauge, m.DeltaReservedBytes},
 		MetricSample{"ridstore_delta_soft_limit_bytes", MetricGauge, m.DeltaSoftLimitBytes},
 		MetricSample{"ridstore_delta_hard_limit_bytes", MetricGauge, m.DeltaHardLimitBytes},
+		MetricSample{"ridstore_mapping_cache_bytes", MetricGauge, m.MappingCacheBytes},
 		MetricSample{"ridstore_gc_started_total", MetricCounter, m.GCStarted},
 		MetricSample{"ridstore_gc_completed_total", MetricCounter, m.GCCompleted},
 		MetricSample{"ridstore_gc_failed_total", MetricCounter, m.GCFailed},

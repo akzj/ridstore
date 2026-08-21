@@ -566,6 +566,15 @@ func newNodeCache(capacity int64) *nodeCache {
 	}
 }
 
+func (c *nodeCache) usedBytes() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return uint64(c.used)
+}
+
 func (c *nodeCache) get(addr base.MapAddr, load func() (storeformat.MappingNode, int, error)) (storeformat.MappingNode, error) {
 	c.mu.Lock()
 	if element := c.items[addr]; element != nil {
