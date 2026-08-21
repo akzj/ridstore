@@ -42,7 +42,7 @@ type Store struct {
 	manifest       storeformat.Manifest
 	lock           *filelock.Lock
 	active         *segment.ActiveData
-	log            *appendlog.Log
+	log            *appendlog.Sequencer
 	mapping        *memory.Mapping
 	coordinator    *commit.Coordinator
 	idAllocator    *allocator.Allocator
@@ -147,6 +147,7 @@ func (s *Store) Close() error {
 			b.finish(BatchStatus{BatchID: b.ID(), State: BatchStateAborted})
 		}
 	}
+	result = errors.Join(result, s.log.Close())
 	result = errors.Join(result, s.active.Close())
 	result = errors.Join(result, s.lock.Close())
 	return result
