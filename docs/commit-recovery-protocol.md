@@ -268,7 +268,7 @@ Checkpoint 不需要等待 Open Batch 结束，但 Open Batch 引用的 Data Seg
 
 ```text
 1. 获取目录锁
-2. 读取 CURRENT 和 Manifest
+2. 读取有效 CURRENT 和 Manifest；以 CURRENT 为发布权威，删除并 fsync 可证明未发布的 `.CURRENT.tmp`、合法 `MANIFEST-*.tmp` 与 generation 高于 CURRENT 的 orphan final Manifest；保留当前和更老 generation
 3. 校验 Store UUID、格式、硬限制和文件集合
 4. 恢复或完成 Maintenance Journal
 5. 打开 Persistent Mapping Root，并加载 `StatsCoveredCommitSeq == CoveredCommitSeq` 的精确 SegmentStats Base

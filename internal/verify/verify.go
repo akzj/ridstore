@@ -319,6 +319,32 @@ func dirtyArtifacts(root string, allowRestoring bool) ([]string, error) {
 			return nil, err
 		}
 	}
+	entries, err := os.ReadDir(filepath.Join(root, manifest.ManifestDirName))
+	if err != nil {
+		return nil, err
+	}
+	currentName, err := manifest.ReadCurrentName(root)
+	if err != nil {
+		return nil, err
+	}
+	currentGeneration, err := manifest.ParseManifestFileName(currentName)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		candidate := name
+		isTemp := filepath.Ext(name) == ".tmp"
+		if isTemp {
+			candidate = name[:len(name)-len(".tmp")]
+		}
+		generation, err := manifest.ParseManifestFileName(candidate)
+		if err != nil || !isTemp && generation <= currentGeneration {
+			continue
+		}
+		found = append(found, filepath.Join(manifest.ManifestDirName, name))
+	}
+	sort.Strings(found)
 	return found, nil
 }
 
