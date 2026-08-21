@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +46,8 @@ const (
 
 func TestDataGCProcessCrashMatrix(t *testing.T) {
 	points := []failpoint.Point{
+		appendlog.PointRelocationPartWritten, appendlog.PointRelocationSealWritten,
+		appendlog.PointRelocationSynced, commit.PointRelocationPublished,
 		pointDataGCPrepared, pointDataGCCopying, pointDataGCRelocations, pointDataGCCheckpoint,
 		pointDataGCRetired, pointDataGCManifestRemoved, pointDataGCTrashed, pointDataGCDeleted,
 	}
@@ -152,21 +155,25 @@ func TestDataGCCrashChild(t *testing.T) {
 	dir := os.Getenv(dataGCCrashDirEnv)
 	cfg := smallTestConfig(dir)
 	cfg.SegmentSize = 16 << 10
-	store, _, _ := prepareDataGCStore(t, cfg)
-	if os.Getenv(dataGCForceMapRotateEnv) == "1" {
-		fillActiveMappingForNestedDataGC(t, store, cfg)
-	}
 	target := failpoint.Point(os.Getenv(dataGCCrashPointEnv))
+	var armed atomic.Bool
 	hook := failpoint.Func(func(point failpoint.Point) error {
-		if point != target {
+		if !armed.Load() || point != target {
 			return nil
 		}
 		fmt.Printf("RIDSTORE_FAILPOINT_READY %s\n", point)
 		_ = os.Stdout.Sync()
 		select {}
 	})
-	store.hook = hook
-	store.mapping.SetHook(hook)
+	store, err := createWithOptions(cfg, initialize.Options{Hook: hook})
+	if err != nil {
+		t.Fatal(err)
+	}
+	populateDataGCStore(t, store)
+	if os.Getenv(dataGCForceMapRotateEnv) == "1" {
+		fillActiveMappingForNestedDataGC(t, store, cfg)
+	}
+	armed.Store(true)
 	if _, err := store.CompactData(context.Background()); err != nil {
 		t.Fatal(err)
 	}

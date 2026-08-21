@@ -622,6 +622,12 @@ func prepareDataGCStore(t *testing.T, cfg Config) (*Store, ID, Revision) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stableID, revision := populateDataGCStore(t, store)
+	return store, stableID, revision
+}
+
+func populateDataGCStore(t *testing.T, store *Store) (ID, Revision) {
+	t.Helper()
 	ctx := context.Background()
 	first, err := store.Begin(ctx)
 	if err != nil {
@@ -662,5 +668,5 @@ func prepareDataGCStore(t *testing.T, cfg Config) (*Store, ID, Revision) {
 	if len(store.catalog.Snapshot().SealedDataSegments) == 0 {
 		t.Fatal("test did not rotate data")
 	}
-	return store, stableID, Revision(committed.BatchID)
+	return stableID, Revision(committed.BatchID)
 }
