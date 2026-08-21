@@ -18,6 +18,7 @@ import (
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
 	"github.com/akzj/ridstore/internal/mapping/memory"
+	internalmetrics "github.com/akzj/ridstore/internal/metrics"
 	"github.com/akzj/ridstore/internal/rotation"
 	"github.com/akzj/ridstore/internal/segment"
 )
@@ -44,6 +45,7 @@ type Store struct {
 	lock           *filelock.Lock
 	segments       *segment.Registry
 	rotation       *rotation.Manager
+	metrics        *internalmetrics.Runtime
 	log            *appendlog.Sequencer
 	mapping        *memory.Mapping
 	coordinator    *commit.Coordinator

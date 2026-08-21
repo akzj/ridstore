@@ -37,6 +37,26 @@ type CommitResult struct {
 	CommitSeq CommitSeq
 }
 
+type Metrics struct {
+	CommitQueued, CommitGroups, GroupBatches     uint64
+	Committed, Aborted, Conflicts, CommitUnknown uint64
+	QueueWaitNanos, ValidationNanos              uint64
+	WriteSyncNanos, PublishNanos                 uint64
+}
+
+func (s *Store) Metrics() Metrics {
+	if s == nil || s.metrics == nil {
+		return Metrics{}
+	}
+	snapshot := s.metrics.Snapshot()
+	return Metrics{
+		CommitQueued: snapshot.CommitQueued, CommitGroups: snapshot.CommitGroups, GroupBatches: snapshot.GroupBatches,
+		Committed: snapshot.Committed, Aborted: snapshot.Aborted, Conflicts: snapshot.Conflicts, CommitUnknown: snapshot.CommitUnknown,
+		QueueWaitNanos: snapshot.QueueWaitNanos, ValidationNanos: snapshot.ValidationNanos,
+		WriteSyncNanos: snapshot.WriteSyncNanos, PublishNanos: snapshot.PublishNanos,
+	}
+}
+
 type Batch struct {
 	store *Store
 	inner *batchimpl.Batch

@@ -80,6 +80,10 @@ func TestPublicCommitGetStatusAndRecovery(t *testing.T) {
 	if err != nil || commitResult.BatchID != 1 || commitResult.CommitSeq != 1 {
 		t.Fatalf("commit=%+v error=%v", commitResult, err)
 	}
+	metrics := store.Metrics()
+	if metrics.CommitQueued != 1 || metrics.CommitGroups != 1 || metrics.GroupBatches != 1 || metrics.Committed != 1 || metrics.WriteSyncNanos == 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
 	record, err := store.GetRecord(context.Background(), id)
 	if err != nil || string(record.Value) != "value" || record.Revision != 1 {
 		t.Fatalf("record=%+v error=%v", record, err)

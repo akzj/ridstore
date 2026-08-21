@@ -12,6 +12,7 @@ import (
 	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/metrics"
 	"github.com/akzj/ridstore/internal/recovery"
 	"github.com/akzj/ridstore/internal/rotation"
 	"github.com/akzj/ridstore/internal/segment"
@@ -79,14 +80,16 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return failWithLog(err)
 	}
+	runtimeMetrics := &metrics.Runtime{}
 	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, recovered.Mapping, segmentRecordReader{segments: segments}, commit.Config{
 		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: uint64(cfg.MaxGroupBytes), MaxDelay: cfg.MaxGroupDelay,
+		Metrics: runtimeMetrics,
 	}, hook)
 	if err != nil {
 		return failWithLog(err)
 	}
 	store := &Store{
-		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, log: log,
+		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, metrics: runtimeMetrics, log: log,
 		mapping: recovered.Mapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
 		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]BatchStatus), slotNotify: make(chan struct{}, 1),
 		issuedBatchHigh:      recovered.ReservedBatchIDHighExclusive,
