@@ -1,6 +1,7 @@
 package radix
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -185,5 +186,77 @@ func TestCheckpointPrunesEmptyPath(t *testing.T) {
 	}
 	if err := mapping.CompleteCheckpoint(checkpoint, root); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResolvedRelocationPublishesWithoutRootIO(t *testing.T) {
+	dir, manifest := radixFixture(t)
+	mapping, err := Open(dir, manifest, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr, _ := base.NewVAddr(1, base.FirstContentOffset)
+	newAddr, _ := base.NewVAddr(2, base.FirstContentOffset)
+	if _, err := mapping.Apply(1, api.ApplyUserCommit, []api.Change{{RecordID: 42, NewAddr: oldAddr}}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := mapping.BeginCheckpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := mapping.BuildCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mapping.CompleteCheckpoint(checkpoint, root); err != nil {
+		t.Fatal(err)
+	}
+	mapping.cache = newNodeCache(4096)
+	plan, err := mapping.Resolve(api.ApplyRelocation, []api.Change{{RecordID: 42, NewAddr: newAddr, ExpectedOldAddr: oldAddr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Changes) != 1 || !plan.Changes[0].Apply || plan.BaseCommitSeq != 1 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	// Closing the node store makes any subsequent Root I/O fail. Resolved
+	// publication must still succeed because it is a pure in-memory operation.
+	if err := mapping.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := mapping.ApplyResolved(2, plan)
+	if err != nil || result.Applied != 1 || result.Skipped != 0 {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if got, ok, err := mapping.Lookup(42); err != nil || !ok || got != newAddr {
+		t.Fatalf("lookup=(%x,%v,%v)", got, ok, err)
+	}
+}
+
+func TestResolvedRelocationFailsClosedWhenPlanIsStale(t *testing.T) {
+	dir, manifest := radixFixture(t)
+	mapping, err := Open(dir, manifest, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mapping.Close()
+	a1, _ := base.NewVAddr(1, base.FirstContentOffset)
+	a2, _ := base.NewVAddr(1, base.FirstContentOffset+128)
+	a3, _ := base.NewVAddr(1, base.FirstContentOffset+256)
+	if _, err := mapping.Apply(1, api.ApplyUserCommit, []api.Change{{RecordID: 7, NewAddr: a1}}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := mapping.Resolve(api.ApplyRelocation, []api.Change{{RecordID: 7, NewAddr: a2, ExpectedOldAddr: a1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mapping.Apply(2, api.ApplyUserCommit, []api.Change{{RecordID: 7, NewAddr: a3}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mapping.ApplyResolved(3, plan); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("stale plan error=%v", err)
+	}
+	if got, _, _ := mapping.Lookup(7); got != a3 {
+		t.Fatalf("stale plan changed mapping to %x", got)
 	}
 }
