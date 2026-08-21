@@ -132,6 +132,18 @@ type commitGroupResult struct {
 	err     error
 }
 
+func (s *Sequencer) AppendRelocation(prepared RelocationPrepared, seq base.CommitSeq) (CommitAppendResult, error) {
+	result, err := s.submit(context.Background(), func(log *Log) any {
+		got, err := log.AppendRelocation(prepared, seq)
+		return commitResult{result: got, err: err}
+	})
+	if err != nil {
+		return CommitAppendResult{}, err
+	}
+	got := result.(commitResult)
+	return got.result, got.err
+}
+
 func (s *Sequencer) AppendCommitGroup(prepared []batch.Prepared, seqs []base.CommitSeq) ([]CommitAppendResult, error) {
 	result, err := s.submit(context.Background(), func(log *Log) any {
 		got, err := log.AppendCommitGroup(prepared, seqs)
