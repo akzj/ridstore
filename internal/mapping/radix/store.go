@@ -368,23 +368,36 @@ func (s *nodeStore) trashRetired(refs []storeformat.JournalFileRef, operationID 
 		if !ok {
 			return trash, fmt.Errorf("retired mapping file %d missing: %w", id, base.ErrCorrupt)
 		}
-		if err := item.file.Close(); err != nil {
-			return trash, err
-		}
 		source := filepath.Join(s.root, "mapping", activeMapFileName(id))
 		if ref.State == storeformat.FileStateSealed {
 			source = filepath.Join(s.root, "mapping", sealedMapFileName(id))
 		}
 		target := mappingGCTrashPath(s.root, operationID, id)
-		if err := os.Rename(source, target); err != nil {
+		if err := failpoint.Hit(s.hook, PointBeforeMappingGCTrashRename); err != nil {
 			return trash, err
 		}
+		if err := item.file.Close(); err != nil {
+			return trash, err
+		}
+		renameErr := os.Rename(source, target)
+		// The descriptor is closed regardless of rename outcome. Drop its runtime
+		// ownership so Store.Close does not close it again after a fail-closed
+		// rename error; fresh Open owns filesystem reconciliation from here.
 		s.mu.Lock()
 		delete(s.retired, id)
 		s.mu.Unlock()
+		if renameErr != nil {
+			return trash, renameErr
+		}
 		trash = append(trash, target)
 	}
+	if err := failpoint.Hit(s.hook, PointBeforeMappingGCTrashMappingDirSync); err != nil {
+		return trash, err
+	}
 	if err := syncDirectory(filepath.Join(s.root, "mapping")); err != nil {
+		return trash, err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeMappingGCTrashPublishDirSync); err != nil {
 		return trash, err
 	}
 	if err := syncDirectory(filepath.Join(s.root, "trash")); err != nil {

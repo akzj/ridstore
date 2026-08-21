@@ -24,6 +24,21 @@ const (
 	PointMappingGCManifestInstalled failpoint.Point = "mapping-gc.manifest-installed"
 	PointMappingGCRuntimeInstalled  failpoint.Point = "mapping-gc.runtime-installed"
 	PointMappingGCTrashed           failpoint.Point = "mapping-gc.trashed"
+
+	PointBeforeMappingGCHeaderWrite         failpoint.Point = "mapping-gc.before-header-write"
+	PointBeforeMappingGCNodeWrite           failpoint.Point = "mapping-gc.before-node-write"
+	PointBeforeMappingGCFooterWrite         failpoint.Point = "mapping-gc.before-footer-write"
+	PointBeforeMappingGCFileSync            failpoint.Point = "mapping-gc.before-file-sync"
+	PointBeforeMappingGCTempDirSync         failpoint.Point = "mapping-gc.before-temp-dir-sync"
+	PointBeforeMappingGCPublishRename       failpoint.Point = "mapping-gc.before-publish-rename"
+	PointBeforeMappingGCPublishDirSync      failpoint.Point = "mapping-gc.before-publish-dir-sync"
+	PointBeforeMappingGCCleanupRemove       failpoint.Point = "mapping-gc.before-cleanup-remove"
+	PointBeforeMappingGCCleanupDirSync      failpoint.Point = "mapping-gc.before-cleanup-dir-sync"
+	PointBeforeMappingGCTrashRename         failpoint.Point = "mapping-gc.before-trash-rename"
+	PointBeforeMappingGCTrashMappingDirSync failpoint.Point = "mapping-gc.before-trash-mapping-dir-sync"
+	PointBeforeMappingGCTrashPublishDirSync failpoint.Point = "mapping-gc.before-trash-publish-dir-sync"
+	PointBeforeMappingGCTrashDelete         failpoint.Point = "mapping-gc.before-trash-delete"
+	PointBeforeMappingGCTrashDeleteDirSync  failpoint.Point = "mapping-gc.before-trash-delete-dir-sync"
 )
 
 type mapGCFile struct {
@@ -38,30 +53,35 @@ type mapGCFile struct {
 }
 
 type mapGCWriter struct {
-	root        string
-	uuid        base.StoreUUID
-	segmentSize uint64
-	operationID [16]byte
-	currentID   base.MapSegmentID
-	nextID      base.MapSegmentID
-	nextNodeSeq base.NodeSeq
-	file        *os.File
-	end         uint64
-	first       base.NodeSeq
-	last        base.NodeSeq
-	count       uint64
-	files       []mapGCFile
+	root         string
+	uuid         base.StoreUUID
+	segmentSize  uint64
+	operationID  [16]byte
+	currentID    base.MapSegmentID
+	nextID       base.MapSegmentID
+	nextNodeSeq  base.NodeSeq
+	file         *os.File
+	end          uint64
+	first        base.NodeSeq
+	last         base.NodeSeq
+	count        uint64
+	files        []mapGCFile
+	hook         failpoint.Hook
+	currentOwned bool
 }
 
-func newMapGCWriter(root string, uuid base.StoreUUID, segmentSize uint64, firstID base.MapSegmentID, firstSeq base.NodeSeq, operationID [16]byte) (*mapGCWriter, error) {
+func newMapGCWriter(root string, uuid base.StoreUUID, segmentSize uint64, firstID base.MapSegmentID, firstSeq base.NodeSeq, operationID [16]byte, hook failpoint.Hook) (*mapGCWriter, error) {
 	if root == "" || uuid == (base.StoreUUID{}) || firstID == 0 || firstSeq == 0 || operationID == ([16]byte{}) {
 		return nil, base.ErrInvalidConfig
 	}
-	w := &mapGCWriter{root: root, uuid: uuid, segmentSize: segmentSize, currentID: firstID, nextID: firstID + 1, nextNodeSeq: firstSeq, operationID: operationID}
+	w := &mapGCWriter{root: root, uuid: uuid, segmentSize: segmentSize, currentID: firstID, nextID: firstID + 1, nextNodeSeq: firstSeq, operationID: operationID, hook: hook}
 	if w.nextID == 0 {
 		return nil, base.ErrGenerationExhausted
 	}
 	if err := w.createCurrent(); err != nil {
+		if w.currentOwned {
+			return w, err
+		}
 		return nil, err
 	}
 	return w, nil
@@ -79,10 +99,15 @@ func (w *mapGCWriter) createCurrent() error {
 	if err != nil {
 		return err
 	}
-	if _, err := writeFullAt(file, header[:], 0); err != nil {
-		return errors.Join(err, file.Close(), os.Remove(path))
+	w.file, w.end, w.first, w.last, w.count = file, 0, w.nextNodeSeq, 0, 0
+	w.currentOwned = true
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCHeaderWrite); err != nil {
+		return err
 	}
-	w.file, w.end, w.first, w.last, w.count = file, storeformat.SegmentHeaderSize, w.nextNodeSeq, 0, 0
+	if _, err := writeFullAt(file, header[:], 0); err != nil {
+		return err
+	}
+	w.end = storeformat.SegmentHeaderSize
 	return nil
 }
 
@@ -113,6 +138,9 @@ func (w *mapGCWriter) append(level uint8, prefix uint64, covered base.CommitSeq,
 		}
 	}
 	offset := w.end
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCNodeWrite); err != nil {
+		return 0, err
+	}
 	if _, err := writeFullAt(w.file, encoded, int64(offset)); err != nil {
 		return 0, err
 	}
@@ -132,7 +160,13 @@ func (w *mapGCWriter) sealCurrent() error {
 	if err != nil {
 		return err
 	}
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCFooterWrite); err != nil {
+		return err
+	}
 	if _, err := writeFullAt(w.file, footer[:], int64(w.end)); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCFileSync); err != nil {
 		return err
 	}
 	if err := w.file.Sync(); err != nil {
@@ -144,12 +178,16 @@ func (w *mapGCWriter) sealCurrent() error {
 	}
 	w.files = append(w.files, mapGCFile{id: w.currentID, tempPath: path, final: filepath.Join(w.root, "mapping", sealedMapFileName(w.currentID)), sealed: true, validEnd: w.end, first: w.first, last: w.last, count: w.count})
 	w.file = nil
+	w.currentOwned = false
 	return nil
 }
 
 func (w *mapGCWriter) finish() error {
 	if w.file == nil {
 		return base.ErrCorrupt
+	}
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCFileSync); err != nil {
+		return err
 	}
 	if err := w.file.Sync(); err != nil {
 		return err
@@ -164,14 +202,24 @@ func (w *mapGCWriter) finish() error {
 	}
 	w.files = append(w.files, mapGCFile{id: w.currentID, tempPath: path, final: filepath.Join(w.root, "mapping", activeMapFileName(w.currentID)), validEnd: w.end, first: w.first, last: last, count: w.count})
 	w.file = nil
+	w.currentOwned = false
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCTempDirSync); err != nil {
+		return err
+	}
 	return syncDirectory(filepath.Join(w.root, "mapping"))
 }
 
 func (w *mapGCWriter) publishFiles() error {
 	for _, file := range w.files {
+		if err := failpoint.Hit(w.hook, PointBeforeMappingGCPublishRename); err != nil {
+			return err
+		}
 		if err := os.Rename(file.tempPath, file.final); err != nil {
 			return err
 		}
+	}
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCPublishDirSync); err != nil {
+		return err
 	}
 	return syncDirectory(filepath.Join(w.root, "mapping"))
 }
@@ -210,23 +258,35 @@ func (w *mapGCWriter) cleanup() error {
 	var result error
 	if w.file != nil {
 		result = errors.Join(result, w.file.Close())
+		w.file = nil
 	}
 	for _, file := range w.files {
-		if err := os.Remove(file.tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			result = errors.Join(result, err)
-		}
-		if err := os.Remove(file.final); err != nil && !errors.Is(err, os.ErrNotExist) {
-			result = errors.Join(result, err)
-		}
+		result = errors.Join(result, removeMappingGCPath(file.tempPath, w.hook))
+		result = errors.Join(result, removeMappingGCPath(file.final, w.hook))
 	}
-	if err := os.Remove(mappingGCTempPath(w.root, w.operationID, w.currentID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if w.currentOwned {
+		result = errors.Join(result, removeMappingGCPath(mappingGCTempPath(w.root, w.operationID, w.currentID), w.hook))
+		w.currentOwned = false
+	}
+	if err := failpoint.Hit(w.hook, PointBeforeMappingGCCleanupDirSync); err != nil {
 		result = errors.Join(result, err)
+	} else {
+		result = errors.Join(result, syncDirectory(filepath.Join(w.root, "mapping")))
 	}
-	result = errors.Join(result, syncDirectory(filepath.Join(w.root, "mapping")))
 	return result
 }
 
-func (m *Mapping) Compact(ctx context.Context) (storeformat.Manifest, error) {
+func removeMappingGCPath(path string, hook failpoint.Hook) error {
+	if err := failpoint.Hit(hook, PointBeforeMappingGCCleanupRemove); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (m *Mapping) Compact(ctx context.Context) (_ storeformat.Manifest, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return storeformat.Manifest{}, err
 	}
@@ -270,31 +330,32 @@ func (m *Mapping) Compact(ctx context.Context) (storeformat.Manifest, error) {
 		Generation: current.MaintenanceGeneration + 1, StoreUUID: current.StoreUUID, OperationID: operationID,
 		OperationType: storeformat.MaintenanceMappingGC, Phase: 1, SourceFiles: sourceRefs, OldManifestGeneration: current.Generation,
 	}
-	if err := installMaintenanceJournal(m.store.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(m.store.root, journal, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if err := failpoint.Hit(m.store.hook, PointMappingGCPrepared); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	writer, err := newMapGCWriter(m.store.root, m.store.uuid, m.store.segmentSize, current.NextMapSegmentID, firstNodeSeq, operationID)
+	writer, err := newMapGCWriter(m.store.root, m.store.uuid, m.store.segmentSize, current.NextMapSegmentID, firstNodeSeq, operationID, m.store.hook)
+	manifestInstallAttempted := false
+	if writer != nil {
+		defer func() {
+			if manifestInstallAttempted {
+				return
+			}
+			cleanupErr := writer.cleanup()
+			if cleanupErr == nil {
+				cleanupErr = removeMaintenanceJournalWithHook(m.store.root, m.store.hook)
+			}
+			resultErr = errors.Join(resultErr, cleanupErr)
+		}()
+	}
 	if err != nil {
-		_ = removeMaintenanceJournal(m.store.root)
 		return storeformat.Manifest{}, err
 	}
 	if err := failpoint.Hit(m.store.hook, PointMappingGCCopying); err != nil {
-		if cleanupErr := writer.cleanup(); cleanupErr == nil {
-			_ = removeMaintenanceJournal(m.store.root)
-		}
 		return storeformat.Manifest{}, err
 	}
-	installedManifest := false
-	defer func() {
-		if !installedManifest {
-			if cleanupErr := writer.cleanup(); cleanupErr == nil {
-				_ = removeMaintenanceJournal(m.store.root)
-			}
-		}
-	}()
 	newRoot := base.MapAddr(0)
 	if oldRoot != 0 {
 		newRoot, err = m.copyMappingTree(ctx, writer, oldRoot, 7, 0, covered)
@@ -306,7 +367,7 @@ func (m *Mapping) Compact(ctx context.Context) (storeformat.Manifest, error) {
 		return storeformat.Manifest{}, err
 	}
 	journal.Phase, journal.DestinationFiles = 2, writer.temporaryRefs()
-	if err := installMaintenanceJournal(m.store.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(m.store.root, journal, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if err := failpoint.Hit(m.store.hook, PointMappingGCCopied); err != nil {
@@ -316,12 +377,16 @@ func (m *Mapping) Compact(ctx context.Context) (storeformat.Manifest, error) {
 		return storeformat.Manifest{}, err
 	}
 	journal.Phase, journal.DestinationFiles = 3, writer.finalRefs()
-	if err := installMaintenanceJournal(m.store.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(m.store.root, journal, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if err := failpoint.Hit(m.store.hook, PointMappingGCFilesDurable); err != nil {
 		return storeformat.Manifest{}, err
 	}
+	// From this point onward the Manifest Installer may have made CURRENT name
+	// the new generation even when it returns an error. Runtime cleanup must not
+	// guess the publication outcome or remove files referenced by that CURRENT;
+	// a fresh Open reconciles the durable Manifest and Maintenance Journal.
 	installed, err := m.store.catalog.Install(0, func(next *storeformat.Manifest) error {
 		if next.ActiveMapSegmentID != current.ActiveMapSegmentID || !sameFileSummaries(next.SealedMappingSegments, current.SealedMappingSegments) || next.MappingRoot != oldRoot || next.CoveredCommitSeq != covered {
 			return base.ErrConflict
@@ -331,14 +396,17 @@ func (m *Mapping) Compact(ctx context.Context) (storeformat.Manifest, error) {
 		next.ActiveMapSegmentID = writer.currentID
 		next.NextMapSegmentID = writer.nextID
 		next.MaintenanceGeneration = journal.Generation
+		// Catalog invokes the durable Installer immediately after this callback
+		// succeeds while retaining its install lock. A conflict returned above
+		// has not begun publication and remains safe to clean up.
+		manifestInstallAttempted = true
 		return nil
 	})
 	if err != nil {
 		return storeformat.Manifest{}, err
 	}
-	installedManifest = true
 	journal.Phase, journal.NewManifestGeneration = 4, installed.Generation
-	if err := installMaintenanceJournal(m.store.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(m.store.root, journal, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if err := failpoint.Hit(m.store.hook, PointMappingGCManifestInstalled); err != nil {
@@ -357,20 +425,20 @@ func (m *Mapping) Compact(ctx context.Context) (storeformat.Manifest, error) {
 		return storeformat.Manifest{}, err
 	}
 	journal.Phase = 5
-	if err := installMaintenanceJournal(m.store.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(m.store.root, journal, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if err := failpoint.Hit(m.store.hook, PointMappingGCTrashed); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := deleteMappingTrash(m.store.root, trash); err != nil {
+	if err := deleteMappingTrash(m.store.root, trash, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	journal.Phase = 6
-	if err := installMaintenanceJournal(m.store.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(m.store.root, journal, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := removeMaintenanceJournal(m.store.root); err != nil {
+	if err := removeMaintenanceJournalWithHook(m.store.root, m.store.hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	return installed, nil
@@ -439,16 +507,26 @@ func sortJournalRefs(refs []storeformat.JournalFileRef) {
 	})
 }
 
-func deleteMappingTrash(root string, paths []string) error {
+func deleteMappingTrash(root string, paths []string, hook failpoint.Hook) error {
 	for _, path := range paths {
+		if err := failpoint.Hit(hook, PointBeforeMappingGCTrashDelete); err != nil {
+			return err
+		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+	}
+	if err := failpoint.Hit(hook, PointBeforeMappingGCTrashDeleteDirSync); err != nil {
+		return err
 	}
 	return syncDirectory(filepath.Join(root, "trash"))
 }
 
 func recoverMappingGC(root string, current storeformat.Manifest, journal storeformat.MaintenanceJournal) (storeformat.Manifest, error) {
+	return recoverMappingGCWithHook(root, current, journal, nil)
+}
+
+func recoverMappingGCWithHook(root string, current storeformat.Manifest, journal storeformat.MaintenanceJournal, hook failpoint.Hook) (storeformat.Manifest, error) {
 	if journal.StoreUUID != current.StoreUUID || journal.OperationType != storeformat.MaintenanceMappingGC {
 		return storeformat.Manifest{}, base.ErrCorrupt
 	}
@@ -459,7 +537,7 @@ func recoverMappingGC(root string, current storeformat.Manifest, journal storefo
 			return storeformat.Manifest{}, err
 		}
 		for _, path := range temps {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := removeMappingGCPath(path, hook); err != nil {
 				return storeformat.Manifest{}, err
 			}
 		}
@@ -471,15 +549,18 @@ func recoverMappingGC(root string, current storeformat.Manifest, journal storefo
 				filepath.Join(root, "mapping", sealedMapFileName(id)),
 			}
 			for _, path := range paths {
-				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if err := removeMappingGCPath(path, hook); err != nil {
 					return storeformat.Manifest{}, err
 				}
 			}
 		}
+		if err := failpoint.Hit(hook, PointBeforeMappingGCCleanupDirSync); err != nil {
+			return storeformat.Manifest{}, err
+		}
 		if err := syncDirectory(filepath.Join(root, "mapping")); err != nil {
 			return storeformat.Manifest{}, err
 		}
-		if err := removeMaintenanceJournal(root); err != nil {
+		if err := removeMaintenanceJournalWithHook(root, hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 		return current, nil
@@ -511,6 +592,9 @@ func recoverMappingGC(root string, current storeformat.Manifest, journal storefo
 			if ref.State == storeformat.FileStateSealed {
 				source = filepath.Join(root, "mapping", sealedMapFileName(id))
 			}
+			if err := failpoint.Hit(hook, PointBeforeMappingGCTrashRename); err != nil {
+				return storeformat.Manifest{}, err
+			}
 			if err := os.Rename(source, target); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return storeformat.Manifest{}, err
 			}
@@ -519,16 +603,22 @@ func recoverMappingGC(root string, current storeformat.Manifest, journal storefo
 		}
 		trash = append(trash, target)
 	}
+	if err := failpoint.Hit(hook, PointBeforeMappingGCTrashMappingDirSync); err != nil {
+		return storeformat.Manifest{}, err
+	}
 	if err := syncDirectory(filepath.Join(root, "mapping")); err != nil {
+		return storeformat.Manifest{}, err
+	}
+	if err := failpoint.Hit(hook, PointBeforeMappingGCTrashPublishDirSync); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if err := syncDirectory(filepath.Join(root, "trash")); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := deleteMappingTrash(root, trash); err != nil {
+	if err := deleteMappingTrash(root, trash, hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := removeMaintenanceJournal(root); err != nil {
+	if err := removeMaintenanceJournalWithHook(root, hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	return current, nil
