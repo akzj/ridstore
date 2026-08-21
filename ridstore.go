@@ -2,16 +2,23 @@
 package ridstore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 
+	"github.com/akzj/ridstore/internal/allocator"
+	"github.com/akzj/ridstore/internal/appendlog"
 	"github.com/akzj/ridstore/internal/base"
+	batchimpl "github.com/akzj/ridstore/internal/batch"
+	"github.com/akzj/ridstore/internal/commit"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
+	"github.com/akzj/ridstore/internal/mapping/memory"
+	"github.com/akzj/ridstore/internal/segment"
 )
 
 // ID is a stable logical record identifier. Zero is invalid.
@@ -28,11 +35,29 @@ type Revision = base.Revision
 
 // Store is an exclusively opened ridstore data directory.
 type Store struct {
-	mu       sync.Mutex
-	config   Config
-	manifest storeformat.Manifest
-	lock     *filelock.Lock
-	closed   bool
+	ops sync.RWMutex
+	mu  sync.Mutex
+
+	config         Config
+	manifest       storeformat.Manifest
+	lock           *filelock.Lock
+	active         *segment.ActiveData
+	log            *appendlog.Log
+	mapping        *memory.Mapping
+	coordinator    *commit.Coordinator
+	idAllocator    *allocator.Allocator
+	batchAllocator *allocator.Allocator
+
+	batches              map[BatchID]*Batch
+	statuses             map[BatchID]BatchStatus
+	openCount            int
+	slotNotify           chan struct{}
+	issuedBatchHigh      uint64
+	recoveryAbortedStart uint64
+	recoveryAbortedEnd   uint64
+
+	closed bool
+	fault  error
 }
 
 // Create initializes and exclusively opens a new Store. Interrupted
@@ -55,10 +80,13 @@ func createWithOptions(cfg Config, opts initialize.Options) (*Store, error) {
 	}
 	m, err := initialize.CreateWithOptions(normalized.Dir, hard, opts)
 	if err != nil {
-		_ = lock.Close()
-		return nil, err
+		return nil, errors.Join(err, lock.Close())
 	}
-	return &Store{config: normalized, manifest: m, lock: lock}, nil
+	store, err := buildStore(normalized, m, lock)
+	if err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	return store, nil
 }
 
 // Open recovers and exclusively opens an existing Store. It never creates a
@@ -79,15 +107,17 @@ func Open(cfg Config) (*Store, error) {
 	}
 	m, err := initialize.Open(cfg.Dir)
 	if err != nil {
-		_ = lock.Close()
-		return nil, err
+		return nil, errors.Join(err, lock.Close())
 	}
 	normalized, err := normalizeOpenConfig(cfg, m.HardLimits)
 	if err != nil {
-		_ = lock.Close()
-		return nil, err
+		return nil, errors.Join(err, lock.Close())
 	}
-	return &Store{config: normalized, manifest: m, lock: lock}, nil
+	store, err := buildStore(normalized, m, lock)
+	if err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	return store, nil
 }
 
 // Close releases the directory writer lease. Repeated Close returns ErrClosed.
@@ -95,13 +125,31 @@ func (s *Store) Close() error {
 	if s == nil {
 		return base.ErrClosed
 	}
+	s.ops.Lock()
+	defer s.ops.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return base.ErrClosed
 	}
 	s.closed = true
-	return s.lock.Close()
+	batches := make([]*Batch, 0, len(s.batches))
+	for _, b := range s.batches {
+		batches = append(batches, b)
+	}
+	s.signalSlotLocked()
+	s.mu.Unlock()
+	var result error
+	for _, b := range batches {
+		state, _ := b.inner.State()
+		if state == batchimpl.StateOpen || state == batchimpl.StateFailed {
+			result = errors.Join(result, b.inner.Abort(context.Background(), storeformat.AbortReasonCloseCleanup))
+			b.finish(BatchStatus{BatchID: b.ID(), State: BatchStateAborted})
+		}
+	}
+	result = errors.Join(result, s.active.Close())
+	result = errors.Join(result, s.lock.Close())
+	return result
 }
 
 func prepareDirectory(path string, create bool) error {
