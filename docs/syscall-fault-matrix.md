@@ -18,7 +18,8 @@
 | Mapping GC | Header/Node/Footer 已覆盖 | sealed/final Active sync 已覆盖 | temp publish、checkpoint 前 cleanup、old-file trash/delete 已覆盖 | temp/publish/mapping/trash/delete dir sync 已覆盖 | 完整 runtime/recovery matrix；三类错误、部分多文件操作、Manifest publication 不确定性和 fresh Open 收敛均验证 |
 | Data GC trash/delete | N/A | N/A | source rename-to-trash、trash delete 已覆盖 | data/trash publish 与 delete dir sync 已覆盖 | 完整 runtime/recovery matrix；Manifest 已移除 source 后 Store fail closed，恢复自身失败可重试并保留记录一致性 |
 | Initialize marker/files | 已覆盖 | 已覆盖 | 已覆盖 | 已覆盖 | 完整 syscall matrix；损坏的未发布 temp/初始 Segment 可清理重建，durable phase fail closed，Marker 删除后的 root sync 可由 marker-free Open 补做 |
-| Backup/Restore artifact publication | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；不影响已打开 Store，但影响可声明的离线运维完整性 |
+| Backup artifact publication | payload/Marker/Verify LOCK/metadata 已覆盖 | payload/Marker/Verify LOCK/metadata 已覆盖 | INCOMPLETE remove、Verify cleanup 已覆盖；无 rename | prepared/parent/payload/metadata/publish/补偿 dir sync 已覆盖 | 完整 syscall matrix；发布前失败保留 INCOMPLETE，最终 root sync 失败补偿恢复 Marker，补偿失败保留双重 cause |
+| Restore artifact publication | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；不影响源 Backup，但影响恢复目标的发布完整性 |
 
 ## Active Data 已闭合的失败语义
 
@@ -30,7 +31,6 @@
 
 ## 剩余推进顺序
 
-1. Backup artifact publication；
-2. Restore artifact publication。
+1. Restore artifact publication。
 
 只有所有行闭合，`phase-5-audit.md` 的“所有 durable writer 完成 syscall error matrix”才能勾选。

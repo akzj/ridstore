@@ -69,6 +69,33 @@ const (
 	PointBackupMetadataSynced  failpoint.Point = "backup.metadata-synced"
 	PointBackupMarkerRemoved   failpoint.Point = "backup.marker-removed"
 	PointBackupPublished       failpoint.Point = "backup.published"
+
+	PointBeforeBackupRootCreate             failpoint.Point = "backup.before-root-create"
+	PointBeforeBackupMarkerWrite            failpoint.Point = "backup.before-marker-write"
+	PointBeforeBackupMarkerFileSync         failpoint.Point = "backup.before-marker-file-sync"
+	PointBeforeBackupPreparedRootSync       failpoint.Point = "backup.before-prepared-root-sync"
+	PointBeforeBackupParentSync             failpoint.Point = "backup.before-parent-sync"
+	PointBeforeBackupPayloadRootCreate      failpoint.Point = "backup.before-payload-root-create"
+	PointBeforeBackupPayloadDirectoryCreate failpoint.Point = "backup.before-payload-directory-create"
+	PointBeforeBackupPayloadWrite           failpoint.Point = "backup.before-payload-write"
+	PointBeforeBackupPayloadFileSync        failpoint.Point = "backup.before-payload-file-sync"
+	PointBeforeBackupVerifyTrashCreate      failpoint.Point = "backup.before-verify-trash-create"
+	PointBeforeBackupVerifyLockWrite        failpoint.Point = "backup.before-verify-lock-write"
+	PointBeforeBackupVerifyLockFileSync     failpoint.Point = "backup.before-verify-lock-file-sync"
+	PointBeforeBackupVerifyLockRemove       failpoint.Point = "backup.before-verify-lock-remove"
+	PointBeforeBackupVerifyTrashRemove      failpoint.Point = "backup.before-verify-trash-remove"
+	PointBeforeBackupMetadataWrite          failpoint.Point = "backup.before-metadata-write"
+	PointBeforeBackupMetadataFileSync       failpoint.Point = "backup.before-metadata-file-sync"
+	PointBeforeBackupManifestDirectorySync  failpoint.Point = "backup.before-manifest-directory-sync"
+	PointBeforeBackupDataDirectorySync      failpoint.Point = "backup.before-data-directory-sync"
+	PointBeforeBackupMapDirectorySync       failpoint.Point = "backup.before-map-directory-sync"
+	PointBeforeBackupPayloadDirectorySync   failpoint.Point = "backup.before-payload-directory-sync"
+	PointBeforeBackupMetadataRootSync       failpoint.Point = "backup.before-metadata-root-sync"
+	PointBeforeBackupMarkerRemove           failpoint.Point = "backup.before-marker-remove"
+	PointBeforeBackupPublishRootSync        failpoint.Point = "backup.before-publish-root-sync"
+	PointBeforeBackupRecoveryMarkerWrite    failpoint.Point = "backup.before-recovery-marker-write"
+	PointBeforeBackupRecoveryMarkerFileSync failpoint.Point = "backup.before-recovery-marker-file-sync"
+	PointBeforeBackupRecoveryRootSync       failpoint.Point = "backup.before-recovery-root-sync"
 )
 
 // Create writes a complete offline backup artifact. Source verification and
@@ -109,7 +136,7 @@ func CreateWithOptions(ctx context.Context, source, destination string, options 
 		return report, err
 	}
 	paths := storePaths(current)
-	if err := createArtifactRoot(destinationAbs); err != nil {
+	if err := createArtifactRoot(destinationAbs, options.Hook); err != nil {
 		return report, err
 	}
 	if err := failpoint.Hit(options.Hook, PointBackupPrepared); err != nil {
@@ -117,6 +144,9 @@ func CreateWithOptions(ctx context.Context, source, destination string, options 
 	}
 	payloadRoot := filepath.Join(destinationAbs, payloadDirName)
 	for _, name := range []string{"manifests", "data", "mapping"} {
+		if err := failpoint.Hit(options.Hook, PointBeforeBackupPayloadDirectoryCreate); err != nil {
+			return report, err
+		}
 		if err := os.Mkdir(filepath.Join(payloadRoot, name), 0o700); err != nil {
 			return report, err
 		}
@@ -131,7 +161,10 @@ func CreateWithOptions(ctx context.Context, source, destination string, options 
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
-		size, digest, copyErr := copyRegularFile(ctx, filepath.Join(sourceAbs, relative), filepath.Join(payloadRoot, relative))
+		size, digest, copyErr := copyRegularFileWithHook(
+			ctx, filepath.Join(sourceAbs, relative), filepath.Join(payloadRoot, relative),
+			options.Hook, PointBeforeBackupPayloadWrite, PointBeforeBackupPayloadFileSync,
+		)
 		if copyErr != nil {
 			return report, copyErr
 		}
@@ -143,7 +176,7 @@ func CreateWithOptions(ctx context.Context, source, destination string, options 
 	if err := failpoint.Hit(options.Hook, PointBackupFilesCopied); err != nil {
 		return report, err
 	}
-	if err := verifyCopiedPayload(ctx, payloadRoot); err != nil {
+	if err := verifyCopiedPayload(ctx, payloadRoot, options.Hook); err != nil {
 		return report, err
 	}
 	if err := failpoint.Hit(options.Hook, PointBackupPayloadVerified); err != nil {
@@ -154,13 +187,23 @@ func CreateWithOptions(ctx context.Context, source, destination string, options 
 		return report, err
 	}
 	encoded = append(encoded, '\n')
-	if err := writeNewSynced(filepath.Join(destinationAbs, metadataName), encoded, 0o600); err != nil {
+	if err := writeNewSyncedWithHook(
+		filepath.Join(destinationAbs, metadataName), encoded, 0o600, options.Hook,
+		PointBeforeBackupMetadataWrite, PointBeforeBackupMetadataFileSync,
+	); err != nil {
 		return report, err
 	}
-	for _, dir := range []string{
-		filepath.Join(payloadRoot, "manifests"), filepath.Join(payloadRoot, "data"), filepath.Join(payloadRoot, "mapping"), payloadRoot, destinationAbs,
+	for _, entry := range []struct {
+		dir   string
+		point failpoint.Point
+	}{
+		{filepath.Join(payloadRoot, "manifests"), PointBeforeBackupManifestDirectorySync},
+		{filepath.Join(payloadRoot, "data"), PointBeforeBackupDataDirectorySync},
+		{filepath.Join(payloadRoot, "mapping"), PointBeforeBackupMapDirectorySync},
+		{payloadRoot, PointBeforeBackupPayloadDirectorySync},
+		{destinationAbs, PointBeforeBackupMetadataRootSync},
 	} {
-		if err := syncDirectory(dir); err != nil {
+		if err := syncDirectoryWithHook(entry.dir, options.Hook, entry.point); err != nil {
 			return report, err
 		}
 	}
@@ -170,21 +213,18 @@ func CreateWithOptions(ctx context.Context, source, destination string, options 
 	if _, err := validateArtifact(ctx, destinationAbs, true); err != nil {
 		return report, err
 	}
+	if err := failpoint.Hit(options.Hook, PointBeforeBackupMarkerRemove); err != nil {
+		return report, err
+	}
 	if err := os.Remove(filepath.Join(destinationAbs, incompleteName)); err != nil {
 		return report, err
 	}
 	if err := failpoint.Hit(options.Hook, PointBackupMarkerRemoved); err != nil {
-		restoreErr := writeNewSynced(filepath.Join(destinationAbs, incompleteName), []byte("ridstore backup incomplete\n"), 0o600)
-		if restoreErr == nil {
-			restoreErr = syncDirectory(destinationAbs)
-		}
+		restoreErr := restoreBackupMarker(destinationAbs, options.Hook)
 		return report, errors.Join(err, restoreErr)
 	}
-	if err := syncDirectory(destinationAbs); err != nil {
-		restoreErr := writeNewSynced(filepath.Join(destinationAbs, incompleteName), []byte("ridstore backup incomplete\n"), 0o600)
-		if restoreErr == nil {
-			restoreErr = syncDirectory(destinationAbs)
-		}
+	if err := syncDirectoryWithHook(destinationAbs, options.Hook, PointBeforeBackupPublishRootSync); err != nil {
+		restoreErr := restoreBackupMarker(destinationAbs, options.Hook)
 		return report, errors.Join(err, restoreErr)
 	}
 	if err := failpoint.Hit(options.Hook, PointBackupPublished); err != nil {
@@ -335,7 +375,7 @@ func storePaths(current storeformat.Manifest) []string {
 	return paths
 }
 
-func createArtifactRoot(root string) error {
+func createArtifactRoot(root string, hook failpoint.Hook) error {
 	parent := filepath.Dir(root)
 	info, err := os.Lstat(parent)
 	if err != nil {
@@ -344,16 +384,25 @@ func createArtifactRoot(root string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("backup parent is not a real directory: %w", base.ErrInvalidConfig)
 	}
+	if err := failpoint.Hit(hook, PointBeforeBackupRootCreate); err != nil {
+		return err
+	}
 	if err := os.Mkdir(root, 0o700); err != nil {
 		return err
 	}
-	if err := writeNewSynced(filepath.Join(root, incompleteName), []byte("ridstore backup incomplete\n"), 0o600); err != nil {
+	if err := writeNewSyncedWithHook(
+		filepath.Join(root, incompleteName), []byte("ridstore backup incomplete\n"), 0o600, hook,
+		PointBeforeBackupMarkerWrite, PointBeforeBackupMarkerFileSync,
+	); err != nil {
 		return errors.Join(err, os.Remove(root))
 	}
-	if err := syncDirectory(root); err != nil {
+	if err := syncDirectoryWithHook(root, hook, PointBeforeBackupPreparedRootSync); err != nil {
 		return err
 	}
-	if err := syncDirectory(parent); err != nil {
+	if err := syncDirectoryWithHook(parent, hook, PointBeforeBackupParentSync); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(hook, PointBeforeBackupPayloadRootCreate); err != nil {
 		return err
 	}
 	if err := os.Mkdir(filepath.Join(root, payloadDirName), 0o700); err != nil {
@@ -362,16 +411,26 @@ func createArtifactRoot(root string) error {
 	return nil
 }
 
-func verifyCopiedPayload(ctx context.Context, payloadRoot string) (resultErr error) {
+func verifyCopiedPayload(ctx context.Context, payloadRoot string, hook failpoint.Hook) (resultErr error) {
 	trash := filepath.Join(payloadRoot, "trash")
 	lock := filepath.Join(payloadRoot, filelock.FileName)
+	if err := failpoint.Hit(hook, PointBeforeBackupVerifyTrashCreate); err != nil {
+		return err
+	}
 	if err := os.Mkdir(trash, 0o700); err != nil {
 		return err
 	}
 	defer func() {
-		resultErr = errors.Join(resultErr, removeIfExists(lock), removeIfExists(trash))
+		resultErr = errors.Join(
+			resultErr,
+			removeIfExistsWithHook(lock, hook, PointBeforeBackupVerifyLockRemove),
+			removeIfExistsWithHook(trash, hook, PointBeforeBackupVerifyTrashRemove),
+		)
 	}()
-	if err := writeNewSynced(lock, []byte{}, 0o600); err != nil {
+	if err := writeNewSyncedWithHook(
+		lock, []byte{}, 0o600, hook,
+		PointBeforeBackupVerifyLockWrite, PointBeforeBackupVerifyLockFileSync,
+	); err != nil {
 		return err
 	}
 	report, err := verify.Run(ctx, payloadRoot)
@@ -385,6 +444,13 @@ func verifyCopiedPayload(ctx context.Context, payloadRoot string) (resultErr err
 }
 
 func removeIfExists(path string) error {
+	return removeIfExistsWithHook(path, nil, "")
+}
+
+func removeIfExistsWithHook(path string, hook failpoint.Hook, point failpoint.Point) error {
+	if err := hitOptional(hook, point); err != nil {
+		return err
+	}
 	err := os.Remove(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -393,6 +459,15 @@ func removeIfExists(path string) error {
 }
 
 func copyRegularFile(ctx context.Context, source, destination string) (size uint64, digest string, resultErr error) {
+	return copyRegularFileWithHook(ctx, source, destination, nil, "", "")
+}
+
+func copyRegularFileWithHook(
+	ctx context.Context,
+	source, destination string,
+	hook failpoint.Hook,
+	beforeWrite, beforeSync failpoint.Point,
+) (size uint64, digest string, resultErr error) {
 	fd, err := syscall.Open(source, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return 0, "", err
@@ -416,12 +491,18 @@ func copyRegularFile(ctx context.Context, source, destination string) (size uint
 	}
 	defer func() { resultErr = errors.Join(resultErr, out.Close()) }()
 	hash := sha256.New()
+	if err := hitOptional(hook, beforeWrite); err != nil {
+		return 0, "", err
+	}
 	written, err := copyContext(ctx, io.MultiWriter(out, hash), in)
 	if err != nil {
 		return 0, "", err
 	}
 	if written != info.Size() {
 		return 0, "", fmt.Errorf("backup source size changed during copy: %w", base.ErrCorrupt)
+	}
+	if err := hitOptional(hook, beforeSync); err != nil {
+		return 0, "", err
 	}
 	if err := out.Sync(); err != nil {
 		return 0, "", err
@@ -573,16 +654,32 @@ func readRegularFile(path string, maxSize int64) ([]byte, error) {
 }
 
 func writeNewSynced(path string, data []byte, mode os.FileMode) (resultErr error) {
+	return writeNewSyncedWithHook(path, data, mode, nil, "", "")
+}
+
+func writeNewSyncedWithHook(
+	path string,
+	data []byte,
+	mode os.FileMode,
+	hook failpoint.Hook,
+	beforeWrite, beforeSync failpoint.Point,
+) (resultErr error) {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
 	writer := bufio.NewWriter(file)
+	if err := hitOptional(hook, beforeWrite); err != nil {
+		return err
+	}
 	if _, err := writer.Write(data); err != nil {
 		return err
 	}
 	if err := writer.Flush(); err != nil {
+		return err
+	}
+	if err := hitOptional(hook, beforeSync); err != nil {
 		return err
 	}
 	return file.Sync()
@@ -595,6 +692,30 @@ func syncDirectory(path string) (resultErr error) {
 	}
 	defer func() { resultErr = errors.Join(resultErr, directory.Close()) }()
 	return directory.Sync()
+}
+
+func syncDirectoryWithHook(path string, hook failpoint.Hook, point failpoint.Point) error {
+	if err := hitOptional(hook, point); err != nil {
+		return err
+	}
+	return syncDirectory(path)
+}
+
+func hitOptional(hook failpoint.Hook, point failpoint.Point) error {
+	if point == "" {
+		return nil
+	}
+	return failpoint.Hit(hook, point)
+}
+
+func restoreBackupMarker(root string, hook failpoint.Hook) error {
+	if err := writeNewSyncedWithHook(
+		filepath.Join(root, incompleteName), []byte("ridstore backup incomplete\n"), 0o600, hook,
+		PointBeforeBackupRecoveryMarkerWrite, PointBeforeBackupRecoveryMarkerFileSync,
+	); err != nil {
+		return err
+	}
+	return syncDirectoryWithHook(root, hook, PointBeforeBackupRecoveryRootSync)
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {
