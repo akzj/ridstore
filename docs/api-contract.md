@@ -211,6 +211,10 @@ Batch 不提供跨 Store 原子性。
 
 `Metrics()` 是无 I/O 快照，除 Commit/Delta 字段外还包含 GC started/completed/failed/no-candidate/insufficient-space 计数、copied/reclaimed bytes、Relocation applied/skipped、累计 duration 和 throttled nanos。它们用于调度与诊断，不参与删除授权。
 
+`Metrics.AppendMetricSamples(dst)` 提供固定顺序、稳定名称和 counter/gauge kind 的
+无后端绑定 export contract；Prometheus HTTP 适配与 counter reset、label 约束见
+[Metrics Export](metrics-export.md)。exporter 回调和网络服务不在 Store 锁内执行。
+
 ## 8. 并发覆盖
 
 默认 Blind Put 对同一 ID 采用 commit-order last-writer-wins：
