@@ -9,7 +9,7 @@
 | Manifest + CURRENT publication | 已覆盖 | 已覆盖 | 已覆盖 | 已覆盖 | 完整 syscall matrix；不确定 publication 后运行时 fail closed，fresh Open 以 CURRENT 恢复 |
 | Active Data append/commit | `segment.before-append-write` | `segment.before-sync` | N/A | N/A | 已覆盖；write 错误 poison Active，Seal 已开始后的 sync 错误返回 CommitUnknown，Store fail closed |
 | Active Data seal/rotation | seal/footer write 已覆盖 | seal/footer sync 已覆盖 | seal rename 已覆盖 | data dir sync 已覆盖 | 已覆盖已有 Active 的 seal 主路径；每个失败点均可由 fresh recovery 得到严格 sealed 文件 |
-| Active Data create/tail repair | 未覆盖 | 未覆盖 | N/A | 未覆盖 | 待补；包括新 Active Header、repair truncate/fsync |
+| Active Data create/tail repair | new Active Header 已覆盖 | create file sync、tail repair/resync 已覆盖 | recovery partial remove 已覆盖 | create/remove data dir sync 已覆盖 | 完整 runtime/recovery matrix；unpublished partial regular file 可重建，symlink 拒绝且不触碰 target，tail repair 失败 Open 可重试 |
 | Rotation Journal | 已覆盖 | 已覆盖 | 已覆盖 install/remove | 已覆盖 install/remove | 完整 syscall matrix；Phase 1–5 publication 均验证，未发布 temp 在 Open 时按 regular-file 规则删除并 fsync，已发布 Journal 幂等完成 rotation |
 | Maintenance Journal | 已覆盖 | 已覆盖 | 已覆盖 install/remove | 已覆盖 install/remove | 完整 syscall matrix；checkpoint 前清理失败会 fail closed，checkpoint publication 与 phase-4 Journal 之间失败由 Manifest 证明并在 Open 时继续 Data GC |
 | Active Mapping append/checkpoint | `mapping.before-append-write` | `mapping.before-sync` | N/A | N/A | 已覆盖；任一错误 poison Active Mapping writer，Store fail closed，fresh Open 从旧 Manifest + Log replay 重建 |
@@ -30,8 +30,8 @@
 
 ## 剩余推进顺序
 
-1. Active Data create/tail repair；
-2. Initialize marker/files；
-3. Backup/Restore artifact publication。
+1. Initialize marker/files；
+2. Backup artifact publication；
+3. Restore artifact publication。
 
 只有所有行闭合，`phase-5-audit.md` 的“所有 durable writer 完成 syscall error matrix”才能勾选。

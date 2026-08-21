@@ -25,7 +25,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, err
 	}
-	manifest, err = rotation.Recover(cfg.Dir, manifest, maxFramePayload)
+	manifest, err = rotation.RecoverWithHook(cfg.Dir, manifest, maxFramePayload, hook)
 	if err != nil {
 		return nil, err
 	}
@@ -52,11 +52,10 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		}
 		sealed = append(sealed, item)
 	}
-	active, err := segment.OpenActiveData(cfg.Dir, manifest.StoreUUID, manifest.ActiveDataSegmentID, manifest.HardLimits.SegmentSize, maxFramePayload)
+	active, err := segment.OpenActiveDataWithHook(cfg.Dir, manifest.StoreUUID, manifest.ActiveDataSegmentID, manifest.HardLimits.SegmentSize, maxFramePayload, hook)
 	if err != nil {
 		return nil, errors.Join(err, closeSealed())
 	}
-	active.SetHook(hook)
 	segments, err := segment.NewRegistry(active, sealed)
 	if err != nil {
 		return nil, errors.Join(err, active.Close(), closeSealed())

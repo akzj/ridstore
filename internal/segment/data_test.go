@@ -262,6 +262,69 @@ func TestOpenActiveDataTruncatesIncompletePayloadButRejectsCompleteCorruption(t 
 	}
 }
 
+func TestOpenActiveDataTailRepairSyscallErrorsAreRetryable(t *testing.T) {
+	points := []failpoint.Point{PointBeforeTailTruncate, PointBeforeTailSync}
+	causes := []struct {
+		name string
+		err  error
+	}{{"EIO", syscall.EIO}, {"ENOSPC", syscall.ENOSPC}, {"EACCES", syscall.EACCES}}
+	for _, point := range points {
+		point := point
+		for _, cause := range causes {
+			cause := cause
+			t.Run(string(point)+"/"+cause.name, func(t *testing.T) {
+				root := t.TempDir()
+				uuid := base.StoreUUID{1}
+				createActiveDataFile(t, root, uuid, 1)
+				path := filepath.Join(root, "data", ActiveDataFileName(1))
+				file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := file.Write([]byte("incomplete-tail")); err != nil {
+					t.Fatal(err)
+				}
+				if err := file.Sync(); err != nil {
+					t.Fatal(err)
+				}
+				if err := file.Close(); err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				hook := failpoint.Func(func(got failpoint.Point) error {
+					if got == point {
+						return cause.err
+					}
+					return nil
+				})
+				if _, err := OpenActiveDataWithHook(root, uuid, 1, 1<<20, 1024, hook); !errors.Is(err, cause.err) {
+					t.Fatalf("Open error=%v", err)
+				}
+				after, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if point == PointBeforeTailTruncate && after.Size() != before.Size() {
+					t.Fatalf("truncate failpoint changed size from %d to %d", before.Size(), after.Size())
+				}
+				recovered, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+				if err != nil {
+					t.Fatalf("retry Open: %v", err)
+				}
+				if recovered.End() != storeformat.SegmentHeaderSize {
+					t.Fatalf("recovered end=%d", recovered.End())
+				}
+				if err := recovered.Close(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
 func TestActiveDataSealCreatesStrictImmutableSegment(t *testing.T) {
 	root := t.TempDir()
 	uuid := base.StoreUUID{1}
