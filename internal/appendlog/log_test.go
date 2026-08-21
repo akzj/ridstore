@@ -99,6 +99,38 @@ func TestCommitPreflightNoSpaceWritesNothing(t *testing.T) {
 	}
 }
 
+func TestAppendCommitGroupPreflightsAndOrdersDescriptors(t *testing.T) {
+	active, _ := newActive(t, 1<<20)
+	defer active.Close()
+	log, err := New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := log.AppendCommitGroup(
+		[]batch.Prepared{{BatchID: 7}, {BatchID: 8}},
+		[]base.CommitSeq{11, 12},
+	)
+	if err != nil || len(results) != 2 || results[0].SealFrameSeq != 1 || results[1].SealFrameSeq != 2 || !results[0].SealStarted || !results[1].SealStarted {
+		t.Fatalf("results=%+v error=%v", results, err)
+	}
+	var commits []base.CommitSeq
+	if err := active.Scan(func(_ base.VAddr, frame storeformat.Frame) error {
+		if frame.Type == storeformat.FrameTypeCommitSeal {
+			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorCommit, nil, frame, 10)
+			if err != nil {
+				return err
+			}
+			commits = append(commits, decoded.Seal.CommitSeq)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 2 || commits[0] != 11 || commits[1] != 12 {
+		t.Fatalf("commits=%v", commits)
+	}
+}
+
 func TestAppendLogRejectsCancellationAndInvalidReserve(t *testing.T) {
 	active, _ := newActive(t, 1<<20)
 	defer active.Close()

@@ -39,6 +39,12 @@ type CommitAppendResult struct {
 	SealStarted  bool
 }
 
+type commitPlan struct {
+	frames []storeformat.Frame
+	bytes  uint64
+	result CommitAppendResult
+}
+
 func New(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxFramePayload, maxPartPayload uint64) (*Log, error) {
 	return NewWithHook(active, nextFrameSeq, maxFramePayload, maxPartPayload, nil)
 }
@@ -144,89 +150,125 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 }
 
 func (l *Log) AppendCommit(prepared batch.Prepared, commitSeq base.CommitSeq) (CommitAppendResult, error) {
+	results, err := l.AppendCommitGroup([]batch.Prepared{prepared}, []base.CommitSeq{commitSeq})
+	if len(results) == 0 {
+		return CommitAppendResult{}, err
+	}
+	return results[0], err
+}
+
+// AppendCommitGroup appends every descriptor in CommitSeq order and performs
+// exactly one sync. Capacity and descriptor encoding are preflighted for the
+// entire group, so ErrFull never leaves a partial group on disk.
+func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.CommitSeq) ([]CommitAppendResult, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if err := l.ready(); err != nil {
-		return CommitAppendResult{}, err
+		return nil, err
 	}
-	if prepared.BatchID == 0 || commitSeq == 0 {
-		return CommitAppendResult{}, fmt.Errorf("commit append identity: %w", base.ErrInvalidConfig)
+	if len(prepared) == 0 || len(prepared) != len(commitSeqs) {
+		return nil, fmt.Errorf("commit group size: %w", base.ErrInvalidConfig)
 	}
+	plans := make([]commitPlan, len(prepared))
+	next := l.nextFrameSeq
+	var totalBytes uint64
+	for i := range prepared {
+		if prepared[i].BatchID == 0 || commitSeqs[i] == 0 || (i != 0 && commitSeqs[i] <= commitSeqs[i-1]) {
+			return nil, fmt.Errorf("commit append identity or order: %w", base.ErrInvalidConfig)
+		}
+		plan, err := l.buildCommitPlan(prepared[i], commitSeqs[i], next)
+		if err != nil {
+			return nil, err
+		}
+		plans[i] = plan
+		next = plan.result.SealFrameSeq + 1
+		totalBytes, err = base.AddUint64(totalBytes, plan.bytes)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if totalBytes > l.active.Remaining() {
+		return make([]CommitAppendResult, len(prepared)), segment.ErrFull
+	}
+	results := make([]CommitAppendResult, len(plans))
+	for planIndex, plan := range plans {
+		results[planIndex].SealFrameSeq = plan.result.SealFrameSeq
+		for frameIndex, frame := range plan.frames {
+			_, written, err := l.appendLocked(frame)
+			if err != nil {
+				if frameIndex == len(plan.frames)-1 && written != 0 {
+					results[planIndex].SealStarted = true
+				}
+				return results, err
+			}
+			if frameIndex == len(plan.frames)-1 {
+				results[planIndex].SealStarted = true
+				if err := failpoint.Hit(l.hook, PointCommitSealWritten); err != nil {
+					l.faulted = true
+					return results, err
+				}
+			} else if err := failpoint.Hit(l.hook, PointCommitPartWritten); err != nil {
+				l.faulted = true
+				return results, err
+			}
+		}
+	}
+	if err := l.active.Sync(); err != nil {
+		l.faulted = true
+		return results, err
+	}
+	if err := failpoint.Hit(l.hook, PointCommitSynced); err != nil {
+		l.faulted = true
+		return results, err
+	}
+	return results, nil
+}
+
+func (l *Log) buildCommitPlan(prepared batch.Prepared, commitSeq base.CommitSeq, next base.FrameSeq) (commitPlan, error) {
 	partPayloads, entries, err := l.commitParts(prepared)
 	if err != nil {
-		return CommitAppendResult{}, err
+		return commitPlan{}, err
 	}
 	partCount := len(partPayloads)
 	if uint64(partCount) > math.MaxUint32 || uint64(len(entries)) > math.MaxUint32 {
-		return CommitAppendResult{}, fmt.Errorf("commit descriptor count: %w", base.ErrInvalidConfig)
+		return commitPlan{}, fmt.Errorf("commit descriptor count: %w", base.ErrInvalidConfig)
 	}
 	firstPartSeq, lastPartSeq := base.FrameSeq(0), base.FrameSeq(0)
 	if partCount != 0 {
-		firstPartSeq = l.nextFrameSeq
-		lastPartSeq = l.nextFrameSeq + base.FrameSeq(partCount) - 1
+		firstPartSeq = next
+		lastPartSeq = next + base.FrameSeq(partCount) - 1
 		if lastPartSeq < firstPartSeq || lastPartSeq == base.FrameSeq(math.MaxUint64) {
-			return CommitAppendResult{}, base.ErrGenerationExhausted
+			return commitPlan{}, base.ErrGenerationExhausted
 		}
 	}
-	sealSeq := l.nextFrameSeq + base.FrameSeq(partCount)
-	if sealSeq < l.nextFrameSeq || sealSeq == 0 || sealSeq == base.FrameSeq(math.MaxUint64) {
-		return CommitAppendResult{}, base.ErrGenerationExhausted
+	sealSeq := next + base.FrameSeq(partCount)
+	if sealSeq < next || sealSeq == 0 || sealSeq == base.FrameSeq(math.MaxUint64) {
+		return commitPlan{}, base.ErrGenerationExhausted
 	}
 	sealPayload, err := storeformat.EncodeDescriptorSealPayload(storeformat.DescriptorSeal{
 		CommitSeq: commitSeq, PartCount: uint32(partCount), MutationCount: uint32(len(entries)),
 		LogicalPayloadBytes: prepared.LogicalPayloadBytes, FirstPartFrameSeq: firstPartSeq, LastPartFrameSeq: lastPartSeq,
 	}, partPayloads)
 	if err != nil {
-		return CommitAppendResult{}, err
+		return commitPlan{}, err
 	}
 	frames := make([]storeformat.Frame, 0, partCount+1)
 	for i, payload := range partPayloads {
-		frames = append(frames, storeformat.Frame{Type: storeformat.FrameTypeCommitPart, FrameSeq: l.nextFrameSeq + base.FrameSeq(i), BatchID: prepared.BatchID, Payload: payload})
+		frames = append(frames, storeformat.Frame{Type: storeformat.FrameTypeCommitPart, FrameSeq: next + base.FrameSeq(i), BatchID: prepared.BatchID, Payload: payload})
 	}
 	frames = append(frames, storeformat.Frame{Type: storeformat.FrameTypeCommitSeal, FrameSeq: sealSeq, BatchID: prepared.BatchID, Payload: sealPayload[:]})
 	var totalBytes uint64
 	for _, frame := range frames {
 		encoded, err := storeformat.EncodeFrame(frame, l.maxFramePayload)
 		if err != nil {
-			return CommitAppendResult{}, err
+			return commitPlan{}, err
 		}
 		totalBytes, err = base.AddUint64(totalBytes, uint64(len(encoded)))
 		if err != nil {
-			return CommitAppendResult{}, err
+			return commitPlan{}, err
 		}
 	}
-	if totalBytes > l.active.Remaining() {
-		return CommitAppendResult{}, segment.ErrFull
-	}
-	result := CommitAppendResult{SealFrameSeq: sealSeq}
-	for i, frame := range frames {
-		_, written, err := l.appendLocked(frame)
-		if err != nil {
-			if i == len(frames)-1 && written != 0 {
-				result.SealStarted = true
-			}
-			return result, err
-		}
-		if i == len(frames)-1 {
-			result.SealStarted = true
-			if err := failpoint.Hit(l.hook, PointCommitSealWritten); err != nil {
-				l.faulted = true
-				return result, err
-			}
-		} else if err := failpoint.Hit(l.hook, PointCommitPartWritten); err != nil {
-			l.faulted = true
-			return result, err
-		}
-	}
-	if err := l.active.Sync(); err != nil {
-		l.faulted = true
-		return result, err
-	}
-	if err := failpoint.Hit(l.hook, PointCommitSynced); err != nil {
-		l.faulted = true
-		return result, err
-	}
-	return result, nil
+	return commitPlan{frames: frames, bytes: totalBytes, result: CommitAppendResult{SealFrameSeq: sealSeq}}, nil
 }
 
 func (l *Log) NextFrameSeq() base.FrameSeq {
