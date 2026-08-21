@@ -84,6 +84,7 @@ type Config struct {
     DeltaSoftLimitBytes int64
     DeltaHardLimitBytes int64
     CheckpointMemoryBytes int64
+    StatusRetention    int
     MaxGroupBytes      int64
     MaxGroupBatches    int
     MaxGroupDelay      time.Duration
@@ -279,6 +280,7 @@ var (
     ErrGenerationExhausted = errors.New("ridstore: metadata generation exhausted")
     ErrCommitUnknown   = errors.New("ridstore: commit outcome unknown")
     ErrStatusExpired   = errors.New("ridstore: batch status expired")
+    ErrStatusCapacity  = errors.New("ridstore: batch status replay capacity reached")
     ErrCorrupt         = errors.New("ridstore: corruption detected")
     ErrUnsupported     = errors.New("ridstore: unsupported format")
 )
@@ -322,6 +324,7 @@ Close 返回成功不是恢复正确性的前提。所有 crash test 必须通�
 | MaxBatchMutations | 1,000,000 | Commit Descriptor 必须可分帧 |
 | MaxBatchConditions | 1,000,000 | 条件集合必须可在内存中排序和验证 |
 | MaxOpenBatches | 1024 | 超限 backpressure |
+| StatusRetention | 65,536 | 必须不少于 MaxOpenBatches；限制近期状态与 replay terminal 集合 |
 | MappingCacheBytes | 256 MiB | 最小值覆盖 Root/上层节点 |
 | IDReserveSize | 1,048,576 | 必须为正数 |
 | BatchIDReserveSize | 65,536 | 必须为正数 |

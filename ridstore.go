@@ -59,12 +59,20 @@ type Store struct {
 	batchAllocator *allocator.Allocator
 
 	batches              map[BatchID]*Batch
-	statuses             map[BatchID]BatchStatus
+	statuses             map[BatchID]statusEntry
+	statusOrder          []statusOrderEntry
+	statusOrderHead      int
+	statusSerial         uint64
+	resolvedStatusCount  int
 	openCount            int
+	internalStatusSlots  int
 	slotNotify           chan struct{}
+	slotWaiters          int
 	issuedBatchHigh      uint64
 	recoveryAbortedStart uint64
 	recoveryAbortedEnd   uint64
+	terminalStatusTotal  uint64
+	terminalStatusBase   uint64
 
 	closed            bool
 	fault             error
@@ -74,6 +82,16 @@ type Store struct {
 }
 
 var defaultAvailableBytes = diskspace.Available
+
+type statusEntry struct {
+	status BatchStatus
+	serial uint64
+}
+
+type statusOrderEntry struct {
+	id     BatchID
+	serial uint64
+}
 
 // Create initializes and exclusively opens a new Store. Interrupted
 // initialization is resumed from INITIALIZING using the original Store UUID.

@@ -44,6 +44,12 @@ type Report struct {
 	Issues                  []string `json:"issues,omitempty"`
 }
 
+const DefaultStatusLimit uint64 = 1 << 16
+
+type Options struct {
+	StatusLimit uint64
+}
+
 type dataScanner struct {
 	id   base.DataSegmentID
 	scan func(func(base.VAddr, storeformat.Frame) error) error
@@ -62,8 +68,15 @@ func (s dataScanner) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
 // recover journals or truncate active tails; operators must run normal Open to
 // complete recovery before retrying verify.
 func Run(ctx context.Context, root string) (report Report, resultErr error) {
+	return RunWithOptions(ctx, root, Options{StatusLimit: DefaultStatusLimit})
+}
+
+func RunWithOptions(ctx context.Context, root string, options Options) (report Report, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return report, err
+	}
+	if options.StatusLimit == 0 {
+		return report, base.ErrInvalidConfig
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -79,7 +92,7 @@ func Run(ctx context.Context, root string) (report Report, resultErr error) {
 		return report, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lock.Close()) }()
-	return RunUnderLease(ctx, abs)
+	return runUnderLease(ctx, abs, false, options.StatusLimit)
 }
 
 // RunUnderLease performs verification without acquiring LOCK. The caller must
@@ -87,17 +100,17 @@ func Run(ctx context.Context, root string) (report Report, resultErr error) {
 // offline operation can verify and then consume the exact same immutable file
 // set without a lease-release race between the two steps.
 func RunUnderLease(ctx context.Context, root string) (report Report, resultErr error) {
-	return runUnderLease(ctx, root, false)
+	return runUnderLease(ctx, root, false, DefaultStatusLimit)
 }
 
 // RunRestoringUnderLease is restricted to Restore after it has created and
 // owns RESTORING plus the destination LOCK. All other recovery artifacts remain
 // fatal, and the public verifier never enables this exception.
 func RunRestoringUnderLease(ctx context.Context, root string) (report Report, resultErr error) {
-	return runUnderLease(ctx, root, true)
+	return runUnderLease(ctx, root, true, DefaultStatusLimit)
 }
 
-func runUnderLease(ctx context.Context, root string, allowRestoring bool) (report Report, resultErr error) {
+func runUnderLease(ctx context.Context, root string, allowRestoring bool, statusLimit uint64) (report Report, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return report, err
 	}
@@ -176,7 +189,7 @@ func runUnderLease(ctx context.Context, root string, allowRestoring bool) (repor
 			return segment.ReadActiveDataFrame(abs, m.StoreUUID, activeID, m.HardLimits.SegmentSize, maxPayload, addr)
 		},
 	}
-	recovered, err := recovery.RecoverIntoScanners(m, sealedScanners, activeScanner, mapping)
+	recovered, err := recovery.RecoverIntoScanners(m, sealedScanners, activeScanner, mapping, statusLimit)
 	if err != nil {
 		return issue(report, err)
 	}

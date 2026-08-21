@@ -30,6 +30,7 @@ type Config struct {
 	DeltaSoftLimitBytes   int64
 	DeltaHardLimitBytes   int64
 	CheckpointMemoryBytes int64
+	StatusRetention       int
 	MaxGroupBytes         int64
 	MaxGroupBatches       int
 	MaxGroupDelay         time.Duration
@@ -109,6 +110,9 @@ func applyRuntimeDefaults(cfg *Config) {
 	if cfg.CheckpointMemoryBytes == 0 {
 		cfg.CheckpointMemoryBytes = 256 * mib
 	}
+	if cfg.StatusRetention == 0 {
+		cfg.StatusRetention = 1 << 16
+	}
 	if cfg.MaxGroupBytes == 0 {
 		cfg.MaxGroupBytes = 8 * mib
 	}
@@ -163,7 +167,7 @@ func hardLimits(cfg Config) (storeformat.HardLimits, error) {
 
 func validateRuntime(cfg Config, hard storeformat.HardLimits) error {
 	if cfg.MappingCacheBytes <= 0 || cfg.DeltaSoftLimitBytes <= 0 || cfg.DeltaHardLimitBytes <= cfg.DeltaSoftLimitBytes ||
-		cfg.CheckpointMemoryBytes < 64<<10 || cfg.MaxGroupBytes <= 0 || cfg.MaxGroupBatches <= 0 || cfg.MaxGroupDelay < 0 ||
+		cfg.CheckpointMemoryBytes < 64<<10 || cfg.StatusRetention < cfg.MaxOpenBatches || cfg.MaxGroupBytes <= 0 || cfg.MaxGroupBatches <= 0 || cfg.MaxGroupDelay < 0 ||
 		cfg.GCBatchBytes <= 0 || uint64(cfg.GCBatchBytes) > hard.MaxBatchBytes || cfg.GCBatchMutations <= 0 || uint64(cfg.GCBatchMutations) > hard.MaxBatchMutations || cfg.GCMinFreeBytes < 0 || cfg.GCBytesPerSecond <= 0 {
 		return fmt.Errorf("invalid runtime budget: %w", base.ErrInvalidConfig)
 	}

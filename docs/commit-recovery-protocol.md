@@ -323,7 +323,7 @@ BatchAbort 只用于诊断，不覆盖已经 durable 的 CommitSeal。协议禁�
 
 ## 15. Status(BatchID)
 
-运行时维护有界最近 Batch 状态表。更老状态通过 Commit Descriptor 索引或离线扫描查询。
+运行时维护有界最近 Batch 状态表。第一版不提供在线历史 Descriptor 索引；更老已分配状态返回 `ErrStatusExpired`，离线工具可以扫描诊断。
 
 第一版状态：
 
@@ -336,6 +336,10 @@ CommitUnknown
 ```
 
 `Status` 只保证当前进程内 Batch、最近保留的 Batch 和未解决 CommitUnknown。Committed 状态同时返回 CommitSeq，其余状态的 CommitSeq 为 0。超过状态保留边界返回 `ErrStatusExpired`，不能谎报 NotFound。发生 CommitUnknown 时 Store 阻止 Mapping Checkpoint/GC 越过该 Batch，直到重启恢复或状态被确认，因此未决结果不会在查询前被回收。
+
+`StatusRetention` 是 runtime budget，默认 65,536 且不得小于 `MaxOpenBatches`。已解决状态按终态完成顺序逐出；CommitUnknown 钉住到重新 Open。相同预算也是 replay terminal hard limit：每个 Open Batch 预留一个 terminal slot，内部 Relocation 显式预留；达到 75% 异步请求 Checkpoint，达到 100% 时 `Begin` 等待。Checkpoint 在 log barrier 前捕获保守 terminal 计数，Manifest durable 后才释放被 cut 覆盖的 slot。这样 crash recovery 的 `Statuses`/重复终态集合不会随空 Batch 或 Abort 无限增长。
+
+Recovery 在应用 replay 时对每个 terminal BatchID 保持精确集合；超过配置上限返回 `ErrStatusCapacity`，要求以更高 `StatusRetention` 打开并立即 Checkpoint，而不是 OOM 或放弃重复 Commit/Abort 检查。Descriptor Part 只允许同一 Batch 连续出现，并受持久化 `MaxBatchMutations` 约束，避免恶意交错 Part 构造无界 map。
 
 重启后的判定使用 Manifest cut 元数据：
 

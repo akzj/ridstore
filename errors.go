@@ -23,6 +23,7 @@ var (
 	ErrGenerationExhausted = base.ErrGenerationExhausted
 	ErrCommitUnknown       = base.ErrCommitUnknown
 	ErrStatusExpired       = base.ErrStatusExpired
+	ErrStatusCapacity      = base.ErrStatusCapacity
 	ErrCorrupt             = base.ErrCorrupt
 	ErrUnsupported         = base.ErrUnsupported
 	ErrInsufficientSpace   = base.ErrInsufficientSpace

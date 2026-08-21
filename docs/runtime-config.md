@@ -32,6 +32,7 @@ type Config struct {
     DeltaSoftLimitBytes   int64
     DeltaHardLimitBytes   int64
     CheckpointMemoryBytes int64
+    StatusRetention       int
     MaxGroupBytes         int64
     MaxGroupBatches       int
     MaxGroupDelay         time.Duration
@@ -58,6 +59,7 @@ type Config struct {
 | DeltaSoftLimitBytes | 256 MiB |
 | DeltaHardLimitBytes | 512 MiB |
 | CheckpointMemoryBytes | 256 MiB |
+| StatusRetention | 65,536 |
 | MaxGroupBytes | 8 MiB |
 | MaxGroupBatches | 64 |
 | MaxGroupDelay | 0 |
@@ -80,6 +82,7 @@ Create 先填充零值、再验证、最后把 8 个 FormatHardLimits 写入 INI
 - count 字段能安全转换为实现使用的 `int` 和分配大小；
 - `0 < DeltaSoftLimitBytes < DeltaHardLimitBytes`；
 - `CheckpointMemoryBytes` 至少容纳一个最大编码 Node、排序块和 Header 批读窗口，但不要求容纳整个 Delta；
+- `StatusRetention >= MaxOpenBatches`；该预算同时约束近期查询缓存与 Manifest replay cut 后的 terminal Batch 数；
 - `MaxGroupBytes > 0` 并限制多请求 group buffer；若单 Descriptor 更大，则该请求单独成组，不能拒绝一个已由 FormatHardLimits 允许的 Batch；
 - `GCBatchBytes <= MaxBatchBytes` 且 `GCBatchMutations <= MaxBatchMutations`；
 - `GCMinFreeBytes >= 0`；零值采用一个 Segment 的保留空间，不能用零值关闭预检；
@@ -105,6 +108,10 @@ Group admission 不能持有一部分 reservation 等待另一部分：按 queue
 一旦预算已预留并允许 Descriptor 落盘，fsync 后的 Mapping Publish 和 Stats addition 绝不能因 hard limit 再阻塞或失败；成功 Publish 后把 reservation 转为 active Delta charge。这样不会形成“durable Commit 等待 Checkpoint，而 Checkpoint 又等待 Publish”的环。
 
 若 Checkpoint 持续失败，新的 Commit 在 hard limit 前停止，Get、Abort、Recovery、Checkpoint retry 和 Close 仍可运行；错误与最长等待时间必须可观测。
+
+Batch Status 使用独立预算。运行时最多保留 `StatusRetention` 个已解决近期状态；更老已分配 BatchID 返回 `ErrStatusExpired`。`CommitUnknown` 不进入逐出队列，Store 在重新 Open 前也不会越过它建立新 Checkpoint。replay window 中 terminal Commit/Relocation/Abort 达到 75% 时请求 Checkpoint；`Begin` 为所有 Open Batch 预留最坏一个 terminal slot，到达硬上限后 Context-aware 等待 Checkpoint。Data GC 的内部 Relocation 同样预留 slot；若它在持有维护串行锁时到达上限，则返回 `ErrStatusCapacity`、安全撤销本轮 cleaning journal 并请求 Checkpoint，调用者可重试，不允许等待自身形成死锁。
+
+Checkpoint 在 log barrier **之前**捕获 terminal 完成计数。已计数的终态要么已完成所需 append，要么是无需 terminal Frame 的确定性失败，随后 barrier 会覆盖它的全部恢复影响；并发较晚完成的终态即使物理 Frame 落在 barrier 前，也被保守计入下一 replay window。Manifest 安装完成后只释放该快照覆盖的容量，因此 crash recovery 的 terminal 去重表始终受同一上限约束。
 
 ## 5. Checkpoint 有界构建
 
