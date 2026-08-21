@@ -38,6 +38,10 @@ type Store struct {
 // Create initializes and exclusively opens a new Store. Interrupted
 // initialization is resumed from INITIALIZING using the original Store UUID.
 func Create(cfg Config) (*Store, error) {
+	return createWithOptions(cfg, initialize.Options{})
+}
+
+func createWithOptions(cfg Config, opts initialize.Options) (*Store, error) {
 	normalized, hard, err := normalizeCreateConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -49,7 +53,7 @@ func Create(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	m, err := initialize.Create(normalized.Dir, hard)
+	m, err := initialize.CreateWithOptions(normalized.Dir, hard, opts)
 	if err != nil {
 		_ = lock.Close()
 		return nil, err

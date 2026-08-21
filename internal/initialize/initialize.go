@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/manifest"
 )
@@ -23,8 +24,33 @@ const (
 
 var storeDirectories = []string{"manifests", "data", "mapping", "journal", "trash", "tmp"}
 
+const (
+	PointMarkerWritten       failpoint.Point = "initialize.marker-written"
+	PointMarkerFileSynced    failpoint.Point = "initialize.marker-file-synced"
+	PointMarkerRenamed       failpoint.Point = "initialize.marker-renamed"
+	PointMarkerDirSynced     failpoint.Point = "initialize.marker-dir-synced"
+	PointDirectoriesCreated  failpoint.Point = "initialize.directories-created"
+	PointDirectoriesSynced   failpoint.Point = "initialize.directories-synced"
+	PointDataHeaderWritten   failpoint.Point = "initialize.data-header-written"
+	PointDataHeaderSynced    failpoint.Point = "initialize.data-header-synced"
+	PointDataDirectorySynced failpoint.Point = "initialize.data-directory-synced"
+	PointMapHeaderWritten    failpoint.Point = "initialize.map-header-written"
+	PointMapHeaderSynced     failpoint.Point = "initialize.map-header-synced"
+	PointMapDirectorySynced  failpoint.Point = "initialize.map-directory-synced"
+	PointMarkerRemoved       failpoint.Point = "initialize.marker-removed"
+	PointFinalDirSynced      failpoint.Point = "initialize.final-dir-synced"
+)
+
+type Options struct {
+	Hook failpoint.Hook
+}
+
 func Create(dir string, hard storeformat.HardLimits) (storeformat.Manifest, error) {
-	marker, found, err := loadRecoverableMarker(dir)
+	return CreateWithOptions(dir, hard, Options{})
+}
+
+func CreateWithOptions(dir string, hard storeformat.HardLimits, opts Options) (storeformat.Manifest, error) {
+	marker, found, err := loadRecoverableMarker(dir, opts.Hook)
 	if err != nil {
 		return storeformat.Manifest{}, err
 	}
@@ -43,22 +69,26 @@ func Create(dir string, hard storeformat.HardLimits) (storeformat.Manifest, erro
 				return storeformat.Manifest{}, err
 			}
 		}
-		if err := installMarker(dir, marker); err != nil {
+		if err := installMarker(dir, marker, opts.Hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 	} else if marker.HardLimits != hard {
 		return storeformat.Manifest{}, base.ErrConfigMismatch
 	}
-	return resume(dir, marker)
+	return resume(dir, marker, opts)
 }
 
 func Open(dir string) (storeformat.Manifest, error) {
-	marker, found, err := loadRecoverableMarker(dir)
+	return OpenWithOptions(dir, Options{})
+}
+
+func OpenWithOptions(dir string, opts Options) (storeformat.Manifest, error) {
+	marker, found, err := loadRecoverableMarker(dir, opts.Hook)
 	if err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if found {
-		return resume(dir, marker)
+		return resume(dir, marker, opts)
 	}
 	m, err := manifest.LoadCurrent(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -67,36 +97,36 @@ func Open(dir string) (storeformat.Manifest, error) {
 	return m, err
 }
 
-func resume(dir string, marker storeformat.InitializingMarker) (storeformat.Manifest, error) {
-	if err := ensureDirectories(dir, marker.Phase >= storeformat.InitializingDirectoriesDurable); err != nil {
+func resume(dir string, marker storeformat.InitializingMarker, opts Options) (storeformat.Manifest, error) {
+	if err := ensureDirectories(dir, marker.Phase >= storeformat.InitializingDirectoriesDurable, opts.Hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if marker.Phase < storeformat.InitializingDirectoriesDurable {
 		marker.Phase = storeformat.InitializingDirectoriesDurable
-		if err := installMarker(dir, marker); err != nil {
+		if err := installMarker(dir, marker, opts.Hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 	}
 
 	createdUnixNano := uint64(time.Now().UnixNano())
 	dataHeader := storeformat.SegmentHeader{Kind: storeformat.SegmentKindData, StoreUUID: marker.StoreUUID, FileID: 1, CreatedUnixNano: createdUnixNano, FirstSeq: 1}
-	if err := ensureInitialSegment(dir, "data", "DATA-00000001.active", dataHeader, marker.Phase >= storeformat.InitializingDataHeaderDurable); err != nil {
+	if err := ensureInitialSegment(dir, "data", "DATA-00000001.active", dataHeader, marker.Phase >= storeformat.InitializingDataHeaderDurable, opts.Hook, PointDataHeaderWritten, PointDataHeaderSynced, PointDataDirectorySynced); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if marker.Phase < storeformat.InitializingDataHeaderDurable {
 		marker.Phase = storeformat.InitializingDataHeaderDurable
-		if err := installMarker(dir, marker); err != nil {
+		if err := installMarker(dir, marker, opts.Hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 	}
 
 	mapHeader := storeformat.SegmentHeader{Kind: storeformat.SegmentKindMapping, StoreUUID: marker.StoreUUID, FileID: 1, CreatedUnixNano: createdUnixNano, FirstSeq: 1}
-	if err := ensureInitialSegment(dir, "mapping", "MAP-00000001.active", mapHeader, marker.Phase >= storeformat.InitializingMapHeaderDurable); err != nil {
+	if err := ensureInitialSegment(dir, "mapping", "MAP-00000001.active", mapHeader, marker.Phase >= storeformat.InitializingMapHeaderDurable, opts.Hook, PointMapHeaderWritten, PointMapHeaderSynced, PointMapDirectorySynced); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if marker.Phase < storeformat.InitializingMapHeaderDurable {
 		marker.Phase = storeformat.InitializingMapHeaderDurable
-		if err := installMarker(dir, marker); err != nil {
+		if err := installMarker(dir, marker, opts.Hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 	}
@@ -105,12 +135,12 @@ func resume(dir string, marker storeformat.InitializingMarker) (storeformat.Mani
 	if err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := (manifest.Installer{Dir: dir}).Install(want); err != nil {
+	if err := (manifest.Installer{Dir: dir, FailpointHook: opts.Hook}).Install(want); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if marker.Phase < storeformat.InitializingManifestInstalled {
 		marker.Phase = storeformat.InitializingManifestInstalled
-		if err := installMarker(dir, marker); err != nil {
+		if err := installMarker(dir, marker, opts.Hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 	}
@@ -124,10 +154,16 @@ func resume(dir string, marker storeformat.InitializingMarker) (storeformat.Mani
 	if err := os.Remove(filepath.Join(dir, MarkerFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return storeformat.Manifest{}, err
 	}
+	if err := failpoint.Hit(opts.Hook, PointMarkerRemoved); err != nil {
+		return storeformat.Manifest{}, err
+	}
 	if err := os.Remove(filepath.Join(dir, markerTempFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return storeformat.Manifest{}, err
 	}
 	if err := syncDirectory(dir); err != nil {
+		return storeformat.Manifest{}, err
+	}
+	if err := failpoint.Hit(opts.Hook, PointFinalDirSynced); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	return got, nil
@@ -148,7 +184,7 @@ func initialManifest(marker storeformat.InitializingMarker) (storeformat.Manifes
 	}, nil
 }
 
-func ensureDirectories(root string, mustExist bool) error {
+func ensureDirectories(root string, mustExist bool, hook failpoint.Hook) error {
 	for _, name := range storeDirectories {
 		path := filepath.Join(root, name)
 		info, err := os.Lstat(path)
@@ -168,16 +204,33 @@ func ensureDirectories(root string, mustExist bool) error {
 			return fmt.Errorf("initialization path is not a directory: %s: %w", name, base.ErrCorrupt)
 		}
 	}
-	return syncDirectory(root)
+	if err := failpoint.Hit(hook, PointDirectoriesCreated); err != nil {
+		return err
+	}
+	if err := syncDirectory(root); err != nil {
+		return err
+	}
+	return failpoint.Hit(hook, PointDirectoriesSynced)
 }
 
-func ensureInitialSegment(root, directory, name string, want storeformat.SegmentHeader, mustBeDurable bool) error {
+func ensureInitialSegment(root, directory, name string, want storeformat.SegmentHeader, mustBeDurable bool, hook failpoint.Hook, written, synced, directorySynced failpoint.Point) error {
 	path := filepath.Join(root, directory, name)
 	data, err := readRegularFile(path, storeformat.SegmentHeaderSize)
 	if err == nil {
 		got, decodeErr := storeformat.DecodeSegmentHeader(data)
 		if decodeErr == nil && got.Kind == want.Kind && got.StoreUUID == want.StoreUUID && got.FileID == want.FileID && got.FirstSeq == want.FirstSeq {
-			return syncDirectory(filepath.Join(root, directory))
+			if !mustBeDurable {
+				if err := syncRegularFile(path); err != nil {
+					return err
+				}
+				if err := failpoint.Hit(hook, synced); err != nil {
+					return err
+				}
+			}
+			if err := syncDirectory(filepath.Join(root, directory)); err != nil {
+				return err
+			}
+			return failpoint.Hit(hook, directorySynced)
 		}
 		if mustBeDurable {
 			if decodeErr != nil {
@@ -202,13 +255,16 @@ func ensureInitialSegment(root, directory, name string, want storeformat.Segment
 	if err != nil {
 		return err
 	}
-	if err := writeExclusiveSynced(path, header[:]); err != nil {
+	if err := writeExclusiveSynced(path, header[:], hook, written, synced); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Join(root, directory))
+	if err := syncDirectory(filepath.Join(root, directory)); err != nil {
+		return err
+	}
+	return failpoint.Hit(hook, directorySynced)
 }
 
-func loadRecoverableMarker(dir string) (storeformat.InitializingMarker, bool, error) {
+func loadRecoverableMarker(dir string, hook failpoint.Hook) (storeformat.InitializingMarker, bool, error) {
 	path := filepath.Join(dir, MarkerFileName)
 	data, err := readRegularFile(path, storeformat.MaxJournalPayloadSize+storeformat.ContainerHeaderSize)
 	if err == nil {
@@ -233,13 +289,19 @@ func loadRecoverableMarker(dir string) (storeformat.InitializingMarker, bool, er
 	if err := os.Rename(tempPath, path); err != nil {
 		return storeformat.InitializingMarker{}, false, err
 	}
+	if err := failpoint.Hit(hook, PointMarkerRenamed); err != nil {
+		return storeformat.InitializingMarker{}, false, err
+	}
 	if err := syncDirectory(dir); err != nil {
+		return storeformat.InitializingMarker{}, false, err
+	}
+	if err := failpoint.Hit(hook, PointMarkerDirSynced); err != nil {
 		return storeformat.InitializingMarker{}, false, err
 	}
 	return marker, true, nil
 }
 
-func installMarker(dir string, marker storeformat.InitializingMarker) error {
+func installMarker(dir string, marker storeformat.InitializingMarker, hook failpoint.Hook) error {
 	data, err := storeformat.EncodeInitializingMarker(marker)
 	if err != nil {
 		return err
@@ -248,13 +310,19 @@ func installMarker(dir string, marker storeformat.InitializingMarker) error {
 	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := writeExclusiveSynced(tempPath, data); err != nil {
+	if err := writeExclusiveSynced(tempPath, data, hook, PointMarkerWritten, PointMarkerFileSynced); err != nil {
 		return err
 	}
 	if err := os.Rename(tempPath, filepath.Join(dir, MarkerFileName)); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
+	if err := failpoint.Hit(hook, PointMarkerRenamed); err != nil {
+		return err
+	}
+	if err := syncDirectory(dir); err != nil {
+		return err
+	}
+	return failpoint.Hit(hook, PointMarkerDirSynced)
 }
 
 func requireFreshDirectory(dir string) error {
@@ -270,7 +338,7 @@ func requireFreshDirectory(dir string) error {
 	return nil
 }
 
-func writeExclusiveSynced(path string, data []byte) (retErr error) {
+func writeExclusiveSynced(path string, data []byte, hook failpoint.Hook, written, synced failpoint.Point) (retErr error) {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
@@ -283,7 +351,13 @@ func writeExclusiveSynced(path string, data []byte) (retErr error) {
 	if _, err := io.Copy(file, bytes.NewReader(data)); err != nil {
 		return err
 	}
-	return file.Sync()
+	if err := failpoint.Hit(hook, written); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	return failpoint.Hit(hook, synced)
 }
 
 func readRegularFile(path string, maxSize int64) ([]byte, error) {
@@ -323,4 +397,16 @@ func syncDirectory(path string) error {
 		return err
 	}
 	return dir.Close()
+}
+
+func syncRegularFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
