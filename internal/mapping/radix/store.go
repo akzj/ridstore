@@ -331,7 +331,14 @@ type nodeCache struct {
 	capacity int64
 	used     int64
 	items    map[base.MapAddr]*list.Element
+	loading  map[base.MapAddr]*cacheLoad
 	lru      *list.List
+}
+
+type cacheLoad struct {
+	done chan struct{}
+	node storeformat.MappingNode
+	err  error
 }
 
 type cacheEntry struct {
@@ -341,7 +348,12 @@ type cacheEntry struct {
 }
 
 func newNodeCache(capacity int64) *nodeCache {
-	return &nodeCache{capacity: capacity, items: make(map[base.MapAddr]*list.Element), lru: list.New()}
+	return &nodeCache{
+		capacity: capacity,
+		items:    make(map[base.MapAddr]*list.Element),
+		loading:  make(map[base.MapAddr]*cacheLoad),
+		lru:      list.New(),
+	}
 }
 
 func (c *nodeCache) get(addr base.MapAddr, load func() (storeformat.MappingNode, int, error)) (storeformat.MappingNode, error) {
@@ -352,29 +364,37 @@ func (c *nodeCache) get(addr base.MapAddr, load func() (storeformat.MappingNode,
 		c.mu.Unlock()
 		return node, nil
 	}
+	if pending := c.loading[addr]; pending != nil {
+		c.mu.Unlock()
+		<-pending.done
+		return pending.node, pending.err
+	}
+	pending := &cacheLoad{done: make(chan struct{})}
+	c.loading[addr] = pending
 	c.mu.Unlock()
 	node, encodedSize, err := load()
-	if err != nil {
-		return storeformat.MappingNode{}, err
-	}
-	size := int64(encodedSize) + 128
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if element := c.items[addr]; element != nil {
-		c.lru.MoveToFront(element)
-		return element.Value.(cacheEntry).node, nil
-	}
-	if size <= c.capacity {
-		for c.used+size > c.capacity && c.lru.Len() != 0 {
-			last := c.lru.Back()
-			entry := last.Value.(cacheEntry)
-			delete(c.items, entry.addr)
-			c.used -= entry.size
-			c.lru.Remove(last)
+	if err == nil {
+		size := int64(encodedSize) + 128
+		if element := c.items[addr]; element != nil {
+			c.lru.MoveToFront(element)
+			node = element.Value.(cacheEntry).node
+		} else if size <= c.capacity {
+			for c.used+size > c.capacity && c.lru.Len() != 0 {
+				last := c.lru.Back()
+				entry := last.Value.(cacheEntry)
+				delete(c.items, entry.addr)
+				c.used -= entry.size
+				c.lru.Remove(last)
+			}
+			entry := cacheEntry{addr: addr, node: node, size: size}
+			c.items[addr] = c.lru.PushFront(entry)
+			c.used += size
 		}
-		entry := cacheEntry{addr: addr, node: node, size: size}
-		c.items[addr] = c.lru.PushFront(entry)
-		c.used += size
 	}
-	return node, nil
+	pending.node, pending.err = node, err
+	delete(c.loading, addr)
+	close(pending.done)
+	c.mu.Unlock()
+	return node, err
 }
