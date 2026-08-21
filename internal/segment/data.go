@@ -182,6 +182,15 @@ func (s *ActiveData) End() uint64 {
 	return s.end
 }
 
+func (s *ActiveData) Remaining() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.end >= s.segmentSize-storeformat.SegmentFooterSize {
+		return 0
+	}
+	return s.segmentSize - storeformat.SegmentFooterSize - s.end
+}
+
 func (s *ActiveData) SegmentID() base.DataSegmentID { return s.segmentID }
 
 // Scan visits every complete frame currently present in the Active segment.
