@@ -13,6 +13,7 @@ import (
 	"github.com/akzj/ridstore/internal/appendlog"
 	"github.com/akzj/ridstore/internal/base"
 	batchimpl "github.com/akzj/ridstore/internal/batch"
+	"github.com/akzj/ridstore/internal/catalog"
 	"github.com/akzj/ridstore/internal/commit"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
@@ -45,6 +46,7 @@ type Store struct {
 	lock           *filelock.Lock
 	segments       *segment.Registry
 	rotation       *rotation.Manager
+	catalog        *catalog.Manager
 	metrics        *internalmetrics.Runtime
 	log            *appendlog.Sequencer
 	mapping        *memory.Mapping
