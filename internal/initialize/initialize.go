@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	MarkerFileName     = "INITIALIZING"
-	markerTempFileName = ".INITIALIZING.tmp"
+	MarkerFileName          = "INITIALIZING"
+	RestoringMarkerFileName = "RESTORING"
+	markerTempFileName      = ".INITIALIZING.tmp"
 )
 
 var storeDirectories = []string{"manifests", "data", "mapping", "journal", "trash", "tmp"}
@@ -50,6 +51,9 @@ func Create(dir string, hard storeformat.HardLimits) (storeformat.Manifest, erro
 }
 
 func CreateWithOptions(dir string, hard storeformat.HardLimits, opts Options) (storeformat.Manifest, error) {
+	if err := rejectRestoring(dir); err != nil {
+		return storeformat.Manifest{}, err
+	}
 	marker, found, err := loadRecoverableMarker(dir, opts.Hook)
 	if err != nil {
 		return storeformat.Manifest{}, err
@@ -83,6 +87,9 @@ func Open(dir string) (storeformat.Manifest, error) {
 }
 
 func OpenWithOptions(dir string, opts Options) (storeformat.Manifest, error) {
+	if err := rejectRestoring(dir); err != nil {
+		return storeformat.Manifest{}, err
+	}
 	marker, found, err := loadRecoverableMarker(dir, opts.Hook)
 	if err != nil {
 		return storeformat.Manifest{}, err
@@ -95,6 +102,15 @@ func OpenWithOptions(dir string, opts Options) (storeformat.Manifest, error) {
 		return storeformat.Manifest{}, base.ErrNotInitialized
 	}
 	return m, err
+}
+
+func rejectRestoring(dir string) error {
+	if _, err := os.Lstat(filepath.Join(dir, RestoringMarkerFileName)); err == nil {
+		return base.ErrRecoveryRequired
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func resume(dir string, marker storeformat.InitializingMarker, opts Options) (storeformat.Manifest, error) {
