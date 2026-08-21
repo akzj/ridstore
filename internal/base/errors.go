@@ -1,0 +1,30 @@
+package base
+
+import "errors"
+
+var (
+	ErrInvalidID           = errors.New("ridstore: invalid id")
+	ErrNotFound            = errors.New("ridstore: not found")
+	ErrLocked              = errors.New("ridstore: directory locked")
+	ErrAlreadyExists       = errors.New("ridstore: store already exists")
+	ErrNotInitialized      = errors.New("ridstore: store is not initialized")
+	ErrInvalidConfig       = errors.New("ridstore: invalid configuration")
+	ErrConfigMismatch      = errors.New("ridstore: configuration does not match store format")
+	ErrClosed              = errors.New("ridstore: closed")
+	ErrReadOnly            = errors.New("ridstore: read only after storage fault")
+	ErrBatchClosed         = errors.New("ridstore: batch closed")
+	ErrBatchFailed         = errors.New("ridstore: batch failed")
+	ErrBatchTooLarge       = errors.New("ridstore: batch too large")
+	ErrValueTooLarge       = errors.New("ridstore: value too large")
+	ErrInvalidRevision     = errors.New("ridstore: invalid revision")
+	ErrConflict            = errors.New("ridstore: optimistic conflict")
+	ErrIDExhausted         = errors.New("ridstore: id space exhausted")
+	ErrAddressExhausted    = errors.New("ridstore: physical address space exhausted")
+	ErrGenerationExhausted = errors.New("ridstore: metadata generation exhausted")
+	ErrCommitUnknown       = errors.New("ridstore: commit outcome unknown")
+	ErrStatusExpired       = errors.New("ridstore: batch status expired")
+	ErrCorrupt             = errors.New("ridstore: corruption detected")
+	ErrUnsupported         = errors.New("ridstore: unsupported format")
+	ErrOverflow            = errors.New("ridstore: integer overflow")
+	ErrInvalidAddress      = errors.New("ridstore: invalid physical address")
+)
