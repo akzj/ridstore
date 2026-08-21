@@ -19,7 +19,7 @@
 | Data GC trash/delete | N/A | N/A | source rename-to-trash、trash delete 已覆盖 | data/trash publish 与 delete dir sync 已覆盖 | 完整 runtime/recovery matrix；Manifest 已移除 source 后 Store fail closed，恢复自身失败可重试并保留记录一致性 |
 | Initialize marker/files | 已覆盖 | 已覆盖 | 已覆盖 | 已覆盖 | 完整 syscall matrix；损坏的未发布 temp/初始 Segment 可清理重建，durable phase fail closed，Marker 删除后的 root sync 可由 marker-free Open 补做 |
 | Backup artifact publication | payload/Marker/Verify LOCK/metadata 已覆盖 | payload/Marker/Verify LOCK/metadata 已覆盖 | INCOMPLETE remove、Verify cleanup 已覆盖；无 rename | prepared/parent/payload/metadata/publish/补偿 dir sync 已覆盖 | 完整 syscall matrix；发布前失败保留 INCOMPLETE，最终 root sync 失败补偿恢复 Marker，补偿失败保留双重 cause |
-| Restore artifact publication | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；不影响源 Backup，但影响恢复目标的发布完整性 |
+| Restore artifact publication | payload/LOCK/Header/Manifest/Marker 已覆盖 | payload/LOCK/Header/Manifest/Marker 已覆盖 | Manifest replace、partial payload rename、cleanup/Marker remove 已覆盖 | prepared/rewrite/source+destination publish/补偿 dir sync 已覆盖 | 完整 syscall matrix；任意失败保留 RESTORING，部分 UUID rewrite/多目录 publish 均 fail closed，源 Backup 不变 |
 
 ## Active Data 已闭合的失败语义
 
@@ -29,8 +29,8 @@
 - rename 或 data directory sync 返回错误：运行时不猜测文件名是否 durable；fresh recovery 同时识别合法 `.active` 或 sealed name 并完成转换；
 - 任一注入点后均不得继续前台写。Segment 单元矩阵对每一点分别注入 `EIO/ENOSPC/EACCES` 并验证 cause 与恢复；Store 级 descriptor write/sync Case 使用 `EIO` 再验证对外 Aborted/CommitUnknown 和 fail-closed 语义。
 
-## 剩余推进顺序
+## 当前结论
 
-1. Restore artifact publication。
-
-只有所有行闭合，`phase-5-audit.md` 的“所有 durable writer 完成 syscall error matrix”才能勾选。
+当前已识别的 Format v1 durable writer 均完成 syscall error matrix，可以勾选
+`phase-5-audit.md` 的对应代码级门禁。该结论仍不包含设备 power-loss、长期 fuzz、
+72h soak、异机恢复或同 durability 对比证据，也不构成 production-ready 声明。
