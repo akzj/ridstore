@@ -19,7 +19,8 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 13. [Consistent Backup/Restore](backup-restore.md)：离线快照、artifact 与 UUID 策略；
 14. [Metrics Export](metrics-export.md)：稳定 samples 与 Prometheus adapter；
 15. [Format Upgrade/Migration](format-migration.md)：兼容规则、只读 plan 与 step 门禁；
-16. [Format v1 Freeze Review](format-freeze-review.md)：格式冻结结论、代码映射和验证边界。
+16. [Format v1 Freeze Review](format-freeze-review.md)：格式冻结结论、代码映射和验证边界；
+17. [Phase 5 全局审计](phase-5-audit.md)：requirement-to-evidence、当前 P0/P1 缺口和 production checklist。
 
 ## 文档状态
 
@@ -45,6 +46,7 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 | `backup-restore.md` | Phase 5 protocol v1 | 离线一致备份、恢复发布与 UUID 策略 |
 | `metrics-export.md` | Phase 5 implemented | bounded samples 与 Prometheus HTTP adapter |
 | `format-migration.md` | Phase 5 skeleton | 只读 plan、registry 与 copy-on-write 门禁 |
+| `phase-5-audit.md` | Phase 5 in progress | 全局证据矩阵与生产声明门禁 |
 
 磁盘格式已在 Phase 0 的 golden vectors、decoder fuzz 和初始化 crash harness 通过后冻结。后续非兼容修改必须提升 major version 并提供离线迁移。
 
