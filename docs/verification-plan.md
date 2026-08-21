@@ -200,6 +200,8 @@ Abort 独立覆盖 marker append 前、完整 write 后未 sync、API 已返回�
 - 返回可分类错误并 fail closed；
 - Scrub 与 Open 对 corruption 的判断一致。
 
+“一致”指两者对已读取字节使用同一格式/CRC 结论，不要求普通 Open 主动全扫所有历史 payload。Open 必须拒绝损坏的文件 envelope、Replay window 和被 Descriptor/Mapping 实际访问的 Record；离线 Scrub 必须扫描并报告未被普通启动路径触及的 sealed corruption。
+
 ## 9. 资源与收敛测试
 
 长期循环：

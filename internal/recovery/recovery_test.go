@@ -11,8 +11,26 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/batch"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/mapping/api"
+	"github.com/akzj/ridstore/internal/mapping/memory"
 	"github.com/akzj/ridstore/internal/segment"
 )
+
+type countingScanner struct {
+	DataScanner
+	scans int
+	reads int
+}
+
+func (s *countingScanner) Scan(visit func(base.VAddr, storeformat.Frame) error) error {
+	s.scans++
+	return s.DataScanner.Scan(visit)
+}
+
+func (s *countingScanner) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
+	s.reads++
+	return s.DataScanner.ReadFrame(addr)
+}
 
 func recoveryFixture(t *testing.T) (*segment.ActiveData, *appendlog.Log, storeformat.Manifest) {
 	t.Helper()
@@ -185,5 +203,100 @@ func TestRecoverRejectsRelocationValueMismatch(t *testing.T) {
 	}
 	if _, err := RecoverPhase1(manifest, active); !errors.Is(err, base.ErrCorrupt) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestRecoverySkipsPreReplaySegmentsAndRandomReadsReferencedPut(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1, 2, 3}
+	if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	create := func(id base.DataSegmentID, first base.FrameSeq) *segment.ActiveData {
+		header, err := storeformat.EncodeSegmentHeader(storeformat.SegmentHeader{
+			Kind: storeformat.SegmentKindData, StoreUUID: uuid, FileID: uint32(id), FirstSeq: uint64(first),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "data", segment.ActiveDataFileName(id)), header[:], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		active, err := segment.OpenActiveData(root, uuid, id, 1<<20, 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return active
+	}
+
+	first := create(1, 1)
+	oldAddr, physical, err := first.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 7, RecordID: 1, Payload: []byte("before-cut")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSummary, err := first.Seal(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSealed, err := segment.OpenSealedData(root, uuid, firstSummary, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstSealed.Close()
+
+	second := create(2, 3)
+	log, err := appendlog.New(second, 3, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.AppendCommit(batch.Prepared{BatchID: 7, LogicalPayloadBytes: 10, Mutations: []batch.Mutation{{
+		RecordID: 1, Operation: batch.Put, Addr: oldAddr, ValueBytes: 10, PhysicalSize: physical,
+	}}}, 1); err != nil {
+		t.Fatal(err)
+	}
+	secondSummary, err := second.Seal(log.NextFrameSeq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSealed, err := segment.OpenSealedData(root, uuid, secondSummary, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondSealed.Close()
+	third := create(3, log.NextFrameSeq()+1)
+	defer third.Close()
+
+	replay, err := base.NewLogPos(2, storeformat.SegmentHeaderSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := storeformat.Manifest{
+		Generation: 1, StoreUUID: uuid,
+		HardLimits: storeformat.HardLimits{
+			SegmentSize: 1 << 20, MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16,
+			MaxBatchConditions: 16, MaxOpenBatches: 16, IDReserveSize: 4, BatchIDReserveSize: 4,
+		},
+		SealedDataSegments:  []storeformat.FileSummary{firstSummary, secondSummary},
+		ActiveDataSegmentID: 3, NextDataSegmentID: 4, ActiveMapSegmentID: 1, NextMapSegmentID: 2,
+		ReplayStart: replay, ReservedIDHighExclusive: 1, ReservedBatchIDHighExclusive: 1,
+		IssuedBatchIDHighExclusiveAtCut: 8, OpenBatchIDsAtCut: []base.BatchID{7},
+		NextFrameSeq: 3, NextCommitSeq: 1,
+	}
+	mapping, err := memory.New(api.Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := &countingScanner{DataScanner: firstSealed}
+	replayScanner := &countingScanner{DataScanner: secondSealed}
+	active := &countingScanner{DataScanner: third}
+	result, err := RecoverIntoScanners(manifest, []DataScanner{old, replayScanner}, active, mapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.scans != 0 || old.reads != 1 || replayScanner.scans != 1 || active.scans != 1 {
+		t.Fatalf("old scans=%d reads=%d replay scans=%d active scans=%d", old.scans, old.reads, replayScanner.scans, active.scans)
+	}
+	if got, ok, err := result.Mapping.Lookup(1); err != nil || !ok || got != oldAddr {
+		t.Fatalf("mapping addr=%x ok=%v error=%v", got, ok, err)
 	}
 }

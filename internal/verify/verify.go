@@ -47,11 +47,15 @@ type Report struct {
 type dataScanner struct {
 	id   base.DataSegmentID
 	scan func(func(base.VAddr, storeformat.Frame) error) error
+	read func(base.VAddr) (storeformat.Frame, error)
 }
 
 func (s dataScanner) SegmentID() base.DataSegmentID { return s.id }
 func (s dataScanner) Scan(visit func(base.VAddr, storeformat.Frame) error) error {
 	return s.scan(visit)
+}
+func (s dataScanner) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
+	return s.read(addr)
 }
 
 // Run performs an exclusive, offline, read-only verification. It refuses to
@@ -148,18 +152,30 @@ func runUnderLease(ctx context.Context, root string, allowRestoring bool) (repor
 	for i, summary := range m.SealedDataSegments {
 		summary := summary
 		id := base.DataSegmentID(summary.FileID)
-		sealedScanners[i] = dataScanner{id: id, scan: func(visit func(base.VAddr, storeformat.Frame) error) error {
-			return segment.InspectSealedData(abs, m.StoreUUID, summary, m.HardLimits.SegmentSize, maxPayload, func(addr base.VAddr, frame storeformat.Frame, _ uint64) error {
-				return visit(addr, frame)
-			})
-		}}
+		sealedScanners[i] = dataScanner{
+			id: id,
+			scan: func(visit func(base.VAddr, storeformat.Frame) error) error {
+				return segment.InspectSealedData(abs, m.StoreUUID, summary, m.HardLimits.SegmentSize, maxPayload, func(addr base.VAddr, frame storeformat.Frame, _ uint64) error {
+					return visit(addr, frame)
+				})
+			},
+			read: func(addr base.VAddr) (storeformat.Frame, error) {
+				return segment.ReadSealedDataFrame(abs, m.StoreUUID, summary, m.HardLimits.SegmentSize, maxPayload, addr)
+			},
+		}
 	}
 	activeID := m.ActiveDataSegmentID
-	activeScanner := dataScanner{id: activeID, scan: func(visit func(base.VAddr, storeformat.Frame) error) error {
-		return segment.InspectActiveData(abs, m.StoreUUID, activeID, m.HardLimits.SegmentSize, maxPayload, func(addr base.VAddr, frame storeformat.Frame, _ uint64) error {
-			return visit(addr, frame)
-		})
-	}}
+	activeScanner := dataScanner{
+		id: activeID,
+		scan: func(visit func(base.VAddr, storeformat.Frame) error) error {
+			return segment.InspectActiveData(abs, m.StoreUUID, activeID, m.HardLimits.SegmentSize, maxPayload, func(addr base.VAddr, frame storeformat.Frame, _ uint64) error {
+				return visit(addr, frame)
+			})
+		},
+		read: func(addr base.VAddr) (storeformat.Frame, error) {
+			return segment.ReadActiveDataFrame(abs, m.StoreUUID, activeID, m.HardLimits.SegmentSize, maxPayload, addr)
+		},
+	}
 	recovered, err := recovery.RecoverIntoScanners(m, sealedScanners, activeScanner, mapping)
 	if err != nil {
 		return issue(report, err)

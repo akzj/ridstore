@@ -269,16 +269,16 @@ Checkpoint 不需要等待 Open Batch 结束，但 Open Batch 引用的 Data Seg
 ```text
 1. 获取目录锁
 2. 读取有效 CURRENT 和 Manifest；以 CURRENT 为发布权威，删除并 fsync 可证明未发布的 `.CURRENT.tmp`、合法 `MANIFEST-*.tmp` 与 generation 高于 CURRENT 的 orphan final Manifest；保留当前和更老 generation
-3. 校验 Store UUID、格式、硬限制和文件集合
+3. 校验 Store UUID、格式、硬限制、文件集合及 sealed Header/Footer/terminal Seal envelope
 4. 恢复或完成 Maintenance Journal
 5. 打开 Persistent Mapping Root，并加载 `StatsCoveredCommitSeq == CoveredCommitSeq` 的精确 SegmentStats Base
-6. 从 ReplayStart 扫描 Data Frames
+6. 从 ReplayStart 所在 Segment 开始扫描 Data Frames；更早 sealed Segment 不做启动全扫
 7. 验证 Frame/Commit Descriptor
 8. 按 CommitSeq 重放 Mapping；用户 Put 和成功 Relocation 的 NewVAddr 同时累加到 replay Delta 的保守 SegmentStats 上界
 9. 恢复 IDReserve、BatchIDReserve、FrameSeq、CommitSeq high watermark
 10. 修复 Active Segment torn tail
 11. 重建 Segment live/open/pin 元数据
-12. 校验 Mapping 所指 Record
+12. replay Descriptor 引用的 Record 按 VAddr 随机读取并校验；历史 Mapping Record 在 Get/GC/Verify 访问时校验
 13. 创建/恢复 Active Segment
 14. 开放 API
 ```
@@ -287,7 +287,7 @@ Checkpoint 不需要等待 Open Batch 结束，但 Open Batch 引用的 Data Seg
 
 ## 13. Frame 扫描
 
-扫描规则：
+Replay 扫描规则：
 
 - 从 Segment Header 后开始；
 - 每次先读取固定 Header 并验证 Header CRC；
@@ -298,6 +298,8 @@ Checkpoint 不需要等待 Open Batch 结束，但 Open Batch 引用的 Data Seg
 - Active Segment 最后一个不完整 Frame 可以截断；
 - Active 中间位置损坏是 corruption；
 - Sealed 任意损坏是 corruption。
+
+普通 Open 不为了发现与 replay/当前访问无关的历史损坏而顺序扫描所有旧 sealed payload。它先验证每个 immutable 文件的 Header、Footer 和固定大小 terminal SegmentSeal；ReplayStart 之前、被新 Descriptor 引用的 PutRecord 通过 VAddr 随机读取并验证完整 Frame CRC。Get/GC 同样在使用时验证，offline Verify/Scrub 负责全文件扫描。这个边界只延迟无关历史 corruption 的发现，不允许返回未通过 CRC 的 Value。
 
 未知 FrameType/major version 立即停止并返回 `ErrUnsupported`。
 
