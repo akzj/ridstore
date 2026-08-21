@@ -161,6 +161,36 @@ func TestOpenActiveDataTruncatesIncompletePayloadButRejectsCompleteCorruption(t 
 	}
 }
 
+func TestActiveDataSealCreatesStrictImmutableSegment(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	createActiveDataFile(t, root, uuid, 1)
+	active, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1, Payload: []byte("value")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := active.Seal(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FileID != 1 || summary.FirstSeq != 1 || summary.LastSeq != 2 {
+		t.Fatalf("summary=%+v", summary)
+	}
+	sealed, err := OpenSealedData(root, uuid, summary, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sealed.Close()
+	frame, err := sealed.ReadFrame(addr)
+	if err != nil || string(frame.Payload) != "value" {
+		t.Fatalf("frame=%+v error=%v", frame, err)
+	}
+}
+
 func mustHeader(t *testing.T, uuid base.StoreUUID, id base.DataSegmentID) []byte {
 	t.Helper()
 	header, err := storeformat.EncodeSegmentHeader(storeformat.SegmentHeader{Kind: storeformat.SegmentKindData, StoreUUID: uuid, FileID: uint32(id), FirstSeq: 1})
