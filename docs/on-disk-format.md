@@ -446,7 +446,7 @@ Manifest 使用版本化二进制 TLV，文件以固定 64-byte Header 开始：
 | 56 | 4 | Flags |
 | 60 | 4 | Reserved |
 
-Payload 是连续 TLV，单项格式为 `Type uint16, Flags uint16, Length uint32, Value[Length], zero padding to 8 bytes`。Flags bit 0 表示 required，其余位第一版必须为 0。Type 不得重复；标量 Length 必须精确匹配；数组先保存 `Count uint32 + Reserved uint32`，再保存定长元素。解析时先检查 PayloadLength、单项 Length、Count 乘法和 padding，再分配内存。
+Payload 是连续 TLV，第一版 Manifest PayloadLength 上限为 64 MiB。单项格式为 `Type uint16, Flags uint16, Length uint32, Value[Length], zero padding to 8 bytes`。Flags bit 0 表示 required，其余位第一版必须为 0。Type 不得重复；标量 Length 必须精确匹配；数组先保存 `Count uint32 + Reserved uint32`，再保存定长元素。解析时先检查文件大小、PayloadLength、单项 Length、Count 乘法和 padding，再分配内存；超过上限必须拒绝，不能先按磁盘 Length 分配。
 
 第一版 TLV Type：
 
