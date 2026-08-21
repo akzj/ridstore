@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/manifest"
@@ -57,9 +58,26 @@ type CreateReport struct {
 	Bytes              uint64 `json:"bytes"`
 }
 
+type CreateOptions struct {
+	Hook failpoint.Hook
+}
+
+const (
+	PointBackupPrepared        failpoint.Point = "backup.prepared"
+	PointBackupFilesCopied     failpoint.Point = "backup.files-copied"
+	PointBackupPayloadVerified failpoint.Point = "backup.payload-verified"
+	PointBackupMetadataSynced  failpoint.Point = "backup.metadata-synced"
+	PointBackupMarkerRemoved   failpoint.Point = "backup.marker-removed"
+	PointBackupPublished       failpoint.Point = "backup.published"
+)
+
 // Create writes a complete offline backup artifact. Source verification and
 // all file copies occur while the same exclusive Store lease is held.
 func Create(ctx context.Context, source, destination string) (report CreateReport, resultErr error) {
+	return CreateWithOptions(ctx, source, destination, CreateOptions{})
+}
+
+func CreateWithOptions(ctx context.Context, source, destination string, options CreateOptions) (report CreateReport, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return report, err
 	}
@@ -94,6 +112,9 @@ func Create(ctx context.Context, source, destination string) (report CreateRepor
 	if err := createArtifactRoot(destinationAbs); err != nil {
 		return report, err
 	}
+	if err := failpoint.Hit(options.Hook, PointBackupPrepared); err != nil {
+		return report, err
+	}
 	payloadRoot := filepath.Join(destinationAbs, payloadDirName)
 	for _, name := range []string{"manifests", "data", "mapping"} {
 		if err := os.Mkdir(filepath.Join(payloadRoot, name), 0o700); err != nil {
@@ -119,7 +140,13 @@ func Create(ctx context.Context, source, destination string) (report CreateRepor
 			return report, err
 		}
 	}
+	if err := failpoint.Hit(options.Hook, PointBackupFilesCopied); err != nil {
+		return report, err
+	}
 	if err := verifyCopiedPayload(ctx, payloadRoot); err != nil {
+		return report, err
+	}
+	if err := failpoint.Hit(options.Hook, PointBackupPayloadVerified); err != nil {
 		return report, err
 	}
 	encoded, err := json.MarshalIndent(metadata, "", "  ")
@@ -137,13 +164,30 @@ func Create(ctx context.Context, source, destination string) (report CreateRepor
 			return report, err
 		}
 	}
+	if err := failpoint.Hit(options.Hook, PointBackupMetadataSynced); err != nil {
+		return report, err
+	}
 	if _, err := validateArtifact(ctx, destinationAbs, true); err != nil {
 		return report, err
 	}
 	if err := os.Remove(filepath.Join(destinationAbs, incompleteName)); err != nil {
 		return report, err
 	}
+	if err := failpoint.Hit(options.Hook, PointBackupMarkerRemoved); err != nil {
+		restoreErr := writeNewSynced(filepath.Join(destinationAbs, incompleteName), []byte("ridstore backup incomplete\n"), 0o600)
+		if restoreErr == nil {
+			restoreErr = syncDirectory(destinationAbs)
+		}
+		return report, errors.Join(err, restoreErr)
+	}
 	if err := syncDirectory(destinationAbs); err != nil {
+		restoreErr := writeNewSynced(filepath.Join(destinationAbs, incompleteName), []byte("ridstore backup incomplete\n"), 0o600)
+		if restoreErr == nil {
+			restoreErr = syncDirectory(destinationAbs)
+		}
+		return report, errors.Join(err, restoreErr)
+	}
+	if err := failpoint.Hit(options.Hook, PointBackupPublished); err != nil {
 		return report, err
 	}
 	report.Destination = destinationAbs

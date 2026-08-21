@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
@@ -23,7 +24,19 @@ const restorePayloadDirName = ".payload"
 
 type RestoreOptions struct {
 	PreserveUUID bool
+	Hook         failpoint.Hook
 }
+
+const (
+	PointRestorePrepared         failpoint.Point = "restore.prepared"
+	PointRestoreFilesCopied      failpoint.Point = "restore.files-copied"
+	PointRestoreUUIDRewritten    failpoint.Point = "restore.uuid-rewritten"
+	PointRestorePayloadVerified  failpoint.Point = "restore.payload-verified"
+	PointRestorePayloadPublished failpoint.Point = "restore.payload-published"
+	PointRestoreLayoutVerified   failpoint.Point = "restore.layout-verified"
+	PointRestoreMarkerRemoved    failpoint.Point = "restore.marker-removed"
+	PointRestorePublished        failpoint.Point = "restore.published"
+)
 
 type RestoreReport struct {
 	Destination        string `json:"destination"`
@@ -59,6 +72,9 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 	if err := createRestoreRoot(destinationAbs); err != nil {
 		return report, err
 	}
+	if err := failpoint.Hit(options.Hook, PointRestorePrepared); err != nil {
+		return report, err
+	}
 	payloadRoot := filepath.Join(destinationAbs, restorePayloadDirName)
 	for _, name := range []string{"manifests", "data", "mapping", "journal", "trash", "tmp"} {
 		if err := os.Mkdir(filepath.Join(payloadRoot, name), 0o700); err != nil {
@@ -83,6 +99,9 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 			return report, err
 		}
 	}
+	if err := failpoint.Hit(options.Hook, PointRestoreFilesCopied); err != nil {
+		return report, err
+	}
 	sourceUUID, err := parseUUID(metadata.StoreUUID)
 	if err != nil {
 		return report, err
@@ -98,6 +117,9 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 		if err := rewriteStoreUUID(payloadRoot, metadata.Files, sourceUUID, restoredUUID); err != nil {
 			return report, err
 		}
+	}
+	if err := failpoint.Hit(options.Hook, PointRestoreUUIDRewritten); err != nil {
+		return report, err
 	}
 	for _, dir := range []string{
 		filepath.Join(payloadRoot, "manifests"), filepath.Join(payloadRoot, "data"), filepath.Join(payloadRoot, "mapping"),
@@ -124,7 +146,13 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 		}
 		return report, err
 	}
+	if err := failpoint.Hit(options.Hook, PointRestorePayloadVerified); err != nil {
+		return report, err
+	}
 	if err := publishRestorePayload(payloadRoot, destinationAbs); err != nil {
+		return report, err
+	}
+	if err := failpoint.Hit(options.Hook, PointRestorePayloadPublished); err != nil {
 		return report, err
 	}
 	postPublish, err := verify.RunRestoringUnderLease(ctx, destinationAbs)
@@ -134,8 +162,18 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 		}
 		return report, err
 	}
+	if err := failpoint.Hit(options.Hook, PointRestoreLayoutVerified); err != nil {
+		return report, err
+	}
 	if err := os.Remove(filepath.Join(destinationAbs, initialize.RestoringMarkerFileName)); err != nil {
 		return report, err
+	}
+	if err := failpoint.Hit(options.Hook, PointRestoreMarkerRemoved); err != nil {
+		restoreErr := writeNewSynced(filepath.Join(destinationAbs, initialize.RestoringMarkerFileName), []byte("ridstore restore incomplete\n"), 0o600)
+		if restoreErr == nil {
+			restoreErr = syncDirectory(destinationAbs)
+		}
+		return report, errors.Join(err, restoreErr)
 	}
 	if err := syncDirectory(destinationAbs); err != nil {
 		restoreErr := writeNewSynced(filepath.Join(destinationAbs, initialize.RestoringMarkerFileName), []byte("ridstore restore incomplete\n"), 0o600)
@@ -143,6 +181,9 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 			restoreErr = syncDirectory(destinationAbs)
 		}
 		return report, errors.Join(err, restoreErr)
+	}
+	if err := failpoint.Hit(options.Hook, PointRestorePublished); err != nil {
+		return report, err
 	}
 	if err := lease.Close(); err != nil {
 		leaseClosed = true
