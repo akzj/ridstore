@@ -120,6 +120,8 @@ Mapping rotation 对旧 Active 的 pre-journal sync、Footer write/sync、sealed
 
 Mapping GC 对新 generation 的 Header、Node、Footer write，sealed/final Active file sync，temp directory sync、temp→final rename 和 publish directory sync 注入 `EIO/ENOSPC/EACCES`；checkpoint 前 cleanup remove/dir-sync、旧文件 rename-to-trash、mapping/trash directory sync、trash delete/delete-dir-sync 使用同一矩阵。运行时错误均保留底层 cause 并由 Store fail closed；fresh Open 在 Manifest 前删除所有 temp/final destination，Manifest 后验证新 Root 再完成 old-file trash/delete。恢复 writer 的 cleanup/trash/delete syscall 失败后再次 Open 必须幂等重试；多文件 Case 额外覆盖第一个 rename/delete 成功、第二个失败。Catalog 在进入 Installer 前返回 Mapping baseline conflict 时允许完整清理；一旦 mutation 校验成功并进入 Installer，即使返回错误也禁止删除新文件，因为 CURRENT 可能已发布，只能由 fresh Open 判定。Reader pin 仍须在首次 old-file rename 前清零，最终 offline Verify clean。
 
+Data GC 在 checkpoint Manifest 已证明 source 无 live Mapping、reader pin 清零且第二个 Manifest 已移除 source 后，对 source rename-to-trash、data directory sync、trash publish directory sync、trash remove 和 delete directory sync 注入 `EIO/ENOSPC/EACCES`。任一点失败时 Store 保留 cause 并 fail closed；fresh Open 根据 phase-5/6 Journal 和当前 Manifest 幂等完成 rename 或 delete。恢复路径使用同一 hook，恢复 syscall 自身失败必须释放 Open 资源并允许下一次 Open 重试；rename 已完成但任一 directory sync 失败、delete 已完成但 directory sync 失败均须重新 fsync。恢复期 Journal phase advance/final remove 也继承同一 hook。成功后 source/trash 均不存在、Journal 清空、记录 revision/value 不变且 offline Verify clean。
+
 ## 4. Commit Crash Matrix
 
 每个 Case 至少验证旧值、新值、NotFound 和 Batch Status。

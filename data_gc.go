@@ -38,6 +38,12 @@ const (
 	pointDataGCManifestRemoved failpoint.Point = "data-gc.manifest-removed"
 	pointDataGCTrashed         failpoint.Point = "data-gc.trashed"
 	pointDataGCDeleted         failpoint.Point = "data-gc.deleted"
+
+	pointBeforeDataGCTrashRename         failpoint.Point = "data-gc.before-trash-rename"
+	pointBeforeDataGCDataDirSync         failpoint.Point = "data-gc.before-data-dir-sync"
+	pointBeforeDataGCTrashPublishDirSync failpoint.Point = "data-gc.before-trash-publish-dir-sync"
+	pointBeforeDataGCTrashDelete         failpoint.Point = "data-gc.before-trash-delete"
+	pointBeforeDataGCTrashDeleteDirSync  failpoint.Point = "data-gc.before-trash-delete-dir-sync"
 )
 
 type dataGCSession struct {
@@ -569,10 +575,19 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 		return DataGCResult{}, err
 	}
 	trashPath := dataGCTrashPath(s.config.Dir, operationID, sourceID)
+	if err := failpoint.Hit(s.hook, pointBeforeDataGCTrashRename); err != nil {
+		return DataGCResult{}, err
+	}
 	if err := os.Rename(dataGCSealedPath(s.config.Dir, sourceID), trashPath); err != nil {
 		return DataGCResult{}, err
 	}
+	if err := failpoint.Hit(s.hook, pointBeforeDataGCDataDirSync); err != nil {
+		return DataGCResult{}, err
+	}
 	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "data")); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := failpoint.Hit(s.hook, pointBeforeDataGCTrashPublishDirSync); err != nil {
 		return DataGCResult{}, err
 	}
 	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
@@ -584,7 +599,13 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	if err := failpoint.Hit(s.hook, pointDataGCTrashed); err != nil {
 		return DataGCResult{}, err
 	}
+	if err := failpoint.Hit(s.hook, pointBeforeDataGCTrashDelete); err != nil {
+		return DataGCResult{}, err
+	}
 	if err := os.Remove(trashPath); err != nil {
+		return DataGCResult{}, err
+	}
+	if err := failpoint.Hit(s.hook, pointBeforeDataGCTrashDeleteDirSync); err != nil {
 		return DataGCResult{}, err
 	}
 	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
@@ -705,7 +726,7 @@ func (s *Store) resumeDataGC() error {
 	if journal.Phase <= 3 {
 		current := s.catalog.Snapshot()
 		if current.MaintenanceGeneration < journal.Generation {
-			return maintenance.Remove(s.config.Dir)
+			return maintenance.RemoveWithHook(s.config.Dir, s.hook)
 		}
 		if current.MaintenanceGeneration != journal.Generation || journal.Phase != 3 {
 			return fmt.Errorf("data GC recovery checkpoint phase: %w", base.ErrCorrupt)
@@ -716,7 +737,7 @@ func (s *Store) resumeDataGC() error {
 				// A nested Mapping rotation can publish the parent maintenance
 				// generation while the DataGC journal remains at phase 3. The
 				// still-live source statistic proves its checkpoint did not run.
-				return maintenance.Remove(s.config.Dir)
+				return maintenance.RemoveWithHook(s.config.Dir, s.hook)
 			}
 		}
 		// The checkpoint Manifest won the race with phase-4 journal publication.
@@ -724,7 +745,7 @@ func (s *Store) resumeDataGC() error {
 		if err := validateRecoveredDataGCCheckpoint(current, journal, sourceID); err != nil {
 			return err
 		}
-		if err := advanceDataGCJournal(s.config.Dir, &journal, 4, current.Generation, nil); err != nil {
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 4, current.Generation, s.hook); err != nil {
 			return err
 		}
 	}
@@ -768,7 +789,7 @@ func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.Main
 		}
 		session.cleaning = false
 		retiredInRuntime = true
-		if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration, nil); err != nil {
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration, s.hook); err != nil {
 			return err
 		}
 	}
@@ -808,10 +829,10 @@ func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.Main
 				return err
 			}
 		}
-		if err := ensureDataGCTrashed(s.config.Dir, journal.OperationID, sourceID); err != nil {
+		if err := ensureDataGCTrashed(s.config.Dir, journal.OperationID, sourceID, s.hook); err != nil {
 			return err
 		}
-		if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration, nil); err != nil {
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration, s.hook); err != nil {
 			return err
 		}
 	}
@@ -820,20 +841,26 @@ func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.Main
 			return fmt.Errorf("data GC source remains in manifest at trash phase: %w", base.ErrCorrupt)
 		}
 		trashPath := dataGCTrashPath(s.config.Dir, journal.OperationID, sourceID)
+		if err := failpoint.Hit(s.hook, pointBeforeDataGCTrashDelete); err != nil {
+			return err
+		}
 		if err := os.Remove(trashPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := failpoint.Hit(s.hook, pointBeforeDataGCTrashDeleteDirSync); err != nil {
 			return err
 		}
 		if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
 			return err
 		}
-		if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration, nil); err != nil {
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration, s.hook); err != nil {
 			return err
 		}
 	}
 	if journal.Phase != 7 {
 		return fmt.Errorf("data GC recovery phase %d: %w", journal.Phase, base.ErrCorrupt)
 	}
-	return maintenance.Remove(s.config.Dir)
+	return maintenance.RemoveWithHook(s.config.Dir, s.hook)
 }
 
 func validateRecoveredDataGCCheckpoint(manifest storeformat.Manifest, journal storeformat.MaintenanceJournal, sourceID base.DataSegmentID) error {
@@ -882,7 +909,7 @@ func manifestHasDataSegment(manifest storeformat.Manifest, id base.DataSegmentID
 	return false
 }
 
-func ensureDataGCTrashed(root string, operationID [16]byte, id base.DataSegmentID) error {
+func ensureDataGCTrashed(root string, operationID [16]byte, id base.DataSegmentID, hook failpoint.Hook) error {
 	source, trash := dataGCSealedPath(root, id), dataGCTrashPath(root, operationID, id)
 	_, sourceErr := os.Lstat(source)
 	_, trashErr := os.Lstat(trash)
@@ -890,6 +917,9 @@ func ensureDataGCTrashed(root string, operationID [16]byte, id base.DataSegmentI
 		return fmt.Errorf("data GC source and trash both exist: %w", base.ErrCorrupt)
 	}
 	if sourceErr == nil {
+		if err := failpoint.Hit(hook, pointBeforeDataGCTrashRename); err != nil {
+			return err
+		}
 		if err := os.Rename(source, trash); err != nil {
 			return err
 		}
@@ -901,7 +931,13 @@ func ensureDataGCTrashed(root string, operationID [16]byte, id base.DataSegmentI
 		}
 		return trashErr
 	}
+	if err := failpoint.Hit(hook, pointBeforeDataGCDataDirSync); err != nil {
+		return err
+	}
 	if err := maintenance.SyncDirectory(filepath.Join(root, "data")); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(hook, pointBeforeDataGCTrashPublishDirSync); err != nil {
 		return err
 	}
 	return maintenance.SyncDirectory(filepath.Join(root, "trash"))

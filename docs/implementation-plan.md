@@ -2,7 +2,7 @@
 
 状态：Execution plan v1
 
-当前进度（2026-08-22）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1–4 分别通过 [Phase 1 Review](phase-1-review.md)、[Phase 2 Review](phase-2-review.md)、[Phase 3 Review](phase-3-review.md) 与 [Phase 4 Review](phase-4-review.md)。Phase 5 Verify/Scrub、[Backup/Restore](backup-restore.md)、[Metrics Export](metrics-export.md) 与 [Migration Skeleton](format-migration.md) 已实现；ID reserve、Abort、Backup/Restore、Checkpoint/GC 等 process-crash matrix，以及 Manifest/CURRENT、Journal、Active Mapping/rotation/GC 等 syscall-error matrix 已自动化。Active Data create/tail、Data GC trash/delete、Initialize、Backup/Restore 的 syscall matrix，长期验证、同 durability benchmark 与 production checklist 仍未完成，项目未达到 production-ready。
+当前进度（2026-08-22）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1–4 分别通过 [Phase 1 Review](phase-1-review.md)、[Phase 2 Review](phase-2-review.md)、[Phase 3 Review](phase-3-review.md) 与 [Phase 4 Review](phase-4-review.md)。Phase 5 Verify/Scrub、[Backup/Restore](backup-restore.md)、[Metrics Export](metrics-export.md) 与 [Migration Skeleton](format-migration.md) 已实现；ID reserve、Abort、Backup/Restore、Checkpoint/GC 等 process-crash matrix，以及 Manifest/CURRENT、Journal、Data GC trash/delete、Active Mapping/rotation/GC 等 syscall-error matrix 已自动化。Active Data create/tail、Initialize、Backup/Restore 的 syscall matrix，长期验证、同 durability benchmark 与 production checklist 仍未完成，项目未达到 production-ready。
 
 ## 1. 开发原则
 
