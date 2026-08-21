@@ -9,13 +9,14 @@ import (
 	"github.com/akzj/ridstore/internal/appendlog"
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/commit"
+	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/recovery"
 	"github.com/akzj/ridstore/internal/segment"
 )
 
-func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock) (*Store, error) {
+func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, hook failpoint.Hook) (*Store, error) {
 	maxFramePayload, maxPartPayload, err := framePayloadLimits(manifest.HardLimits)
 	if err != nil {
 		return nil, err
@@ -31,7 +32,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock) 
 	if err != nil {
 		return fail(err)
 	}
-	log, err := appendlog.New(active, recovered.NextFrameSeq, maxFramePayload, maxPartPayload)
+	log, err := appendlog.NewWithHook(active, recovered.NextFrameSeq, maxFramePayload, maxPartPayload, hook)
 	if err != nil {
 		return fail(err)
 	}
@@ -43,7 +44,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock) 
 	if err != nil {
 		return fail(err)
 	}
-	coordinator, err := commit.New(recovered.NextCommitSeq, log, recovered.Mapping, activeRecordReader{active: active})
+	coordinator, err := commit.NewWithHook(recovered.NextCommitSeq, log, recovered.Mapping, activeRecordReader{active: active}, hook)
 	if err != nil {
 		return fail(err)
 	}
