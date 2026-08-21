@@ -163,18 +163,49 @@ func TestCompactDataRejectsInsufficientTemporarySpaceBeforeJournal(t *testing.T)
 	}
 }
 
-func TestDataGCTemporarySpaceUpperIncludesLiveMappingAndReserve(t *testing.T) {
+func TestDataGCCopySpaceUpperIncludesLiveDescriptorAndReserve(t *testing.T) {
 	cfg := smallTestConfig(t.TempDir())
 	cfg.SegmentSize = 16 << 10
 	cfg.GCMinFreeBytes = 4096
 	manifest := storeformat.Manifest{SegmentStats: []storeformat.SegmentStatsEntry{{SegmentID: 1, ExactLiveBytes: 128, ExactLiveRecords: 2}}}
-	required, err := dataGCTemporarySpaceUpper(manifest, storeformat.FileSummary{FileID: 1}, cfg)
+	required, err := dataGCCopySpaceUpper(manifest, storeformat.FileSummary{FileID: 1}, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := uint64(cfg.GCMinFreeBytes) + 128 + 2*uint64(storeformat.MappingNodeHeaderSize+storeformat.MappingNodeSlots*8)*8 + 2*storeformat.MutationEntrySize + 2*uint64(cfg.SegmentSize)
+	want := uint64(cfg.GCMinFreeBytes) + 128 + 2*storeformat.MutationEntrySize + 2*uint64(cfg.SegmentSize)
 	if required != want {
 		t.Fatalf("required=%d want=%d", required, want)
+	}
+}
+
+func TestCompactDataRechecksSpaceAfterCheckpointBarrier(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, stableID, revision := prepareDataGCStore(t, cfg)
+	defer store.Close()
+	calls := 0
+	store.availableBytes = func(string) (uint64, error) {
+		calls++
+		if calls == 1 {
+			return ^uint64(0), nil
+		}
+		return 0, nil
+	}
+	if _, err := store.CompactData(context.Background()); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("error=%v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("available-space calls=%d", calls)
+	}
+	if store.fault != nil {
+		t.Fatalf("store faulted before durable checkpoint: %v", store.fault)
+	}
+	if _, found, err := maintenance.Load(dir); err != nil || found {
+		t.Fatalf("journal found=%v error=%v", found, err)
+	}
+	if record, err := store.GetRecord(context.Background(), stableID); err != nil || record.Revision != revision || string(record.Value) != "stable" {
+		t.Fatalf("record=%+v error=%v", record, err)
 	}
 }
 

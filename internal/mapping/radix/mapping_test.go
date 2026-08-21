@@ -53,6 +53,9 @@ func TestRadixCheckpointLookupDeleteAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if checkpoint.EntryCount() != uint64(len(changes)) {
+		t.Fatalf("checkpoint entries=%d want=%d", checkpoint.EntryCount(), len(changes))
+	}
 	root, err := mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
