@@ -19,16 +19,138 @@ import (
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
 	"github.com/akzj/ridstore/internal/manifest"
+	"github.com/akzj/ridstore/internal/rotation"
 )
 
 const (
-	crashChildEnv       = "RIDSTORE_INITIALIZE_CRASH_CHILD"
-	crashDirEnv         = "RIDSTORE_INITIALIZE_CRASH_DIR"
-	crashPointEnv       = "RIDSTORE_INITIALIZE_CRASH_POINT"
-	commitCrashChildEnv = "RIDSTORE_COMMIT_CRASH_CHILD"
-	commitCrashDirEnv   = "RIDSTORE_COMMIT_CRASH_DIR"
-	commitCrashPointEnv = "RIDSTORE_COMMIT_CRASH_POINT"
+	crashChildEnv         = "RIDSTORE_INITIALIZE_CRASH_CHILD"
+	crashDirEnv           = "RIDSTORE_INITIALIZE_CRASH_DIR"
+	crashPointEnv         = "RIDSTORE_INITIALIZE_CRASH_POINT"
+	commitCrashChildEnv   = "RIDSTORE_COMMIT_CRASH_CHILD"
+	commitCrashDirEnv     = "RIDSTORE_COMMIT_CRASH_DIR"
+	commitCrashPointEnv   = "RIDSTORE_COMMIT_CRASH_POINT"
+	rotationCrashChildEnv = "RIDSTORE_ROTATION_CRASH_CHILD"
+	rotationCrashDirEnv   = "RIDSTORE_ROTATION_CRASH_DIR"
+	rotationCrashPointEnv = "RIDSTORE_ROTATION_CRASH_POINT"
 )
+
+func TestRotationProcessCrashMatrix(t *testing.T) {
+	points := []failpoint.Point{
+		rotation.PointPrepared, rotation.PointOldSealed, rotation.PointNewCreated, rotation.PointManifestInstalled,
+	}
+	for _, point := range points {
+		point := point
+		t.Run(string(point), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "store")
+			killRotationChildAt(t, dir, point)
+			cfg := smallTestConfig(dir)
+			cfg.SegmentSize = 16 << 10
+			store, err := Open(cfg)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer store.Close()
+			b, err := store.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := b.Allocate(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Put(context.Background(), id, []byte("after-recovery")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.Commit(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if value, err := store.Get(context.Background(), id); err != nil || string(value) != "after-recovery" {
+				t.Fatalf("value=%q error=%v", value, err)
+			}
+		})
+	}
+}
+
+func killRotationChildAt(t *testing.T, dir string, point failpoint.Point) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRotationCrashChild$", "-test.count=1")
+	cmd.Env = append(os.Environ(), rotationCrashChildEnv+"=1", rotationCrashDirEnv+"="+dir, rotationCrashPointEnv+"="+string(point))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	want := "RIDSTORE_FAILPOINT_READY " + string(point)
+	scanner := bufio.NewScanner(stdout)
+	ready := make(chan string, 1)
+	go func() {
+		if scanner.Scan() {
+			ready <- scanner.Text()
+			return
+		}
+		ready <- ""
+	}()
+	select {
+	case line := <-ready:
+		if line != want {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("child did not reach failpoint: line=%q stderr=%s", line, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("timeout waiting for %s: stderr=%s", point, stderr.String())
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("SIGKILL child exited successfully")
+	}
+}
+
+func TestRotationCrashChild(t *testing.T) {
+	if os.Getenv(rotationCrashChildEnv) != "1" {
+		t.Skip("subprocess helper")
+	}
+	target := failpoint.Point(os.Getenv(rotationCrashPointEnv))
+	hook := failpoint.Func(func(point failpoint.Point) error {
+		if point != target {
+			return nil
+		}
+		fmt.Printf("RIDSTORE_FAILPOINT_READY %s\n", point)
+		_ = os.Stdout.Sync()
+		select {}
+	})
+	cfg := smallTestConfig(os.Getenv(rotationCrashDirEnv))
+	cfg.SegmentSize = 16 << 10
+	store, err := createWithOptions(cfg, initialize.Options{Hook: hook})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		b, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := b.Allocate(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put(context.Background(), id, bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Fatalf("rotation failpoint %s was not reached", target)
+}
 
 func TestCommitProcessCrashMatrix(t *testing.T) {
 	tests := []struct {
