@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
 
@@ -35,8 +36,9 @@ const (
 type Hook func(Step) error
 
 type Installer struct {
-	Dir  string
-	Hook Hook
+	Dir           string
+	Hook          Hook
+	FailpointHook failpoint.Hook
 }
 
 func ManifestFileName(generation uint64) string {
@@ -88,13 +90,13 @@ func (i Installer) Install(m storeformat.Manifest) error {
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return readErr
 	} else {
-		if err := writeSyncedFile(tempPath, encoded, 0o600, i.Hook, StepManifestWritten, StepManifestFileSynced); err != nil {
+		if err := writeSyncedFile(tempPath, encoded, 0o600, i.hit, StepManifestWritten, StepManifestFileSynced); err != nil {
 			return err
 		}
 		if err := os.Rename(tempPath, finalPath); err != nil {
 			return err
 		}
-		if err := runHook(i.Hook, StepManifestRenamed); err != nil {
+		if err := i.hit(StepManifestRenamed); err != nil {
 			return err
 		}
 	}
@@ -103,25 +105,25 @@ func (i Installer) Install(m storeformat.Manifest) error {
 	if err := syncDirectory(manifestDir); err != nil {
 		return err
 	}
-	if err := runHook(i.Hook, StepManifestDirSynced); err != nil {
+	if err := i.hit(StepManifestDirSynced); err != nil {
 		return err
 	}
 
 	current := []byte(name + "\n")
 	currentTemp := filepath.Join(i.Dir, ".CURRENT.tmp")
-	if err := writeSyncedFile(currentTemp, current, 0o600, i.Hook, StepCurrentWritten, StepCurrentFileSynced); err != nil {
+	if err := writeSyncedFile(currentTemp, current, 0o600, i.hit, StepCurrentWritten, StepCurrentFileSynced); err != nil {
 		return err
 	}
 	if err := os.Rename(currentTemp, filepath.Join(i.Dir, CurrentFileName)); err != nil {
 		return err
 	}
-	if err := runHook(i.Hook, StepCurrentRenamed); err != nil {
+	if err := i.hit(StepCurrentRenamed); err != nil {
 		return err
 	}
 	if err := syncDirectory(i.Dir); err != nil {
 		return err
 	}
-	return runHook(i.Hook, StepRootDirSynced)
+	return i.hit(StepRootDirSynced)
 }
 
 func LoadCurrent(dir string) (storeformat.Manifest, error) {
@@ -263,4 +265,13 @@ func runHook(hook Hook, step Step) error {
 		return nil
 	}
 	return hook(step)
+}
+
+// FailpointHook adapts the stable manifest step names to the shared failpoint
+// interface used by subprocess crash tests.
+func (i Installer) hit(step Step) error {
+	if err := failpoint.Hit(i.FailpointHook, failpoint.Point("manifest."+string(step))); err != nil {
+		return err
+	}
+	return runHook(i.Hook, step)
 }
