@@ -31,6 +31,12 @@ const (
 	PointBeforeFooterSync  failpoint.Point = "segment.before-footer-sync"
 	PointBeforeSealRename  failpoint.Point = "segment.before-seal-rename"
 	PointBeforeDataDirSync failpoint.Point = "segment.before-data-dir-sync"
+
+	PointBeforeCreateHeaderWrite failpoint.Point = "segment.before-create-header-write"
+	PointBeforeCreateFileSync    failpoint.Point = "segment.before-create-file-sync"
+	PointBeforeCreateDirSync     failpoint.Point = "segment.before-create-dir-sync"
+	PointBeforeTailTruncate      failpoint.Point = "segment.before-tail-truncate"
+	PointBeforeTailSync          failpoint.Point = "segment.before-tail-sync"
 )
 
 type ActiveData struct {
@@ -51,6 +57,10 @@ func ActiveDataFileName(id base.DataSegmentID) string {
 }
 
 func CreateActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, firstSeq base.FrameSeq, segmentSize, maxPayloadSize uint64) (*ActiveData, error) {
+	return CreateActiveDataWithHook(root, uuid, id, firstSeq, segmentSize, maxPayloadSize, nil)
+}
+
+func CreateActiveDataWithHook(root string, uuid base.StoreUUID, id base.DataSegmentID, firstSeq base.FrameSeq, segmentSize, maxPayloadSize uint64, hook failpoint.Hook) (*ActiveData, error) {
 	if uuid == (base.StoreUUID{}) || id == 0 || firstSeq == 0 {
 		return nil, base.ErrInvalidConfig
 	}
@@ -65,7 +75,13 @@ func CreateActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, f
 	if err != nil {
 		return nil, err
 	}
+	if err := failpoint.Hit(hook, PointBeforeCreateHeaderWrite); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
 	if _, err := writeFullAt(file, header[:], 0); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	if err := failpoint.Hit(hook, PointBeforeCreateFileSync); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
 	if err := file.Sync(); err != nil {
@@ -78,15 +94,22 @@ func CreateActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, f
 	if err != nil {
 		return nil, err
 	}
+	if err := failpoint.Hit(hook, PointBeforeCreateDirSync); err != nil {
+		return nil, errors.Join(err, dir.Close())
+	}
 	if err := errors.Join(dir.Sync(), dir.Close()); err != nil {
 		return nil, err
 	}
-	return OpenActiveData(root, uuid, id, segmentSize, maxPayloadSize)
+	return openActiveData(root, uuid, id, segmentSize, maxPayloadSize, hook, false)
 }
 
 // ResumeSeal completes an interrupted Active->Sealed transition. It recognizes
 // a complete terminal SegmentSeal even when the footer or rename was lost.
 func ResumeSeal(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, fallbackNext base.FrameSeq) (storeformat.FileSummary, error) {
+	return ResumeSealWithHook(root, uuid, id, segmentSize, maxPayloadSize, fallbackNext, nil)
+}
+
+func ResumeSealWithHook(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, fallbackNext base.FrameSeq, hook failpoint.Hook) (storeformat.FileSummary, error) {
 	path := filepath.Join(root, "data", ActiveDataFileName(id))
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -186,7 +209,7 @@ func ResumeSeal(root string, uuid base.StoreUUID, id base.DataSegmentID, segment
 		}
 		fallbackNext = previous + 1
 	}
-	active, err := OpenActiveData(root, uuid, id, segmentSize, maxPayloadSize)
+	active, err := OpenActiveDataWithHook(root, uuid, id, segmentSize, maxPayloadSize, hook)
 	if err != nil {
 		return storeformat.FileSummary{}, err
 	}
@@ -194,6 +217,20 @@ func ResumeSeal(root string, uuid base.StoreUUID, id base.DataSegmentID, segment
 }
 
 func OpenActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64) (*ActiveData, error) {
+	return OpenActiveDataWithHook(root, uuid, id, segmentSize, maxPayloadSize, nil)
+}
+
+func OpenActiveDataWithHook(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, hook failpoint.Hook) (*ActiveData, error) {
+	return openActiveData(root, uuid, id, segmentSize, maxPayloadSize, hook, true)
+}
+
+// OpenUnpublishedActiveDataWithHook validates a rotation destination whose
+// durability is established explicitly by EnsureCreationDurable.
+func OpenUnpublishedActiveDataWithHook(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, hook failpoint.Hook) (*ActiveData, error) {
+	return openActiveData(root, uuid, id, segmentSize, maxPayloadSize, hook, false)
+}
+
+func openActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, hook failpoint.Hook, syncOnCleanOpen bool) (*ActiveData, error) {
 	if uuid == (base.StoreUUID{}) || id == 0 || segmentSize <= storeformat.SegmentHeaderSize+storeformat.SegmentFooterSize || maxPayloadSize == 0 {
 		return nil, fmt.Errorf("active data configuration: %w", base.ErrInvalidConfig)
 	}
@@ -230,22 +267,62 @@ func OpenActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, seg
 	}
 	active := &ActiveData{
 		file: file, storeUUID: uuid, segmentID: id, segmentSize: segmentSize,
-		maxPayloadSize: maxPayloadSize, end: uint64(info.Size()),
+		maxPayloadSize: maxPayloadSize, end: uint64(info.Size()), hook: hook,
 	}
 	validEnd, _, err := scanDataFrames(file, uint64(info.Size()), segmentSize-storeformat.SegmentFooterSize, maxPayloadSize, base.FrameSeq(header.FirstSeq), false, nil)
 	if err != nil {
 		return fail(err)
 	}
 	if validEnd != uint64(info.Size()) {
+		if err := failpoint.Hit(hook, PointBeforeTailTruncate); err != nil {
+			return fail(err)
+		}
 		if err := file.Truncate(int64(validEnd)); err != nil {
+			return fail(err)
+		}
+		active.end = validEnd
+		if err := failpoint.Hit(hook, PointBeforeTailSync); err != nil {
 			return fail(err)
 		}
 		if err := file.Sync(); err != nil {
 			return fail(err)
 		}
-		active.end = validEnd
+	} else if syncOnCleanOpen {
+		// A previous Open may have completed truncate but failed its fsync. With
+		// no durable repair marker, every later Open must resync the clean prefix
+		// before accepting it as the Active append boundary.
+		if err := file.Sync(); err != nil {
+			return fail(err)
+		}
 	}
 	return active, nil
+}
+
+// EnsureCreationDurable re-establishes file and directory durability for an
+// already-valid, unpublished empty Active created by interrupted rotation.
+func (s *ActiveData) EnsureCreationDurable() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return base.ErrClosed
+	}
+	if s.end != storeformat.SegmentHeaderSize {
+		return fmt.Errorf("unpublished active is not empty: %w", base.ErrCorrupt)
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeCreateFileSync); err != nil {
+		return err
+	}
+	if err := s.file.Sync(); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(s.file.Name()))
+	if err != nil {
+		return err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeCreateDirSync); err != nil {
+		return errors.Join(err, dir.Close())
+	}
+	return errors.Join(dir.Sync(), dir.Close())
 }
 
 func (s *ActiveData) Append(frame storeformat.Frame) (base.VAddr, uint64, error) {

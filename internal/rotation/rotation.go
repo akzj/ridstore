@@ -41,6 +41,8 @@ const (
 	PointBeforeJournalRemove        failpoint.Point = "rotation.before-journal-remove"
 	PointBeforeJournalRemoveTemp    failpoint.Point = "rotation.before-journal-remove-temp"
 	PointBeforeJournalRemoveDirSync failpoint.Point = "rotation.before-journal-remove-dir-sync"
+	PointBeforeNewActiveRemove      failpoint.Point = "rotation.before-new-active-remove"
+	PointBeforeNewActiveRemoveSync  failpoint.Point = "rotation.before-new-active-remove-dir-sync"
 )
 
 func NewManager(root string, catalog *catalog.Manager, registry *segment.Registry, maxPayload uint64, hook failpoint.Hook) (*Manager, error) {
@@ -88,7 +90,7 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	if err := installJournal(m.root, journal, m.hook); err != nil {
 		return nil, err
 	}
-	newActive, err := segment.CreateActiveData(m.root, current.StoreUUID, newID, nextFrameSeq+1, current.HardLimits.SegmentSize, m.maxPayload)
+	newActive, err := segment.CreateActiveDataWithHook(m.root, current.StoreUUID, newID, nextFrameSeq+1, current.HardLimits.SegmentSize, m.maxPayload, m.hook)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +143,10 @@ func (m *Manager) Current() storeformat.Manifest {
 
 // Recover completes an interrupted rotation before normal segment opening.
 func Recover(root string, current storeformat.Manifest, maxPayload uint64) (storeformat.Manifest, error) {
+	return RecoverWithHook(root, current, maxPayload, nil)
+}
+
+func RecoverWithHook(root string, current storeformat.Manifest, maxPayload uint64, hook failpoint.Hook) (storeformat.Manifest, error) {
 	journal, found, err := loadJournal(root)
 	if err != nil {
 		return current, err
@@ -152,7 +158,7 @@ func Recover(root string, current storeformat.Manifest, maxPayload uint64) (stor
 		return storeformat.Manifest{}, fmt.Errorf("rotation StoreUUID mismatch: %w", base.ErrCorrupt)
 	}
 	if current.ActiveDataSegmentID == journal.NewSegmentID && containsSummary(current.SealedDataSegments, journal.OldSegmentID) {
-		if err := removeJournal(root, nil); err != nil {
+		if err := removeJournal(root, hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 		return current, nil
@@ -160,49 +166,28 @@ func Recover(root string, current storeformat.Manifest, maxPayload uint64) (stor
 	if current.Generation < journal.BaseManifestGeneration || current.ActiveDataSegmentID != journal.OldSegmentID {
 		return storeformat.Manifest{}, fmt.Errorf("rotation base manifest mismatch: %w", base.ErrCorrupt)
 	}
-	oldSummary, err := ensureOldSealed(root, current, journal, maxPayload)
+	oldSummary, err := ensureOldSealed(root, current, journal, maxPayload, hook)
 	if err != nil {
 		return storeformat.Manifest{}, err
 	}
 	nextFrameSeq := base.FrameSeq(oldSummary.LastSeq + 1)
-	newPath := filepath.Join(root, "data", segment.ActiveDataFileName(journal.NewSegmentID))
-	if _, err := os.Lstat(newPath); errors.Is(err, os.ErrNotExist) {
-		active, createErr := segment.CreateActiveData(root, current.StoreUUID, journal.NewSegmentID, nextFrameSeq, current.HardLimits.SegmentSize, maxPayload)
-		if createErr != nil {
-			return storeformat.Manifest{}, createErr
-		}
-		if err := active.Close(); err != nil {
-			return storeformat.Manifest{}, err
-		}
-	} else if err != nil {
+	if err := ensureNewActive(root, current, journal.NewSegmentID, nextFrameSeq, maxPayload, hook); err != nil {
 		return storeformat.Manifest{}, err
-	} else {
-		active, openErr := segment.OpenActiveData(root, current.StoreUUID, journal.NewSegmentID, current.HardLimits.SegmentSize, maxPayload)
-		if openErr != nil {
-			return storeformat.Manifest{}, openErr
-		}
-		if active.End() != storeformat.SegmentHeaderSize {
-			_ = active.Close()
-			return storeformat.Manifest{}, fmt.Errorf("unpublished new active is not empty: %w", base.ErrCorrupt)
-		}
-		if err := active.Close(); err != nil {
-			return storeformat.Manifest{}, err
-		}
 	}
 	nextManifest, err := rotatedManifest(current, oldSummary, journal.NewSegmentID, nextFrameSeq)
 	if err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := (manifest.Installer{Dir: root}).Install(nextManifest); err != nil {
+	if err := (manifest.Installer{Dir: root, FailpointHook: hook}).Install(nextManifest); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := removeJournal(root, nil); err != nil {
+	if err := removeJournal(root, hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	return nextManifest, nil
 }
 
-func ensureOldSealed(root string, current storeformat.Manifest, journal storeformat.RotationJournal, maxPayload uint64) (storeformat.FileSummary, error) {
+func ensureOldSealed(root string, current storeformat.Manifest, journal storeformat.RotationJournal, maxPayload uint64, hook failpoint.Hook) (storeformat.FileSummary, error) {
 	sealedPath := filepath.Join(root, "data", segment.SealedDataFileName(journal.OldSegmentID))
 	if _, err := os.Lstat(sealedPath); err == nil {
 		summary, err := segment.LoadSealedDataSummary(root, journal.OldSegmentID)
@@ -219,7 +204,63 @@ func ensureOldSealed(root string, current storeformat.Manifest, journal storefor
 	// ResumeSeal discovers an already-written terminal seal itself. When no
 	// seal exists, OpenActiveData truncates only an incomplete tail and uses the
 	// manifest watermark as the conservative fallback sequence.
-	return segment.ResumeSeal(root, current.StoreUUID, journal.OldSegmentID, current.HardLimits.SegmentSize, maxPayload, current.NextFrameSeq)
+	return segment.ResumeSealWithHook(root, current.StoreUUID, journal.OldSegmentID, current.HardLimits.SegmentSize, maxPayload, current.NextFrameSeq, hook)
+}
+
+func ensureNewActive(root string, current storeformat.Manifest, newID base.DataSegmentID, firstSeq base.FrameSeq, maxPayload uint64, hook failpoint.Hook) error {
+	path := filepath.Join(root, "data", segment.ActiveDataFileName(newID))
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		active, createErr := segment.CreateActiveDataWithHook(root, current.StoreUUID, newID, firstSeq, current.HardLimits.SegmentSize, maxPayload, hook)
+		if createErr != nil {
+			return createErr
+		}
+		return active.Close()
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("unpublished new active is not a regular file: %w", base.ErrCorrupt)
+	}
+	if info.Size() != storeformat.SegmentHeaderSize {
+		if info.Size() > storeformat.SegmentHeaderSize {
+			return fmt.Errorf("unpublished new active is not empty: %w", base.ErrCorrupt)
+		}
+		return recreateNewActive(root, current, newID, firstSeq, maxPayload, hook)
+	}
+	active, openErr := segment.OpenUnpublishedActiveDataWithHook(root, current.StoreUUID, newID, current.HardLimits.SegmentSize, maxPayload, hook)
+	if openErr != nil {
+		if errors.Is(openErr, base.ErrCorrupt) {
+			return recreateNewActive(root, current, newID, firstSeq, maxPayload, hook)
+		}
+		return openErr
+	}
+	if err := active.EnsureCreationDurable(); err != nil {
+		return errors.Join(err, active.Close())
+	}
+	return active.Close()
+}
+
+func recreateNewActive(root string, current storeformat.Manifest, newID base.DataSegmentID, firstSeq base.FrameSeq, maxPayload uint64, hook failpoint.Hook) error {
+	path := filepath.Join(root, "data", segment.ActiveDataFileName(newID))
+	if err := failpoint.Hit(hook, PointBeforeNewActiveRemove); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := failpoint.Hit(hook, PointBeforeNewActiveRemoveSync); err != nil {
+		return err
+	}
+	if err := syncDir(filepath.Join(root, "data")); err != nil {
+		return err
+	}
+	active, err := segment.CreateActiveDataWithHook(root, current.StoreUUID, newID, firstSeq, current.HardLimits.SegmentSize, maxPayload, hook)
+	if err != nil {
+		return err
+	}
+	return active.Close()
 }
 
 func rotatedManifest(current storeformat.Manifest, summary storeformat.FileSummary, newID base.DataSegmentID, nextFrameSeq base.FrameSeq) (storeformat.Manifest, error) {
