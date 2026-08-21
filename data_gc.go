@@ -15,6 +15,7 @@ import (
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/maintenance"
 	"github.com/akzj/ridstore/internal/mapping/api"
+	"github.com/akzj/ridstore/internal/mapping/radix"
 	"github.com/akzj/ridstore/internal/segment"
 )
 
@@ -66,7 +67,7 @@ func (s *Store) beginDataGC() (*dataGCSession, error) {
 	return nil, base.ErrNotFound
 }
 
-func (s *Store) admitDataGC(session *dataGCSession) error {
+func (s *Store) admitDataGCCopy(session *dataGCSession) error {
 	if session == nil {
 		return base.ErrInvalidConfig
 	}
@@ -78,7 +79,7 @@ func (s *Store) admitDataGC(session *dataGCSession) error {
 	if err != nil {
 		return err
 	}
-	required, err := dataGCTemporarySpaceUpper(s.catalog.Snapshot(), session.source, s.config)
+	required, err := dataGCCopySpaceUpper(s.catalog.Snapshot(), session.source, s.config)
 	if err != nil {
 		return err
 	}
@@ -88,26 +89,13 @@ func (s *Store) admitDataGC(session *dataGCSession) error {
 	return nil
 }
 
-func dataGCTemporarySpaceUpper(manifest storeformat.Manifest, source storeformat.FileSummary, cfg Config) (uint64, error) {
+func dataGCCopySpaceUpper(manifest storeformat.Manifest, source storeformat.FileSummary, cfg Config) (uint64, error) {
 	var liveBytes, liveRecords uint64
 	for _, stat := range manifest.SegmentStats {
 		if stat.SegmentID == base.DataSegmentID(source.FileID) {
 			liveBytes, liveRecords = stat.ExactLiveBytes, stat.ExactLiveRecords
 			break
 		}
-	}
-	// One changed ID can rewrite at most one node at each of the eight radix
-	// levels. Dense512 is the largest node encoding. This deliberately
-	// conservative bound keeps admission independent of cache residency and
-	// prefix sharing; actual writes are normally much smaller.
-	maxNodeBytes := uint64(storeformat.MappingNodeHeaderSize + storeformat.MappingNodeSlots*8)
-	mappingPerRecord, err := base.MulUint64(maxNodeBytes, 8)
-	if err != nil {
-		return 0, err
-	}
-	mappingBytes, err := base.MulUint64(liveRecords, mappingPerRecord)
-	if err != nil {
-		return 0, err
 	}
 	descriptorBytes, err := base.MulUint64(liveRecords, storeformat.MutationEntrySize)
 	if err != nil {
@@ -121,13 +109,61 @@ func dataGCTemporarySpaceUpper(manifest storeformat.Manifest, source storeformat
 		return 0, err
 	}
 	required := uint64(cfg.GCMinFreeBytes)
-	for _, value := range []uint64{liveBytes, mappingBytes, descriptorBytes, rotationBytes} {
+	for _, value := range []uint64{liveBytes, descriptorBytes, rotationBytes} {
 		required, err = base.AddUint64(required, value)
 		if err != nil {
 			return 0, err
 		}
 	}
 	return required, nil
+}
+
+func (s *Store) admitDataGCCheckpoint(checkpoint *radix.Checkpoint) error {
+	if checkpoint == nil {
+		return base.ErrInvalidConfig
+	}
+	availableFn := s.availableBytes
+	if availableFn == nil {
+		availableFn = defaultAvailableBytes
+	}
+	available, err := availableFn(s.config.Dir)
+	if err != nil {
+		return err
+	}
+	// The barrier has frozen the exact layers this checkpoint will build. One
+	// entry can rewrite at most one Dense512 node at each of eight radix levels.
+	// Convert the node count to whole Segment bytes so headers, footers and tail
+	// fragmentation are included in the conservative bound.
+	maxNodeBytes := uint64(storeformat.MappingNodeHeaderSize + storeformat.MappingNodeSlots*8)
+	usable := uint64(s.config.SegmentSize) - storeformat.SegmentHeaderSize - storeformat.SegmentFooterSize
+	nodesPerSegment := usable / maxNodeBytes
+	if nodesPerSegment == 0 {
+		return base.ErrInvalidConfig
+	}
+	nodeCount, err := base.MulUint64(checkpoint.EntryCount(), 8)
+	if err != nil {
+		return err
+	}
+	segmentCount := nodeCount / nodesPerSegment
+	if nodeCount%nodesPerSegment != 0 {
+		segmentCount++
+	}
+	required, err := base.MulUint64(segmentCount, uint64(s.config.SegmentSize))
+	if err != nil {
+		return err
+	}
+	required, err = base.AddUint64(required, uint64(s.config.GCMinFreeBytes))
+	if err != nil {
+		return err
+	}
+	required, err = base.AddUint64(required, uint64(s.config.SegmentSize))
+	if err != nil {
+		return err
+	}
+	if available < required {
+		return fmt.Errorf("data GC checkpoint requires %d temporary bytes for %d entries with %d available: %w", required, checkpoint.EntryCount(), available, base.ErrInsufficientSpace)
+	}
+	return nil
 }
 
 func dataGCCandidates(manifest storeformat.Manifest) []storeformat.FileSummary {
@@ -349,7 +385,7 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 		// must finish the journal rather than silently roll the operation back.
 		s.setFault(resultErr)
 	}()
-	if err := s.admitDataGC(session); err != nil {
+	if err := s.admitDataGCCopy(session); err != nil {
 		if errors.Is(err, base.ErrInsufficientSpace) {
 			s.metrics.GCInsufficientSpace()
 		}
@@ -394,7 +430,10 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 		return DataGCResult{}, err
 	}
 	var checkpointManifest storeformat.Manifest
-	if err := s.checkpointLocked(ctx, journal.Generation, &checkpointManifest); err != nil {
+	if err := s.checkpointLocked(ctx, journal.Generation, &checkpointManifest, s.admitDataGCCheckpoint); err != nil {
+		if errors.Is(err, base.ErrInsufficientSpace) {
+			s.metrics.GCInsufficientSpace()
+		}
 		return DataGCResult{}, err
 	}
 	if err := validateDataGCCheckpoint(checkpointManifest, session); err != nil {

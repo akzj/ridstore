@@ -355,7 +355,7 @@ func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
 
 // checkpointLocked requires checkpointMu to be held and an ops read lease.
 // maintenanceGeneration is non-zero only for the checkpoint nested in Data GC.
-func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint64, installedOut *storeformat.Manifest) error {
+func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint64, installedOut *storeformat.Manifest, beforeBuild ...func(*radix.Checkpoint) error) error {
 	var (
 		barrier           appendlog.Barrier
 		checkpoint        *radix.Checkpoint
@@ -403,6 +403,16 @@ func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint
 			s.setFault(err)
 		}
 		return err
+	}
+	if len(beforeBuild) > 1 {
+		s.mapping.AbortCheckpoint()
+		return base.ErrInvalidConfig
+	}
+	if len(beforeBuild) == 1 && beforeBuild[0] != nil {
+		if err := beforeBuild[0](checkpoint); err != nil {
+			s.mapping.AbortCheckpoint()
+			return err
+		}
 	}
 
 	root, err := s.mapping.BuildCheckpoint(checkpoint)

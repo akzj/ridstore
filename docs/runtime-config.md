@@ -115,7 +115,7 @@ Header validation 按 `(SegmentID, offset)` 排序并使用有界窗口；生成
 
 GC 受 `GCBatchBytes/GCBatchMutations`、Delta reservation、前台队列优先级和可用磁盘共同限制。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
 
-Data GC 在安装 Maintenance Journal 前读取目标文件系统的可用空间，并按 exact live bytes、每个 live ID 最坏八层 Dense Mapping COW、Relocation Descriptor、两个 rotation Segment 以及 `GCMinFreeBytes` 计算保守临时空间上界。低于上界返回 `ErrInsufficientSpace`，保留源 Segment 且不留下 Journal。该检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
+Data GC 使用两段磁盘 admission。安装 Maintenance Journal 前按 exact live bytes、Relocation Descriptor、两个 rotation Segment 与 `GCMinFreeBytes` 检查 copy 阶段空间；copy 完成后，GC-required Checkpoint barrier 先冻结其实际 Delta layers，再按冻结 entry 数乘以每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment与 `GCMinFreeBytes` 重新检查。第二段失败时 Relocation 已是可恢复的 durable garbage/Delta，但源 Segment 和旧 checkpoint 仍保留，Journal 安全撤销。这样前台 Commit 可以继续运行，又不会把只按源 live 数得到的估计误称为整个 Checkpoint 上界。任一检查低于上界均返回 `ErrInsufficientSpace`。可用空间检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
 
 ## 7. 可观测性与验收
 

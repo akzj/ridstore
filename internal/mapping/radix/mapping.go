@@ -51,6 +51,17 @@ func (c *Checkpoint) CoveredCommitSeq() base.CommitSeq {
 	return c.covered
 }
 
+func (c *Checkpoint) EntryCount() uint64 {
+	if c == nil {
+		return 0
+	}
+	var count uint64
+	for _, layer := range c.layers {
+		count += uint64(len(layer))
+	}
+	return count
+}
+
 var _ api.Mapping = (*Mapping)(nil)
 
 func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs ...*catalog.Manager) (*Mapping, error) {
