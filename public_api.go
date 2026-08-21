@@ -81,6 +81,20 @@ type MappingSpace struct {
 	UnreachableBytes uint64
 }
 
+type MaintenanceStatus struct {
+	CheckpointPending   bool
+	LastCheckpointError error
+}
+
+func (s *Store) MaintenanceStatus() MaintenanceStatus {
+	if s == nil {
+		return MaintenanceStatus{LastCheckpointError: base.ErrClosed}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return MaintenanceStatus{CheckpointPending: s.checkpointPending, LastCheckpointError: s.checkpointErr}
+}
+
 // MappingSpaceUsage walks the durable Mapping Root and reports exact encoded
 // Node bytes. It is an explicit maintenance operation rather than a cheap
 // Metrics snapshot.
@@ -274,13 +288,18 @@ func (s *Store) Status(ctx context.Context, id BatchID) (BatchStatus, error) {
 	return BatchStatus{}, base.ErrNotFound
 }
 
-func (s *Store) Checkpoint(ctx context.Context) error {
+func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
 	if s == nil {
 		return base.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	defer func() {
+		s.mu.Lock()
+		s.checkpointErr = resultErr
+		s.mu.Unlock()
+	}()
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
 	s.ops.RLock()
@@ -444,10 +463,9 @@ func (s *Store) requestCheckpoint() {
 	s.checkpointPending = true
 	s.mu.Unlock()
 	go func() {
-		err := s.Checkpoint(context.Background())
+		_ = s.Checkpoint(context.Background())
 		s.mu.Lock()
 		s.checkpointPending = false
-		s.checkpointErr = err
 		s.mu.Unlock()
 	}()
 }

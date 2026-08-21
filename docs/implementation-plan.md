@@ -2,7 +2,7 @@
 
 状态：Execution plan v1
 
-当前进度（2026-08-21）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1 已通过 [Phase 1 全局 Review](phase-1-review.md)；Phase 2 已通过 [Phase 2 全局 Review](phase-2-review.md)，正在进入 Phase 3 Persistent Mapping。Checkpoint 与 GC 尚未实现。
+当前进度（2026-08-21）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1、Phase 2、Phase 3 分别通过 [Phase 1 Review](phase-1-review.md)、[Phase 2 Review](phase-2-review.md) 与 [Phase 3 Review](phase-3-review.md)。Persistent Mapping、Checkpoint、Delta admission 与 Mapping GC 已完成，下一阶段是 Phase 4 Data GC。
 
 ## 1. 开发原则
 
