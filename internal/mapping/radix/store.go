@@ -19,6 +19,13 @@ import (
 	"github.com/akzj/ridstore/internal/segment"
 )
 
+var ErrActivePoisoned = errors.New("ridstore: active mapping append state uncertain")
+
+const (
+	PointBeforeAppendWrite failpoint.Point = "mapping.before-append-write"
+	PointBeforeSync        failpoint.Point = "mapping.before-sync"
+)
+
 type nodeStore struct {
 	mu          sync.RWMutex
 	root        string
@@ -31,6 +38,7 @@ type nodeStore struct {
 	sealed      map[base.MapSegmentID]sealedMapFile
 	retired     map[base.MapSegmentID]retiredMapFile
 	closed      bool
+	poisoned    bool
 	readOnly    bool
 	catalog     *catalog.Manager
 	activeFirst base.NodeSeq
@@ -39,7 +47,11 @@ type nodeStore struct {
 	hook        failpoint.Hook
 }
 
-func (s *nodeStore) setHook(hook failpoint.Hook) { s.hook = hook }
+func (s *nodeStore) setHook(hook failpoint.Hook) {
+	s.mu.Lock()
+	s.hook = hook
+	s.mu.Unlock()
+}
 
 type sealedMapFile struct {
 	file    *os.File
@@ -140,6 +152,9 @@ func (s *nodeStore) append(build storeformat.MappingNodeBuild) (base.MapAddr, er
 	if s.readOnly {
 		return 0, base.ErrReadOnly
 	}
+	if s.poisoned {
+		return 0, ErrActivePoisoned
+	}
 	build.NodeSeq = s.nextNodeSeq
 	encoded, err := storeformat.EncodeMappingNode(build)
 	if err != nil {
@@ -159,7 +174,14 @@ func (s *nodeStore) append(build storeformat.MappingNodeBuild) (base.MapAddr, er
 		}
 	}
 	offset := s.activeEnd
-	if _, err := writeFullAt(s.active, encoded, int64(offset)); err != nil {
+	if err := failpoint.Hit(s.hook, PointBeforeAppendWrite); err != nil {
+		s.poisoned = true
+		return 0, err
+	}
+	written, err := writeFullAt(s.active, encoded, int64(offset))
+	if err != nil {
+		s.activeEnd += uint64(written)
+		s.poisoned = true
 		return 0, err
 	}
 	s.activeEnd += uint64(len(encoded))
@@ -178,7 +200,18 @@ func (s *nodeStore) sync() error {
 	if s.readOnly {
 		return base.ErrReadOnly
 	}
-	return s.active.Sync()
+	if s.poisoned {
+		return ErrActivePoisoned
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeSync); err != nil {
+		s.poisoned = true
+		return err
+	}
+	if err := s.active.Sync(); err != nil {
+		s.poisoned = true
+		return err
+	}
+	return nil
 }
 
 func (s *nodeStore) read(addr base.MapAddr) (storeformat.MappingNode, int, error) {
