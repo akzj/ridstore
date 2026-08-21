@@ -211,7 +211,11 @@ func (s *Store) Status(ctx context.Context, id BatchID) (BatchStatus, error) {
 	if raw >= s.recoveryAbortedStart && raw < s.recoveryAbortedEnd {
 		return BatchStatus{BatchID: id, State: BatchStateAborted}, nil
 	}
-	if raw < s.manifest.IssuedBatchIDHighExclusiveAtCut || raw < s.issuedBatchHigh {
+	issuedAtCut := s.manifest.IssuedBatchIDHighExclusiveAtCut
+	if s.catalog != nil {
+		issuedAtCut = s.catalog.Snapshot().IssuedBatchIDHighExclusiveAtCut
+	}
+	if raw < issuedAtCut || raw < s.issuedBatchHigh {
 		return BatchStatus{}, base.ErrStatusExpired
 	}
 	return BatchStatus{}, base.ErrNotFound

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/catalog"
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/manifest"
@@ -20,7 +21,7 @@ const journalName = "ROTATION"
 type Manager struct {
 	mu         sync.Mutex
 	root       string
-	manifest   storeformat.Manifest
+	catalog    *catalog.Manager
 	registry   *segment.Registry
 	maxPayload uint64
 	hook       failpoint.Hook
@@ -33,11 +34,11 @@ const (
 	PointManifestInstalled failpoint.Point = "rotation.manifest-installed"
 )
 
-func NewManager(root string, current storeformat.Manifest, registry *segment.Registry, maxPayload uint64, hook failpoint.Hook) (*Manager, error) {
-	if root == "" || current.Generation == 0 || registry == nil || maxPayload == 0 {
+func NewManager(root string, catalog *catalog.Manager, registry *segment.Registry, maxPayload uint64, hook failpoint.Hook) (*Manager, error) {
+	if root == "" || catalog == nil || registry == nil || maxPayload == 0 {
 		return nil, base.ErrInvalidConfig
 	}
-	return &Manager{root: root, manifest: current, registry: registry, maxPayload: maxPayload, hook: hook}, nil
+	return &Manager{root: root, catalog: catalog, registry: registry, maxPayload: maxPayload, hook: hook}, nil
 }
 
 // Rotate runs under the append sequencer. No frame can be allocated between
@@ -45,16 +46,17 @@ func NewManager(root string, current storeformat.Manifest, registry *segment.Reg
 func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq) (*segment.ActiveData, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if active == nil || active.SegmentID() != m.manifest.ActiveDataSegmentID || nextFrameSeq == 0 {
+	current := m.catalog.Snapshot()
+	if active == nil || active.SegmentID() != current.ActiveDataSegmentID || nextFrameSeq == 0 {
 		return nil, base.ErrInvalidConfig
 	}
-	oldID, newID := active.SegmentID(), m.manifest.NextDataSegmentID
+	oldID, newID := active.SegmentID(), current.NextDataSegmentID
 	if newID <= oldID || newID == base.DataSegmentID(^uint32(0)) {
 		return nil, base.ErrGenerationExhausted
 	}
 	journal := storeformat.RotationJournal{
-		StoreUUID: m.manifest.StoreUUID, OldSegmentID: oldID, NewSegmentID: newID,
-		BaseManifestGeneration: m.manifest.Generation, Phase: 1,
+		StoreUUID: current.StoreUUID, OldSegmentID: oldID, NewSegmentID: newID,
+		BaseManifestGeneration: current.Generation, Phase: 1,
 	}
 	if err := installJournal(m.root, journal); err != nil {
 		return nil, err
@@ -77,7 +79,7 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	if err := installJournal(m.root, journal); err != nil {
 		return nil, err
 	}
-	newActive, err := segment.CreateActiveData(m.root, m.manifest.StoreUUID, newID, nextFrameSeq+1, m.manifest.HardLimits.SegmentSize, m.maxPayload)
+	newActive, err := segment.CreateActiveData(m.root, current.StoreUUID, newID, nextFrameSeq+1, current.HardLimits.SegmentSize, m.maxPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -88,15 +90,22 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	if err := installJournal(m.root, journal); err != nil {
 		return nil, errors.Join(err, newActive.Close())
 	}
-	sealed, err := segment.OpenSealedData(m.root, m.manifest.StoreUUID, summary, m.manifest.HardLimits.SegmentSize, m.maxPayload)
+	sealed, err := segment.OpenSealedData(m.root, current.StoreUUID, summary, current.HardLimits.SegmentSize, m.maxPayload)
 	if err != nil {
 		return nil, errors.Join(err, newActive.Close())
 	}
-	nextManifest, err := rotatedManifest(m.manifest, summary, newID, nextFrameSeq+1)
+	nextManifest, err := m.catalog.Install(0, func(next *storeformat.Manifest) error {
+		if next.ActiveDataSegmentID != oldID || next.NextDataSegmentID != newID {
+			return fmt.Errorf("data file set changed during rotation: %w", base.ErrConflict)
+		}
+		next.ActiveDataSegmentID = newID
+		next.NextDataSegmentID = newID + 1
+		next.NextFrameSeq = nextFrameSeq + 1
+		next.SealedDataSegments = append(next.SealedDataSegments, summary)
+		sort.Slice(next.SealedDataSegments, func(i, j int) bool { return next.SealedDataSegments[i].FileID < next.SealedDataSegments[j].FileID })
+		return nil
+	})
 	if err != nil {
-		return nil, errors.Join(err, sealed.Close(), newActive.Close())
-	}
-	if err := (manifest.Installer{Dir: m.root}).Install(nextManifest); err != nil {
 		return nil, errors.Join(err, sealed.Close(), newActive.Close())
 	}
 	if err := failpoint.Hit(m.hook, PointManifestInstalled); err != nil {
@@ -110,7 +119,6 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	if err := m.registry.ReplaceActive(oldID, sealed, newActive); err != nil {
 		return nil, errors.Join(err, sealed.Close(), newActive.Close())
 	}
-	m.manifest = nextManifest
 	if err := removeJournal(m.root); err != nil {
 		return nil, err
 	}
@@ -118,9 +126,7 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 }
 
 func (m *Manager) Current() storeformat.Manifest {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return cloneManifest(m.manifest)
+	return m.catalog.Snapshot()
 }
 
 // Recover completes an interrupted rotation before normal segment opening.
@@ -132,16 +138,13 @@ func Recover(root string, current storeformat.Manifest, maxPayload uint64) (stor
 	if journal.StoreUUID != current.StoreUUID {
 		return storeformat.Manifest{}, fmt.Errorf("rotation StoreUUID mismatch: %w", base.ErrCorrupt)
 	}
-	if current.Generation > journal.BaseManifestGeneration {
-		if current.ActiveDataSegmentID != journal.NewSegmentID || !containsSummary(current.SealedDataSegments, journal.OldSegmentID) {
-			return storeformat.Manifest{}, fmt.Errorf("rotation manifest result mismatch: %w", base.ErrCorrupt)
-		}
+	if current.ActiveDataSegmentID == journal.NewSegmentID && containsSummary(current.SealedDataSegments, journal.OldSegmentID) {
 		if err := removeJournal(root); err != nil {
 			return storeformat.Manifest{}, err
 		}
 		return current, nil
 	}
-	if current.Generation != journal.BaseManifestGeneration || current.ActiveDataSegmentID != journal.OldSegmentID {
+	if current.Generation < journal.BaseManifestGeneration || current.ActiveDataSegmentID != journal.OldSegmentID {
 		return storeformat.Manifest{}, fmt.Errorf("rotation base manifest mismatch: %w", base.ErrCorrupt)
 	}
 	oldSummary, err := ensureOldSealed(root, current, journal, maxPayload)

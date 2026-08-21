@@ -8,6 +8,7 @@ import (
 	"github.com/akzj/ridstore/internal/allocator"
 	"github.com/akzj/ridstore/internal/appendlog"
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/catalog"
 	"github.com/akzj/ridstore/internal/commit"
 	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
@@ -24,6 +25,10 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		return nil, err
 	}
 	manifest, err = rotation.Recover(cfg.Dir, manifest, maxFramePayload)
+	if err != nil {
+		return nil, err
+	}
+	catalogManager, err := catalog.New(cfg.Dir, manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +62,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return fail(err)
 	}
-	rotator, err := rotation.NewManager(cfg.Dir, manifest, segments, maxFramePayload, hook)
+	rotator, err := rotation.NewManager(cfg.Dir, catalogManager, segments, maxFramePayload, hook)
 	if err != nil {
 		return fail(err)
 	}
@@ -89,7 +94,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		return failWithLog(err)
 	}
 	store := &Store{
-		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, metrics: runtimeMetrics, log: log,
+		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, catalog: catalogManager, metrics: runtimeMetrics, log: log,
 		mapping: recovered.Mapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
 		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]BatchStatus), slotNotify: make(chan struct{}, 1),
 		issuedBatchHigh:      recovered.ReservedBatchIDHighExclusive,
