@@ -110,3 +110,80 @@ func TestRecoverRejectsUnsupportedFileTopology(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestRecoverRelocationApplyAndCASSkip(t *testing.T) {
+	active, log, manifest := recoveryFixture(t)
+	defer active.Close()
+	oldAddr, _, oldPhysical, err := log.AppendPut(context.Background(), 7, 1, []byte("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.AppendCommit(batch.Prepared{BatchID: 7, LogicalPayloadBytes: 3, Mutations: []batch.Mutation{{
+		RecordID: 1, Operation: batch.Put, Addr: oldAddr, ValueBytes: 3, PhysicalSize: oldPhysical,
+	}}}, 1); err != nil {
+		t.Fatal(err)
+	}
+	copy1, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.AppendRelocation(appendlog.RelocationPrepared{BatchID: 8, LogicalPayloadBytes: 3, Entries: []appendlog.RelocationEntry{{
+		RecordID: 1, ExpectedOldAddr: oldAddr, NewAddr: copy1,
+	}}}, 2); err != nil {
+		t.Fatal(err)
+	}
+	newerAddr, _, newerPhysical, err := log.AppendPut(context.Background(), 9, 1, []byte("newer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.AppendCommit(batch.Prepared{BatchID: 9, LogicalPayloadBytes: 5, Mutations: []batch.Mutation{{
+		RecordID: 1, Operation: batch.Put, Addr: newerAddr, ValueBytes: 5, PhysicalSize: newerPhysical,
+	}}}, 3); err != nil {
+		t.Fatal(err)
+	}
+	copy2, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.AppendRelocation(appendlog.RelocationPrepared{BatchID: 10, LogicalPayloadBytes: 3, Entries: []appendlog.RelocationEntry{{
+		RecordID: 1, ExpectedOldAddr: copy1, NewAddr: copy2,
+	}}}, 4); err != nil {
+		t.Fatal(err)
+	}
+	result, err := RecoverPhase1(manifest, active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := result.Mapping.Lookup(1); err != nil || !ok || got != newerAddr {
+		t.Fatalf("mapping=(%x,%v,%v) want=%x", got, ok, err, newerAddr)
+	}
+	if result.NextCommitSeq != 5 || result.Statuses[8].CommitSeq != 2 || result.Statuses[10].CommitSeq != 4 {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestRecoverRejectsRelocationValueMismatch(t *testing.T) {
+	active, log, manifest := recoveryFixture(t)
+	defer active.Close()
+	oldAddr, _, physical, err := log.AppendPut(context.Background(), 7, 1, []byte("same-size-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.AppendCommit(batch.Prepared{BatchID: 7, LogicalPayloadBytes: 11, Mutations: []batch.Mutation{{
+		RecordID: 1, Operation: batch.Put, Addr: oldAddr, ValueBytes: 11, PhysicalSize: physical,
+	}}}, 1); err != nil {
+		t.Fatal(err)
+	}
+	badCopy, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("same-size-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.AppendRelocation(appendlog.RelocationPrepared{BatchID: 8, LogicalPayloadBytes: 11, Entries: []appendlog.RelocationEntry{{
+		RecordID: 1, ExpectedOldAddr: oldAddr, NewAddr: badCopy,
+	}}}, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecoverPhase1(manifest, active); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("error=%v", err)
+	}
+}

@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"math"
 
@@ -34,9 +35,12 @@ type Result struct {
 }
 
 type putRecord struct {
-	RecordID base.ID
-	BatchID  base.BatchID
-	Bytes    uint64
+	RecordID     base.ID
+	BatchID      base.BatchID
+	FrameSeq     base.FrameSeq
+	Bytes        uint64
+	PhysicalSize uint64
+	ValueDigest  [sha256.Size]byte
 }
 
 func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (Result, error) {
@@ -89,13 +93,20 @@ func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, ac
 			result.NextFrameSeq = frame.FrameSeq + 1
 		}
 		if frame.Type == storeformat.FrameTypePutRecord {
-			puts[addr] = putRecord{RecordID: frame.RecordID, BatchID: frame.BatchID, Bytes: uint64(len(frame.Payload))}
+			physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
+			if err != nil {
+				return fmt.Errorf("put physical size: %w", base.ErrCorrupt)
+			}
+			puts[addr] = putRecord{
+				RecordID: frame.RecordID, BatchID: frame.BatchID, FrameSeq: frame.FrameSeq,
+				Bytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize, ValueDigest: sha256.Sum256(frame.Payload),
+			}
 		}
 		if addr.SegmentID() < replaySegment || (addr.SegmentID() == replaySegment && uint64(addr.Offset()) < replayOffset) {
 			return nil
 		}
 		switch frame.Type {
-		case storeformat.FrameTypeCommitPart:
+		case storeformat.FrameTypeCommitPart, storeformat.FrameTypeRelocationPart:
 			parts[frame.BatchID] = append(parts[frame.BatchID], frame)
 		case storeformat.FrameTypeCommitSeal:
 			if _, exists := result.Statuses[frame.BatchID]; exists {
@@ -115,7 +126,7 @@ func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, ac
 				changes[i].RecordID = entry.RecordID
 				if entry.Operation == storeformat.MutationPut {
 					record, ok := puts[entry.NewVAddr]
-					if !ok || record.RecordID != entry.RecordID || record.BatchID != frame.BatchID {
+					if !ok || record.RecordID != entry.RecordID || record.BatchID != frame.BatchID || record.FrameSeq >= frame.FrameSeq {
 						return fmt.Errorf("commit points to invalid PutRecord: %w", base.ErrCorrupt)
 					}
 					changes[i].NewAddr = entry.NewVAddr
@@ -131,6 +142,47 @@ func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, ac
 			applied, err := mapping.Apply(decoded.Seal.CommitSeq, api.ApplyUserCommit, changes)
 			if err != nil || applied.Applied != uint32(len(changes)) || applied.Skipped != 0 {
 				return fmt.Errorf("replay mapping apply: %w", base.ErrCorrupt)
+			}
+			lastCommit = decoded.Seal.CommitSeq
+			if decoded.Seal.CommitSeq >= result.NextCommitSeq {
+				result.NextCommitSeq = decoded.Seal.CommitSeq + 1
+			}
+			result.Statuses[frame.BatchID] = BatchStatus{State: BatchCommitted, CommitSeq: decoded.Seal.CommitSeq}
+		case storeformat.FrameTypeRelocationSeal:
+			if _, exists := result.Statuses[frame.BatchID]; exists {
+				return fmt.Errorf("duplicate terminal batch state: %w", base.ErrCorrupt)
+			}
+			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorRelocation, parts[frame.BatchID], frame, uint32(manifest.HardLimits.MaxBatchMutations))
+			if err != nil {
+				return err
+			}
+			delete(parts, frame.BatchID)
+			if decoded.Seal.CommitSeq <= lastCommit || decoded.Seal.CommitSeq == base.CommitSeq(math.MaxUint64) {
+				return fmt.Errorf("relocation sequence regression or exhaustion: %w", base.ErrCorrupt)
+			}
+			changes := make([]api.Change, len(decoded.Entries))
+			var logicalBytes uint64
+			for i, entry := range decoded.Entries {
+				oldRecord, oldOK := puts[entry.ExpectedOldAddr]
+				newRecord, newOK := puts[entry.NewVAddr]
+				if !oldOK || !newOK || oldRecord.RecordID != entry.RecordID || newRecord.RecordID != entry.RecordID ||
+					oldRecord.BatchID == 0 || oldRecord.BatchID != newRecord.BatchID || frame.BatchID == oldRecord.BatchID ||
+					oldRecord.Bytes != newRecord.Bytes || oldRecord.PhysicalSize != newRecord.PhysicalSize || oldRecord.ValueDigest != newRecord.ValueDigest ||
+					oldRecord.FrameSeq >= frame.FrameSeq || newRecord.FrameSeq >= frame.FrameSeq {
+					return fmt.Errorf("relocation points to mismatched PutRecord: %w", base.ErrCorrupt)
+				}
+				logicalBytes, err = base.AddUint64(logicalBytes, newRecord.Bytes)
+				if err != nil {
+					return fmt.Errorf("relocation logical bytes: %w", base.ErrCorrupt)
+				}
+				changes[i] = api.Change{RecordID: entry.RecordID, ExpectedOldAddr: entry.ExpectedOldAddr, NewAddr: entry.NewVAddr}
+			}
+			if logicalBytes != decoded.Seal.LogicalPayloadBytes {
+				return fmt.Errorf("relocation logical payload bytes mismatch: %w", base.ErrCorrupt)
+			}
+			applied, err := mapping.Apply(decoded.Seal.CommitSeq, api.ApplyRelocation, changes)
+			if err != nil || applied.Applied+applied.Skipped != uint32(len(changes)) {
+				return fmt.Errorf("replay relocation apply: %w", base.ErrCorrupt)
 			}
 			lastCommit = decoded.Seal.CommitSeq
 			if decoded.Seal.CommitSeq >= result.NextCommitSeq {
@@ -155,8 +207,6 @@ func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, ac
 			if err != nil {
 				return err
 			}
-		case storeformat.FrameTypeRelocationPart, storeformat.FrameTypeRelocationSeal:
-			return fmt.Errorf("relocation during phase 1 recovery: %w", base.ErrUnsupported)
 		case storeformat.FrameTypeSegmentSeal:
 			if len(parts) != 0 {
 				return fmt.Errorf("incomplete descriptor at sealed boundary: %w", base.ErrCorrupt)
