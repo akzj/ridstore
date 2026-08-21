@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/batch"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/mapping/api"
 	"github.com/akzj/ridstore/internal/mapping/memory"
 	"github.com/akzj/ridstore/internal/segment"
 )
@@ -37,6 +38,24 @@ func (r activeReader) ReadPutHeader(addr base.VAddr) (RecordHeader, error) {
 		return RecordHeader{}, err
 	}
 	return RecordHeader{RecordID: frame.RecordID, OriginBatch: frame.BatchID, ValueBytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize}, nil
+}
+
+func (r activeReader) ReadPutRecord(addr base.VAddr) (PutRecord, error) {
+	frame, err := r.active.ReadFrame(addr)
+	if err != nil {
+		return PutRecord{}, err
+	}
+	if frame.Type != storeformat.FrameTypePutRecord {
+		return PutRecord{}, base.ErrCorrupt
+	}
+	physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
+	if err != nil {
+		return PutRecord{}, err
+	}
+	return PutRecord{Header: RecordHeader{
+		RecordID: frame.RecordID, OriginBatch: frame.BatchID,
+		ValueBytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize,
+	}, Value: frame.Payload}, nil
 }
 
 func coordinatorFixture(t *testing.T) (*Coordinator, *appendlog.Log, *segment.ActiveData, *memory.Mapping) {
@@ -146,6 +165,89 @@ func TestDeleteAndEmptyCommit(t *testing.T) {
 	empty := makeBatch(t, 3, log)
 	if result, err := coordinator.Commit(context.Background(), empty); err != nil || result.CommitSeq != 3 {
 		t.Fatalf("empty result=%+v error=%v", result, err)
+	}
+}
+
+func TestRelocationSharesCommitOrderAndPreservesRevision(t *testing.T) {
+	coordinator, log, active, mapping := coordinatorFixture(t)
+	defer active.Close()
+	batch := makeBatch(t, 7, log)
+	if err := batch.Put(context.Background(), 1, []byte("stable-value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	oldAddr, ok, err := mapping.Lookup(1)
+	if err != nil || !ok {
+		t.Fatalf("old mapping=(%x,%v,%v)", oldAddr, ok, err)
+	}
+	newAddr, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("stable-value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.Relocate(context.Background(), 8, []api.Change{{RecordID: 1, ExpectedOldAddr: oldAddr, NewAddr: newAddr}})
+	if err != nil || result.CommitSeq != 2 || result.Applied != 1 || result.Skipped != 0 {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if got, _, _ := mapping.Lookup(1); got != newAddr {
+		t.Fatalf("mapping=%x want=%x", got, newAddr)
+	}
+	record, err := activeReader{active}.ReadPutRecord(newAddr)
+	if err != nil || record.Header.OriginBatch != 7 {
+		t.Fatalf("record=%+v error=%v", record.Header, err)
+	}
+	var relocationParts []storeformat.Frame
+	var relocationSeal storeformat.Frame
+	if err := active.Scan(func(_ base.VAddr, frame storeformat.Frame) error {
+		switch frame.Type {
+		case storeformat.FrameTypeRelocationPart:
+			relocationParts = append(relocationParts, frame)
+		case storeformat.FrameTypeRelocationSeal:
+			relocationSeal = frame
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorRelocation, relocationParts, relocationSeal, 10)
+	if err != nil || decoded.Seal.CommitSeq != 2 || decoded.BatchID != 8 || decoded.Seal.LogicalPayloadBytes != uint64(len("stable-value")) {
+		t.Fatalf("descriptor=%+v error=%v", decoded, err)
+	}
+	if coordinator.NextCommitSeq() != 3 {
+		t.Fatalf("next commit=%d", coordinator.NextCommitSeq())
+	}
+}
+
+func TestRelocationCASDoesNotOverwriteLaterUserCommit(t *testing.T) {
+	coordinator, log, active, mapping := coordinatorFixture(t)
+	defer active.Close()
+	first := makeBatch(t, 7, log)
+	if err := first.Put(context.Background(), 1, []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	oldAddr, _, _ := mapping.Lookup(1)
+	copyAddr, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := makeBatch(t, 8, log)
+	if err := later.Put(context.Background(), 1, []byte("later")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), later); err != nil {
+		t.Fatal(err)
+	}
+	laterAddr, _, _ := mapping.Lookup(1)
+	result, err := coordinator.Relocate(context.Background(), 9, []api.Change{{RecordID: 1, ExpectedOldAddr: oldAddr, NewAddr: copyAddr}})
+	if err != nil || result.Applied != 0 || result.Skipped != 1 || result.CommitSeq != 3 {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if got, _, _ := mapping.Lookup(1); got != laterAddr {
+		t.Fatalf("relocation overwrote later commit: got=%x want=%x", got, laterAddr)
 	}
 }
 
