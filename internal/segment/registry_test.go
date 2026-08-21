@@ -146,6 +146,62 @@ func TestRegistryRetireRejectsOpenBatchReference(t *testing.T) {
 	}
 }
 
+func TestRegistryCleaningExcludesLateOpenBatchPin(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	createActiveDataFile(t, root, uuid, 1)
+	oldActive, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, _, err := oldActive.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := oldActive.Seal(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := OpenSealedData(root, uuid, summary, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createActiveDataFileWithFirstSeq(t, root, uuid, 2, 3)
+	active, err := OpenActiveData(root, uuid, 2, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry(active, []*SealedData{sealed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	if err := registry.BeginCleaning(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.PinOpenBatch(1); !errors.Is(err, ErrCleaning) {
+		t.Fatalf("late open ref error=%v", err)
+	}
+	var scanned int
+	if err := registry.ScanCleaning(1, func(got base.VAddr, _ storeformat.Frame) error {
+		if got == addr {
+			scanned++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if scanned != 1 {
+		t.Fatalf("scanned=%d", scanned)
+	}
+	if err := registry.RetireCleaning(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Acquire(1); !errors.Is(err, ErrRetired) {
+		t.Fatalf("retired acquire error=%v", err)
+	}
+}
+
 func createActiveDataFileWithFirstSeq(t *testing.T, root string, uuid base.StoreUUID, id base.DataSegmentID, first base.FrameSeq) {
 	t.Helper()
 	header, err := storeformat.EncodeSegmentHeader(storeformat.SegmentHeader{

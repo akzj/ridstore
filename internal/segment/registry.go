@@ -13,7 +13,10 @@ import (
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
 
-var ErrRetired = errors.New("ridstore: data segment retired")
+var (
+	ErrCleaning = errors.New("ridstore: data segment cleaning")
+	ErrRetired  = errors.New("ridstore: data segment retired")
+)
 
 // SealedData is an immutable, strictly validated Data Segment.
 type SealedData struct {
@@ -113,6 +116,7 @@ type Registry struct {
 	sealed     map[base.DataSegmentID]*SealedData
 	openRefs   map[base.DataSegmentID]uint64
 	readerRefs map[base.DataSegmentID]uint64
+	cleaning   map[base.DataSegmentID]struct{}
 	retired    map[base.DataSegmentID]struct{}
 	notify     chan struct{}
 	closed     bool
@@ -134,7 +138,7 @@ func NewRegistry(active *ActiveData, sealed []*SealedData) (*Registry, error) {
 	r := &Registry{
 		active: active, sealed: make(map[base.DataSegmentID]*SealedData, len(sealed)),
 		openRefs: make(map[base.DataSegmentID]uint64), readerRefs: make(map[base.DataSegmentID]uint64),
-		retired: make(map[base.DataSegmentID]struct{}), notify: make(chan struct{}),
+		cleaning: make(map[base.DataSegmentID]struct{}), retired: make(map[base.DataSegmentID]struct{}), notify: make(chan struct{}),
 	}
 	for _, item := range sealed {
 		if item == nil || item.segmentID == active.SegmentID() {
@@ -159,6 +163,9 @@ func (r *Registry) PinOpenBatch(id base.DataSegmentID) error {
 	}
 	if _, retired := r.retired[id]; retired {
 		return ErrRetired
+	}
+	if _, cleaning := r.cleaning[id]; cleaning {
+		return ErrCleaning
 	}
 	if (r.active == nil || r.active.SegmentID() != id) && r.sealed[id] == nil {
 		return base.ErrInvalidAddress
@@ -277,6 +284,73 @@ func (r *Registry) ReaderRefs(id base.DataSegmentID) uint64 {
 	return r.readerRefs[id]
 }
 
+func (r *Registry) BeginCleaning(id base.DataSegmentID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return base.ErrClosed
+	}
+	if _, retired := r.retired[id]; retired {
+		return ErrRetired
+	}
+	if _, cleaning := r.cleaning[id]; cleaning {
+		return ErrCleaning
+	}
+	if r.sealed[id] == nil {
+		return base.ErrInvalidAddress
+	}
+	if r.openRefs[id] != 0 {
+		return fmt.Errorf("clean segment with open batch refs: %w", base.ErrInvalidConfig)
+	}
+	r.cleaning[id] = struct{}{}
+	r.signalLocked()
+	return nil
+}
+
+func (r *Registry) CancelCleaning(id base.DataSegmentID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, cleaning := r.cleaning[id]; !cleaning {
+		return base.ErrInvalidConfig
+	}
+	delete(r.cleaning, id)
+	r.signalLocked()
+	return nil
+}
+
+func (r *Registry) ScanCleaning(id base.DataSegmentID, visit func(base.VAddr, storeformat.Frame) error) error {
+	if visit == nil {
+		return base.ErrInvalidConfig
+	}
+	r.mu.RLock()
+	_, cleaning := r.cleaning[id]
+	sealed := r.sealed[id]
+	closed := r.closed
+	r.mu.RUnlock()
+	if closed {
+		return base.ErrClosed
+	}
+	if !cleaning || sealed == nil {
+		return base.ErrInvalidConfig
+	}
+	return sealed.Scan(visit)
+}
+
+func (r *Registry) RetireCleaning(id base.DataSegmentID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return base.ErrClosed
+	}
+	if _, cleaning := r.cleaning[id]; !cleaning || r.sealed[id] == nil || r.openRefs[id] != 0 {
+		return base.ErrInvalidConfig
+	}
+	delete(r.cleaning, id)
+	r.retired[id] = struct{}{}
+	r.signalLocked()
+	return nil
+}
+
 // Retire atomically prevents new readers from acquiring a sealed segment.
 // Existing ReadPins remain valid until released.
 func (r *Registry) Retire(id base.DataSegmentID) error {
@@ -290,6 +364,9 @@ func (r *Registry) Retire(id base.DataSegmentID) error {
 			return ErrRetired
 		}
 		return base.ErrInvalidAddress
+	}
+	if _, cleaning := r.cleaning[id]; cleaning {
+		return ErrCleaning
 	}
 	if r.openRefs[id] != 0 {
 		return fmt.Errorf("retire segment with open batch refs: %w", base.ErrInvalidConfig)
