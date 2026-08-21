@@ -14,7 +14,7 @@ uint64 ID -> variable-length bytes
 
 ridstore 只负责 Record，不内置 KV、Page、Blob、Stream、SQL 或业务保留策略。这些能力应当构建在稳定 ID 和原子 Batch 之上。
 
-当前 Phase 0–3 已完成并通过阶段 Review，正在进入 Phase 4 Data GC；项目仍未达到 production-ready：
+当前 Phase 0–4 已完成并通过阶段 Review，正在进入 Phase 5 完整性与运维；项目仍未达到 production-ready：
 
 - [设计文档索引](docs/README.md)
 - [总体设计](docs/design.md)
