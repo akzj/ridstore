@@ -7,8 +7,9 @@ func TestAppendMetricSamplesMapsEveryFieldInStableOrder(t *testing.T) {
 		CommitQueued: 1, CommitGroups: 2, GroupBatches: 3, Committed: 4, Aborted: 5, Conflicts: 6, CommitUnknown: 7,
 		QueueWaitNanos: 8, ValidationNanos: 9, WriteSyncNanos: 10, PublishNanos: 11,
 		DeltaChargedBytes: 12, DeltaReservedBytes: 13, DeltaSoftLimitBytes: 14, DeltaHardLimitBytes: 15,
-		GCStarted: 16, GCCompleted: 17, GCFailed: 18, GCNoCandidate: 19, GCInsufficientSpace: 20,
-		GCCopiedBytes: 21, GCReclaimedBytes: 22, GCRelocated: 23, GCSkipped: 24, GCDurationNanos: 25, GCThrottledNanos: 26,
+		MappingCacheBytes: 16,
+		GCStarted:         17, GCCompleted: 18, GCFailed: 19, GCNoCandidate: 20, GCInsufficientSpace: 21,
+		GCCopiedBytes: 22, GCReclaimedBytes: 23, GCRelocated: 24, GCSkipped: 25, GCDurationNanos: 26, GCThrottledNanos: 27,
 	}
 	buffer := make([]MetricSample, 0, MetricSampleCount)
 	samples := metrics.AppendMetricSamples(buffer)

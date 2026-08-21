@@ -64,6 +64,13 @@ func (c *Checkpoint) EntryCount() uint64 {
 
 var _ api.Mapping = (*Mapping)(nil)
 
+func (m *Mapping) CacheBytes() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.cache.usedBytes()
+}
+
 func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs ...*catalog.Manager) (*Mapping, error) {
 	return OpenWithHook(root, manifest, cacheBytes, nil, catalogs...)
 }
