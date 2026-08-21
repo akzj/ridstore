@@ -63,6 +63,8 @@ Level 0              -> Data VAddr
 
 八层覆盖完整 uint64；最高层只使用最高 1 bit。Node 只在存在有效子项时创建，空 Node 剪枝，因此容量与有效 Mapping 分布相关，不与历史最大 ID 线性绑定。
 
+逻辑上每个 Node 有 512 个 Slot；磁盘上根据 occupancy 使用 SparseBitmap 或 Dense512。SparseBitmap 保存 512-bit occupancy bitmap 和紧密排列的非零 value，Dense512 保存完整 Slot 数组。两种编码不改变路径和 MapAddr 语义。
+
 Persistent Radix 是 Mapping Checkpoint，不在每个用户 Commit 时写 Node。
 
 ## 3. 为什么不直接使用 LSM Mapping
@@ -176,6 +178,8 @@ node prefix  = level == 7 ? 0 : ID >> (9 * (level + 1))
 
 Level 7 的 Slot 2..511 必须为 0。Node Header 的 Prefix 保存到达该 Node 之前已经消费的高位值；加载 child 时必须由 parent prefix、slot 和 child level 重新计算并校验，不能只相信磁盘指针。
 
+读取 SparseBitmap 时先检查目标 bit，再对之前的 bitmap word 执行 popcount 得到 packed value index。读取 Dense512 时直接下标访问。空 Node 不落盘；删除最后一个 Entry 后父 Slot 变为 0。
+
 ## 7. Node Cache
 
 Node Cache 使用字节容量而不是条目数量限制。要求：
@@ -184,9 +188,10 @@ Node Cache 使用字节容量而不是条目数量限制。要求：
 - 其余 Node 使用 CLOCK/SLRU 类淘汰策略，具体算法由基准决定；
 - 正在 Lookup 的 Node 有引用计数，不能被释放；
 - Cache miss 合并同一 MapAddr 的并发加载；
+- SparseBitmap 在 Cache 中保持 bitmap+packed values，不为了查询方便无条件展开成 4096-byte Dense 数组；
 - CRC 失败不负缓存，Store fail closed；
 - Cache 统计 hit/miss/load latency/eviction/pinned bytes；
-- MappingCacheBytes 达到上限时仍可通过淘汰继续工作。
+- Cache 容量同时计算编码数据和 Go 对象/索引开销，MappingCacheBytes 达到上限时仍可通过淘汰继续工作。
 
 第一版不依赖操作系统无限 Page Cache；基准同时报告 Library Cache 和进程 RSS。
 
@@ -281,14 +286,14 @@ Lookup 在安装期间始终通过 `active + frozen + root` 得到正确结果�
 1. merged entries 按 ID 排序；
 2. 同一 Leaf 的修改合并；
 3. 从旧 Leaf 按需读取并应用全部 slot 变化；
-4. Leaf 非空则 append 新 Leaf，空则返回 MapAddr 0；
+4. Leaf 非空则按 occupancy 选择 SparseBitmap/Dense512 并 append，空则返回 MapAddr 0；
 5. 将 child 变化按父 Prefix 分组；
-6. 自底向上每个受影响 Internal Node 只重写一次；
+6. 自底向上每个受影响 Internal Node 只重写一次，并重新选择编码；
 7. 最终得到 NewRoot；
 8. 所有 Node append 后 fsync Mapping Segment；
 9. Manifest 原子安装 Root。
 
-Checkpoint 的写放大按“受影响 Node 数”衡量。必须记录：dirty IDs、dirty leaves、rewritten internal nodes、bytes written。
+Checkpoint 的写放大同时按“受影响 Node 数”和编码后 bytes 衡量。必须记录：dirty IDs、dirty leaves、rewritten internal nodes、Sparse/Dense Node 数、occupancy histogram、bytes written、dense-equivalent bytes 和节省比例。
 
 ## 12. Checkpoint 失败
 
@@ -309,7 +314,7 @@ COW 会产生不可达旧 Node。Mapping GC 独立于 Data GC：
 
 1. pin 当前 Root；
 2. 遍历可达 Node；
-3. 将可达 Node copy 到新 Mapping generation，重写 child MapAddr；
+3. 将可达 Node copy 到新 Mapping generation，重写 child MapAddr，并按当前 occupancy 重新选择 SparseBitmap/Dense512；
 4. fsync 新 Mapping files；
 5. 安装指向新 Root 的 Manifest；
 6. 等待旧 Root/Node Cache 引用释放；
@@ -368,6 +373,7 @@ Checkpoint 速度若追不上 Commit，Delta 会增长。达到软/硬限制：
 - Mapping Cache 严格受预算限制；
 - Delta hard limit 能 backpressure；
 - Delete Checkpoint 后 Leaf/路径可剪枝；
+- 稀疏随机 ID 不写入整页空 Slot，Delete 后 Node 可以 Dense→Sparse 或被剪枝；
 - 并发 Publish/Lookup 无 partial batch；
 - Checkpoint 与并发 Commit 不丢更新；
 - Manifest 任意崩溃点只选择旧 Root 或新 Root；

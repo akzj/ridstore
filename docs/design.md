@@ -293,7 +293,7 @@ Bounded Mapping Page Cache
 - Cache 命中率与内存预算；
 - 增量 Checkpoint 吞吐是否追得上提交速率。
 
-第一版 Node 使用固定 512 个 uint64 Slot；自适应 Leaf 编码只有在稳定态数据证明磁盘空间成为主要瓶颈后再设计，不能改变 Lookup 语义。
+第一版逻辑 fanout 固定为 512，但磁盘 Node 从 Format v1 起同时支持 SparseBitmap 和 Dense512。低 occupancy Node 只写 bitmap 与非零 value，高 occupancy Node 使用完整数组；Checkpoint 可以在删除后自动 Dense→Sparse。这样保持相同 Radix 路径和 Lookup 语义，同时避免随机稀疏 ID 下每个有效项占用整页空 Slot。
 
 ### 6.3 信息下界
 
@@ -675,7 +675,8 @@ Mapping Lookup + Segment Pin + Record Header/Payload Read
 11. ID 通过 durable reserve range 发放，默认每次预留 1,048,576 个；
 12. BatchID 通过独立 durable reserve range 发放，默认每次预留 65,536 个；
 13. 第一版不提供 SyncNone production mode；
-14. 默认 Blind Put 使用 Last-Writer-Wins；可选 ExpectRevision/ExpectAbsent 在 Seal 前提供 Batch 级乐观冲突检测，Revision 复用 PutRecord OriginBatchID，Blind 路径不承担条件读取成本。
+14. 默认 Blind Put 使用 Last-Writer-Wins；可选 ExpectRevision/ExpectAbsent 在 Seal 前提供 Batch 级乐观冲突检测，Revision 复用 PutRecord OriginBatchID，Blind 路径不承担条件读取成本；
+15. Mapping Node 逻辑 fanout 固定 512，Format v1 同时支持 SparseBitmap/Dense512，Builder 按 occupancy 选择编码。
 
 这些决策的精确协议分别由 API、Format、Commit/Recovery、Mapping 和 GC 文档约束。修改任何一项必须进行跨文档 Review。
 

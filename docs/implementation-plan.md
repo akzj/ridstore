@@ -75,7 +75,7 @@ ridstore/
 3. Data/Mapping Segment Header/Footer codec；
 4. Data Frame codec 与 PutRecord OriginBatchID 语义；
 5. Commit/Relocation Descriptor codec；
-6. Mapping Node codec；
+6. SparseBitmap/Dense512 Mapping Node codec、golden vectors 和 decoder fuzz；
 7. Manifest/CURRENT codec 与原子安装；
 8. INITIALIZING/ROTATION/MAINTENANCE Journal codec；
 9. 文件锁与可恢复 Create/Open 初始化；
@@ -130,13 +130,13 @@ ridstore/
 
 1. Mapping interface 模型测试；
 2. Map Segment/MapAddr；
-3. Radix Node codec/path validation；
+3. SparseBitmap/Dense512 Radix Node codec、rank/path validation；
 4. bounded Node Cache；
 5. Persistent Root Lookup；
 6. Delta Overlay；
 7. atomic Mapping State/Publish；
 8. checkpoint overlay cut；
-9. bottom-up COW builder；
+9. bottom-up COW builder 与 occupancy 编码选择；
 10. Mapping Segment rotation journal + files fsync + Manifest Root install；
 11. Recovery from Root + replay；
 12. Delta limits/backpressure；
