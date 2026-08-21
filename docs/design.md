@@ -4,7 +4,7 @@
 
 范围：单机存储内核
 
-当前阶段：详细规格完成，磁盘格式等待 Phase 0 Format Freeze
+当前阶段：Format v1 已冻结，Phase 0–4 已通过 Review，正在进入 Phase 5 完整性与运维
 
 详细文档入口见 [README.md](README.md)。项目与 LSM/RocksDB 的能力边界和性能判定标准见 [positioning-vs-lsm.md](positioning-vs-lsm.md)。这些文档属于项目定位与开发契约，而不是可随实现便利改变的优化建议。
 

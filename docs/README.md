@@ -33,16 +33,20 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 | `verification-plan.md` | Acceptance contract v1 | 测试证据要求 |
 | `implementation-plan.md` | Execution plan v1 | 开发推进顺序 |
 | `format-freeze-review.md` | Frozen 2026-08-21 | Phase 0 全局 Review 与证据边界 |
+| `phase-1-review.md` | Passed 2026-08-21 | 最小 durable Record Store Review |
+| `phase-2-review.md` | Passed 2026-08-21 | 并发与 group commit Review |
+| `phase-3-review.md` | Passed 2026-08-21 | Persistent Mapping Review |
+| `phase-4-review.md` | Passed 2026-08-21 | Data GC Review 与剩余运维边界 |
 
 磁盘格式已在 Phase 0 的 golden vectors、decoder fuzz 和初始化 crash harness 通过后冻结。后续非兼容修改必须提升 major version 并提供离线迁移。
 
 ## 当前完整性结论
 
-Phase 0 格式与 Harness、Phase 1 最小 durable Record Store、Phase 2 并发与 group commit、Phase 3 Persistent Mapping 已完成；Review 见 [phase-1-review.md](phase-1-review.md)、[phase-2-review.md](phase-2-review.md) 与 [phase-3-review.md](phase-3-review.md)。当前进入 **Phase 4 Data GC**；真实 Data Segment 删除仍必须遵守 Relocation、Reader pin、Checkpoint 与 trash 门禁。
+Phase 0 格式与 Harness、Phase 1 最小 durable Record Store、Phase 2 并发与 group commit、Phase 3 Persistent Mapping、Phase 4 Data GC 已完成阶段 Review；Review 见 [phase-1-review.md](phase-1-review.md)、[phase-2-review.md](phase-2-review.md)、[phase-3-review.md](phase-3-review.md) 与 [phase-4-review.md](phase-4-review.md)。当前进入 **Phase 5 完整性与运维**；长期验证尚未完成，不能声明 production-ready。
 
 仍可由实现基准选择而不改变契约的内容包括 Delta shard 数、Node Cache 的 CLOCK/SLRU 具体策略、I/O buffer 大小和后台调度权重。它们不得改变持久化格式、Batch 原子性、内存 hard limit、recovery 结果或 GC 删除门禁。
 
-“格式已冻结”和并发主路径通过都不等于“可以生产”：Persistent Mapping、GC 与长期验证仍由 Phase 3–5 逐步完成。
+“格式已冻结”和 GC 主路径通过都不等于“可以生产”：Verify/Scrub、Backup/Restore、迁移与长期验证仍由 Phase 5 完成。
 
 ## 冲突处理
 
