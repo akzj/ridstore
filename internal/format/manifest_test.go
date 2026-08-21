@@ -3,6 +3,7 @@ package format
 import (
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"reflect"
 	"testing"
 
@@ -87,6 +88,24 @@ func TestContainerRejectsCorruptionAndUnknownRequired(t *testing.T) {
 	bad[len(bad)-1] = 1
 	if _, err := DecodeContainer(bad, ManifestMagic, 1024); !errors.Is(err, base.ErrCorrupt) {
 		t.Fatalf("padding/checksum error=%v", err)
+	}
+}
+
+func TestInspectContainerHeaderReportsUnknownVersion(t *testing.T) {
+	t.Parallel()
+	encoded, err := EncodeContainer(Container{Magic: ManifestMagic, Generation: 7, StoreUUID: testStoreUUID, TLVs: []TLV{{Type: 1, Value: []byte{1}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(encoded[8:10], FormatMajorVersion+1)
+	binary.LittleEndian.PutUint32(encoded[52:56], 0)
+	binary.LittleEndian.PutUint32(encoded[52:56], crc32.Checksum(encoded[:ContainerHeaderSize], castagnoliTable))
+	header, err := InspectContainerHeader(encoded[:ContainerHeaderSize], ManifestMagic, uint64(len(encoded)), 1024)
+	if err != nil || header.MajorVersion != FormatMajorVersion+1 || header.MinorVersion != FormatMinorVersion || header.Generation != 7 || header.StoreUUID != testStoreUUID {
+		t.Fatalf("header=%+v error=%v", header, err)
+	}
+	if _, err := DecodeContainer(encoded, ManifestMagic, 1024); !errors.Is(err, base.ErrUnsupported) {
+		t.Fatalf("decode error=%v", err)
 	}
 }
 

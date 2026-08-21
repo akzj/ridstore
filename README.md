@@ -30,5 +30,6 @@ ridstore 只负责 Record，不内置 KV、Page、Blob、Stream、SQL 或业务�
 - [实施计划](docs/implementation-plan.md)
 - [Backup/Restore](docs/backup-restore.md)
 - [Metrics Export](docs/metrics-export.md)
+- [Format Upgrade/Migration](docs/format-migration.md)
 
 ridstore 类似 RocksDB 的交付形态，是由应用进程直接链接并独占本地数据目录的 storage engine；但它不以替代 RocksDB、LevelDB 或其他通用有序 KV 引擎为目标。独立进程、RPC、复制和分布式系统不属于当前范围。

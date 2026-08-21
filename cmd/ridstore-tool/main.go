@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/akzj/ridstore/internal/backup"
+	"github.com/akzj/ridstore/internal/migration"
 	"github.com/akzj/ridstore/internal/verify"
 )
 
@@ -32,6 +33,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runBackup(ctx, args[1:], stdout, stderr)
 	case "restore":
 		return runRestore(ctx, args[1:], stdout, stderr)
+	case "migrate":
+		return runMigrate(ctx, args[1:], stdout, stderr)
 	default:
 		printUsage(stderr)
 		return 2
@@ -107,6 +110,32 @@ func runRestore(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	return 0
 }
 
+func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] != "plan" {
+		fmt.Fprintln(stderr, "usage: ridstore-tool migrate plan --dir <offline-store-directory>")
+		return 2
+	}
+	flags := flag.NewFlagSet("migrate plan", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dir := flags.String("dir", "", "offline ridstore directory to inspect")
+	if err := flags.Parse(args[1:]); err != nil || *dir == "" || flags.NArg() != 0 {
+		if err == nil {
+			fmt.Fprintln(stderr, "usage: ridstore-tool migrate plan --dir <offline-store-directory>")
+		}
+		return 2
+	}
+	plan, err := migration.Inspect(ctx, *dir)
+	if encodeErr := writeJSON(stdout, plan); encodeErr != nil {
+		fmt.Fprintf(stderr, "encode plan: %v\n", encodeErr)
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "migrate plan: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 func writeJSON(output io.Writer, value any) error {
 	encoder := json.NewEncoder(output)
 	encoder.SetIndent("", "  ")
@@ -118,4 +147,5 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  ridstore-tool verify --dir <store-directory>")
 	fmt.Fprintln(output, "  ridstore-tool backup --source <store-directory> --dest <new-backup-directory>")
 	fmt.Fprintln(output, "  ridstore-tool restore --backup <backup-directory> --dest <new-store-directory> [--preserve-uuid]")
+	fmt.Fprintln(output, "  ridstore-tool migrate plan --dir <offline-store-directory>")
 }
