@@ -784,6 +784,7 @@ func TestConfigValidation(t *testing.T) {
 		{Dir: t.TempDir(), CheckpointMemoryBytes: 32 << 10},
 		{Dir: t.TempDir(), MaxBatchBytes: 1 << 20, GCBatchBytes: 2 << 20},
 		{Dir: t.TempDir(), MaxGroupDelay: -1},
+		{Dir: t.TempDir(), GCMinFreeBytes: -1},
 	}
 	for i, cfg := range cases {
 		if _, _, err := normalizeCreateConfig(cfg); !errors.Is(err, ErrInvalidConfig) {

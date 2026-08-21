@@ -25,6 +25,7 @@ var (
 	ErrStatusExpired       = errors.New("ridstore: batch status expired")
 	ErrCorrupt             = errors.New("ridstore: corruption detected")
 	ErrUnsupported         = errors.New("ridstore: unsupported format")
+	ErrInsufficientSpace   = errors.New("ridstore: insufficient free space")
 	ErrOverflow            = errors.New("ridstore: integer overflow")
 	ErrInvalidAddress      = errors.New("ridstore: invalid physical address")
 )

@@ -50,6 +50,10 @@ type Metrics struct {
 	WriteSyncNanos, PublishNanos                 uint64
 	DeltaChargedBytes, DeltaReservedBytes        uint64
 	DeltaSoftLimitBytes, DeltaHardLimitBytes     uint64
+	GCStarted, GCCompleted, GCFailed             uint64
+	GCNoCandidate, GCInsufficientSpace           uint64
+	GCCopiedBytes, GCReclaimedBytes              uint64
+	GCRelocated, GCSkipped, GCDurationNanos      uint64
 }
 
 const (
@@ -69,6 +73,10 @@ func (s *Store) Metrics() Metrics {
 		QueueWaitNanos: snapshot.QueueWaitNanos, ValidationNanos: snapshot.ValidationNanos,
 		WriteSyncNanos: snapshot.WriteSyncNanos, PublishNanos: snapshot.PublishNanos,
 		DeltaSoftLimitBytes: uint64(s.config.DeltaSoftLimitBytes), DeltaHardLimitBytes: uint64(s.config.DeltaHardLimitBytes),
+		GCStarted: snapshot.GCStarted, GCCompleted: snapshot.GCCompleted, GCFailed: snapshot.GCFailed,
+		GCNoCandidate: snapshot.GCNoCandidate, GCInsufficientSpace: snapshot.GCInsufficientSpace,
+		GCCopiedBytes: snapshot.GCCopiedBytes, GCReclaimedBytes: snapshot.GCReclaimedBytes,
+		GCRelocated: snapshot.GCRelocated, GCSkipped: snapshot.GCSkipped, GCDurationNanos: snapshot.GCDurationNanos,
 	}
 	if s.mapping != nil {
 		result.DeltaChargedBytes, result.DeltaReservedBytes = s.mapping.DeltaBytes()

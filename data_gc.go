@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/failpoint"
@@ -63,6 +64,70 @@ func (s *Store) beginDataGC() (*dataGCSession, error) {
 		return &dataGCSession{store: s, source: candidate, cleaning: true}, nil
 	}
 	return nil, base.ErrNotFound
+}
+
+func (s *Store) admitDataGC(session *dataGCSession) error {
+	if session == nil {
+		return base.ErrInvalidConfig
+	}
+	availableFn := s.availableBytes
+	if availableFn == nil {
+		availableFn = defaultAvailableBytes
+	}
+	available, err := availableFn(s.config.Dir)
+	if err != nil {
+		return err
+	}
+	required, err := dataGCTemporarySpaceUpper(s.catalog.Snapshot(), session.source, s.config)
+	if err != nil {
+		return err
+	}
+	if available < required {
+		return fmt.Errorf("data GC requires %d temporary bytes with %d available: %w", required, available, base.ErrInsufficientSpace)
+	}
+	return nil
+}
+
+func dataGCTemporarySpaceUpper(manifest storeformat.Manifest, source storeformat.FileSummary, cfg Config) (uint64, error) {
+	var liveBytes, liveRecords uint64
+	for _, stat := range manifest.SegmentStats {
+		if stat.SegmentID == base.DataSegmentID(source.FileID) {
+			liveBytes, liveRecords = stat.ExactLiveBytes, stat.ExactLiveRecords
+			break
+		}
+	}
+	// One changed ID can rewrite at most one node at each of the eight radix
+	// levels. Dense512 is the largest node encoding. This deliberately
+	// conservative bound keeps admission independent of cache residency and
+	// prefix sharing; actual writes are normally much smaller.
+	maxNodeBytes := uint64(storeformat.MappingNodeHeaderSize + storeformat.MappingNodeSlots*8)
+	mappingPerRecord, err := base.MulUint64(maxNodeBytes, 8)
+	if err != nil {
+		return 0, err
+	}
+	mappingBytes, err := base.MulUint64(liveRecords, mappingPerRecord)
+	if err != nil {
+		return 0, err
+	}
+	descriptorBytes, err := base.MulUint64(liveRecords, storeformat.MutationEntrySize)
+	if err != nil {
+		return 0, err
+	}
+	// Reserve two complete Segments for append/Mapping rotation boundaries and
+	// Manifest/journal progress. Free-space observation is not a reservation,
+	// so every write/fsync must still propagate ENOSPC.
+	rotationBytes, err := base.MulUint64(uint64(cfg.SegmentSize), 2)
+	if err != nil {
+		return 0, err
+	}
+	required := uint64(cfg.GCMinFreeBytes)
+	for _, value := range []uint64{liveBytes, mappingBytes, descriptorBytes, rotationBytes} {
+		required, err = base.AddUint64(required, value)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return required, nil
 }
 
 func dataGCCandidates(manifest storeformat.Manifest) []storeformat.FileSummary {
@@ -245,11 +310,28 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	}
 	session, err := s.beginDataGC()
 	if errors.Is(err, base.ErrNotFound) {
+		s.metrics.GCNoCandidate()
 		return DataGCResult{}, nil
 	}
 	if err != nil {
 		return DataGCResult{}, err
 	}
+	s.metrics.GCStarted()
+	startedAt := time.Now()
+	defer func() {
+		s.metrics.AddGCDuration(uint64(time.Since(startedAt)))
+		if resultErr != nil {
+			s.metrics.GCFailed()
+			return
+		}
+		s.metrics.GCCompleted()
+		s.metrics.AddGCCopiedBytes(result.CopiedBytes)
+		if result.SourceBytes >= result.CopiedBytes {
+			s.metrics.AddGCReclaimedBytes(result.SourceBytes - result.CopiedBytes)
+		}
+		s.metrics.AddGCRelocated(result.Relocated)
+		s.metrics.AddGCSkipped(result.Skipped)
+	}()
 	journalInstalled := false
 	checkpointDurable := false
 	defer func() {
@@ -267,6 +349,12 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 		// must finish the journal rather than silently roll the operation back.
 		s.setFault(resultErr)
 	}()
+	if err := s.admitDataGC(session); err != nil {
+		if errors.Is(err, base.ErrInsufficientSpace) {
+			s.metrics.GCInsufficientSpace()
+		}
+		return DataGCResult{}, err
+	}
 	current := s.catalog.Snapshot()
 	if current.MaintenanceGeneration == ^uint64(0) {
 		return DataGCResult{}, base.ErrGenerationExhausted

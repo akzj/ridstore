@@ -25,4 +25,5 @@ var (
 	ErrStatusExpired       = base.ErrStatusExpired
 	ErrCorrupt             = base.ErrCorrupt
 	ErrUnsupported         = base.ErrUnsupported
+	ErrInsufficientSpace   = base.ErrInsufficientSpace
 )
