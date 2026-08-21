@@ -279,6 +279,8 @@ make bench
 make verify
 ```
 
+`test-fuzz-smoke` 对每个 Format decoder fuzz target 分别运行短时 fuzz（默认 `FUZZ_TIME=1s`，CI/nightly 可覆盖）；`test-integration` 执行 Create→Commit→Checkpoint→离线 Verify→Backup→新 UUID Restore→Open 的跨模块生命周期；`bench` 只生成原始 benchmark，不是正确性门禁；`verify` 聚合普通、race、vet、fuzz smoke、process-crash 和 integration，仍不包含长期 fuzz、72h soak、power-loss 或跨引擎性能结论。
+
 最低合并门禁：
 
 - `go test ./... -count=1`；
