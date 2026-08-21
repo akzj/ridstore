@@ -95,6 +95,79 @@ func TestInstallCrashStepsAreRetryable(t *testing.T) {
 	}
 }
 
+func TestCleanupInterruptedInstallRemovesOnlyUnpublishedTemps(t *testing.T) {
+	t.Parallel()
+	stop := errors.New("stop")
+	for _, test := range []struct {
+		step Step
+		temp string
+	}{
+		{StepManifestFileSynced, filepath.Join(ManifestDirName, ManifestFileName(2)+".tmp")},
+		{StepManifestRenamed, filepath.Join(ManifestDirName, ManifestFileName(2))},
+		{StepCurrentFileSynced, ".CURRENT.tmp"},
+	} {
+		test := test
+		t.Run(string(test.step), func(t *testing.T) {
+			dir := newStoreDir(t)
+			if err := (Installer{Dir: dir}).Install(validManifest(t, 1)); err != nil {
+				t.Fatal(err)
+			}
+			installer := Installer{Dir: dir, Hook: func(step Step) error {
+				if step == test.step {
+					return stop
+				}
+				return nil
+			}}
+			if err := installer.Install(validManifest(t, 2)); !errors.Is(err, stop) {
+				t.Fatalf("install error=%v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, test.temp)); err != nil {
+				t.Fatalf("temp missing before cleanup: %v", err)
+			}
+			if err := CleanupInterruptedInstall(dir); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, test.temp)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("temp remains after cleanup: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, ManifestDirName, ManifestFileName(2))); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unpublished final Manifest remains: %v", err)
+			}
+			current, err := LoadCurrent(dir)
+			if err != nil || current.Generation != 1 {
+				t.Fatalf("current=%+v error=%v", current, err)
+			}
+			next := validManifest(t, 2)
+			next.NextFrameSeq = 9
+			if err := (Installer{Dir: dir}).Install(next); err != nil {
+				t.Fatalf("new generation after cleanup: %v", err)
+			}
+			if err := CleanupInterruptedInstall(dir); err != nil {
+				t.Fatal(err)
+			}
+			for generation := uint64(1); generation <= 2; generation++ {
+				if _, err := os.Lstat(filepath.Join(dir, ManifestDirName, ManifestFileName(generation))); err != nil {
+					t.Fatalf("published generation %d removed: %v", generation, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCleanupInterruptedInstallRejectsSymlinkTemp(t *testing.T) {
+	t.Parallel()
+	dir := newStoreDir(t)
+	if err := (Installer{Dir: dir}).Install(validManifest(t, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, CurrentFileName), filepath.Join(dir, ".CURRENT.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupInterruptedInstall(dir); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestInstallRejectsGenerationContentConflict(t *testing.T) {
 	t.Parallel()
 	dir := newStoreDir(t)

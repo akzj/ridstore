@@ -101,6 +101,9 @@ func OpenWithOptions(dir string, opts Options) (storeformat.Manifest, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		return storeformat.Manifest{}, base.ErrNotInitialized
 	}
+	if err == nil {
+		err = manifest.CleanupInterruptedInstall(dir)
+	}
 	return m, err
 }
 

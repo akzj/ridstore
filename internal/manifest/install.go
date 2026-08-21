@@ -149,6 +149,72 @@ func LoadCurrent(dir string) (storeformat.Manifest, error) {
 	return m, nil
 }
 
+// CleanupInterruptedInstall removes unpublished temp names and final Manifest
+// generations newer than a valid CURRENT. Older/final published generations
+// are retained; CURRENT is the sole publication authority.
+func CleanupInterruptedInstall(dir string) error {
+	current, err := LoadCurrent(dir)
+	if err != nil {
+		return err
+	}
+	rootDirty := false
+	currentTemp := filepath.Join(dir, ".CURRENT.tmp")
+	if found, err := removeRegularTemp(currentTemp); err != nil {
+		return err
+	} else {
+		rootDirty = found
+	}
+	manifestDir := filepath.Join(dir, ManifestDirName)
+	entries, err := os.ReadDir(manifestDir)
+	if err != nil {
+		return err
+	}
+	manifestDirty := false
+	for _, entry := range entries {
+		name := entry.Name()
+		candidate := name
+		isTemp := strings.HasSuffix(name, ".tmp")
+		if isTemp {
+			candidate = strings.TrimSuffix(name, ".tmp")
+		}
+		generation, err := ParseManifestFileName(candidate)
+		if err != nil || !isTemp && generation <= current.Generation {
+			continue
+		}
+		found, err := removeRegularTemp(filepath.Join(manifestDir, name))
+		if err != nil {
+			return err
+		}
+		manifestDirty = manifestDirty || found
+	}
+	if manifestDirty {
+		if err := syncDirectory(manifestDir); err != nil {
+			return err
+		}
+	}
+	if rootDirty {
+		return syncDirectory(dir)
+	}
+	return nil
+}
+
+func removeRegularTemp(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("install temp is not a regular file: %s: %w", path, base.ErrCorrupt)
+	}
+	if err := os.Remove(path); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func ReadCurrentName(dir string) (string, error) {
 	data, err := readRegularFile(filepath.Join(dir, CurrentFileName), 128)
 	if err != nil {
