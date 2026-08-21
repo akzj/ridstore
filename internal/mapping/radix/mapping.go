@@ -18,7 +18,8 @@ type deltaEntry struct {
 }
 
 type Mapping struct {
-	mu sync.RWMutex
+	mu     sync.RWMutex
+	budget *deltaBudget
 
 	store       *nodeStore
 	cache       *nodeCache
@@ -61,7 +62,7 @@ func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs
 	mapping := &Mapping{
 		store: store, cache: newNodeCache(cacheBytes), root: manifest.MappingRoot,
 		rootCovered: manifest.CoveredCommitSeq, runtimeSeq: manifest.CoveredCommitSeq,
-		active: make(map[base.ID]deltaEntry),
+		active: make(map[base.ID]deltaEntry), budget: newDeltaBudget(),
 	}
 	if mapping.root != 0 {
 		if _, err := mapping.loadNode(mapping.root, 7, 0, mapping.rootCovered); err != nil {
@@ -93,22 +94,51 @@ func (m *Mapping) Lookup(id base.ID) (base.VAddr, bool, error) {
 }
 
 func (m *Mapping) Apply(seq base.CommitSeq, kind api.ApplyKind, changes []api.Change) (api.ApplyResult, error) {
+	return m.apply(nil, seq, kind, changes)
+}
+
+func (m *Mapping) ApplyReserved(reservation api.DeltaReservation, seq base.CommitSeq, kind api.ApplyKind, changes []api.Change) (api.ApplyResult, error) {
+	reserved, ok := reservation.(*deltaReservation)
+	if !ok || reserved.budget != m.budget {
+		if reservation != nil {
+			reservation.Release()
+		}
+		return api.ApplyResult{}, base.ErrInvalidConfig
+	}
+	return m.apply(reserved, seq, kind, changes)
+}
+
+func (m *Mapping) apply(reservation *deltaReservation, seq base.CommitSeq, kind api.ApplyKind, changes []api.Change) (api.ApplyResult, error) {
 	if seq == 0 || (kind != api.ApplyUserCommit && kind != api.ApplyRelocation) {
+		if reservation != nil {
+			reservation.Release()
+		}
 		return api.ApplyResult{}, base.ErrInvalidConfig
 	}
 	if err := validateChanges(kind, changes); err != nil {
+		if reservation != nil {
+			reservation.Release()
+		}
 		return api.ApplyResult{}, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if seq <= m.runtimeSeq {
+		if reservation != nil {
+			reservation.Release()
+		}
 		return api.ApplyResult{}, fmt.Errorf("mapping sequence regression: %w", base.ErrInvalidConfig)
 	}
 	result := api.ApplyResult{}
+	applied := make([]api.Change, 0, len(changes))
+	var newEntries uint64
 	for _, change := range changes {
 		if kind == api.ApplyRelocation {
 			current, exists, err := m.lookupLocked(change.RecordID)
 			if err != nil {
+				if reservation != nil {
+					reservation.Release()
+				}
 				return api.ApplyResult{}, err
 			}
 			if !exists || current != change.ExpectedOldAddr {
@@ -116,8 +146,28 @@ func (m *Mapping) Apply(seq base.CommitSeq, kind api.ApplyKind, changes []api.Ch
 				continue
 			}
 		}
-		m.active[change.RecordID] = deltaEntry{addr: change.NewAddr, seq: seq}
+		if _, exists := m.active[change.RecordID]; !exists {
+			newEntries++
+		}
+		applied = append(applied, change)
 		result.Applied++
+	}
+	charge, err := base.MulUint64(newEntries, deltaEntryCharge)
+	if err != nil {
+		if reservation != nil {
+			reservation.Release()
+		}
+		return api.ApplyResult{}, err
+	}
+	if reservation != nil {
+		if err := reservation.consume(charge); err != nil {
+			return api.ApplyResult{}, err
+		}
+	} else if err := m.budget.addReplay(charge); err != nil {
+		return api.ApplyResult{}, err
+	}
+	for _, change := range applied {
+		m.active[change.RecordID] = deltaEntry{addr: change.NewAddr, seq: seq}
 	}
 	m.runtimeSeq = seq
 	return result, nil
@@ -191,6 +241,20 @@ func (m *Mapping) CompleteCheckpoint(checkpoint *Checkpoint, root base.MapAddr) 
 		if len(checkpoint.layers[i]) != len(m.frozen[i]) {
 			return base.ErrCorrupt
 		}
+	}
+	var released uint64
+	for _, layer := range checkpoint.layers {
+		bytes, err := base.MulUint64(uint64(len(layer)), deltaEntryCharge)
+		if err != nil {
+			return err
+		}
+		released, err = base.AddUint64(released, bytes)
+		if err != nil {
+			return err
+		}
+	}
+	if err := m.budget.releaseCharged(released); err != nil {
+		return err
 	}
 	m.root, m.rootCovered = root, checkpoint.covered
 	m.frozen = m.frozen[len(checkpoint.layers):]

@@ -332,6 +332,46 @@ func TestCheckpointInstallsPersistentRootStatsAndReplayCut(t *testing.T) {
 	}
 }
 
+func TestDeltaSoftLimitSchedulesCheckpointAfterCommit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.DeltaSoftLimitBytes = 64
+	cfg.DeltaHardLimitBytes = 128
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(context.Background(), id, []byte("soft-limit")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		metrics := store.Metrics()
+		if store.catalog.Snapshot().CoveredCommitSeq >= 1 && metrics.DeltaChargedBytes == 0 && metrics.DeltaReservedBytes == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("automatic checkpoint did not complete: manifest=%+v metrics=%+v", store.catalog.Snapshot(), metrics)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if value, err := store.Get(context.Background(), id); err != nil || string(value) != "soft-limit" {
+		t.Fatalf("value=%q error=%v", value, err)
+	}
+}
+
 func TestCheckpointRotatesMappingSegments(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	cfg := smallTestConfig(dir)

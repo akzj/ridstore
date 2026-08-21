@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+
 	"github.com/akzj/ridstore/internal/base"
 )
 
@@ -29,6 +31,19 @@ type Mapping interface {
 	Apply(base.CommitSeq, ApplyKind, []Change) (ApplyResult, error)
 	CoveredCommitSeq() base.CommitSeq
 	Snapshot() Snapshot
+}
+
+// DeltaBudget is implemented by persistent mappings whose committed overlay
+// has a bounded memory budget. Reservations are acquired before a commit is
+// admitted to the coordinator, so a checkpoint barrier can always overtake a
+// writer waiting for memory.
+type DeltaBudget interface {
+	ReserveDelta(context.Context, uint64) (DeltaReservation, bool, error)
+	ApplyReserved(DeltaReservation, base.CommitSeq, ApplyKind, []Change) (ApplyResult, error)
+}
+
+type DeltaReservation interface {
+	Release()
 }
 
 type Snapshot struct {
