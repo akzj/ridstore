@@ -24,6 +24,8 @@ ridstore 只负责 Record，不内置 KV、Page、Blob、Stream、SQL 或业务�
 - [Commit/Recovery](docs/commit-recovery-protocol.md)
 - [Mapping](docs/mapping-design.md)
 - [GC](docs/gc-protocol.md)
+- [SegmentStats](docs/segment-stats-design.md)
+- [配置与 Backpressure](docs/runtime-config.md)
 - [验证计划](docs/verification-plan.md)
 - [实施计划](docs/implementation-plan.md)
 

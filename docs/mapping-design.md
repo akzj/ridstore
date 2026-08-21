@@ -86,12 +86,13 @@ Mapping 只处理 uint64 精确 Lookup，不需要任意 Key 排序、Range Scan
 type mappingState struct {
     root         MapAddr
     coveredSeq   CommitSeq
+    statsBase    *segmentStatsBase // exact at coveredSeq
     frozen       []*deltaTable // newest first, waiting for checkpoint install
     activeDelta  *deltaTable
 }
 ```
 
-`mappingState` 通过 atomic pointer 发布。另有独立的 `publishEpoch atomic.Uint64` 保护 active Delta 的原地全批发布；它不能放在 immutable `mappingState` 中。Node Cache、Delta Table 和 Root 都有独立生命周期引用。
+`mappingState` 通过 atomic pointer 发布。`statsBase` 与 Root 属于同一 checkpoint generation；每个 Delta Table 同时保存该层成功 NewVAddr 的 per-segment `upperAddBytes/Records`。因此运行时上界是 `statsBase + active additions + all frozen additions`。Checkpoint 安装只移除已经精确吸收到新 Stats Base 的 merged layers，cut 后 active/较新 frozen 的增量不会因“清零全局计数器”而丢失。另有独立的 `publishEpoch atomic.Uint64` 保护 active Delta 的原地全批发布；它不能放在 immutable `mappingState` 中。Node Cache、Delta Table、Root 和 Stats Base 都有独立生命周期引用。
 
 Delta Entry：
 
@@ -101,6 +102,8 @@ type deltaEntry struct {
     commitSeq CommitSeq
 }
 ```
+
+Delta 的每个 ID shard 内同时保存一个按 SegmentID 聚合的 stats-addition map；mutation 与其 NewVAddr addition 在同一次 shard/publish 临界区更新，不引入按 SegmentID 的第二套锁顺序。读取全局上界时对所有 Delta shard/layer 求和，frozen 后可预聚合成 immutable 表。Stats additions 只增不减：用户 Put 和成功 Relocation 累加 NewVAddr 的完整 Frame bytes/count，Delete、失败 CAS 和 Abort 不累加。
 
 第一版 Delta Table 使用分片 hash table；它不是磁盘格式，也不向外暴露。Active Delta 的每个 shard 有独立 RWMutex，普通 Go map 绝不能仅凭 epoch 做无锁并发读写。Frozen Delta 发布后不可变，不再需要 shard 写锁。分片数和 map 实现由基准决定。
 
@@ -221,19 +224,21 @@ GC Relocation Entry：
 ID, ExpectedOldVAddr, NewVAddr
 ```
 
-发布时：
+GC Relocation 的 CAS 在 Commit Coordinator 的 pre-Seal virtual Mapping 阶段解析：
 
 ```text
 current = Mapping.Lookup(ID)
 if current == ExpectedOldVAddr:
-    Mapping[ID] = NewVAddr
+    resolved outcome = apply NewVAddr
 else:
-    skip
+    resolved outcome = skip
 ```
 
-CAS 结果必须与 Relocation CommitSeq 一起进入 Delta。失败的 NewVAddr 没有 Mapping 指向，后续成为垃圾。
+该 Lookup 可以发生冷 Root I/O，但不持 `publishMu`；Coordinator 在验证到该 group 完成 Publish 期间不允许后续 group 或 Checkpoint barrier 越过，并把本 group 之前已通过的 mutation 保存在 virtual Mapping 中。Relocation Descriptor 始终保存原始 ExpectedOldVAddr/NewVAddr，不把运行时 outcome 写入磁盘。
 
-恢复重放 Relocation 必须执行同样 CAS，不能无条件覆盖。
+fsync 后 Mapping Publisher 按 coordinator 给出的 immutable resolved plan 执行纯内存 apply/skip，不再次调用可能 I/O 的 Lookup。成功结果与 Relocation CommitSeq 一起进入 Delta，失败的 NewVAddr 没有 Mapping 指向并成为垃圾。若 Publisher 观察到内存状态与 resolved plan 前提不符，表示提交串行化实现错误，Store 必须 fail closed。
+
+恢复没有并发 Publisher，按 CommitSeq 从 Root+replay state 执行原始 Descriptor 的同样 CAS，必须得到与运行时 resolved plan 相同的结果，不能无条件覆盖。
 
 ## 10. Checkpoint 双 Overlay
 
@@ -256,7 +261,7 @@ captured = activeDelta
 activeDelta = new empty delta
 baseRoot = current root
 frozen.prepend(captured)
-publish new mappingState(baseRoot, frozen, activeDelta)
+publish new mappingState(baseRoot, current statsBase, frozen, activeDelta)
 merged = snapshot of all frozen layers, oldest-to-newest
 publishMu.Unlock
 ```
@@ -265,19 +270,22 @@ publishMu.Unlock
 
 新的 Commit 继续进入 activeDelta，不等待磁盘 Checkpoint。Lookup 顺序为 activeDelta、frozen newest-to-oldest、persistent root，因此 durable Root 安装前 captured 仍然可见。
 
-后台将 `merged` 中所有 frozen layer 按从旧到新的顺序折叠，每个 ID 只保留最新 mutation；再按 ID 排序、按 Leaf 分组，基于 `baseRoot` 构建新的 COW Radix Root。必须包含以前失败 Checkpoint 留下的 frozen layer，不能只合并本轮 captured。完成后：
+后台将 `merged` 中所有 frozen layer 按从旧到新的顺序折叠，每个 ID 只保留最新 mutation；再按 ID 排序、按 Leaf 分组，基于 `baseRoot` 构建新的 COW Radix Root。Builder 同时从 base Root 的 OldVAddr 与 cut 时 final NewVAddr 生成精确 `SegmentStats(C)`；Header 读取按 SegmentID/offset 排序并在所有 `publishMu`、Delta shard lock 之外执行。必须包含以前失败 Checkpoint 留下的 frozen layer，不能只合并本轮 captured。完成后：
 
 ```text
 fsync mapping files
-publish Manifest(newRoot, CoveredCommitSeq=C, CutFrameSeq=F, ReplayStart)
+publish Manifest(newRoot, CoveredCommitSeq=C, CutFrameSeq=F, ReplayStart,
+                 StatsCoveredCommitSeq=C, SegmentStats(C))
 publishMu.Lock
 verify merged is still the complete frozen set selected by this checkpoint
-publish new mappingState(newRoot, coveredSeq=C, frozen without merged, current activeDelta)
+publish new immutable runtime state(newRoot, coveredSeq=C,
+                                    exactStats(C), frozen without merged,
+                                    current activeDelta)
 publishMu.Unlock
 release merged overlays after readers unpin
 ```
 
-Lookup 在安装期间始终通过 `active + frozen + root` 得到正确结果；不能在 Root durable 前丢弃任何 merged layer。Root/frozen 的内存切换也必须发布一个新的 immutable `mappingState`，不能分别修改字段。Checkpoint 失败时所有 frozen layer 原样保留，下一次必须连同新 captured 一起合并。
+Lookup 在安装期间始终通过 `active + frozen + root` 得到正确结果；不能在 Root durable 前丢弃任何 merged layer。Root/frozen/Stats 的内存切换也必须发布同代 immutable state，不能分别修改字段。Checkpoint 构建、Header 校验、Stats underflow、mapping fsync 或 Manifest 安装任一失败时，旧 Root/旧 exact Stats 与所有 frozen layer 原样保留；下一次必须连同新 captured 一起合并。不得安装新 Root 后再异步补同一 cut 的 Stats。
 
 ## 11. COW Radix 构建
 
@@ -303,6 +311,7 @@ Checkpoint 的写放大同时按“受影响 Node 数”和编码后 bytes 衡�
 - Manifest 发布后崩溃：新 Root 有效，恢复从新 ReplayStart 开始；
 - merged frozen layers 只有在确认新 Manifest durable 后才能释放；
 - Checkpoint 错误必须可观测，不能像成功一样推进 Log/GC 删除边界。
+- SegmentStats 构建失败与 Root 构建失败具有相同语义：整个 checkpoint generation 不安装；
 
 MappingCheckpoint 的 Maintenance Journal phase 固定为：Prepared、NodesWritten、MappingFilesDurable、ManifestInstalled、Complete。ManifestInstalled 之前恢复使用旧 Root，并保留或清理不可达新 Node；之后恢复必须使用新 Manifest。Journal 只证明文件安装进度，内存 Mapping State 始终可由 Manifest + replay 重建。
 
@@ -346,10 +355,13 @@ MappingGC 的 Maintenance Journal phase 固定为：Prepared、Copied、MappingF
 Checkpoint 速度若追不上 Commit，Delta 会增长。达到软/硬限制：
 
 - soft limit：提高 Checkpoint 优先级并记录告警；
-- hard limit：阻塞新的 Commit Publish，但允许 Get、Abort 和 Checkpoint；
+- hard limit 统计 active Delta、全部 frozen Delta 和已 admission 未 Publish 的 reservation；
+- 可能越过 hard limit 的 Commit 在 CommitSeq/Seal 之前等待预算；已经 durable 的 Commit Publish 永不因限额阻塞；
 - 不允许 OOM 后由进程被杀作为流控；
 - 不允许丢弃 Delta，因为它承载最新可见 Mapping；
-- Context 取消等待中的 Commit 按 CommitUnknown 规则处理。
+- Context 在预算等待阶段取消是确定未提交；只有 Seal 已进入不可确定持久化阶段才适用 CommitUnknown。
+
+精确计费、默认值和 reservation 生命周期见 `runtime-config.md`。
 
 ## 16. 第一版实现顺序
 

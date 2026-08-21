@@ -252,11 +252,12 @@ Mapping 是 ridstore 最关键的性能路径，但第一版设计不能把某�
 ```go
 type Mapping interface {
     Lookup(id ID) (VAddr, bool, error)
-    Publish(batchID uint64, changes []MappingChange) error
-    CompareAndSwap(id ID, old, new VAddr) (bool, error)
+    PublishResolved(commitSeq CommitSeq, changes []ResolvedMappingChange) error
     Checkpoint(logPosition LogPosition) (MappingRoot, error)
 }
 ```
+
+`ResolvedMappingChange` 已由 Commit Coordinator 按全局顺序解析用户 Put/Delete 与 Relocation apply/skip；Publish 只做短内存更新，不在发布锁内触发 Lookup/I/O。Recovery 则按 Descriptor 顺序重新解析 Relocation CAS 后调用同一 resolved publish 路径。
 
 要求：
 
@@ -354,6 +355,7 @@ Manifest 至少记录：
 - 下一 Segment identity；
 - 当前 Mapping Root；
 - Mapping Root 覆盖的 Log Position；
+- 与该 Root 同代的精确 SegmentStats 基线；
 - 最近确定完成的维护状态。
 
 Manifest 采用 temp write、file fsync、atomic rename、directory fsync 发布。任何无法证明安全的目录状态都应阻止读写 Open，而不是自动猜测修复。
@@ -460,13 +462,13 @@ Segment 既保存 payload，也保存恢复所需的 Commit 历史。删除前�
 - GC 通过 VAddr CAS 与用户 Put 竞争；
 - Segment Registry 管理 pin、retire 和 delete。
 
-需要明确锁顺序并在实现文档中固定。建议所有模块遵循：
+锁协议不是一条把所有模块串起来的大锁链。append/commit/checkpoint 主要由 goroutine ownership 串行；唯一允许的 Mapping 嵌套锁顺序是：
 
 ```text
-Store lifecycle -> Append sequencer -> Mapping publish -> Segment registry
+publishMu -> affected Delta shards（index 升序）
 ```
 
-实际实现不得在持有 Mapping publish lock 时执行磁盘 fsync 或长时间数据复制。
+Get 不取得 `publishMu`；它释放 Delta shard `RLock` 后才执行磁盘 I/O或进入 Segment Registry。Manifest installer、Segment Registry 和 lifecycle lock 不与 Mapping locks 嵌套。实际实现不得在持有 Mapping publish lock 时执行磁盘 fsync 或长时间数据复制。完整锁和最终 Checkpoint 安装顺序见 [implementation-plan.md](implementation-plan.md)。
 
 ## 11. 关键失败时序
 

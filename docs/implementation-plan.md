@@ -58,10 +58,23 @@ ridstore/
 - Segment Registry lock：只保护状态/pin/ref，不执行磁盘 I/O；
 - Store lifecycle lock：Open/closing/closed/faulted。
 
+`publishMu` 是普通 `sync.Mutex`，不是 Get 共享的 `RWMutex`。Get 不取得 `publishMu`：它只在检查 active Delta 时短暂取得目标 shard 的 `RLock`，完成 epoch/state 校验后释放全部内存锁，再做 Persistent Radix 或 Data Record I/O。
+
+允许的嵌套锁顺序只有：
+
+```text
+publishMu -> affected active Delta shard locks（shard index 升序）
+```
+
+反向释放 shard。Checkpoint cut 使用该顺序交换 Overlay 后立即释放；Root/Stats 构建、Header 读取、mapping fsync 和 Manifest 安装均不持这些锁。Manifest 安装串行器、Segment Registry lock 和 lifecycle lock 不与 `publishMu`/Delta shard lock 嵌套；需要跨域操作时先 pin/复制 immutable 状态、释放当前锁，再进入下一个域。Reader 的顺序固定为 Mapping Lookup 完成并释放 shard lock后再 `SegmentRegistry.Acquire`，Acquire 后重新验证 Mapping。
+
+Checkpoint 最终流程是 `Manifest durable -> release manifest installer -> publishMu -> verify frozen identity -> atomic state swap`，不同时持有两个锁。若 identity 验证失败，不能把已 durable Manifest 当作可忽略结果：Store 必须 fail closed 并通过重新 Open 采用该 Manifest；正常设计应由 maintenance 串行和 frozen identity token 保证该分支不可达。
+
 禁止：
 
 - 在 Mapping publish lock 下 fsync；
 - 在 Segment Registry lock 下复制 payload；
+- 在 Manifest 安装串行器下等待 `publishMu`、reader pin 或执行用户回调；
 - 通过 goroutine ID 查找事务或 collector；
 - 后台 goroutine 忽略错误继续推进删除边界；
 - Close 设置超时后遗留仍访问已关闭文件的 goroutine。
@@ -137,10 +150,11 @@ ridstore/
 7. atomic Mapping State/Publish；
 8. checkpoint overlay cut；
 9. bottom-up COW builder 与 occupancy 编码选择；
-10. Mapping Segment rotation journal + files fsync + Manifest Root install；
-11. Recovery from Root + replay；
-12. Delta limits/backpressure；
-13. Mapping GC。
+10. base→cut-final SegmentStats builder、批量 Header validation 和 exact Stats codec；
+11. Mapping Segment rotation journal + files fsync + Manifest Root/Stats 同代安装；
+12. Recovery from Root/Stats Base + replay Delta additions；
+13. active+all frozen Delta limits/backpressure；
+14. Mapping GC。
 
 切换生产默认前，memoryMapping 与 radixMapping 必须通过同一随机模型测试。
 
@@ -148,9 +162,9 @@ ridstore/
 
 模块/提交顺序：
 
-1. Segment live/dead accounting；
+1. 基于 `LiveUpperBytes` 的候选选择和统计可观测性；
 2. Reader pin/Retire state machine；
-3. GC candidate selection；
+3. GC candidate selection（Stats 不得授权删除）；
 4. live Record copy；
 5. Relocation Descriptor/fsync；
 6. runtime/recovery CAS；

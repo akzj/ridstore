@@ -128,9 +128,9 @@ for request in group order:
 
 因此同组两个 `ExpectAbsent(ID)` 只有第一个可以通过，后一个看到第一个的 virtual mutation 后冲突。Blind Batch 没有条件，始终进入 virtual Mapping 并保持 Last-Writer-Wins。
 
-若 group 中包含内部 Relocation，virtual Mapping 也按全局顺序执行 expected-old-VAddr CAS。Relocation 成功与否不改变 LogicalRevision，但其物理 VAddr 结果必须与之后 Publish/Recovery 一致。
+若 group 中包含内部 Relocation，virtual Mapping 也按全局顺序执行 expected-old-VAddr CAS，并为每条 Entry 生成 immutable apply/skip plan。该阶段允许在不持 `publishMu` 时读取冷 Root；从验证开始到本 group Publish 完成，Coordinator 不允许下一 group 或 Checkpoint barrier 越过。Relocation 成功与否不改变 LogicalRevision；fsync 后 Publisher 只执行 resolved plan，不在短发布锁内重新做可能触发 I/O 的 Lookup。Recovery 按同一 CommitSeq 从 Descriptor 重算 CAS，结果必须一致。
 
-Persistent Mapping 只保存 VAddr；验证 ExpectRevision 时读取当前固定 64-byte PutRecord Header，将 OriginBatchID 解释为 LogicalRevision，并校验 Header CRC。该冷读是 conditional commit 主动选择的成本，不能转移到 Blind Put 热路径。验证期间 coordinator 不允许下一 group 越过，也不允许 Checkpoint barrier 插入；验证完成到对应 group Publish 之间的提交顺序不可改变。
+Persistent Mapping 只保存 VAddr；验证 ExpectRevision 时按 Get 相同的 `Lookup -> SegmentRegistry.Acquire -> revalidate Mapping -> read` 协议 pin 当前 Segment，再读取固定 64-byte PutRecord Header，将 OriginBatchID 解释为 LogicalRevision并校验 Header CRC，最后释放 pin。该冷读是 conditional commit 主动选择的成本，不能转移到 Blind Put 热路径。验证期间 coordinator 不允许下一 group 越过，也不允许 Checkpoint barrier 插入；验证完成到对应 group Publish 之间的提交顺序不可改变。
 
 Blind Batch 不读取旧 Mapping 对应的 Record Header，也不参与 Revision 比较；它只按提交顺序覆盖 Mapping。
 
@@ -148,7 +148,9 @@ Commit Coordinator 单 goroutine 运行。收到第一个 request 后，在以�
 
 第一版默认不主动 sleep 等待更多请求；fsync 自身形成自然 batching window。`MaxGroupDelay` 默认 0，仅作为经过基准证明后的可配置优化。
 
-先按第 6.1 节验证 request，并移除冲突 Batch。对每个 admitted request：
+在进入第 6.1 节不可穿插 barrier 的验证区间前，先按 `runtime-config.md` 为所有最终 mutation/Relocation 成功的上界预留 active Delta + Stats additions charge；超过 hard limit 的请求在此等待，Checkpoint 仍可推进。Context 取消属于确定 Aborted，reservation 必须归还。随后验证 request、移除冲突 Batch并释放其 reservation；Relocation CAS skip 的多余 charge 同样释放。对每个已验证且保有 reservation 的 admitted request：
+
+reservation 按 queue order 获取；已有部分 admitted group 时，不得持有其 reservation 等待下一个无法预留的请求，而应立即执行当前 group并把后者留在队首。只有空 group 的队首无法预留时才允许等待 Checkpoint。
 
 ```text
 append CommitPart(s)
@@ -157,7 +159,7 @@ append CommitSeal with next CommitSeq
 
 整个 group 一次 write，随后一次 `fdatasync/fsync`。CommitSeal 的物理顺序就是 CommitSeq 顺序。
 
-若 group 总大小将跨越 Segment 上限，先 Seal/Sync 当前 Segment并创建新 Active Segment，再把完整 Descriptor 写入新 Segment。单个 Descriptor 可以分 Part，但 CommitPart 与 CommitSeal 不跨 Data Segment，简化恢复。
+append sequencer 始终为最终 128-byte SegmentSeal Frame 和 4096-byte Footer 预留空间。若 group 总大小加该保留区将跨越 Segment 上限，先 Seal/Sync 当前 Segment并创建新 Active Segment，再把完整 Descriptor 写入新 Segment。单个 Descriptor 可以分 Part，但 CommitPart 与 CommitSeal 不跨 Data Segment，简化恢复。
 
 ## 8. Commit 确认与 Mapping 发布
 
@@ -170,6 +172,8 @@ reply CommitResult
 ```
 
 Mapping Publish 必须全批可见。Publish 是内存操作，不执行磁盘 I/O。
+
+Descriptor 一旦允许落盘，其 Delta reservation 已不可撤销地保证 Publish 容量；fsync 成功后的 Publish 不得再被 Delta hard limit 阻塞。Publish 完成后 reservation 转为 active Delta charge。若在落盘前 group 构建失败，必须归还 reservation。
 
 如果 fsync 成功但进程在 Publish/Reply 前崩溃，恢复会从 CommitSeal 重建 Mapping，因此 Batch 仍为 Committed。
 
@@ -249,12 +253,12 @@ Barrier 请求排在 Commit publish 序列中。轮到它时，coordinator 先�
 1. barrier 在 `publishMu` 内原子交换 Delta Overlay
 2. captured overlay 只包含 CommitSeq <= C 的更新
 3. 释放 barrier 后新 Commit 才能进入 fresh overlay
-4. 后台构建新 Persistent Mapping Root
+4. 后台构建新 Persistent Mapping Root，并由 base Root 到 cut-final Mapping 批量生成精确 SegmentStats(C)
 5. fsync Mapping files
-6. 通过 Manifest 安装串行器发布 Manifest(root, C, F, replayStart)
+6. 通过 Manifest 安装串行器原子发布 Manifest(root, C, F, replayStart, StatsCoveredCommitSeq=C, SegmentStats(C))
 ```
 
-第 6 步必须以安装时最新的 durable Data/Mapping 文件集合为基底，只替换 Mapping Root 与 checkpoint cut 字段；不能用切点时缓存的旧 Manifest 覆盖并发 rotation 的结果。
+第 6 步必须以安装时最新的 durable Data/Mapping 文件集合为基底，只替换同代 Mapping Root、checkpoint cut 与 SegmentStats 字段；不能用切点时缓存的旧 Manifest 覆盖并发 rotation 的结果。Root 或 Stats 任一构建/校验失败都不安装该 generation，并保留旧 Root/Stats 与 frozen Delta。
 
 Open Batch 的 payload 可以早于 F，但其 Commit Descriptor 只在未来 Commit 时生成并位于 F 之后。Descriptor 自包含旧 payload 的 VAddr，因此恢复从 ReplayStart 扫描仍能找到所有未覆盖 Commit 的最终 Mutation集合并回读验证 payload。
 
@@ -267,10 +271,10 @@ Checkpoint 不需要等待 Open Batch 结束，但 Open Batch 引用的 Data Seg
 2. 读取 CURRENT 和 Manifest
 3. 校验 Store UUID、格式、硬限制和文件集合
 4. 恢复或完成 Maintenance Journal
-5. 打开 Persistent Mapping Root
+5. 打开 Persistent Mapping Root，并加载 `StatsCoveredCommitSeq == CoveredCommitSeq` 的精确 SegmentStats Base
 6. 从 ReplayStart 扫描 Data Frames
 7. 验证 Frame/Commit Descriptor
-8. 按 CommitSeq 重放 Mapping
+8. 按 CommitSeq 重放 Mapping；用户 Put 和成功 Relocation 的 NewVAddr 同时累加到 replay Delta 的保守 SegmentStats 上界
 9. 恢复 IDReserve、BatchIDReserve、FrameSeq、CommitSeq high watermark
 10. 修复 Active Segment torn tail
 11. 重建 Segment live/open/pin 元数据
@@ -308,6 +312,8 @@ Checkpoint 不需要等待 Open Batch 结束，但 Open Batch 引用的 Data Seg
 5. 确认 CommitSeq 严格递增且大于 Mapping CoveredCommitSeq；
 6. 用户 Commit 原子应用整个 Mutation 集合；Relocation 按 Entry 执行 expected-old-VAddr CAS；
 7. 两类 Seal 共享一个严格递增的 CommitSeq 序列，必须按该序列重放。
+
+重放时 SegmentStats 只处理成功进入 Mapping 的 NewVAddr：用户 Put 累加，Delete 不累加，Relocation CAS 成功累加、失败不累加。使用步骤 3/4 已验证的 PutRecord Header.TotalSize，不读取或扣减 old VAddr。恢复完成后的 `exact Base + replay Delta additions` 必须仍是当前 live bytes/count 的上界。
 
 没有对应 Seal 的完整 CommitPart/RelocationPart 是未提交垃圾，可以忽略并由 GC 回收；它不得改变 Mapping。已经存在完整有效 Seal 时，缺 Part、CRC 不匹配或引用不存在的 Record 才是 corruption，不能作为 Abort 静默跳过。Active 尾部 torn Frame 按第 13 节截断规则处理。
 
