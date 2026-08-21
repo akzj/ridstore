@@ -15,6 +15,7 @@ import (
 	batchimpl "github.com/akzj/ridstore/internal/batch"
 	"github.com/akzj/ridstore/internal/catalog"
 	"github.com/akzj/ridstore/internal/commit"
+	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
@@ -50,6 +51,7 @@ type Store struct {
 	rotation       *rotation.Manager
 	catalog        *catalog.Manager
 	metrics        *internalmetrics.Runtime
+	hook           failpoint.Hook
 	log            *appendlog.Sequencer
 	mapping        *radix.Mapping
 	coordinator    *commit.Coordinator

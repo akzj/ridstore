@@ -8,10 +8,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/catalog"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/segment"
 )
@@ -27,17 +30,25 @@ type nodeStore struct {
 	nextNodeSeq base.NodeSeq
 	sealed      map[base.MapSegmentID]sealedMapFile
 	closed      bool
+	catalog     *catalog.Manager
+	activeFirst base.NodeSeq
+	activeLast  base.NodeSeq
+	activeCount uint64
+	hook        failpoint.Hook
 }
+
+func (s *nodeStore) setHook(hook failpoint.Hook) { s.hook = hook }
 
 type sealedMapFile struct {
-	file *os.File
-	end  uint64
+	file    *os.File
+	end     uint64
+	summary storeformat.FileSummary
 }
 
-func openNodeStore(root string, manifest storeformat.Manifest) (*nodeStore, error) {
+func openNodeStore(root string, manifest storeformat.Manifest, catalog *catalog.Manager) (*nodeStore, error) {
 	store := &nodeStore{
 		root: root, uuid: manifest.StoreUUID, segmentSize: manifest.HardLimits.SegmentSize,
-		activeID: manifest.ActiveMapSegmentID, nextNodeSeq: 1, sealed: make(map[base.MapSegmentID]sealedMapFile),
+		activeID: manifest.ActiveMapSegmentID, nextNodeSeq: 1, sealed: make(map[base.MapSegmentID]sealedMapFile), catalog: catalog,
 	}
 	for _, summary := range manifest.SealedMappingSegments {
 		file, err := openMappingFile(root, manifest.StoreUUID, summary, true, manifest.HardLimits.SegmentSize)
@@ -45,7 +56,7 @@ func openNodeStore(root string, manifest storeformat.Manifest) (*nodeStore, erro
 			_ = store.Close()
 			return nil, err
 		}
-		store.sealed[base.MapSegmentID(summary.FileID)] = sealedMapFile{file: file, end: summary.ValidEnd}
+		store.sealed[base.MapSegmentID(summary.FileID)] = sealedMapFile{file: file, end: summary.ValidEnd, summary: summary}
 		if base.NodeSeq(summary.LastSeq) >= store.nextNodeSeq {
 			store.nextNodeSeq = base.NodeSeq(summary.LastSeq) + 1
 		}
@@ -72,7 +83,7 @@ func openNodeStore(root string, manifest storeformat.Manifest) (*nodeStore, erro
 		_ = store.Close()
 		return nil, errors.Join(err, base.ErrCorrupt)
 	}
-	validEnd, lastSeq, err := scanNodes(store.active, uint64(info.Size()), manifest.HardLimits.SegmentSize-storeformat.SegmentFooterSize, base.NodeSeq(header.FirstSeq), false)
+	validEnd, lastSeq, count, err := scanNodes(store.active, uint64(info.Size()), manifest.HardLimits.SegmentSize-storeformat.SegmentFooterSize, base.NodeSeq(header.FirstSeq), false)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -88,6 +99,9 @@ func openNodeStore(root string, manifest storeformat.Manifest) (*nodeStore, erro
 		}
 	}
 	store.activeEnd = validEnd
+	store.activeFirst = base.NodeSeq(header.FirstSeq)
+	store.activeLast = lastSeq
+	store.activeCount = count
 	if lastSeq >= store.nextNodeSeq {
 		store.nextNodeSeq = lastSeq + 1
 	}
@@ -106,7 +120,17 @@ func (s *nodeStore) append(build storeformat.MappingNodeBuild) (base.MapAddr, er
 		return 0, err
 	}
 	if uint64(len(encoded)) > s.segmentSize-storeformat.SegmentFooterSize-s.activeEnd {
-		return 0, segment.ErrFull
+		if s.catalog == nil || s.activeCount == 0 {
+			return 0, segment.ErrFull
+		}
+		if err := s.rotateLocked(); err != nil {
+			return 0, err
+		}
+		build.NodeSeq = s.nextNodeSeq
+		encoded, err = storeformat.EncodeMappingNode(build)
+		if err != nil || uint64(len(encoded)) > s.segmentSize-storeformat.SegmentFooterSize-s.activeEnd {
+			return 0, errors.Join(err, segment.ErrFull)
+		}
 	}
 	offset := s.activeEnd
 	if _, err := writeFullAt(s.active, encoded, int64(offset)); err != nil {
@@ -114,6 +138,8 @@ func (s *nodeStore) append(build storeformat.MappingNodeBuild) (base.MapAddr, er
 	}
 	s.activeEnd += uint64(len(encoded))
 	s.nextNodeSeq++
+	s.activeLast = build.NodeSeq
+	s.activeCount++
 	return base.NewMapAddr(s.activeID, uint32(offset))
 }
 
@@ -167,8 +193,10 @@ func (s *nodeStore) state() (base.MapSegmentID, base.MapSegmentID, []storeformat
 	defer s.mu.RUnlock()
 	sealed := make([]storeformat.FileSummary, 0, len(s.sealed))
 	for id, item := range s.sealed {
-		sealed = append(sealed, storeformat.FileSummary{FileID: uint32(id), ValidEnd: item.end})
+		_ = id
+		sealed = append(sealed, item.summary)
 	}
+	sort.Slice(sealed, func(i, j int) bool { return sealed[i].FileID < sealed[j].FileID })
 	return s.activeID, s.activeID + 1, sealed
 }
 
@@ -216,7 +244,7 @@ func openMappingFile(root string, uuid base.StoreUUID, summary storeformat.FileS
 	if uint64(info.Size()) != summary.ValidEnd+storeformat.SegmentFooterSize || summary.ValidEnd > segmentSize-storeformat.SegmentFooterSize {
 		return nil, errors.Join(base.ErrCorrupt, file.Close())
 	}
-	validEnd, last, err := scanNodes(file, summary.ValidEnd, summary.ValidEnd, base.NodeSeq(summary.FirstSeq), true)
+	validEnd, last, _, err := scanNodes(file, summary.ValidEnd, summary.ValidEnd, base.NodeSeq(summary.FirstSeq), true)
 	if err != nil || validEnd != summary.ValidEnd || uint64(last) != summary.LastSeq {
 		return nil, errors.Join(err, file.Close(), base.ErrCorrupt)
 	}
@@ -239,46 +267,48 @@ func readMapHeader(file *os.File) (storeformat.SegmentHeader, error) {
 	return storeformat.DecodeSegmentHeader(bytes)
 }
 
-func scanNodes(file *os.File, physicalEnd, contentLimit uint64, first base.NodeSeq, strict bool) (uint64, base.NodeSeq, error) {
+func scanNodes(file *os.File, physicalEnd, contentLimit uint64, first base.NodeSeq, strict bool) (uint64, base.NodeSeq, uint64, error) {
 	offset := uint64(storeformat.SegmentHeaderSize)
 	var previous base.NodeSeq
+	var count uint64
 	for offset < physicalEnd {
 		if physicalEnd-offset < storeformat.MappingNodeHeaderSize {
 			if strict {
-				return offset, previous, base.ErrCorrupt
+				return offset, previous, count, base.ErrCorrupt
 			}
-			return offset, previous, nil
+			return offset, previous, count, nil
 		}
 		header := make([]byte, storeformat.MappingNodeHeaderSize)
 		if _, err := file.ReadAt(header, int64(offset)); err != nil {
-			return offset, previous, err
+			return offset, previous, count, err
 		}
 		size := uint64(binary.LittleEndian.Uint32(header[12:16]))
 		if size < storeformat.MappingNodeHeaderSize || size > contentLimit-offset {
-			return offset, previous, base.ErrCorrupt
+			return offset, previous, count, base.ErrCorrupt
 		}
 		if size > physicalEnd-offset {
 			if strict {
-				return offset, previous, base.ErrCorrupt
+				return offset, previous, count, base.ErrCorrupt
 			}
-			return offset, previous, nil
+			return offset, previous, count, nil
 		}
-		count, err := base.Uint64ToInt(size)
+		nodeBytes, err := base.Uint64ToInt(size)
 		if err != nil {
-			return offset, previous, err
+			return offset, previous, count, err
 		}
-		encoded := make([]byte, count)
+		encoded := make([]byte, nodeBytes)
 		if _, err := file.ReadAt(encoded, int64(offset)); err != nil {
-			return offset, previous, err
+			return offset, previous, count, err
 		}
 		node, consumed, err := storeformat.DecodeMappingNode(encoded, contentLimit-offset)
-		if err != nil || consumed != count || (previous == 0 && node.NodeSeq != first) || (previous != 0 && node.NodeSeq <= previous) {
-			return offset, previous, errors.Join(err, base.ErrCorrupt)
+		if err != nil || consumed != nodeBytes || (previous == 0 && node.NodeSeq != first) || (previous != 0 && node.NodeSeq <= previous) {
+			return offset, previous, count, errors.Join(err, base.ErrCorrupt)
 		}
 		previous = node.NodeSeq
+		count++
 		offset += size
 	}
-	return offset, previous, nil
+	return offset, previous, count, nil
 }
 
 func writeFullAt(file *os.File, data []byte, offset int64) (int, error) {

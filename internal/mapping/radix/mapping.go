@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/catalog"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/mapping/api"
 )
@@ -44,11 +46,15 @@ func (c *Checkpoint) CoveredCommitSeq() base.CommitSeq {
 
 var _ api.Mapping = (*Mapping)(nil)
 
-func Open(root string, manifest storeformat.Manifest, cacheBytes int64) (*Mapping, error) {
+func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs ...*catalog.Manager) (*Mapping, error) {
 	if cacheBytes <= 0 {
 		return nil, base.ErrInvalidConfig
 	}
-	store, err := openNodeStore(root, manifest)
+	var catalogManager *catalog.Manager
+	if len(catalogs) != 0 {
+		catalogManager = catalogs[0]
+	}
+	store, err := openNodeStore(root, manifest, catalogManager)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +215,8 @@ func (m *Mapping) DeltaEntries() int {
 }
 
 func (m *Mapping) Close() error { return m.store.Close() }
+
+func (m *Mapping) SetHook(hook failpoint.Hook) { m.store.setHook(hook) }
 
 func (m *Mapping) lookupLocked(id base.ID) (base.VAddr, bool, error) {
 	if entry, ok := m.active[id]; ok {

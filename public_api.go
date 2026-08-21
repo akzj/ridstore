@@ -10,6 +10,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	batchimpl "github.com/akzj/ridstore/internal/batch"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
 
@@ -45,6 +46,12 @@ type Metrics struct {
 	QueueWaitNanos, ValidationNanos              uint64
 	WriteSyncNanos, PublishNanos                 uint64
 }
+
+const (
+	pointCheckpointMappingSynced     failpoint.Point = "checkpoint.mapping-synced"
+	pointCheckpointManifestInstalled failpoint.Point = "checkpoint.manifest-installed"
+	pointCheckpointRuntimePublished  failpoint.Point = "checkpoint.runtime-published"
+)
 
 func (s *Store) Metrics() Metrics {
 	if s == nil || s.metrics == nil {
@@ -279,6 +286,11 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	root, entries, err := s.mapping.BuildCheckpoint(checkpoint)
 	if err != nil {
 		s.mapping.AbortCheckpoint()
+		s.setFault(err)
+		return err
+	}
+	if err := failpoint.Hit(s.hook, pointCheckpointMappingSynced); err != nil {
+		s.mapping.AbortCheckpoint()
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -319,7 +331,16 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		s.mapping.AbortCheckpoint()
 		return err
 	}
+	if err := failpoint.Hit(s.hook, pointCheckpointManifestInstalled); err != nil {
+		s.mapping.AbortCheckpoint()
+		s.setFault(err)
+		return err
+	}
 	if err := s.mapping.CompleteCheckpoint(checkpoint, root); err != nil {
+		s.setFault(err)
+		return err
+	}
+	if err := failpoint.Hit(s.hook, pointCheckpointRuntimePublished); err != nil {
 		s.setFault(err)
 		return err
 	}
