@@ -150,3 +150,64 @@ func TestAppendLogRejectsCancellationAndInvalidReserve(t *testing.T) {
 		t.Fatalf("next=%d", log.NextFrameSeq())
 	}
 }
+
+func TestAppendRelocationDescriptor(t *testing.T) {
+	active, _ := newActive(t, 1<<20)
+	defer active.Close()
+	log, err := New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old1, _ := base.NewVAddr(3, 4096)
+	new1, _ := base.NewVAddr(1, 4096)
+	old2, _ := base.NewVAddr(3, 8192)
+	new2, _ := base.NewVAddr(1, 8192)
+	result, err := log.AppendRelocation(RelocationPrepared{
+		BatchID: 91, LogicalPayloadBytes: 17,
+		Entries: []RelocationEntry{
+			{RecordID: 7, ExpectedOldAddr: old1, NewAddr: new1},
+			{RecordID: 9, ExpectedOldAddr: old2, NewAddr: new2},
+		},
+	}, 12)
+	if err != nil || !result.SealStarted || result.SealFrameSeq != 2 {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	var parts []storeformat.Frame
+	var seal storeformat.Frame
+	if err := active.Scan(func(_ base.VAddr, frame storeformat.Frame) error {
+		switch frame.Type {
+		case storeformat.FrameTypeRelocationPart:
+			parts = append(parts, frame)
+		case storeformat.FrameTypeRelocationSeal:
+			seal = frame
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorRelocation, parts, seal, 10)
+	if err != nil || decoded.BatchID != 91 || decoded.Seal.CommitSeq != 12 || decoded.Seal.LogicalPayloadBytes != 17 || len(decoded.Entries) != 2 ||
+		decoded.Entries[0].ExpectedOldAddr != old1 || decoded.Entries[1].NewVAddr != new2 {
+		t.Fatalf("descriptor=%+v error=%v", decoded, err)
+	}
+}
+
+func TestRelocationPreflightRejectsInvalidOrOversizedDescriptor(t *testing.T) {
+	active, _ := newActive(t, storeformat.SegmentHeaderSize+storeformat.SegmentFooterSize+storeformat.FrameHeaderSize)
+	defer active.Close()
+	log, err := New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := base.NewVAddr(1, 4096)
+	if _, err := log.AppendRelocation(RelocationPrepared{BatchID: 1}, 1); !errors.Is(err, base.ErrInvalidConfig) {
+		t.Fatalf("empty relocation error=%v", err)
+	}
+	result, err := log.AppendRelocation(RelocationPrepared{BatchID: 1, Entries: []RelocationEntry{{RecordID: 1, ExpectedOldAddr: addr, NewAddr: addr}}}, 1)
+	if !errors.Is(err, segment.ErrFull) || result.SealStarted {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if log.NextFrameSeq() != 1 {
+		t.Fatalf("next=%d", log.NextFrameSeq())
+	}
+}
