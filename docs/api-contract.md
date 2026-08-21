@@ -209,7 +209,7 @@ Batch 不提供跨 Store 原子性。
 
 `CompactData(ctx)` 至多清理一个 checkpoint-safe sealed Data Segment；没有候选时返回零值结果和 nil。成功结果报告 Source/Copied bytes 以及 Relocation applied/skipped 数。它首先建立 exact Stats cut，再执行 Relocation、嵌套 Mapping Checkpoint、Reader pin drain、Manifest remove 和 trash/delete。`ErrInsufficientSpace` 表示在安装 Journal 前未通过保守临时空间 admission，源数据保持可读。若 Context 或 I/O 错误发生在 GC-required Checkpoint durable 之后，Store fail closed，Open 根据 Journal 完成删除，不能把 durable 新 Root 当作已回滚。
 
-`Metrics()` 是无 I/O 快照，除 Commit/Delta 字段外还包含 GC started/completed/failed/no-candidate/insufficient-space 计数、copied/reclaimed bytes、Relocation applied/skipped 和累计 duration。它们用于调度与诊断，不参与删除授权。
+`Metrics()` 是无 I/O 快照，除 Commit/Delta 字段外还包含 GC started/completed/failed/no-candidate/insufficient-space 计数、copied/reclaimed bytes、Relocation applied/skipped、累计 duration 和 throttled nanos。它们用于调度与诊断，不参与删除授权。
 
 ## 8. 并发覆盖
 

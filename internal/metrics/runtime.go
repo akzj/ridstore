@@ -11,6 +11,7 @@ type Runtime struct {
 	gcNoCandidate, gcInsufficientSpace       atomic.Uint64
 	gcCopiedBytes, gcReclaimedBytes          atomic.Uint64
 	gcRelocated, gcSkipped, gcDurationNanos  atomic.Uint64
+	gcThrottledNanos                         atomic.Uint64
 }
 
 type Snapshot struct {
@@ -22,6 +23,7 @@ type Snapshot struct {
 	GCNoCandidate, GCInsufficientSpace           uint64
 	GCCopiedBytes, GCReclaimedBytes              uint64
 	GCRelocated, GCSkipped, GCDurationNanos      uint64
+	GCThrottledNanos                             uint64
 }
 
 func (m *Runtime) CommitQueued()                { m.commitQueued.Add(1) }
@@ -44,6 +46,7 @@ func (m *Runtime) AddGCReclaimedBytes(n uint64) { m.gcReclaimedBytes.Add(n) }
 func (m *Runtime) AddGCRelocated(n uint64)      { m.gcRelocated.Add(n) }
 func (m *Runtime) AddGCSkipped(n uint64)        { m.gcSkipped.Add(n) }
 func (m *Runtime) AddGCDuration(n uint64)       { m.gcDurationNanos.Add(n) }
+func (m *Runtime) AddGCThrottled(n uint64)      { m.gcThrottledNanos.Add(n) }
 
 func (m *Runtime) Snapshot() Snapshot {
 	if m == nil {
@@ -58,5 +61,6 @@ func (m *Runtime) Snapshot() Snapshot {
 		GCNoCandidate: m.gcNoCandidate.Load(), GCInsufficientSpace: m.gcInsufficientSpace.Load(),
 		GCCopiedBytes: m.gcCopiedBytes.Load(), GCReclaimedBytes: m.gcReclaimedBytes.Load(),
 		GCRelocated: m.gcRelocated.Load(), GCSkipped: m.gcSkipped.Load(), GCDurationNanos: m.gcDurationNanos.Load(),
+		GCThrottledNanos: m.gcThrottledNanos.Load(),
 	}
 }

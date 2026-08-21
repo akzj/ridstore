@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
@@ -46,6 +48,8 @@ type dataGCSession struct {
 	copiedBytes uint64
 	lastCommit  base.CommitSeq
 	cleaning    bool
+	startedAt   time.Time
+	throttled   time.Duration
 }
 
 func (s *Store) beginDataGC() (*dataGCSession, error) {
@@ -62,7 +66,7 @@ func (s *Store) beginDataGC() (*dataGCSession, error) {
 			}
 			return nil, err
 		}
-		return &dataGCSession{store: s, source: candidate, cleaning: true}, nil
+		return &dataGCSession{store: s, source: candidate, cleaning: true, startedAt: time.Now()}, nil
 	}
 	return nil, base.ErrNotFound
 }
@@ -237,7 +241,19 @@ func (g *dataGCSession) relocate(ctx context.Context) error {
 		g.lastCommit = result.CommitSeq
 		changes = changes[:0]
 		batchBytes = 0
-		return nil
+		delay := gcThrottleDelay(g.copiedBytes, uint64(s.config.GCBytesPerSecond), time.Since(g.startedAt))
+		if delay <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			g.throttled += delay
+			return nil
+		}
 	}
 	err := s.segments.ScanCleaning(sourceID, func(oldAddr base.VAddr, frame storeformat.Frame) error {
 		if err := ctx.Err(); err != nil {
@@ -288,6 +304,30 @@ func (g *dataGCSession) relocate(ctx context.Context) error {
 	// deletion proof. The later GC-required Checkpoint validates every Mapping
 	// target again before the source can leave the Manifest.
 	return g.validateSourceEmpty(ctx)
+}
+
+func gcThrottleDelay(copiedBytes, bytesPerSecond uint64, elapsed time.Duration) time.Duration {
+	if copiedBytes == 0 || bytesPerSecond == 0 {
+		return 0
+	}
+	seconds := copiedBytes / bytesPerSecond
+	remainder := copiedBytes % bytesPerSecond
+	if seconds > uint64(math.MaxInt64/int64(time.Second)) {
+		return time.Duration(math.MaxInt64)
+	}
+	target := time.Duration(seconds) * time.Second
+	if remainder != 0 {
+		hi, lo := bits.Mul64(remainder, uint64(time.Second))
+		nanos, _ := bits.Div64(hi, lo, bytesPerSecond)
+		if nanos > uint64(math.MaxInt64-int64(target)) {
+			return time.Duration(math.MaxInt64)
+		}
+		target += time.Duration(nanos)
+	}
+	if elapsed >= target {
+		return 0
+	}
+	return target - elapsed
 }
 
 func (g *dataGCSession) validateSourceEmpty(ctx context.Context) error {
@@ -356,6 +396,7 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	startedAt := time.Now()
 	defer func() {
 		s.metrics.AddGCDuration(uint64(time.Since(startedAt)))
+		s.metrics.AddGCThrottled(uint64(session.throttled))
 		if resultErr != nil {
 			s.metrics.GCFailed()
 			return

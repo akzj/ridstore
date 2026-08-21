@@ -38,6 +38,7 @@ type Config struct {
     GCBatchBytes          int64
     GCBatchMutations      int
     GCMinFreeBytes        int64
+    GCBytesPerSecond      int64
 }
 ```
 
@@ -63,6 +64,7 @@ type Config struct {
 | GCBatchBytes | 16 MiB |
 | GCBatchMutations | 4,096 |
 | GCMinFreeBytes | SegmentSize |
+| GCBytesPerSecond | 64 MiB/s |
 
 这些是可运行的安全起点，不是性能承诺；基准可以改变后续默认值，但持久化 hard limits 的改变必须遵守 Open 兼容规则。
 
@@ -81,6 +83,7 @@ Create 先填充零值、再验证、最后把 8 个 FormatHardLimits 写入 INI
 - `MaxGroupBytes > 0` 并限制多请求 group buffer；若单 Descriptor 更大，则该请求单独成组，不能拒绝一个已由 FormatHardLimits 允许的 Batch；
 - `GCBatchBytes <= MaxBatchBytes` 且 `GCBatchMutations <= MaxBatchMutations`；
 - `GCMinFreeBytes >= 0`；零值采用一个 Segment 的保留空间，不能用零值关闭预检；
+- `GCBytesPerSecond > 0`；零值采用 64 MiB/s；
 - 任何 runtime budget 不能解释为允许绕过持久化 hard limit。
 
 ## 4. Delta 计费
@@ -113,7 +116,7 @@ Header validation 按 `(SegmentID, offset)` 排序并使用有界窗口；生成
 
 `MaxGroupBytes` 只计算待写 Commit/Relocation Descriptor 编码字节和 coordinator buffer，不重复计算 Put 阶段已 append 的 Value。`MaxGroupDelay=0` 表示不主动 sleep；大于 0 时从首个排队请求开始计时，Context deadline 更早时不得为了凑组延迟。
 
-GC 受 `GCBatchBytes/GCBatchMutations`、Delta reservation、前台队列优先级和可用磁盘共同限制。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
+GC 受 `GCBatchBytes/GCBatchMutations`、`GCBytesPerSecond`、Delta reservation、前台队列优先级和可用磁盘共同限制。每个 durable Relocation Batch 后按本轮累计 copied bytes 对 wall clock 做 Context-aware pacing；已经排队的用户 Commit 优先于下一批 Relocation，已经选中的单个有限 Relocation Batch 不被拆开。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
 
 Data GC 使用两段磁盘 admission。安装 Maintenance Journal 前按 exact live bytes、Relocation Descriptor、两个 rotation Segment 与 `GCMinFreeBytes` 检查 copy 阶段空间；copy 完成后，GC-required Checkpoint barrier 先冻结其实际 Delta layers，再按冻结 entry 数乘以每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment与 `GCMinFreeBytes` 重新检查。第二段失败时 Relocation 已是可恢复的 durable garbage/Delta，但源 Segment 和旧 checkpoint 仍保留，Journal 安全撤销。这样前台 Commit 可以继续运行，又不会把只按源 live 数得到的估计误称为整个 Checkpoint 上界。任一检查低于上界均返回 `ErrInsufficientSpace`。可用空间检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
 

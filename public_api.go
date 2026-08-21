@@ -54,6 +54,7 @@ type Metrics struct {
 	GCNoCandidate, GCInsufficientSpace           uint64
 	GCCopiedBytes, GCReclaimedBytes              uint64
 	GCRelocated, GCSkipped, GCDurationNanos      uint64
+	GCThrottledNanos                             uint64
 }
 
 const (
@@ -77,6 +78,7 @@ func (s *Store) Metrics() Metrics {
 		GCNoCandidate: snapshot.GCNoCandidate, GCInsufficientSpace: snapshot.GCInsufficientSpace,
 		GCCopiedBytes: snapshot.GCCopiedBytes, GCReclaimedBytes: snapshot.GCReclaimedBytes,
 		GCRelocated: snapshot.GCRelocated, GCSkipped: snapshot.GCSkipped, GCDurationNanos: snapshot.GCDurationNanos,
+		GCThrottledNanos: snapshot.GCThrottledNanos,
 	}
 	if s.mapping != nil {
 		result.DeltaChargedBytes, result.DeltaReservedBytes = s.mapping.DeltaBytes()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -175,6 +176,18 @@ func TestDataGCCopySpaceUpperIncludesLiveDescriptorAndReserve(t *testing.T) {
 	want := uint64(cfg.GCMinFreeBytes) + 128 + 2*storeformat.MutationEntrySize + 2*uint64(cfg.SegmentSize)
 	if required != want {
 		t.Fatalf("required=%d want=%d", required, want)
+	}
+}
+
+func TestGCThrottleDelay(t *testing.T) {
+	if got := gcThrottleDelay(100, 50, 500*time.Millisecond); got != 1500*time.Millisecond {
+		t.Fatalf("delay=%v", got)
+	}
+	if got := gcThrottleDelay(100, 50, 3*time.Second); got != 0 {
+		t.Fatalf("completed delay=%v", got)
+	}
+	if got := gcThrottleDelay(^uint64(0), uint64(math.MaxInt64), 0); got <= 0 {
+		t.Fatalf("large delay=%v", got)
 	}
 }
 
