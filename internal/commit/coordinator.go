@@ -13,6 +13,7 @@ import (
 	"github.com/akzj/ridstore/internal/batch"
 	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/mapping/api"
+	"github.com/akzj/ridstore/internal/metrics"
 	"github.com/akzj/ridstore/internal/segment"
 )
 
@@ -45,6 +46,7 @@ type Config struct {
 	MaxBatches int
 	MaxBytes   uint64
 	MaxDelay   time.Duration
+	Metrics    *metrics.Runtime
 }
 
 type Coordinator struct {
@@ -69,6 +71,7 @@ type request struct {
 	batch    *batch.Batch
 	prepared batch.Prepared
 	result   chan response
+	queuedAt time.Time
 }
 
 type response struct {
@@ -127,7 +130,7 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 		_ = b.MarkAborted()
 		return Result{}, err
 	}
-	request := request{ctx: ctx, batch: b, prepared: prepared, result: make(chan response, 1)}
+	request := request{ctx: ctx, batch: b, prepared: prepared, result: make(chan response, 1), queuedAt: time.Now()}
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()
@@ -136,6 +139,9 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 	}
 	select {
 	case c.requests <- request:
+		if c.config.Metrics != nil {
+			c.config.Metrics.CommitQueued()
+		}
 		c.submitMu.Unlock()
 	case <-ctx.Done():
 		c.submitMu.Unlock()
@@ -232,9 +238,17 @@ func (c *Coordinator) process(group []request) {
 	if len(group) == 0 {
 		return
 	}
+	validationStarted := time.Now()
+	if c.config.Metrics != nil {
+		now := time.Now()
+		for _, request := range group {
+			c.config.Metrics.AddQueueWait(uint64(now.Sub(request.queuedAt)))
+		}
+	}
 	if fault := c.Fault(); fault != nil {
 		for _, request := range group {
 			_ = request.batch.MarkAborted()
+			c.recordAborted()
 			request.result <- response{err: errors.Join(base.ErrReadOnly, fault)}
 		}
 		return
@@ -247,16 +261,19 @@ func (c *Coordinator) process(group []request) {
 	for i, request := range group {
 		if err := request.ctx.Err(); err != nil {
 			_ = request.batch.MarkAborted()
+			c.recordAborted()
 			request.result <- response{err: err}
 			continue
 		}
 		if next == base.CommitSeq(math.MaxUint64) {
 			_ = request.batch.MarkAborted()
+			c.recordAborted()
 			request.result <- response{err: base.ErrGenerationExhausted}
 			continue
 		}
 		if err := c.validatePutRecords(request.prepared); err != nil {
 			_ = request.batch.MarkAborted()
+			c.recordAborted()
 			c.fail(err)
 			request.result <- response{err: err}
 			c.rejectTail(group[i+1:], err)
@@ -265,6 +282,7 @@ func (c *Coordinator) process(group []request) {
 		conflict, err := c.hasConflictVirtual(request.prepared.Conditions, virtual)
 		if err != nil {
 			_ = request.batch.MarkAborted()
+			c.recordAborted()
 			c.fail(err)
 			request.result <- response{err: err}
 			c.rejectTail(group[i+1:], err)
@@ -272,6 +290,9 @@ func (c *Coordinator) process(group []request) {
 		}
 		if conflict {
 			_ = request.batch.MarkAborted()
+			if c.config.Metrics != nil {
+				c.config.Metrics.Conflict()
+			}
 			request.result <- response{err: base.ErrConflict}
 			continue
 		}
@@ -282,14 +303,23 @@ func (c *Coordinator) process(group []request) {
 		next++
 	}
 	if len(admitted) == 0 {
+		c.recordValidation(validationStarted)
 		return
+	}
+	c.recordValidation(validationStarted)
+	if c.config.Metrics != nil {
+		c.config.Metrics.CommitGroup(len(admitted))
 	}
 	prepared := make([]batch.Prepared, len(admitted))
 	seqs := make([]base.CommitSeq, len(admitted))
 	for i := range admitted {
 		prepared[i], seqs[i] = admitted[i].request.prepared, admitted[i].seq
 	}
+	writeStarted := time.Now()
 	appendResults, err := c.appendGroup(prepared, seqs)
+	if c.config.Metrics != nil {
+		c.config.Metrics.AddWriteSync(uint64(time.Since(writeStarted)))
+	}
 	if err != nil {
 		c.handleAppendError(admitted, appendResults, err)
 		return
@@ -298,9 +328,16 @@ func (c *Coordinator) process(group []request) {
 	c.next = next
 	c.mu.Unlock()
 	for i := range admitted {
+		publishStarted := time.Now()
 		if err := c.publish(admitted[i]); err != nil {
+			if c.config.Metrics != nil {
+				c.config.Metrics.AddPublish(uint64(time.Since(publishStarted)))
+			}
 			c.rejectDurableTail(admitted[i+1:], err)
 			return
+		}
+		if c.config.Metrics != nil {
+			c.config.Metrics.AddPublish(uint64(time.Since(publishStarted)))
 		}
 	}
 }
@@ -328,9 +365,11 @@ func (c *Coordinator) handleAppendError(admitted []admittedRequest, results []ap
 		sealStarted := i < len(results) && results[i].SealStarted
 		if sealStarted {
 			_ = item.request.batch.MarkCommitUnknown()
+			c.recordUnknown()
 			item.request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
 		} else {
 			_ = item.request.batch.MarkAborted()
+			c.recordAborted()
 			item.request.result <- response{err: err}
 		}
 	}
@@ -344,22 +383,30 @@ func (c *Coordinator) publish(item admittedRequest) error {
 			err = fmt.Errorf("mapping applied %d/%d changes: %w", applyResult.Applied, len(changes), base.ErrCorrupt)
 		}
 		_ = item.request.batch.MarkCommitUnknown()
+		c.recordUnknown()
 		c.fail(err)
 		item.request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
 		return err
 	}
 	if err := failpoint.Hit(c.hook, PointMappingPublished); err != nil {
 		_ = item.request.batch.MarkCommitUnknown()
+		c.recordUnknown()
 		c.fail(err)
 		item.request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
 		return err
 	}
 	if err := item.request.batch.MarkCommitted(item.seq); err != nil {
+		_ = item.request.batch.MarkCommitUnknown()
+		c.recordUnknown()
 		c.fail(err)
 		item.request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
 		return err
 	}
+	if c.config.Metrics != nil {
+		c.config.Metrics.Committed()
+	}
 	if err := failpoint.Hit(c.hook, PointResultReady); err != nil {
+		c.recordUnknown()
 		c.fail(err)
 		item.request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
 		return err
@@ -451,6 +498,7 @@ func wouldExceed(current, added, limit uint64) bool {
 func (c *Coordinator) rejectTail(requests []request, cause error) {
 	for _, request := range requests {
 		_ = request.batch.MarkAborted()
+		c.recordAborted()
 		request.result <- response{err: errors.Join(base.ErrReadOnly, cause)}
 	}
 }
@@ -458,7 +506,26 @@ func (c *Coordinator) rejectTail(requests []request, cause error) {
 func (c *Coordinator) rejectDurableTail(items []admittedRequest, cause error) {
 	for _, item := range items {
 		_ = item.request.batch.MarkCommitUnknown()
+		c.recordUnknown()
 		item.request.result <- response{err: errors.Join(base.ErrCommitUnknown, cause)}
+	}
+}
+
+func (c *Coordinator) recordAborted() {
+	if c.config.Metrics != nil {
+		c.config.Metrics.Aborted()
+	}
+}
+
+func (c *Coordinator) recordUnknown() {
+	if c.config.Metrics != nil {
+		c.config.Metrics.Unknown()
+	}
+}
+
+func (c *Coordinator) recordValidation(started time.Time) {
+	if c.config.Metrics != nil {
+		c.config.Metrics.AddValidation(uint64(time.Since(started)))
 	}
 }
 
