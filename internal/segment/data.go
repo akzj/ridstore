@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	storeformat "github.com/akzj/ridstore/internal/format"
@@ -33,6 +35,149 @@ type ActiveData struct {
 
 func ActiveDataFileName(id base.DataSegmentID) string {
 	return fmt.Sprintf("DATA-%08d.active", id)
+}
+
+func CreateActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, firstSeq base.FrameSeq, segmentSize, maxPayloadSize uint64) (*ActiveData, error) {
+	if uuid == (base.StoreUUID{}) || id == 0 || firstSeq == 0 {
+		return nil, base.ErrInvalidConfig
+	}
+	header, err := storeformat.EncodeSegmentHeader(storeformat.SegmentHeader{
+		Kind: storeformat.SegmentKindData, StoreUUID: uuid, FileID: uint32(id), FirstSeq: uint64(firstSeq), CreatedUnixNano: uint64(time.Now().UnixNano()),
+	})
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(root, "data", ActiveDataFileName(id))
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := writeFullAt(file, header[:], 0); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	if err := file.Sync(); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	if err := errors.Join(dir.Sync(), dir.Close()); err != nil {
+		return nil, err
+	}
+	return OpenActiveData(root, uuid, id, segmentSize, maxPayloadSize)
+}
+
+// ResumeSeal completes an interrupted Active->Sealed transition. It recognizes
+// a complete terminal SegmentSeal even when the footer or rename was lost.
+func ResumeSeal(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, fallbackNext base.FrameSeq) (storeformat.FileSummary, error) {
+	path := filepath.Join(root, "data", ActiveDataFileName(id))
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return storeformat.FileSummary{}, errors.Join(err, file.Close())
+	}
+	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
+	if _, err := file.ReadAt(headerBytes, 0); err != nil {
+		return storeformat.FileSummary{}, errors.Join(err, file.Close())
+	}
+	header, err := storeformat.DecodeSegmentHeader(headerBytes)
+	if err != nil || header.Kind != storeformat.SegmentKindData || header.StoreUUID != uuid || header.FileID != uint32(id) {
+		return storeformat.FileSummary{}, errors.Join(err, file.Close(), base.ErrCorrupt)
+	}
+	physicalEnd := uint64(info.Size())
+	contentLimit := segmentSize - storeformat.SegmentFooterSize
+	offset := uint64(storeformat.SegmentHeaderSize)
+	var count uint64
+	var first, previous base.FrameSeq
+	for offset+storeformat.FrameHeaderSize <= physicalEnd && offset < contentLimit {
+		headerBytes := make([]byte, storeformat.FrameHeaderSize)
+		if _, err := file.ReadAt(headerBytes, int64(offset)); err != nil {
+			break
+		}
+		limits := storeformat.FrameLimits{MaxPayloadSize: maxPayloadSize, RemainingSegmentSize: contentLimit - offset}
+		frameHeader, err := storeformat.DecodeFrameHeader(headerBytes, limits)
+		if err != nil || frameHeader.TotalSize > physicalEnd-offset {
+			break
+		}
+		total, err := base.Uint64ToInt(frameHeader.TotalSize)
+		if err != nil {
+			return storeformat.FileSummary{}, errors.Join(err, file.Close())
+		}
+		encoded := make([]byte, total)
+		if _, err := file.ReadAt(encoded, int64(offset)); err != nil {
+			break
+		}
+		frame, _, err := storeformat.DecodeFrame(encoded, limits)
+		if err != nil {
+			break
+		}
+		if count == 0 {
+			first = frame.FrameSeq
+			if first != base.FrameSeq(header.FirstSeq) {
+				return storeformat.FileSummary{}, errors.Join(base.ErrCorrupt, file.Close())
+			}
+		} else if frame.FrameSeq <= previous {
+			return storeformat.FileSummary{}, errors.Join(base.ErrCorrupt, file.Close())
+		}
+		count++
+		previous = frame.FrameSeq
+		offset += frameHeader.TotalSize
+		if frame.Type != storeformat.FrameTypeSegmentSeal {
+			continue
+		}
+		seal, err := storeformat.DecodeSegmentSealFrame(frame)
+		if err != nil || seal.SegmentID != id || seal.ValidDataEnd != offset || seal.FirstFrameSeq != first || seal.FrameCount != count {
+			return storeformat.FileSummary{}, errors.Join(err, file.Close(), base.ErrCorrupt)
+		}
+		footer, err := storeformat.EncodeDataSegmentFooter(storeformat.DataSegmentFooter(seal))
+		if err != nil {
+			return storeformat.FileSummary{}, errors.Join(err, file.Close())
+		}
+		if err := file.Truncate(int64(seal.ValidDataEnd)); err != nil {
+			return storeformat.FileSummary{}, errors.Join(err, file.Close())
+		}
+		if _, err := writeFullAt(file, footer[:], int64(seal.ValidDataEnd)); err != nil {
+			return storeformat.FileSummary{}, errors.Join(err, file.Close())
+		}
+		if err := file.Sync(); err != nil {
+			return storeformat.FileSummary{}, errors.Join(err, file.Close())
+		}
+		if err := file.Close(); err != nil {
+			return storeformat.FileSummary{}, err
+		}
+		if err := os.Rename(path, filepath.Join(root, "data", SealedDataFileName(id))); err != nil {
+			return storeformat.FileSummary{}, err
+		}
+		dir, err := os.Open(filepath.Join(root, "data"))
+		if err != nil {
+			return storeformat.FileSummary{}, err
+		}
+		if err := errors.Join(dir.Sync(), dir.Close()); err != nil {
+			return storeformat.FileSummary{}, err
+		}
+		return storeformat.FileSummary{FileID: uint32(id), ValidEnd: seal.ValidDataEnd, FirstSeq: uint64(seal.FirstFrameSeq), LastSeq: uint64(seal.LastFrameSeq)}, nil
+	}
+	if err := file.Close(); err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	if previous >= fallbackNext {
+		if previous == base.FrameSeq(math.MaxUint64) {
+			return storeformat.FileSummary{}, base.ErrGenerationExhausted
+		}
+		fallbackNext = previous + 1
+	}
+	active, err := OpenActiveData(root, uuid, id, segmentSize, maxPayloadSize)
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	return active.Seal(fallbackNext)
 }
 
 func OpenActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64) (*ActiveData, error) {

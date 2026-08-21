@@ -191,6 +191,57 @@ func TestActiveDataSealCreatesStrictImmutableSegment(t *testing.T) {
 	}
 }
 
+func TestResumeSealCompletesFooterAndRename(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	createActiveDataFile(t, root, uuid, 1)
+	active, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	end := active.End()
+	if err := active.Close(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := storeformat.EncodeSegmentSealPayload(storeformat.SegmentSealPayload{
+		SegmentID: 1, ValidDataEnd: end + storeformat.FrameHeaderSize + 64,
+		FirstFrameSeq: 1, LastFrameSeq: 2, FrameCount: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := storeformat.EncodeFrame(storeformat.Frame{Type: storeformat.FrameTypeSegmentSeal, FrameSeq: 2, Payload: payload[:]}, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(root, "data", ActiveDataFileName(1)), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := ResumeSeal(root, uuid, 1, 1<<20, 1024, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.LastSeq != 2 {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if err := ValidateSealedData(root, uuid, summary, 1<<20, 1024); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func mustHeader(t *testing.T, uuid base.StoreUUID, id base.DataSegmentID) []byte {
 	t.Helper()
 	header, err := storeformat.EncodeSegmentHeader(storeformat.SegmentHeader{Kind: storeformat.SegmentKindData, StoreUUID: uuid, FileID: uint32(id), FirstSeq: 1})

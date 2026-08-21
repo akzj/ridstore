@@ -130,7 +130,7 @@ func (s *Store) GetRecord(ctx context.Context, id ID) (Record, error) {
 	if !ok {
 		return Record{}, base.ErrNotFound
 	}
-	frame, err := s.active.ReadFrame(addr)
+	frame, err := s.segments.ReadFrame(addr)
 	if err != nil {
 		s.setFault(err)
 		return Record{}, err

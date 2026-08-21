@@ -13,6 +13,7 @@ import (
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/recovery"
+	"github.com/akzj/ridstore/internal/rotation"
 	"github.com/akzj/ridstore/internal/segment"
 )
 
@@ -21,18 +22,45 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, err
 	}
-	active, err := segment.OpenActiveData(cfg.Dir, manifest.StoreUUID, manifest.ActiveDataSegmentID, manifest.HardLimits.SegmentSize, maxFramePayload)
+	manifest, err = rotation.Recover(cfg.Dir, manifest, maxFramePayload)
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (*Store, error) {
-		return nil, errors.Join(err, active.Close())
+	sealed := make([]*segment.SealedData, 0, len(manifest.SealedDataSegments))
+	closeSealed := func() error {
+		var result error
+		for _, item := range sealed {
+			result = errors.Join(result, item.Close())
+		}
+		return result
 	}
-	recovered, err := recovery.RecoverPhase1(manifest, active)
+	for _, summary := range manifest.SealedDataSegments {
+		item, openErr := segment.OpenSealedData(cfg.Dir, manifest.StoreUUID, summary, manifest.HardLimits.SegmentSize, maxFramePayload)
+		if openErr != nil {
+			return nil, errors.Join(openErr, closeSealed())
+		}
+		sealed = append(sealed, item)
+	}
+	active, err := segment.OpenActiveData(cfg.Dir, manifest.StoreUUID, manifest.ActiveDataSegmentID, manifest.HardLimits.SegmentSize, maxFramePayload)
+	if err != nil {
+		return nil, errors.Join(err, closeSealed())
+	}
+	segments, err := segment.NewRegistry(active, sealed)
+	if err != nil {
+		return nil, errors.Join(err, active.Close(), closeSealed())
+	}
+	fail := func(err error) (*Store, error) {
+		return nil, errors.Join(err, segments.Close())
+	}
+	recovered, err := recovery.Recover(manifest, sealed, active)
 	if err != nil {
 		return fail(err)
 	}
-	physicalLog, err := appendlog.NewWithHook(active, recovered.NextFrameSeq, maxFramePayload, maxPartPayload, hook)
+	rotator, err := rotation.NewManager(cfg.Dir, manifest, segments, maxFramePayload)
+	if err != nil {
+		return fail(err)
+	}
+	physicalLog, err := appendlog.NewWithRotator(active, recovered.NextFrameSeq, maxFramePayload, maxPartPayload, hook, rotator)
 	if err != nil {
 		return fail(err)
 	}
@@ -41,7 +69,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		return fail(err)
 	}
 	failWithLog := func(err error) (*Store, error) {
-		return nil, errors.Join(err, log.Close(), active.Close())
+		return nil, errors.Join(err, log.Close(), segments.Close())
 	}
 	idAllocator, err := allocator.New(allocator.RecordID, manifest.HardLimits.IDReserveSize, recovered.ReservedIDHighExclusive, log)
 	if err != nil {
@@ -51,14 +79,14 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return failWithLog(err)
 	}
-	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, recovered.Mapping, activeRecordReader{active: active}, commit.Config{
+	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, recovered.Mapping, segmentRecordReader{segments: segments}, commit.Config{
 		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: uint64(cfg.MaxGroupBytes), MaxDelay: cfg.MaxGroupDelay,
 	}, hook)
 	if err != nil {
 		return failWithLog(err)
 	}
 	store := &Store{
-		config: cfg, manifest: manifest, lock: lock, active: active, log: log,
+		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, log: log,
 		mapping: recovered.Mapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
 		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]BatchStatus), slotNotify: make(chan struct{}, 1),
 		issuedBatchHigh:      recovered.ReservedBatchIDHighExclusive,
@@ -112,10 +140,10 @@ func framePayloadLimits(h storeformat.HardLimits) (uint64, uint64, error) {
 	return maxFrame, maxPart, nil
 }
 
-type activeRecordReader struct{ active *segment.ActiveData }
+type segmentRecordReader struct{ segments *segment.Registry }
 
-func (r activeRecordReader) ReadPutHeader(addr base.VAddr) (commit.RecordHeader, error) {
-	frame, err := r.active.ReadFrame(addr)
+func (r segmentRecordReader) ReadPutHeader(addr base.VAddr) (commit.RecordHeader, error) {
+	frame, err := r.segments.ReadFrame(addr)
 	if err != nil {
 		return commit.RecordHeader{}, err
 	}

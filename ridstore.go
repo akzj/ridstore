@@ -18,6 +18,7 @@ import (
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
 	"github.com/akzj/ridstore/internal/mapping/memory"
+	"github.com/akzj/ridstore/internal/rotation"
 	"github.com/akzj/ridstore/internal/segment"
 )
 
@@ -41,7 +42,8 @@ type Store struct {
 	config         Config
 	manifest       storeformat.Manifest
 	lock           *filelock.Lock
-	active         *segment.ActiveData
+	segments       *segment.Registry
+	rotation       *rotation.Manager
 	log            *appendlog.Sequencer
 	mapping        *memory.Mapping
 	coordinator    *commit.Coordinator
@@ -149,7 +151,7 @@ func (s *Store) Close() error {
 	}
 	result = errors.Join(result, s.coordinator.Close())
 	result = errors.Join(result, s.log.Close())
-	result = errors.Join(result, s.active.Close())
+	result = errors.Join(result, s.segments.Close())
 	result = errors.Join(result, s.lock.Close())
 	return result
 }
