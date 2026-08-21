@@ -38,7 +38,7 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 
 ## 当前完整性结论
 
-Phase 0 格式与 Harness、Phase 1 最小 durable Record Store、Phase 2 并发与 group commit 已完成；Review 见 [phase-1-review.md](phase-1-review.md) 与 [phase-2-review.md](phase-2-review.md)。当前进入 **Phase 3 Persistent Mapping**；Root/SegmentStats、GC 删除和 Delta admission 的后续实现仍必须遵守既有失败时序。
+Phase 0 格式与 Harness、Phase 1 最小 durable Record Store、Phase 2 并发与 group commit、Phase 3 Persistent Mapping 已完成；Review 见 [phase-1-review.md](phase-1-review.md)、[phase-2-review.md](phase-2-review.md) 与 [phase-3-review.md](phase-3-review.md)。当前进入 **Phase 4 Data GC**；真实 Data Segment 删除仍必须遵守 Relocation、Reader pin、Checkpoint 与 trash 门禁。
 
 仍可由实现基准选择而不改变契约的内容包括 Delta shard 数、Node Cache 的 CLOCK/SLRU 具体策略、I/O buffer 大小和后台调度权重。它们不得改变持久化格式、Batch 原子性、内存 hard limit、recovery 结果或 GC 删除门禁。
 

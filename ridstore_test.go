@@ -362,13 +362,17 @@ func TestDeltaSoftLimitSchedulesCheckpointAfterCommit(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		metrics := store.Metrics()
-		if store.catalog.Snapshot().CoveredCommitSeq >= 1 && metrics.DeltaChargedBytes == 0 && metrics.DeltaReservedBytes == 0 {
+		status := store.MaintenanceStatus()
+		if store.catalog.Snapshot().CoveredCommitSeq >= 1 && metrics.DeltaChargedBytes == 0 && metrics.DeltaReservedBytes == 0 && !status.CheckpointPending {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("automatic checkpoint did not complete: manifest=%+v metrics=%+v", store.catalog.Snapshot(), metrics)
+			t.Fatalf("automatic checkpoint did not complete: manifest=%+v metrics=%+v status=%+v", store.catalog.Snapshot(), metrics, status)
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if status := store.MaintenanceStatus(); status.CheckpointPending || status.LastCheckpointError != nil {
+		t.Fatalf("maintenance status=%+v", status)
 	}
 	if value, err := store.Get(context.Background(), id); err != nil || string(value) != "soft-limit" {
 		t.Fatalf("value=%q error=%v", value, err)
