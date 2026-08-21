@@ -15,7 +15,7 @@
 | Restore/UUID 策略 | 完成 | 新目录发布、RESTORING marker、默认新 UUID、preserve 显式开关、SIGKILL matrix | 应用级异机演练尚未执行 |
 | Metrics adapter | 完成 | 固定 bounded samples、Prometheus adapter tests | dashboard/告警属于部署层 |
 | Migration skeleton | 完成 | 只读 planner、registry、非 v1 明确 `ErrUnsupported` | 没有可执行跨版本迁移；skeleton 不代表升级路径已存在 |
-| Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；Manifest/CURRENT、Journal、Active Data、Data GC trash/delete、Active Mapping/rotation/GC 的 syscall-error matrix | Initialize、Backup/Restore 尚未闭合；没有 power-loss 设备证据 |
+| Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；Manifest/CURRENT、Journal、Active Data、Data GC trash/delete、Active Mapping/rotation/GC、Initialize 的 syscall-error matrix | Backup/Restore 尚未闭合；没有 power-loss 设备证据 |
 | Long fuzz/nightly | 未完成 | 每个 decoder 的 2s smoke gate | 长时 fuzz 未自然结束，也没有 nightly 产物 |
 | 72h steady-state soak | 未完成 | 现有短收敛测试 | 尚无 72h harness 报告、资源时间序列或自然结束证据 |
 | Same-durability benchmark | 未完成 | 单一 ridstore durable commit benchmark | 无 append baseline、Pebble/RocksDB 同 durability 稳定态对比和原始报告 |
@@ -45,7 +45,7 @@ Manifest/CURRENT 已覆盖 write、file sync、rename、directory sync 的 `ENOS
 
 Active Data 主写路径现已增加 append/sync、seal/footer write+sync、rename 和 data directory sync 注入点。单元矩阵证明每个 seal 边界都能经 fresh recovery 收敛为严格 immutable Segment；Store 级测试证明 descriptor write 错误确定未提交、Seal 后 sync 错误返回 CommitUnknown、两者均保留 `EIO` cause 并 fail closed。新 Active 创建的 Header write、file/directory sync，以及 Open incomplete-tail truncate/sync 也完成三类错误矩阵。Rotation recovery 只在 Journal 明确授权且新 ID 尚未发布时删除短 regular file 或 corrupt Header 后重建；合法空文件重新 fsync，非空、symlink/non-regular entry 拒绝。tail truncate 后 sync 失败的下一次 Open 即使已看到 clean size 也补做 file sync。Rotation Journal 与 Maintenance Journal 的 install/remove write、sync、rename/remove、directory sync 也已覆盖三类错误；Open 会删除并 fsync 未发布 regular temp、拒绝 symlink，并幂等完成已发布 Journal。
 
-Maintenance Journal 另按 Data GC phase 验证所有七次 directory-sync publication：phase 1–3 失败且 Manifest 尚未证明 GC checkpoint 时允许撤销；Mapping Checkpoint Manifest 一旦 durable，运行时立即 fail closed，即使 phase-4 Journal rename 尚未成功，fresh Open 也会用 `MaintenanceGeneration`、精确 SegmentStats 和 ReplayStart 的共同证据补写 phase 4 后继续删除。嵌套 Mapping rotation 虽可提前推进相同 MaintenanceGeneration，但旧 source 仍在 SegmentStats 时只能撤销，不能误判为 GC checkpoint。checkpoint 前 Journal cleanup 自身失败也会 fail closed，由 fresh Open 收敛。完整 writer 清单与剩余缺口见 `syscall-fault-matrix.md`；Initialize 和 Backup/Restore 尚未闭合，因此本 P0 仍保持未完成。
+Maintenance Journal 另按 Data GC phase 验证所有七次 directory-sync publication：phase 1–3 失败且 Manifest 尚未证明 GC checkpoint 时允许撤销；Mapping Checkpoint Manifest 一旦 durable，运行时立即 fail closed，即使 phase-4 Journal rename 尚未成功，fresh Open 也会用 `MaintenanceGeneration`、精确 SegmentStats 和 ReplayStart 的共同证据补写 phase 4 后继续删除。嵌套 Mapping rotation 虽可提前推进相同 MaintenanceGeneration，但旧 source 仍在 SegmentStats 时只能撤销，不能误判为 GC checkpoint。checkpoint 前 Journal cleanup 自身失败也会 fail closed，由 fresh Open 收敛。完整 writer 清单与剩余缺口见 `syscall-fault-matrix.md`；Backup/Restore 尚未闭合，因此本 P0 仍保持未完成。
 
 Active Mapping Checkpoint 的 Node append 与最终 file sync 现已覆盖相同三类 syscall 错误。底层 `nodeStore` 在任一失败后 poisoned，Store 保留原始 cause 并停止写；fresh Open 采用旧 Manifest Root、忽略/截断未发布 tail、从 Commit Log replay 后可重新 Checkpoint，offline Verify clean。
 
@@ -53,9 +53,11 @@ Active Mapping Open tail repair 也已覆盖 truncate/sync 的三类错误，失
 
 Mapping rotation 已覆盖旧 Active sync、Footer write/sync、rename/dir-sync 与新 Active Header write/sync/dir-sync；三类错误均验证，Store 级各边界均 fail closed 并由 fresh Open 恢复。普通 rotation 的独立 Maintenance Journal 和 Data GC nested 的父 Journal 所有权分别验证。恢复 writer 的 truncate、partial remove、Footer/Header、rename/dir-sync 也完成三类错误矩阵并证明失败可重试。审计还修复了恢复仅验证“文件当前可见”却未补齐 durability 的问题：合法 sealed/new Active 已存在时仍重新 file sync 与 mapping-dir sync。
 
-Mapping GC 现已覆盖新 generation Header/Node/Footer write、file sync、temp/publish rename 与 directory sync，以及 checkpoint 前 cleanup、旧文件 trash、delete 的 remove/rename/directory-sync；每个边界注入 `EIO/ENOSPC/EACCES`，恢复路径自身失败后可再次 Open。多文件 Case 验证部分 rename/delete，Store 级代表性 Case 验证 fail closed、原始 cause、记录一致与 offline Verify。审计同时修复两处协议缺口：checkpoint 前 cleanup 错误不再被吞掉；Catalog mutation 一旦通过、Installer 可能已发布 CURRENT 后，运行时不再删除新 Mapping 文件。相反，Installer 前的 Mapping baseline conflict 仍完整回滚。旧 Root reader 清零门禁保持在首次 trash rename 之前。至此 Mapping writer 的当前 syscall matrix 闭合，但不能替代尚缺的 Initialize、Backup/Restore writer 与真实 power-loss 证据。
+Mapping GC 现已覆盖新 generation Header/Node/Footer write、file sync、temp/publish rename 与 directory sync，以及 checkpoint 前 cleanup、旧文件 trash、delete 的 remove/rename/directory-sync；每个边界注入 `EIO/ENOSPC/EACCES`，恢复路径自身失败后可再次 Open。多文件 Case 验证部分 rename/delete，Store 级代表性 Case 验证 fail closed、原始 cause、记录一致与 offline Verify。审计同时修复两处协议缺口：checkpoint 前 cleanup 错误不再被吞掉；Catalog mutation 一旦通过、Installer 可能已发布 CURRENT 后，运行时不再删除新 Mapping 文件。相反，Installer 前的 Mapping baseline conflict 仍完整回滚。旧 Root reader 清零门禁保持在首次 trash rename 之前。至此 Mapping writer 的当前 syscall matrix 闭合，但不能替代尚缺的 Backup/Restore writer 与真实 power-loss 证据。
 
-Data GC 的 source rename-to-trash、data/trash directory sync、trash delete 与 delete directory sync 现已覆盖 `EIO/ENOSPC/EACCES`。这些边界均位于 checkpoint 和 source-removal Manifest durable 之后，因此运行时不尝试回滚，而是立即 fail closed；fresh Open 从 phase-5/6 Journal 完成相同操作。恢复路径本身也传播 hook，任一恢复 syscall 或 Journal advance/remove 失败后，下一次 Open 可继续；测试验证记录 revision/value、Journal/trash 清空和 offline Verify。该结果只闭合 Data GC 删除 writer，不代表 Initialize 或 Backup/Restore 已覆盖。
+Data GC 的 source rename-to-trash、data/trash directory sync、trash delete 与 delete directory sync 现已覆盖 `EIO/ENOSPC/EACCES`。这些边界均位于 checkpoint 和 source-removal Manifest durable 之后，因此运行时不尝试回滚，而是立即 fail closed；fresh Open 从 phase-5/6 Journal 完成相同操作。恢复路径本身也传播 hook，任一恢复 syscall 或 Journal advance/remove 失败后，下一次 Open 可继续；测试验证记录 revision/value、Journal/trash 清空和 offline Verify。该结果只闭合 Data GC 删除 writer，不代表 Backup/Restore artifact publication 已覆盖。
+
+Initialize 现已覆盖 Marker temp 清理/write/file sync/rename/root sync、目录创建/root sync、初始 Data/Mapping Header write/file sync/directory sync、损坏的未发布文件清理，以及最终 Marker/temp remove/root sync 的 `EIO/ENOSPC/EACCES`。有效 Marker temp 在恢复时先补做 file sync，再 rename/root sync；损坏 temp 和 durable phase 前的损坏初始 Segment 可删除并重建，durable phase 后仍 fail closed。审计同时修复了最终 Marker remove 成功而 root sync 失败后的重试缺口：marker-free Open 在采用已发布 Manifest 后会重新 sync root，不能仅因 Marker 当前不可见就认定删除 durable。所有 Case 收敛到同一 UUID/HardLimits、generation 1，且不残留 Marker/temp。该结果仍不代表 Backup/Restore artifact publication 或真实 power-loss 已覆盖。
 
 ### P1：磁盘耗尽停止水位
 

@@ -40,6 +40,26 @@ const (
 	PointMapDirectorySynced  failpoint.Point = "initialize.map-directory-synced"
 	PointMarkerRemoved       failpoint.Point = "initialize.marker-removed"
 	PointFinalDirSynced      failpoint.Point = "initialize.final-dir-synced"
+
+	PointBeforeMarkerTempRemove     failpoint.Point = "initialize.before-marker-temp-remove"
+	PointBeforeMarkerWrite          failpoint.Point = "initialize.before-marker-write"
+	PointBeforeMarkerFileSync       failpoint.Point = "initialize.before-marker-file-sync"
+	PointBeforeMarkerRename         failpoint.Point = "initialize.before-marker-rename"
+	PointBeforeMarkerDirSync        failpoint.Point = "initialize.before-marker-dir-sync"
+	PointBeforeMarkerRecoveryRemove failpoint.Point = "initialize.before-marker-recovery-remove"
+	PointBeforeMarkerRecoverySync   failpoint.Point = "initialize.before-marker-recovery-dir-sync"
+	PointBeforeDirectoryCreate      failpoint.Point = "initialize.before-directory-create"
+	PointBeforeDirectoriesSync      failpoint.Point = "initialize.before-directories-sync"
+	PointBeforeInitialSegmentRemove failpoint.Point = "initialize.before-initial-segment-remove"
+	PointBeforeDataHeaderWrite      failpoint.Point = "initialize.before-data-header-write"
+	PointBeforeDataHeaderFileSync   failpoint.Point = "initialize.before-data-header-file-sync"
+	PointBeforeDataDirectorySync    failpoint.Point = "initialize.before-data-directory-sync"
+	PointBeforeMapHeaderWrite       failpoint.Point = "initialize.before-map-header-write"
+	PointBeforeMapHeaderFileSync    failpoint.Point = "initialize.before-map-header-file-sync"
+	PointBeforeMapDirectorySync     failpoint.Point = "initialize.before-map-directory-sync"
+	PointBeforeFinalMarkerRemove    failpoint.Point = "initialize.before-final-marker-remove"
+	PointBeforeFinalTempRemove      failpoint.Point = "initialize.before-final-temp-remove"
+	PointBeforeFinalDirSync         failpoint.Point = "initialize.before-final-dir-sync"
 )
 
 type Options struct {
@@ -102,7 +122,14 @@ func OpenWithOptions(dir string, opts Options) (storeformat.Manifest, error) {
 		return storeformat.Manifest{}, base.ErrNotInitialized
 	}
 	if err == nil {
-		err = manifest.CleanupInterruptedInstall(dir)
+		if err = manifest.CleanupInterruptedInstall(dir); err == nil {
+			// A previous initialization may have removed INITIALIZING but
+			// failed to make that removal durable. Re-sync the root before a
+			// marker-free Open is allowed to succeed.
+			if err = failpoint.Hit(opts.Hook, PointBeforeFinalDirSync); err == nil {
+				err = syncDirectory(dir)
+			}
+		}
 	}
 	return m, err
 }
@@ -170,13 +197,22 @@ func resume(dir string, marker storeformat.InitializingMarker, opts Options) (st
 	if !reflect.DeepEqual(got, want) {
 		return storeformat.Manifest{}, fmt.Errorf("initial manifest does not match INITIALIZING marker: %w", base.ErrCorrupt)
 	}
+	if err := failpoint.Hit(opts.Hook, PointBeforeFinalMarkerRemove); err != nil {
+		return storeformat.Manifest{}, err
+	}
 	if err := os.Remove(filepath.Join(dir, MarkerFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return storeformat.Manifest{}, err
 	}
 	if err := failpoint.Hit(opts.Hook, PointMarkerRemoved); err != nil {
 		return storeformat.Manifest{}, err
 	}
+	if err := failpoint.Hit(opts.Hook, PointBeforeFinalTempRemove); err != nil {
+		return storeformat.Manifest{}, err
+	}
 	if err := os.Remove(filepath.Join(dir, markerTempFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return storeformat.Manifest{}, err
+	}
+	if err := failpoint.Hit(opts.Hook, PointBeforeFinalDirSync); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if err := syncDirectory(dir); err != nil {
@@ -208,6 +244,9 @@ func ensureDirectories(root string, mustExist bool, hook failpoint.Hook) error {
 		path := filepath.Join(root, name)
 		info, err := os.Lstat(path)
 		if errors.Is(err, os.ErrNotExist) && !mustExist {
+			if err := failpoint.Hit(hook, PointBeforeDirectoryCreate); err != nil {
+				return err
+			}
 			if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 				return err
 			}
@@ -226,6 +265,9 @@ func ensureDirectories(root string, mustExist bool, hook failpoint.Hook) error {
 	if err := failpoint.Hit(hook, PointDirectoriesCreated); err != nil {
 		return err
 	}
+	if err := failpoint.Hit(hook, PointBeforeDirectoriesSync); err != nil {
+		return err
+	}
 	if err := syncDirectory(root); err != nil {
 		return err
 	}
@@ -239,12 +281,18 @@ func ensureInitialSegment(root, directory, name string, want storeformat.Segment
 		got, decodeErr := storeformat.DecodeSegmentHeader(data)
 		if decodeErr == nil && got.Kind == want.Kind && got.StoreUUID == want.StoreUUID && got.FileID == want.FileID && got.FirstSeq == want.FirstSeq {
 			if !mustBeDurable {
+				if err := failpoint.Hit(hook, beforeSyncPoint(synced)); err != nil {
+					return err
+				}
 				if err := syncRegularFile(path); err != nil {
 					return err
 				}
 				if err := failpoint.Hit(hook, synced); err != nil {
 					return err
 				}
+			}
+			if err := failpoint.Hit(hook, beforeDirectorySyncPoint(directorySynced)); err != nil {
+				return err
 			}
 			if err := syncDirectory(filepath.Join(root, directory)); err != nil {
 				return err
@@ -257,12 +305,18 @@ func ensureInitialSegment(root, directory, name string, want storeformat.Segment
 			}
 			return fmt.Errorf("durable initial segment identity mismatch: %w", base.ErrCorrupt)
 		}
+		if err := failpoint.Hit(hook, PointBeforeInitialSegmentRemove); err != nil {
+			return err
+		}
 		if err := os.Remove(path); err != nil {
 			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		if mustBeDurable {
 			return err
+		}
+		if hookErr := failpoint.Hit(hook, PointBeforeInitialSegmentRemove); hookErr != nil {
+			return errors.Join(err, hookErr)
 		}
 		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			return errors.Join(err, removeErr)
@@ -277,6 +331,9 @@ func ensureInitialSegment(root, directory, name string, want storeformat.Segment
 	if err := writeExclusiveSynced(path, header[:], hook, written, synced); err != nil {
 		return err
 	}
+	if err := failpoint.Hit(hook, beforeDirectorySyncPoint(directorySynced)); err != nil {
+		return err
+	}
 	if err := syncDirectory(filepath.Join(root, directory)); err != nil {
 		return err
 	}
@@ -288,7 +345,24 @@ func loadRecoverableMarker(dir string, hook failpoint.Hook) (storeformat.Initial
 	data, err := readRegularFile(path, storeformat.MaxJournalPayloadSize+storeformat.ContainerHeaderSize)
 	if err == nil {
 		marker, decodeErr := storeformat.DecodeInitializingMarker(data)
-		return marker, decodeErr == nil, decodeErr
+		if decodeErr != nil {
+			return storeformat.InitializingMarker{}, false, decodeErr
+		}
+		// A previous marker rename may have returned a directory-sync error.
+		// Re-sync both the file and root before trusting the phase on retry.
+		if err := failpoint.Hit(hook, PointBeforeMarkerFileSync); err != nil {
+			return storeformat.InitializingMarker{}, false, err
+		}
+		if err := syncRegularFile(path); err != nil {
+			return storeformat.InitializingMarker{}, false, err
+		}
+		if err := failpoint.Hit(hook, PointBeforeMarkerDirSync); err != nil {
+			return storeformat.InitializingMarker{}, false, err
+		}
+		if err := syncDirectory(dir); err != nil {
+			return storeformat.InitializingMarker{}, false, err
+		}
+		return marker, true, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return storeformat.InitializingMarker{}, false, err
@@ -303,12 +377,36 @@ func loadRecoverableMarker(dir string, hook failpoint.Hook) (storeformat.Initial
 	}
 	marker, err := storeformat.DecodeInitializingMarker(data)
 	if err != nil {
+		if hookErr := failpoint.Hit(hook, PointBeforeMarkerRecoveryRemove); hookErr != nil {
+			return storeformat.InitializingMarker{}, false, errors.Join(err, hookErr)
+		}
+		if removeErr := os.Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return storeformat.InitializingMarker{}, false, errors.Join(err, removeErr)
+		}
+		if syncErr := failpoint.Hit(hook, PointBeforeMarkerRecoverySync); syncErr != nil {
+			return storeformat.InitializingMarker{}, false, errors.Join(err, syncErr)
+		}
+		if syncErr := syncDirectory(dir); syncErr != nil {
+			return storeformat.InitializingMarker{}, false, errors.Join(err, syncErr)
+		}
+		return storeformat.InitializingMarker{}, false, nil
+	}
+	if err := failpoint.Hit(hook, PointBeforeMarkerFileSync); err != nil {
+		return storeformat.InitializingMarker{}, false, err
+	}
+	if err := syncRegularFile(tempPath); err != nil {
+		return storeformat.InitializingMarker{}, false, err
+	}
+	if err := failpoint.Hit(hook, PointBeforeMarkerRename); err != nil {
 		return storeformat.InitializingMarker{}, false, err
 	}
 	if err := os.Rename(tempPath, path); err != nil {
 		return storeformat.InitializingMarker{}, false, err
 	}
 	if err := failpoint.Hit(hook, PointMarkerRenamed); err != nil {
+		return storeformat.InitializingMarker{}, false, err
+	}
+	if err := failpoint.Hit(hook, PointBeforeMarkerDirSync); err != nil {
 		return storeformat.InitializingMarker{}, false, err
 	}
 	if err := syncDirectory(dir); err != nil {
@@ -326,16 +424,25 @@ func installMarker(dir string, marker storeformat.InitializingMarker, hook failp
 		return err
 	}
 	tempPath := filepath.Join(dir, markerTempFileName)
+	if err := failpoint.Hit(hook, PointBeforeMarkerTempRemove); err != nil {
+		return err
+	}
 	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := writeExclusiveSynced(tempPath, data, hook, PointMarkerWritten, PointMarkerFileSynced); err != nil {
 		return err
 	}
+	if err := failpoint.Hit(hook, PointBeforeMarkerRename); err != nil {
+		return err
+	}
 	if err := os.Rename(tempPath, filepath.Join(dir, MarkerFileName)); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(hook, PointMarkerRenamed); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(hook, PointBeforeMarkerDirSync); err != nil {
 		return err
 	}
 	if err := syncDirectory(dir); err != nil {
@@ -367,16 +474,66 @@ func writeExclusiveSynced(path string, data []byte, hook failpoint.Hook, written
 			retErr = closeErr
 		}
 	}()
+	if err := hitOptional(hook, beforeWritePoint(written)); err != nil {
+		return err
+	}
 	if _, err := io.Copy(file, bytes.NewReader(data)); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(hook, written); err != nil {
 		return err
 	}
+	if err := hitOptional(hook, beforeSyncPoint(synced)); err != nil {
+		return err
+	}
 	if err := file.Sync(); err != nil {
 		return err
 	}
 	return failpoint.Hit(hook, synced)
+}
+
+func hitOptional(hook failpoint.Hook, point failpoint.Point) error {
+	if point == "" {
+		return nil
+	}
+	return failpoint.Hit(hook, point)
+}
+
+func beforeWritePoint(after failpoint.Point) failpoint.Point {
+	switch after {
+	case PointMarkerWritten:
+		return PointBeforeMarkerWrite
+	case PointDataHeaderWritten:
+		return PointBeforeDataHeaderWrite
+	case PointMapHeaderWritten:
+		return PointBeforeMapHeaderWrite
+	default:
+		return ""
+	}
+}
+
+func beforeSyncPoint(after failpoint.Point) failpoint.Point {
+	switch after {
+	case PointMarkerFileSynced:
+		return PointBeforeMarkerFileSync
+	case PointDataHeaderSynced:
+		return PointBeforeDataHeaderFileSync
+	case PointMapHeaderSynced:
+		return PointBeforeMapHeaderFileSync
+	default:
+		return ""
+	}
+}
+
+func beforeDirectorySyncPoint(after failpoint.Point) failpoint.Point {
+	switch after {
+	case PointDataDirectorySynced:
+		return PointBeforeDataDirectorySync
+	case PointMapDirectorySynced:
+		return PointBeforeMapDirectorySync
+	default:
+		return ""
+	}
 }
 
 func readRegularFile(path string, maxSize int64) ([]byte, error) {

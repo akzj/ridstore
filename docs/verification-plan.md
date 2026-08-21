@@ -145,6 +145,8 @@ Abort 独立覆盖 marker append 前、完整 write 后未 sync、API 已返回�
 
 初始化另有独立 crash matrix：INITIALIZING marker、子目录、两个初始 Segment Header、generation-1 Manifest、CURRENT 和 marker 删除的每个 write/fsync/rename 前后强制退出；恢复结果只能是可继续完成的同一 UUID Store 或明确错误，不能静默创建第二个空 Store。
 
+初始化 syscall matrix 另在 Marker temp 清理/write/file sync/rename/root sync、子目录 create/root sync、初始 Data/Mapping Header write/file sync/directory sync、损坏的未发布初始文件清理，以及最终 Marker/temp remove/root sync 前分别注入 `EIO/ENOSPC/EACCES`。每次失败都必须保留底层 cause，随后由同一 UUID/HardLimits 恢复到 generation 1；只有最早期尚未形成有效 Marker 时允许返回 `ErrNotInitialized` 并由相同参数重新 Create。损坏的未发布 Marker temp 和初始 Segment 可以删除重建，phase 已声明 durable 后则禁止修复。Marker 已删除但 root sync 失败时，marker-free Open 必须重新 sync root 后才能成功。
+
 ## 5. ID 与 BatchID Reserve Crash Matrix
 
 - Reserve frame 前崩溃：旧区间不变；
