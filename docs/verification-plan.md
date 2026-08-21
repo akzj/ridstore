@@ -110,6 +110,8 @@ Active Data 另覆盖 append write、commit sync、SegmentSeal write/sync、Foot
 
 Rotation Journal 对 install 的 temp-remove/write/file-sync/rename/dir-sync 和完成时的 final-remove/temp-remove/dir-sync 注入相同三类错误。rename 前失败时 fresh Open 必须删除 `.ROTATION.tmp` 并 fsync journal 目录；temp 不是 regular file 或为 symlink 时 fail closed。dir-sync 错误额外覆盖 Phase 1–5 每个已 rename Journal 状态；Open 必须完成 Active→Sealed→new Active→Manifest 转换或确认已安装 Manifest，恢复后 offline Verify 必须 clean。
 
+Maintenance Journal 对同一组 install/remove syscall 注入 `EIO/ENOSPC/EACCES`，并额外覆盖 Data GC phase 1–7 的 directory-sync 失败。GC checkpoint Manifest durable 前允许取消 cleaning 并删除 Journal；该清理任一 syscall 失败时 Store 必须 fail closed。Manifest durable 后不得因 phase-4 Journal publication 失败回滚：fresh Open 以 MaintenanceGeneration、source 不在精确 SegmentStats、ReplayStart 越过 source 三项共同证据恢复 phase 4 并继续协议。只有 MaintenanceGeneration 而 source 仍为 live 的情况属于嵌套 Mapping rotation，必须撤销而不能删除 source。恢复后 `.MAINTENANCE.tmp` 不得残留且 offline Verify 必须 clean；非 regular/symlink temp 必须拒绝。
+
 ## 4. Commit Crash Matrix
 
 每个 Case 至少验证旧值、新值、NotFound 和 Batch Status。

@@ -194,13 +194,15 @@ DataGC 在 RelocationsDurable 后调用的 Mapping Checkpoint 是该 DataGC oper
 | Phase | Open 行为 |
 |---|---|
 | Prepared/Copying | 保留源 Segment；复制副本按 Mapping 判定为垃圾 |
-| RelocationsDurable | 重放 CAS；继续 Mapping Checkpoint |
+| RelocationsDurable | Manifest 尚无 GC checkpoint 证明时撤销本轮；若 checkpoint 已发布而 phase-4 Journal publication 失败，则由 Manifest 证明并补写 phase 4 后继续 |
 | MappingCheckpointDurable | 验证无 Mapping 指向源后继续 Retire |
 | Retired | 等待 pin（重启后进程 pin 为 0）并继续 Trash |
 | Trashed | 确认 Manifest 不引用后删除 |
 | Deleted | 清理 Journal |
 
 任一验证失败停止 Open，并提供确定错误；不能跳到更后 Phase。
+
+`MaintenanceGeneration == Journal.Generation` 不是单独充分证据：Data GC 内嵌的 Mapping rotation 也可能先发布该 generation。phase 3 恢复必须同时验证精确 SegmentStats 不再包含 source、ReplayStart 已越过 source、StatsCoveredCommitSeq 等于 CoveredCommitSeq；source 仍为 live 时证明 GC checkpoint 尚未完成，只能保留 source 并撤销 Journal。
 
 ## 11. Manifest 与文件操作顺序
 

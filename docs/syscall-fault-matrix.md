@@ -11,7 +11,7 @@
 | Active Data seal/rotation | seal/footer write 已覆盖 | seal/footer sync 已覆盖 | seal rename 已覆盖 | data dir sync 已覆盖 | 已覆盖已有 Active 的 seal 主路径；每个失败点均可由 fresh recovery 得到严格 sealed 文件 |
 | Active Data create/tail repair | 未覆盖 | 未覆盖 | N/A | 未覆盖 | 待补；包括新 Active Header、repair truncate/fsync |
 | Rotation Journal | 已覆盖 | 已覆盖 | 已覆盖 install/remove | 已覆盖 install/remove | 完整 syscall matrix；Phase 1–5 publication 均验证，未发布 temp 在 Open 时按 regular-file 规则删除并 fsync，已发布 Journal 幂等完成 rotation |
-| Maintenance Journal | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；影响 Data GC phase ownership |
+| Maintenance Journal | 已覆盖 | 已覆盖 | 已覆盖 install/remove | 已覆盖 install/remove | 完整 syscall matrix；checkpoint 前清理失败会 fail closed，checkpoint publication 与 phase-4 Journal 之间失败由 Manifest 证明并在 Open 时继续 Data GC |
 | Active Mapping append/checkpoint | 未覆盖 | 未覆盖 | N/A | N/A | 待补；优先级高 |
 | Mapping rotation/GC | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；已有 crash phase，但 syscall cause/cleanup 未系统验证 |
 | Data GC trash/delete | N/A | N/A | 未覆盖 | 未覆盖 | 待补；必须分别证明删除前/后的 Manifest 与 Journal 收敛 |
@@ -28,9 +28,8 @@
 
 ## 剩余推进顺序
 
-1. Maintenance Journal 的 write→sync→rename→dir-sync；
-2. Active Mapping、Mapping rotation 和 Mapping GC；
-3. Data GC trash/delete；
-4. Initialize 与 Backup/Restore。
+1. Active Mapping、Mapping rotation 和 Mapping GC；
+2. Data GC trash/delete；
+3. Initialize 与 Backup/Restore。
 
 只有所有行闭合，`phase-5-audit.md` 的“所有 durable writer 完成 syscall error matrix”才能勾选。
