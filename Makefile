@@ -1,6 +1,7 @@
 .PHONY: fmt test test-race test-fuzz-smoke test-crash test-integration bench vet check verify tool
 
-FUZZ_TIME ?= 1s
+FUZZ_TIME ?= 2s
+FUZZ_PARALLEL ?= 4
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -type f)
@@ -22,7 +23,7 @@ test-fuzz-smoke:
 		FuzzDecodeSegmentStructures \
 		FuzzDecodeFrame \
 		FuzzDecodeSystemPayloads; do \
-		go test ./internal/format -run '^$$' -fuzz "^$${target}$$" -fuzztime "$(FUZZ_TIME)"; \
+		go test ./internal/format -run '^$$' -fuzz "^$${target}$$" -fuzztime "$(FUZZ_TIME)" -parallel "$(FUZZ_PARALLEL)"; \
 	done
 
 test-crash:
