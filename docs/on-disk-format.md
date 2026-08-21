@@ -13,6 +13,7 @@
 - 磁盘格式不序列化 Go struct 内存布局；
 - 文件名用于发现，Manifest 和文件内部 UUID/ID 用于确认身份；
 - payload 与 Commit Descriptor 存在同一有序 Data Log，不另写完整 Value WAL。
+- 第一版 Segment Header Flags、Frame Header Flags、CommitFlags、Mapping Node Flags、Manifest/Journal container Header Flags、FileSummary/SegmentStatsEntry/SegmentSeal Flags 以及所有 Reserved 字节/字段都必须为 0；encoder 只能写 0，decoder 发现任意未知 bit 或非零 Reserved 必须拒绝，不能把它当作 optional extension。TLV Flags 是唯一例外，按第 13 节只允许 required bit 0。
 
 ## 2. 数据目录
 
@@ -53,21 +54,28 @@ Store 不接受身份不明的额外 `.seg` 文件静默加入。发现 Manifest
 
 ### 2.1 首次初始化
 
-Create 在获得目录锁后写入 `INITIALIZING` container（Magic `RIDINIT1`，保存 StoreUUID、ConfigHardLimits 和 Phase），按以下顺序推进：
+Create 在获得目录锁后写入 `INITIALIZING` container。它复用第 13 节 64-byte Header/TLV framing，Magic=`RIDINIT1`、Generation=1，Header StoreUUID 是本次初始化唯一生成的 UUID。Payload 只允许以下 required TLV：
+
+| Type | Name | Value |
+|---:|---|---|
+| 1 | ConfigHardLimits | 与 Manifest Type 2 完全相同的 8 个 uint64 |
+| 2 | Phase | uint16 |
+
+Phase 精确定义为：1=Prepared、2=DirectoriesDurable、3=DataHeaderDurable、4=MapHeaderDurable、5=ManifestInstalled。每完成下一项 durable 动作，就完整重写 marker 并 fsync `INITIALIZING` 和 root directory 后才能推进 Phase：
 
 ```text
-marker Prepared durable
--> create/fsync subdirectories
--> create/fsync DATA-00000001.active header
--> create/fsync MAP-00000001.active header
--> publish generation-1 Manifest and CURRENT
+marker Phase=Prepared durable
+-> create/fsync subdirectories; marker Phase=DirectoriesDurable
+-> create/fsync DATA-00000001.active header and data dir; marker Phase=DataHeaderDurable
+-> create/fsync MAP-00000001.active header and mapping dir; marker Phase=MapHeaderDurable
+-> publish generation-1 Manifest and CURRENT; marker Phase=ManifestInstalled
 -> fsync root directory
 -> remove INITIALIZING and fsync root directory
 ```
 
-初始 Manifest：Root=0、CoveredCommitSeq=0、CutFrameSeq=0、ReplayStart 指向 Data Segment 1 的 offset 4096、两个 reserved high 和 IssuedBatchIDHighExclusiveAtCut 均为 1、OpenBatchIDsAtCut 为空、NextFrameSeq/NextCommitSeq 均为 1、Next Data/Map Segment ID 均为 2。
+初始 Manifest：Root=0、CoveredCommitSeq=0、StatsCoveredCommitSeq=0、SegmentStatsTable 为空、CutFrameSeq=0、ReplayStart 指向 Data Segment 1 的 offset 4096、两个 reserved high 和 IssuedBatchIDHighExclusiveAtCut 均为 1、OpenBatchIDsAtCut 为空、NextFrameSeq/NextCommitSeq 均为 1、Next Data/Map Segment ID 均为 2、MaintenanceGeneration=0。
 
-Create/Open 看到 marker 时只能按已校验的 StoreUUID、配置和 Phase 幂等完成初始化；如果 CURRENT 已 durable，则只需验证后移除 marker。没有 marker 的非空未知目录绝不自动清空或接管。
+Create/Open 看到 marker 时只能按已校验的 StoreUUID、配置和 Phase 幂等完成初始化。Phase 只能保持或加 1；未知值、跳级、UUID/config 冲突或某一 Phase 声称 durable 但对应对象缺失/身份不符都返回 corruption，不能重新生成 UUID 或覆盖文件。若 CURRENT 已 durable，则必须验证其 generation-1 Manifest、两个 Segment Header 和 marker 完全一致，随后可把 Phase 推进到 ManifestInstalled 并移除 marker。没有 marker 的非空未知目录绝不自动清空或接管。
 
 ## 3. 标识与地址
 
@@ -103,6 +111,10 @@ vaddr = uint64(segmentID)<<32 | uint64(offset)
 - Mapping 文件使用独立的 `MapAddr`，采用相同 `fileID:offset` 编码但类型不互换。
 
 类型系统中 VAddr 与 MapAddr 必须是不同定义类型，避免把 Mapping Node 地址当作用户 Record 地址。
+
+### 3.4 LogPos
+
+`LogPos` 也编码为 `uint32 DataSegmentID : uint32 byte_offset`，但它表示 Frame 扫描边界，不是 Record 地址，必须与 VAddr/MapAddr 使用不同定义类型。offset 可以指向下一 Frame Header，也可以等于 Active Segment 当前 durable end；跨 rotation 时指向新 Active Segment 的 4096。它不能指向 Footer 内部、padding 中间或 Manifest 未列出的 Segment。`ReplayStartLogPos` 使用该类型。
 
 ## 4. Segment Header
 
@@ -176,7 +188,25 @@ BatchID 字段按 FrameType 解释：
 
 Delete 不需要独立 payload Frame；它只出现在 CommitPart 的最终 Mutation Entry 中。
 
-### 5.3 PutRecord OriginBatchID 与 LogicalRevision
+### 5.3 SegmentSeal Payload
+
+SegmentSeal 是 Data Segment 中最后一条 Frame，Header 的 BatchID/RecordID 必须为 0，Payload 固定 64 bytes：
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | SegmentID |
+| 4 | 4 | Flags，v1=0 |
+| 8 | 8 | ValidDataEndOffset，SegmentSeal padding 后、Footer 前的位置 |
+| 16 | 8 | FirstFrameSeq |
+| 24 | 8 | LastFrameSeq，等于本 SegmentSeal 的 FrameSeq |
+| 32 | 8 | FrameCount，包含本 SegmentSeal |
+| 40 | 8 | MinCommitSeq，无 Commit 为 0 |
+| 48 | 8 | MaxCommitSeq，无 Commit 为 0 |
+| 56 | 8 | Reserved，必须为 0 |
+
+其后紧接 4096-byte Footer；Footer 的 SegmentID、ValidDataEndOffset、First/LastFrameSeq、FrameCount 和 Min/MaxCommitSeq 必须与 SegmentSeal 完全一致。SegmentSeal 完整但 Footer 缺失的 `.active` 文件仍按未完成 rotation 由 `ROTATION` Journal 恢复，不能仅凭 SegmentSeal 把文件自动收编为 sealed。
+
+### 5.4 PutRecord OriginBatchID 与 LogicalRevision
 
 PutRecord Payload 是原始用户 Value，`PayloadSize = len(Value)`，可以为 0。PutRecord Header 的 BatchID 字段具有更精确的语义 `OriginBatchID`：它表示最后一次产生该用户逻辑值的用户 Batch，并作为对外 opaque LogicalRevision。
 
@@ -214,6 +244,8 @@ Put Entry 指向的 Frame 必须满足：
 
 大量 Mutation 可以分成多个 CommitPart。每个 Part Header 的 BatchID 相同；Payload 为 Mutation Entry 数组。
 
+PartCount=0 只允许空 Batch，此时 FirstPartFrameSeq=LastPartFrameSeq=0。PartCount>0 时，CommitPart/RelocationPart 必须在同一 Segment 中按 FrameSeq 连续排列并紧邻其 Seal，First/LastPartFrameSeq 精确指向首尾 Part；Part 之间或 Part 与 Seal 之间不允许夹入其他 Frame。
+
 CommitSeal Payload 固定 64 bytes：
 
 | Offset | Size | Field |
@@ -228,7 +260,7 @@ CommitSeal Payload 固定 64 bytes：
 | 44 | 4 | CommitFlags |
 | 48 | 16 | Reserved |
 
-DescriptorCRC 按 Part 顺序覆盖所有 Mutation Entry 原始字节和 CommitSeal 中除 CRC 外的语义字段。
+DescriptorCRC32C 使用 Go `crc32.Checksum(stream, castagnoliTable)` 等价语义，输入流精确定义为：按 Part FrameSeq 严格升序拼接每个 Part 的完整原始 Payload，随后拼接 64-byte Seal Payload 的副本，其中 byte 40..43 的 DescriptorCRC 字段置 0，其余字节保持编码值。空 Batch 的 Part 拼接为空，只校验 Seal Payload。Commit 与 Relocation 使用相同算法；Frame Header 不进入该 CRC，但由各自 HeaderCRC 保护。PartCount、First/LastPartFrameSeq 与实际 Part 序列不一致、Part FrameType/BatchID 不匹配或 CRC 不同均为 corruption。
 
 LogicalPayloadBytes 是该 Batch 最终 Put mutation 的用户 Value bytes 总和，不包含 Frame Header、Descriptor 或 padding。
 
@@ -253,6 +285,8 @@ BatchAbort Payload 固定 32 bytes：
 | 8 | 8 | AppendedPayloadBytes |
 | 16 | 8 | LastBatchFrameSeq |
 | 24 | 8 | Reserved |
+
+ReasonCode 第一版固定为：1=CallerAbort、2=ConditionConflict、3=DefinitePreSealFailure、4=CloseCleanup、5=BatchFailed。未知值拒绝；ReasonCode 只用于诊断，不能覆盖 CommitSeal 的提交语义。
 
 Abort Frame 用于诊断和释放 Open Batch Segment pin。它不需要立即 fsync；没有 CommitSeal 的 Batch 在恢复中始终不可见。
 
@@ -385,12 +419,14 @@ Manifest 中保存：
 MappingRootAddr
 CoveredCommitSeq
 CutFrameSeq
-ReplayStartVAddr
+ReplayStartLogPos
+StatsCoveredCommitSeq
+SegmentStatsTable
 IssuedBatchIDHighExclusiveAtCut
 OpenBatchIDsAtCut
 ```
 
-这些字段是一个原子 checkpoint 状态：Root 包含所有 `CommitSeq <= CoveredCommitSeq` 的 Mapping 和截至 CutFrameSeq 的 allocator/system 状态；恢复从 ReplayStartVAddr（CutFrameSeq 后的精确物理位置）扫描后续 Frame。BatchID cut 字段描述同一 barrier 时的发放和 Open/Committing 集合，用于恢复 Status。
+这些字段是一个原子 checkpoint 状态：Root 包含所有 `CommitSeq <= CoveredCommitSeq` 的 Mapping 和截至 CutFrameSeq 的 allocator/system 状态；恢复从 ReplayStartLogPos（CutFrameSeq 后的精确物理扫描边界）扫描后续 Frame。BatchID cut 字段描述同一 barrier 时的发放和 Open/Committing 集合，用于恢复 Status。
 
 ## 13. Manifest
 
@@ -427,7 +463,7 @@ Payload 是连续 TLV，单项格式为 `Type uint16, Flags uint16, Length uint3
 | 9 | MappingRootAddr | uint64 MapAddr |
 | 10 | CoveredCommitSeq | uint64 |
 | 11 | CutFrameSeq | uint64 |
-| 12 | ReplayStartVAddr | uint64 VAddr |
+| 12 | ReplayStartLogPos | uint64 LogPos |
 | 13 | ReservedIDHighExclusive | uint64 |
 | 14 | ReservedBatchIDHighExclusive | uint64 |
 | 15 | IssuedBatchIDHighExclusiveAtCut | uint64 |
@@ -435,6 +471,8 @@ Payload 是连续 TLV，单项格式为 `Type uint16, Flags uint16, Length uint3
 | 17 | NextFrameSeq | uint64 |
 | 18 | NextCommitSeq | uint64 |
 | 19 | MaintenanceGeneration | uint64 |
+| 20 | StatsCoveredCommitSeq | uint64 |
+| 21 | SegmentStatsTable | SegmentStatsEntry array |
 
 FileSummary 固定 32 bytes：`FileID uint32, Flags uint32, ValidEnd uint64, FirstSeq uint64, LastSeq uint64`。Data 中 Seq 表示 FrameSeq，Mapping 中表示 NodeSeq。数组必须按 FileID 升序、不得重复，且必须与文件 Header/Footer 一致。
 
@@ -451,7 +489,7 @@ FileSummary 固定 32 bytes：`FileID uint32, Flags uint32, ValidEnd uint64, Fir
 - MappingRootAddr；
 - CoveredCommitSeq；
 - CutFrameSeq；
-- ReplayStartVAddr；
+- ReplayStartLogPos；
 - ReservedIDHighExclusive；
 - ReservedBatchIDHighExclusive；
 - IssuedBatchIDHighExclusiveAtCut；
@@ -459,12 +497,27 @@ FileSummary 固定 32 bytes：`FileID uint32, Flags uint32, ValidEnd uint64, Fir
 - NextFrameSeq；
 - NextCommitSeq；
 - MaintenanceGeneration。
+- StatsCoveredCommitSeq；
+- SegmentStatsTable。
+
+SegmentStatsEntry 固定 24 bytes：
+
+```text
+SegmentID        uint32
+Flags            uint32   // v1 必须为 0
+ExactLiveBytes   uint64
+ExactLiveRecords uint64
+```
+
+表只保存 `ExactLiveBytes != 0 || ExactLiveRecords != 0` 的 Data Segment，按 SegmentID 严格升序且不得重复；缺失 Segment 表示该 cut 时 live bytes/count 均为 0。非零 records 必须对应非零 bytes，SegmentID 不能为 0，并且必须引用同一 Manifest 文件集合中的 Data Segment。`StatsCoveredCommitSeq` 必须等于 `CoveredCommitSeq`。
 
 `NextFrameSeq`、`NextCommitSeq` 和两个 reserved high watermark 都是永不回退的分配下界，不表示所有更小序号都一定存在。恢复扫描 ReplayStart 之后的有效 Frame，并以 `max(manifest value, scanned durable value + 1)` 恢复下一序号；允许因崩溃留下空洞，不允许复用。
 
+`MaintenanceGeneration` 是已安装维护操作的单调 generation。开始新 MAINTENANCE operation 时取 `current MaintenanceGeneration + 1`，该值在本操作所有 Journal 重写中保持不变；本操作安装 Manifest 时必须把同一值写入新 Manifest。操作在 Manifest 安装前回滚时可以不推进该值，OperationID 仍用于区分遗留临时文件。加法溢出后禁止新维护操作并返回 `ErrGenerationExhausted`。
+
 `IssuedBatchIDHighExclusiveAtCut` 是 checkpoint barrier 时已经由用户 `Begin` 或内部 Relocation allocator 取用的最大连续 BatchID 上界。`OpenBatchIDsAtCut` 是该时刻仍为 Open/Committing 的用户 BatchID 排序数组，数量不得超过持久化的 `MaxOpenBatches` 硬限制；maintenance coordinator 保证建立 checkpoint cut 时没有未完成的 Relocation Batch。二者只用于恢复 Batch Status：切点前已经结束且不在保留状态索引中的 Batch 返回 `ErrStatusExpired`；切点时开放或切点后可能发放的 Batch，可以由 ReplayStart 后的 Seal/Abort 或其缺失确定结果。
 
-Checkpoint 构建期间 Data/Mapping 文件集合仍可能因 append rotation 而变化。安装新 Root 时必须持有 Manifest 安装串行器，读取最新 durable 文件目录，再把新的 `(MappingRootAddr, CoveredCommitSeq, CutFrameSeq, ReplayStartVAddr, IssuedBatchIDHighExclusiveAtCut, OpenBatchIDsAtCut)` 合并进去生成完整新 Manifest。不得从 Checkpoint 开始时保存的旧 Manifest 整体覆盖当前文件集合。Mapping Checkpoint、Mapping GC 和 Data GC 的 Manifest 安装都经过同一个串行器，并用 generation CAS 拒绝基于过期 generation 的安装。
+Checkpoint 构建期间 Data/Mapping 文件集合仍可能因 append rotation 而变化。安装新 Root 时必须持有 Manifest 安装串行器，读取最新 durable 文件目录，再把新的 `(MappingRootAddr, CoveredCommitSeq, CutFrameSeq, ReplayStartLogPos, StatsCoveredCommitSeq, SegmentStatsTable, IssuedBatchIDHighExclusiveAtCut, OpenBatchIDsAtCut)` 合并进去生成完整新 Manifest。Root、cut 和 Stats 必须由同一个 Manifest generation 原子安装；不得从 Checkpoint 开始时保存的旧 Manifest 整体覆盖当前文件集合。Mapping Checkpoint、Mapping GC 和 Data GC 的 Manifest 安装都经过同一个串行器，并用 generation CAS 拒绝基于过期 generation 的安装。
 
 未知 optional TLV 可跳过；未知 required TLV 必须拒绝。
 
@@ -481,11 +534,11 @@ write tmp manifest
 -> fsync root directory
 ```
 
-旧 Manifest 在新 CURRENT durable 后才能进入 trash。Open 在 CURRENT 损坏时可以扫描 Manifest generation，但只有 CRC、UUID、文件引用全部成立的最高 generation 才可作为恢复候选；自动选择必须记录诊断。
+Manifest Generation 使用 checked increment；耗尽时返回 `ErrGenerationExhausted`，不能回绕或覆盖旧文件。旧 Manifest 在新 CURRENT durable 后才能进入 trash。Open 在 CURRENT 损坏时可以扫描 Manifest generation，但只有 CRC、UUID、文件引用全部成立的最高 generation 才可作为恢复候选；自动选择必须记录诊断。
 
 ## 14. Maintenance Journal
 
-GC/Mapping 安装使用单个版本化 Journal，状态至少包括：
+GC/Mapping 安装使用单个版本化 Journal，其逻辑状态固定包括：
 
 ```text
 OperationID
@@ -498,11 +551,33 @@ NewManifestGeneration
 CRC
 ```
 
-`MAINTENANCE` 使用与 Manifest 相同的 64-byte container header 和 TLV framing，Magic 改为 `RIDJNL01`；Header Generation 是 journal generation。required TLV 固定为：OperationID 16 bytes、OperationType uint16、Phase uint16、SourceFiles FileSummary array、DestinationFiles FileSummary array、OldManifestGeneration uint64、NewManifestGeneration uint64。OperationType 第一版为 1=DataGC、2=MappingCheckpoint、3=MappingGC；各协议列出的 Phase 从 1 开始按顺序编号，只允许保持当前 phase 或前进到下一 phase，未知值拒绝 Open。
+`MAINTENANCE` 使用与 Manifest 相同的 64-byte container header 和 TLV framing，Magic 改为 `RIDJNL01`；Header Generation 是本次 operation 固定的 `old Manifest.MaintenanceGeneration + 1`，每次 Phase 重写保持不变。required TLV Type 固定为：
 
-Journal 同样采用 temp+fsync+rename+directory fsync。每个 Phase 必须幂等；Open 根据 Phase 继续或回滚文件安装，不能依靠文件名猜测。Phase 更新必须完整重写 Journal container，不原地覆盖字节。
+| Type | Name | Value |
+|---:|---|---|
+| 1 | OperationID | 16 opaque bytes |
+| 2 | OperationType | uint16 |
+| 3 | Phase | uint16 |
+| 4 | SourceFiles | JournalFileRef array |
+| 5 | DestinationFiles | JournalFileRef array |
+| 6 | OldManifestGeneration | uint64 |
+| 7 | NewManifestGeneration | uint64，尚未安装时为 0 |
 
-Data rotation 使用独立 `ROTATION` journal，采用相同 container header，Magic 为 `RIDROT01`，Payload 固定 32 bytes：OldSegmentID uint32、NewSegmentID uint32、BaseManifestGeneration uint64、InstalledManifestGeneration uint64、Phase uint32、Reserved uint32。Phase 为 1=Prepared、2=OldSealed、3=OldRenamed、4=NewCreated、5=ManifestInstalled。它与长时间 GC/Mapping 操作分开，避免 Active Segment 满时等待整个维护任务结束；两者最终安装 Manifest 时仍由同一个安装串行器协调。
+JournalFileRef 固定 40 bytes：`FileKind uint16, FileState uint16, FileID uint32, ValidEnd uint64, FirstSeq uint64, LastSeq uint64, Reserved uint64`。FileKind 为 1=Data、2=Mapping；FileState 为 1=Active、2=Sealed、3=Temporary、4=Trash。数组按 `(FileKind, FileID, FileState)` 严格升序且不得重复；Reserved 为 0。正式文件名由 Kind/ID/State 推导，Temporary/Trash 文件名额外包含 OperationID；恢复不能用目录扫描猜测身份。
+
+OperationType 与 Phase 精确映射：
+
+| OperationType | Name | Phase |
+|---:|---|---|
+| 1 | DataGC | 1=Prepared, 2=Copying, 3=RelocationsDurable, 4=MappingCheckpointDurable, 5=Retired, 6=Trashed, 7=Deleted |
+| 2 | MappingCheckpoint | 1=Prepared, 2=NodesWritten, 3=MappingFilesDurable, 4=ManifestInstalled, 5=Complete |
+| 3 | MappingGC | 1=Prepared, 2=Copied, 3=MappingFilesDurable, 4=ManifestInstalled, 5=OldFilesTrashed, 6=Deleted |
+
+Phase 只能保持或前进到同一操作的下一值；未知 OperationType/Phase、跳级或倒退均拒绝 Open。ManifestInstalled/MappingCheckpointDurable 之前 `NewManifestGeneration=0`；安装成功后必须等于当前或可验证的后继 Manifest generation，该 Manifest 的 MaintenanceGeneration 必须等于 Journal Header Generation，并且必须包含每个 State=Active/Sealed 的 DestinationFiles 条目、满足对应 Root/Stats 或 file-set 后置条件；Temporary/Trash 条目则按 Phase 验证其应存在或应消失。Source/Destination 集合可以随 Phase 完整重写扩充，但已有条目不能改变身份或缩短 durable ValidEnd。
+
+Journal 同样采用 temp+fsync+rename+directory fsync。每个 Phase 必须幂等；Open 根据 Phase 和上述后置条件继续或回滚文件安装，不能依靠文件名猜测。Phase 更新必须完整重写 Journal container，不原地覆盖字节。达到最终 Phase 后先验证后置条件，再删除 Journal 并 fsync `journal` directory。
+
+Data rotation 使用独立 `ROTATION` journal，采用相同 container header，Magic=`RIDROT01`，Header Generation=`NewSegmentID`，Payload 固定 32 bytes：OldSegmentID uint32、NewSegmentID uint32、BaseManifestGeneration uint64、InstalledManifestGeneration uint64、Phase uint32、Reserved uint32。Phase 为 1=Prepared、2=OldSealed、3=OldRenamed、4=NewCreated、5=ManifestInstalled；Phase 5 之前 InstalledManifestGeneration 必须为 0，之后必须引用同时列出 old sealed/new active 的有效 Manifest。Phase 只能保持或加 1，Old/New Segment ID 和 Base generation 在重写中不可改变。它与长时间 GC/Mapping 操作分开，避免 Active Segment 满时等待整个维护任务结束；两者最终安装 Manifest 时仍由同一个安装串行器协调。
 
 ## 15. 格式冻结门禁
 

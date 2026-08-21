@@ -46,7 +46,13 @@ Segment 同时满足以下条件才可进入 Cleaning：
 - 不是当前故障诊断保留文件；
 - 预估 dead ratio 达到阈值或磁盘压力要求强制清理。
 
-第一版统计可以近似，但删除前必须做精确 Mapping 校验。
+候选估算使用 `segment-stats-design.md` 定义的 `LiveUpperBytes`：
+
+```text
+reclaimableLowerBound = max(0, reclaimablePhysicalBytes - LiveUpperBytes)
+```
+
+上界可能因 cut 后多次覆盖而高估 live，只会漏选一时值得清理的 Segment，不会把 live 空间误报为可回收。即使 `LiveUpperBytes == 0`，删除前仍必须完成本协议的精确 Mapping 扫描、Relocation 后复查、Checkpoint、Pin、Manifest 和 Trash 全部门禁；SegmentStats 永不授权删除。
 
 ## 4. 存活判定
 
@@ -79,7 +85,7 @@ RelocationPart/Seal 使用新的内部 GC BatchID；copied PutRecord 则必须�
 
 Relocation 可以分多个有限 Batch，避免单次占用过多内存或阻塞 group commit。
 
-Relocation 使用独立 Frame Type，但共享 append sequencer、fsync 和 CommitSeq 顺序。RelocationSeal durable 后，Mapping Publisher 对每条 Entry 执行 CAS：
+Relocation 使用独立 Frame Type，但共享 append sequencer、fsync 和 CommitSeq 顺序。Commit Coordinator 在 pre-Seal virtual Mapping 顺序中对每条 Entry 解析 CAS：
 
 ```text
 if Mapping[ID] == ExpectedOldVAddr:
@@ -88,7 +94,7 @@ else:
     skip
 ```
 
-Relocation CAS 成功和失败数量必须记录。失败副本不重试覆盖；它是新垃圾。
+Coordinator 将 apply/skip plan 传给 fsync 后的 Mapping Publisher，Publisher 在短内存临界区执行该计划，不在 `publishMu` 内做冷 Lookup。Recovery 按 Descriptor/CommitSeq 重算相同 CAS。Relocation CAS 成功和失败数量必须记录；失败副本不重试覆盖，它是新垃圾。
 
 ## 6. 持久化顺序
 
@@ -99,7 +105,7 @@ append copied PutRecords
 -> append RelocationPart(s)
 -> append RelocationSeal
 -> fsync
--> CAS publish Mapping
+-> publish resolved CAS plan to Mapping
 ```
 
 因此 Mapping 永不指向尚未 durable 的复制数据。
@@ -238,7 +244,7 @@ score = reclaimableBytes / (copyBytes + fixedCost)
 
 考虑：
 
-- live/dead bytes；
+- `LiveUpperBytes` 推导的 live ratio 上界和 reclaimable bytes 下界；
 - Segment age；
 - 预计 copy bytes；
 - 当前前台 fsync/带宽压力；

@@ -81,6 +81,14 @@ type Config struct {
     MaxBatchConditions int
     MaxOpenBatches     int
     MappingCacheBytes  int64
+    DeltaSoftLimitBytes int64
+    DeltaHardLimitBytes int64
+    CheckpointMemoryBytes int64
+    MaxGroupBytes      int64
+    MaxGroupBatches    int
+    MaxGroupDelay      time.Duration
+    GCBatchBytes       int64
+    GCBatchMutations   int
     IDReserveSize      uint64
     BatchIDReserveSize uint64
 }
@@ -113,6 +121,8 @@ type CommitResult struct {
     CommitSeq CommitSeq
 }
 ```
+
+字段分类、零值默认、持久化硬限制、跨字段校验和 Delta admission 语义以 [runtime-config.md](runtime-config.md) 为准。配置不接受“0 表示无限”。
 
 第一版不暴露任意 `[]byte` Key、Iterator、Range Scan、Snapshot、Column Family 或 TransactionDB API。
 
@@ -224,7 +234,8 @@ GC Relocation 使用内部 expected-old-VAddr CAS，不改变用户并发语义�
 - Put 已成功 append 后收到取消，该 Record 仍是当前 Open Batch 的一部分；调用者应 Abort；
 - Commit 一旦写入 Commit Seal 就不能因 Context 取消而宣告 Abort；
 - Conditional Commit 在生成任何 CommitPart/Seal 前取消，属于确定未提交并进入 Aborted；
-- Commit 等待期间 Context 取消可能返回 `ErrCommitUnknown`；
+- Commit 在 Delta budget admission 等任何 pre-Seal 阶段取消，属于确定未提交并进入 Aborted；
+- CommitSeal 已交给 append/write 后等待期间 Context 取消可能返回 `ErrCommitUnknown`；
 - 后台 fsync 和恢复不能因单个调用者取消而停止到不一致状态；
 - Close 使用调用者显式超时策略，不在内部静默放弃持久化任务。
 
@@ -239,6 +250,8 @@ var (
     ErrLocked          = errors.New("ridstore: directory locked")
     ErrAlreadyExists   = errors.New("ridstore: store already exists")
     ErrNotInitialized  = errors.New("ridstore: store is not initialized")
+    ErrInvalidConfig   = errors.New("ridstore: invalid configuration")
+    ErrConfigMismatch  = errors.New("ridstore: configuration does not match store format")
     ErrClosed          = errors.New("ridstore: closed")
     ErrReadOnly        = errors.New("ridstore: read only after storage fault")
     ErrBatchClosed     = errors.New("ridstore: batch closed")
@@ -249,6 +262,7 @@ var (
     ErrConflict         = errors.New("ridstore: optimistic conflict")
     ErrIDExhausted      = errors.New("ridstore: id space exhausted")
     ErrAddressExhausted = errors.New("ridstore: physical address space exhausted")
+    ErrGenerationExhausted = errors.New("ridstore: metadata generation exhausted")
     ErrCommitUnknown   = errors.New("ridstore: commit outcome unknown")
     ErrStatusExpired   = errors.New("ridstore: batch status expired")
     ErrCorrupt         = errors.New("ridstore: corruption detected")

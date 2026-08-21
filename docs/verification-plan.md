@@ -29,9 +29,13 @@
 - unknown version/type/TLV；
 - truncated Header/Payload/Footer；
 - Store UUID/FileID 不匹配；
-- full uint64 ID 和边界 VAddr；
+- full uint64 ID、边界 VAddr、ReplayStartLogPos 的 active-end/rotation 边界和类型不可互换；
 - PutRecord 固定 64-byte Header、OriginBatchID revision、空 Value 和 Relocation revision preservation；
 - SparseBitmap/Dense512 Node golden bytes、EntryCount/NodeSize/bitmap rank 边界；
+- SegmentSeal/Footer 镜像字段、DescriptorCRC 精确拼接顺序和空 Batch vector；
+- INITIALIZING/MAINTENANCE 各 OperationType/Phase 的 golden bytes、非法跳级和恢复后置条件；
+- 所有 v1 Flags/CommitFlags/Reserved 非零均拒绝；
+- SegmentStatsEntry 排序、重复、零项、covered seq 和 Root generation 一致性；
 - fuzz 所有不可信 decoder。
 
 ### 2.2 模型属性测试
@@ -72,6 +76,7 @@ map[ID]{value, revision} + atomic conditional batch
 - Checkpoint cut 与 Commit；
 - Reader pin 与 Retire；
 - 用户 Put 与 GC CAS；
+- 冷 Root 上 Relocation CAS 在 pre-Seal 阶段解析，publish 临界区零文件 I/O，runtime/recovery outcome 一致；
 - Close 与 Commit/Checkpoint/GC；
 - backpressure 和 Context cancel。
 
@@ -145,6 +150,11 @@ Failpoint 必须位于真实 write/fsync/rename/dir sync/publish 操作两侧。
 - 变长 Node 跨 Mapping Segment 尾部时先 rotation，不允许跨文件写 Node；
 - Open 只加载 Root/上层，不全量加载；
 - Delta hard limit backpressure。
+- Root/Stats 在 Manifest 中同代安装：每个 write/fsync/rename 崩溃点只能得到旧 Root+旧 Stats 或新 Root+新 Stats；
+- Stats Builder 对同一 ID 多次覆盖只计算 base→cut-final，Abort、条件冲突和 Relocation CAS failure 不计 live；
+- Header 批读错误、Stats underflow 或 Segment 身份错误时新 Root/Stats 均不安装，frozen Delta 不丢失；
+- cut 后并发 Commit、Checkpoint 安装和 Recovery replay 中，`exact Base + active/frozen additions` 始终不低于全量 Mapping 得到的精确 live；
+- Stats 表为 0 或缺失 Segment 时仍不能绕过 GC 精确 Mapping 校验和删除门禁。
 
 恢复只能选择完整旧 Root 或完整新 Root。
 
@@ -160,6 +170,7 @@ Failpoint 必须位于真实 write/fsync/rename/dir sync/publish 操作两侧。
 - trash 文件不重新加入正式集合；
 - 空间最终收敛；
 - ENOSPC 不破坏旧数据。
+- SegmentStats 只能改变候选顺序，不能改变任意 Record 的搬迁和删除结论。
 
 ## 8. Corruption 测试
 
@@ -206,6 +217,7 @@ Put/overwrite/delete/abort
 - disk allocated/logical bytes；
 - GC copied/reclaimed bytes；
 - Checkpoint lag。
+- exact/live-upper SegmentStats、StatsCoveredCommitSeq 和 overestimate bytes。
 
 通过条件不是固定文件数，而是工作负载停止后维护过程最终稳定、trash 清空、FD/goroutine 回到基线附近、空间不继续增长。
 
