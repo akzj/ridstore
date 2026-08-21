@@ -123,8 +123,9 @@ type virtualEntry struct {
 }
 
 const (
-	PointMappingPublished failpoint.Point = "commit.mapping-published"
-	PointResultReady      failpoint.Point = "commit.result-ready"
+	PointMappingPublished    failpoint.Point = "commit.mapping-published"
+	PointResultReady         failpoint.Point = "commit.result-ready"
+	PointRelocationPublished failpoint.Point = "commit.relocation-published"
 )
 
 func New(next base.CommitSeq, log CommitLog, mapping api.Mapping, reader RecordReader) (*Coordinator, error) {
@@ -591,6 +592,11 @@ func (c *Coordinator) processRelocation(request request) {
 		if err == nil {
 			err = fmt.Errorf("relocation mapping result applied=%d/%d skipped=%d/%d: %w", applied.Applied, wantApplied, applied.Skipped, wantSkipped, base.ErrCorrupt)
 		}
+		c.fail(err)
+		request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
+		return
+	}
+	if err := failpoint.Hit(c.hook, PointRelocationPublished); err != nil {
 		c.fail(err)
 		request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
 		return
