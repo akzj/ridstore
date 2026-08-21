@@ -106,6 +106,8 @@ Failpoint 必须位于真实 write/fsync/rename/dir sync/publish 操作两侧。
 
 Manifest/CURRENT publication 另有 syscall-error matrix：在两个文件的 write、file sync、rename 和 directory sync 操作前分别注入 `ENOSPC`、`EIO` 或 `EACCES`，验证底层 cause 不丢失、CURRENT 只指向完整旧/新 generation、离线 Installer 可幂等重试。运行中 Checkpoint 一旦进入 Manifest Installer 后得到错误，不猜测 publication outcome，Store 立即 fail closed；fresh Open 清理未发布 generation 或采用已发布 CURRENT，并通过 offline Verify。该矩阵尚未代表其他 Journal、Segment 和 GC 文件操作均已覆盖。
 
+Active Data 另覆盖 append write、commit sync、SegmentSeal write/sync、Footer write/sync、rename 和 data directory sync。每个边界分别注入 `EIO/ENOSPC/EACCES`；write/sync 失败必须 poison 当前 Active，rename/dir-sync 失败必须停止 Rotation。Store 级 descriptor write/sync Case 分别验证确定 Aborted 与 CommitUnknown，随后 fresh Open 按磁盘完整 Frame 判定。完整覆盖状态以 `syscall-fault-matrix.md` 为准。
+
 ## 4. Commit Crash Matrix
 
 每个 Case 至少验证旧值、新值、NotFound 和 Batch Status。

@@ -4,9 +4,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
 
@@ -61,6 +63,105 @@ func TestActiveDataAppendReadAndReopen(t *testing.T) {
 	got, err = reopened.ReadFrame(addr)
 	if err != nil || string(got.Payload) != "value" {
 		t.Fatalf("reopened frame=%+v error=%v", got, err)
+	}
+}
+
+func TestActiveDataSyscallErrorsPoisonAppendAndSync(t *testing.T) {
+	for _, point := range []failpoint.Point{PointBeforeAppendWrite, PointBeforeSync} {
+		point := point
+		for _, injected := range []struct {
+			name string
+			err  error
+		}{{"EIO", syscall.EIO}, {"ENOSPC", syscall.ENOSPC}, {"EACCES", syscall.EACCES}} {
+			injected := injected
+			t.Run(string(point)+"/"+injected.name, func(t *testing.T) {
+				root := t.TempDir()
+				uuid := base.StoreUUID{1}
+				createActiveDataFile(t, root, uuid, 1)
+				active, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer active.Close()
+				if point == PointBeforeSync {
+					if _, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				active.SetHook(failpoint.Func(func(got failpoint.Point) error {
+					if got == point {
+						return injected.err
+					}
+					return nil
+				}))
+				if point == PointBeforeAppendWrite {
+					_, _, err = active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1})
+				} else {
+					err = active.Sync()
+				}
+				if !errors.Is(err, injected.err) {
+					t.Fatalf("operation error=%v", err)
+				}
+				if _, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 2, BatchID: 1, RecordID: 2}); !errors.Is(err, ErrPoisoned) {
+					t.Fatalf("append after syscall error=%v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestActiveDataSealSyscallErrorsResumeToValidImmutableSegment(t *testing.T) {
+	points := []failpoint.Point{
+		PointBeforeSealWrite, PointBeforeSealSync, PointBeforeFooterWrite, PointBeforeFooterSync,
+		PointBeforeSealRename, PointBeforeDataDirSync,
+	}
+	for _, point := range points {
+		point := point
+		for _, injected := range []struct {
+			name string
+			err  error
+		}{{"EIO", syscall.EIO}, {"ENOSPC", syscall.ENOSPC}, {"EACCES", syscall.EACCES}} {
+			injected := injected
+			t.Run(string(point)+"/"+injected.name, func(t *testing.T) {
+				root := t.TempDir()
+				uuid := base.StoreUUID{1}
+				createActiveDataFile(t, root, uuid, 1)
+				active, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1, Payload: []byte("value")}); err != nil {
+					t.Fatal(err)
+				}
+				active.SetHook(failpoint.Func(func(got failpoint.Point) error {
+					if got == point {
+						return injected.err
+					}
+					return nil
+				}))
+				if _, err := active.Seal(2); !errors.Is(err, injected.err) {
+					t.Fatalf("Seal error=%v", err)
+				}
+				_ = active.Close()
+
+				sealedPath := filepath.Join(root, "data", SealedDataFileName(1))
+				var summary storeformat.FileSummary
+				var recoveryErr error
+				if _, statErr := os.Lstat(sealedPath); statErr == nil {
+					summary, recoveryErr = LoadSealedDataSummary(root, 1)
+				} else if errors.Is(statErr, os.ErrNotExist) {
+					summary, recoveryErr = ResumeSeal(root, uuid, 1, 1<<20, 1024, 2)
+				} else {
+					recoveryErr = statErr
+				}
+				if recoveryErr != nil {
+					t.Fatal(recoveryErr)
+				}
+				if err := ValidateSealedData(root, uuid, summary, 1<<20, 1024); err != nil {
+					t.Fatalf("recovered sealed data: %v", err)
+				}
+			})
+		}
 	}
 }
 
