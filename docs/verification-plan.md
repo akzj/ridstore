@@ -108,6 +108,8 @@ Manifest/CURRENT publication 另有 syscall-error matrix：在两个文件的 wr
 
 Active Data 另覆盖 append write、commit sync、SegmentSeal write/sync、Footer write/sync、rename 和 data directory sync。每个边界分别注入 `EIO/ENOSPC/EACCES`；write/sync 失败必须 poison 当前 Active，rename/dir-sync 失败必须停止 Rotation。Store 级 descriptor write/sync Case 分别验证确定 Aborted 与 CommitUnknown，随后 fresh Open 按磁盘完整 Frame 判定。完整覆盖状态以 `syscall-fault-matrix.md` 为准。
 
+Rotation Journal 对 install 的 temp-remove/write/file-sync/rename/dir-sync 和完成时的 final-remove/temp-remove/dir-sync 注入相同三类错误。rename 前失败时 fresh Open 必须删除 `.ROTATION.tmp` 并 fsync journal 目录；temp 不是 regular file 或为 symlink 时 fail closed。dir-sync 错误额外覆盖 Phase 1–5 每个已 rename Journal 状态；Open 必须完成 Active→Sealed→new Active→Manifest 转换或确认已安装 Manifest，恢复后 offline Verify 必须 clean。
+
 ## 4. Commit Crash Matrix
 
 每个 Case 至少验证旧值、新值、NotFound 和 Batch Status。
