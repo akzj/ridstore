@@ -32,21 +32,28 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return fail(err)
 	}
-	log, err := appendlog.NewWithHook(active, recovered.NextFrameSeq, maxFramePayload, maxPartPayload, hook)
+	physicalLog, err := appendlog.NewWithHook(active, recovered.NextFrameSeq, maxFramePayload, maxPartPayload, hook)
 	if err != nil {
 		return fail(err)
+	}
+	log, err := appendlog.NewSequencer(physicalLog, cfg.MaxOpenBatches+cfg.MaxGroupBatches)
+	if err != nil {
+		return fail(err)
+	}
+	failWithLog := func(err error) (*Store, error) {
+		return nil, errors.Join(err, log.Close(), active.Close())
 	}
 	idAllocator, err := allocator.New(allocator.RecordID, manifest.HardLimits.IDReserveSize, recovered.ReservedIDHighExclusive, log)
 	if err != nil {
-		return fail(err)
+		return failWithLog(err)
 	}
 	batchAllocator, err := allocator.New(allocator.BatchID, manifest.HardLimits.BatchIDReserveSize, recovered.ReservedBatchIDHighExclusive, log)
 	if err != nil {
-		return fail(err)
+		return failWithLog(err)
 	}
 	coordinator, err := commit.NewWithHook(recovered.NextCommitSeq, log, recovered.Mapping, activeRecordReader{active: active}, hook)
 	if err != nil {
-		return fail(err)
+		return failWithLog(err)
 	}
 	store := &Store{
 		config: cfg, manifest: manifest, lock: lock, active: active, log: log,
