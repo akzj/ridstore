@@ -1,6 +1,6 @@
 # 磁盘与二进制格式
 
-状态：Format draft v1；Phase 0 通过后单独冻结
+状态：Format v1 frozen（2026-08-21）
 
 ## 1. 格式原则
 
@@ -509,7 +509,7 @@ ExactLiveBytes   uint64
 ExactLiveRecords uint64
 ```
 
-表只保存 `ExactLiveBytes != 0 || ExactLiveRecords != 0` 的 Data Segment，按 SegmentID 严格升序且不得重复；缺失 Segment 表示该 cut 时 live bytes/count 均为 0。非零 records 必须对应非零 bytes，SegmentID 不能为 0，并且必须引用同一 Manifest 文件集合中的 Data Segment。`StatsCoveredCommitSeq` 必须等于 `CoveredCommitSeq`。
+表只保存 `ExactLiveBytes != 0 && ExactLiveRecords != 0` 的 Data Segment，按 SegmentID 严格升序且不得重复；两者必须同时为零或同时非零，缺失 Segment 表示该 cut 时 live bytes/count 均为 0。SegmentID 不能为 0，并且必须引用同一 Manifest 文件集合中的 Data Segment。`StatsCoveredCommitSeq` 必须等于 `CoveredCommitSeq`。
 
 `NextFrameSeq`、`NextCommitSeq` 和两个 reserved high watermark 都是永不回退的分配下界，不表示所有更小序号都一定存在。恢复扫描 ReplayStart 之后的有效 Frame，并以 `max(manifest value, scanned durable value + 1)` 恢复下一序号；允许因崩溃留下空洞，不允许复用。
 

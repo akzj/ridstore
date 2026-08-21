@@ -14,7 +14,8 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 8. [SegmentStats 设计](segment-stats-design.md)：Checkpoint 批量统计、恢复上界和 GC 候选；
 9. [配置、预算与 Backpressure](runtime-config.md)：持久化硬限制、内存预算和 admission；
 10. [验证计划](verification-plan.md)：故障注入、属性测试、基准与门禁；
-11. [实施计划](implementation-plan.md)：模块依赖、迭代顺序和每阶段完成定义。
+11. [实施计划](implementation-plan.md)：模块依赖、迭代顺序和每阶段完成定义；
+12. [Format v1 Freeze Review](format-freeze-review.md)：格式冻结结论、代码映射和验证边界。
 
 ## 文档状态
 
@@ -23,7 +24,7 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 | `design.md` | Accepted architecture | 总体边界与不变量 |
 | `positioning-vs-lsm.md` | Accepted boundary | 防止漂移成 RocksDB 替代品 |
 | `api-contract.md` | Development contract v1 | 第一版 Library API |
-| `on-disk-format.md` | Format draft v1 | 实现前冻结；当前不承诺向后兼容 |
+| `on-disk-format.md` | Format v1 frozen | Phase 0 后的兼容性边界 |
 | `commit-recovery-protocol.md` | Development contract v1 | 提交与恢复状态机 |
 | `mapping-design.md` | Development contract v1 | 第一版和目标 Mapping 架构 |
 | `gc-protocol.md` | Development contract v1 | GC 安全协议 |
@@ -31,16 +32,17 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 | `runtime-config.md` | Development contract v1 | 配置、资源预算与 Backpressure |
 | `verification-plan.md` | Acceptance contract v1 | 测试证据要求 |
 | `implementation-plan.md` | Execution plan v1 | 开发推进顺序 |
+| `format-freeze-review.md` | Frozen 2026-08-21 | Phase 0 全局 Review 与证据边界 |
 
-磁盘格式只有在 Phase 0 的 golden vectors、decoder fuzz 和 crash harness 通过并单独提交 Format Freeze 后，才成为兼容性承诺。在此之前可以修改，但必须同步更新所有协议文档和测试向量。
+磁盘格式已在 Phase 0 的 golden vectors、decoder fuzz 和初始化 crash harness 通过后冻结。后续非兼容修改必须提升 major version 并提供离线迁移。
 
 ## 当前完整性结论
 
-设计已闭合到可以开始 **Phase 0 格式与 Harness 开发**：Frame/Node/Manifest/Journal 有字节级边界，Commit/Recovery、Root/SegmentStats、GC 删除和 Delta admission 有对应失败时序，锁协议不要求在发布临界区执行磁盘 I/O。
+Phase 0 格式与 Harness 已完成，当前进入 **Phase 1 最小 durable Record Store**。Frame/Node/Manifest/Journal 已具备字节级实现与冻结边界；Commit/Recovery、Root/SegmentStats、GC 删除和 Delta admission 的后续实现仍必须遵守既有失败时序。
 
 仍可由实现基准选择而不改变契约的内容包括 Delta shard 数、Node Cache 的 CLOCK/SLRU 具体策略、I/O buffer 大小和后台调度权重。它们不得改变持久化格式、Batch 原子性、内存 hard limit、recovery 结果或 GC 删除门禁。
 
-“可以开发”不等于“格式已冻结”或“可以生产”：Phase 0 必须先用 golden vectors、decoder fuzz、INITIALIZING/Journal/Manifest crash matrix 证明当前 draft；若证据迫使格式变化，应在 Format Freeze 前回改文档和 vectors。
+“格式已冻结”不等于“可以生产”：durable Commit、恢复、并发、Persistent Mapping、GC 与长期验证仍由 Phase 1–5 逐步完成。
 
 ## 冲突处理
 

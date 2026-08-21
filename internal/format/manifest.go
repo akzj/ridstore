@@ -218,11 +218,11 @@ func validateManifest(m Manifest) error {
 	if uint32(m.ActiveDataSegmentID) >= uint32(m.NextDataSegmentID) || uint32(m.ActiveMapSegmentID) >= uint32(m.NextMapSegmentID) {
 		return fmt.Errorf("manifest next file ID: %w", base.ErrInvalidConfig)
 	}
-	if m.MappingRoot != 0 && !validMapAddr(m.MappingRoot) {
-		return fmt.Errorf("mapping root: %w", base.ErrInvalidConfig)
-	}
 	if _, err := base.ParseLogPos(uint64(m.ReplayStart)); err != nil {
 		return fmt.Errorf("replay start: %w", base.ErrInvalidConfig)
+	}
+	if err := validateManifestAddresses(m); err != nil {
+		return err
 	}
 	if m.CoveredCommitSeq >= m.NextCommitSeq || m.CutFrameSeq >= m.NextFrameSeq || m.StatsCoveredCommitSeq != m.CoveredCommitSeq {
 		return fmt.Errorf("manifest checkpoint sequence: %w", base.ErrInvalidConfig)
@@ -260,9 +260,62 @@ func validateHardLimits(h HardLimits) error {
 		}
 	}
 	frameEnd, err := base.AddUint64(h.MaxValueSize, FrameHeaderSize+SegmentHeaderSize+SegmentFooterSize)
-	if err != nil || h.SegmentSize > math.MaxUint32 || h.MaxValueSize > h.MaxBatchBytes || frameEnd > h.SegmentSize ||
+	if err != nil || h.SegmentSize > uint64(math.MaxUint32)+1 || h.MaxValueSize > h.MaxBatchBytes || frameEnd > h.SegmentSize ||
 		h.MaxBatchMutations > math.MaxUint32 || h.MaxBatchConditions > math.MaxUint32 || h.MaxOpenBatches > math.MaxUint32 {
 		return fmt.Errorf("inconsistent hard limits: %w", base.ErrInvalidConfig)
+	}
+	return nil
+}
+
+func validateManifestAddresses(m Manifest) error {
+	contentLimit := m.HardLimits.SegmentSize - SegmentFooterSize
+	for _, file := range m.SealedDataSegments {
+		if file.ValidEnd > contentLimit {
+			return fmt.Errorf("sealed data extent exceeds segment: %w", base.ErrInvalidConfig)
+		}
+	}
+	for _, file := range m.SealedMappingSegments {
+		if file.ValidEnd > contentLimit {
+			return fmt.Errorf("sealed mapping extent exceeds segment: %w", base.ErrInvalidConfig)
+		}
+	}
+
+	replaySegment, replayOffset := m.ReplayStart.SegmentID(), uint64(m.ReplayStart.Offset())
+	replayBound, replayFound := uint64(0), false
+	if replaySegment == m.ActiveDataSegmentID {
+		replayBound, replayFound = contentLimit, true
+	} else {
+		for _, file := range m.SealedDataSegments {
+			if file.FileID == uint32(replaySegment) {
+				replayBound, replayFound = file.ValidEnd, true
+				break
+			}
+		}
+	}
+	if !replayFound || replayOffset > replayBound {
+		return fmt.Errorf("replay start is outside manifest data files: %w", base.ErrInvalidConfig)
+	}
+
+	if m.MappingRoot == 0 {
+		return nil
+	}
+	if !validMapAddr(m.MappingRoot) {
+		return fmt.Errorf("mapping root: %w", base.ErrInvalidConfig)
+	}
+	rootSegment, rootOffset := m.MappingRoot.SegmentID(), uint64(m.MappingRoot.Offset())
+	rootBound, rootFound := uint64(0), false
+	if rootSegment == m.ActiveMapSegmentID {
+		rootBound, rootFound = contentLimit, true
+	} else {
+		for _, file := range m.SealedMappingSegments {
+			if file.FileID == uint32(rootSegment) {
+				rootBound, rootFound = file.ValidEnd, true
+				break
+			}
+		}
+	}
+	if !rootFound || rootOffset >= rootBound {
+		return fmt.Errorf("mapping root is outside manifest mapping files: %w", base.ErrInvalidConfig)
 	}
 	return nil
 }

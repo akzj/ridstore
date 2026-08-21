@@ -139,7 +139,7 @@ func hardLimits(cfg Config) (storeformat.HardLimits, error) {
 		cfg.IDReserveSize == 0 || cfg.BatchIDReserveSize == 0 {
 		return storeformat.HardLimits{}, fmt.Errorf("non-positive hard limit: %w", base.ErrInvalidConfig)
 	}
-	if uint64(cfg.SegmentSize) > math.MaxUint32 || cfg.MaxValueSize > cfg.MaxBatchBytes ||
+	if uint64(cfg.SegmentSize) > uint64(math.MaxUint32)+1 || cfg.MaxValueSize > cfg.MaxBatchBytes ||
 		uint64(cfg.MaxValueSize)+storeformat.FrameHeaderSize+2*storeformat.SegmentHeaderSize > uint64(cfg.SegmentSize) {
 		return storeformat.HardLimits{}, fmt.Errorf("incompatible segment/value limits: %w", base.ErrInvalidConfig)
 	}
