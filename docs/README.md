@@ -38,11 +38,11 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 
 ## 当前完整性结论
 
-Phase 0 格式与 Harness 已完成，当前进入 **Phase 1 最小 durable Record Store**。Frame/Node/Manifest/Journal 已具备字节级实现与冻结边界；Commit/Recovery、Root/SegmentStats、GC 删除和 Delta admission 的后续实现仍必须遵守既有失败时序。
+Phase 0 格式与 Harness、Phase 1 最小 durable Record Store 已完成；Phase 1 的 Commit/Recovery 结论见 [phase-1-review.md](phase-1-review.md)。当前进入 **Phase 2 并发与 group commit**；Root/SegmentStats、GC 删除和 Delta admission 的后续实现仍必须遵守既有失败时序。
 
 仍可由实现基准选择而不改变契约的内容包括 Delta shard 数、Node Cache 的 CLOCK/SLRU 具体策略、I/O buffer 大小和后台调度权重。它们不得改变持久化格式、Batch 原子性、内存 hard limit、recovery 结果或 GC 删除门禁。
 
-“格式已冻结”不等于“可以生产”：durable Commit、恢复、并发、Persistent Mapping、GC 与长期验证仍由 Phase 1–5 逐步完成。
+“格式已冻结”和“Phase 1 通过”都不等于“可以生产”：并发、Persistent Mapping、GC 与长期验证仍由 Phase 2–5 逐步完成。
 
 ## 冲突处理
 
