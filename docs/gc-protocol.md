@@ -267,6 +267,12 @@ score = reclaimableBytes / (copyBytes + fixedCost)
 - GC 带宽/并发限制；
 - trash 最大停留时间告警。
 
+内核以 `WriteStopFreeBytes` 承接“新写停止水位”：Begin、ID Allocate 和 Put 会在新
+reserve/payload append 前执行缓存式空间 admission；已有 Batch 的 Commit/Abort、读取、
+Checkpoint 与 GC 保持可运行，以免水位门禁阻塞自身的收敛路径。该检查不预留文件系统
+空间，不能替代所有 write/fsync 的 ENOSPC 传播，也不能替代部署层独立文件系统、容量
+告警和外部写入隔离。
+
 当可用空间不足以同时保存 live copy 和旧 Segment 时，不能开始无法完成的 GC。返回明确 `ENOSPC`/资源错误并保持旧数据可读。
 
 第一版采用两段保守 admission：Journal `Prepared` 前覆盖 exact live copy、Relocation Descriptor、两个 rotation Segment 和 `GCMinFreeBytes`；Relocation 完成后，Checkpoint barrier 冻结实际 Delta layers，再按实际 entry 数覆盖每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment 和 `GCMinFreeBytes`。不能只按源 Segment 的 live Record 数估计最终 Mapping，因为 copy 期间允许前台 Commit，最终 cut 还可能包含这些用户 Delta。第二段返回 `ErrInsufficientSpace` 时 Relocation 副本可作为垃圾保留，源 Segment 与旧 checkpoint 仍可恢复，Journal 在 Phase 4 前撤销。文件系统可用空间不是可锁定资源，因此 admission 通过后仍必须处理真实 `ENOSPC`；在 MappingCheckpointDurable 之前保留源文件，之后则 fault closed 并由 Open 完成既定删除协议。

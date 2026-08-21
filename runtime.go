@@ -1,6 +1,7 @@
 package ridstore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/catalog"
 	"github.com/akzj/ridstore/internal/commit"
+	"github.com/akzj/ridstore/internal/diskspace"
 	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
@@ -92,11 +94,22 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	failWithLog := func(err error) (*Store, error) {
 		return nil, errors.Join(err, log.Close(), persistentMapping.Close(), segments.Close())
 	}
-	idAllocator, err := allocator.New(allocator.RecordID, manifest.HardLimits.IDReserveSize, recovered.ReservedIDHighExclusive, log)
+	var store *Store
+	spaceGuard, err := diskspace.NewGuard(cfg.Dir, uint64(cfg.WriteStopFreeBytes), cfg.DiskSpaceCheckInterval, func(path string) (uint64, error) {
+		if store == nil {
+			return defaultAvailableBytes(path)
+		}
+		return store.availableBytes(path)
+	})
 	if err != nil {
 		return failWithLog(err)
 	}
-	batchAllocator, err := allocator.New(allocator.BatchID, manifest.HardLimits.BatchIDReserveSize, recovered.ReservedBatchIDHighExclusive, log)
+	reserveWriter := spaceAwareReserveWriter{log: log, guard: spaceGuard}
+	idAllocator, err := allocator.New(allocator.RecordID, manifest.HardLimits.IDReserveSize, recovered.ReservedIDHighExclusive, reserveWriter)
+	if err != nil {
+		return failWithLog(err)
+	}
+	batchAllocator, err := allocator.New(allocator.BatchID, manifest.HardLimits.BatchIDReserveSize, recovered.ReservedBatchIDHighExclusive, reserveWriter)
 	if err != nil {
 		return failWithLog(err)
 	}
@@ -113,7 +126,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return failWithLog(err)
 	}
-	store := &Store{
+	store = &Store{
 		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, catalog: catalogManager, metrics: runtimeMetrics, hook: hook, log: log,
 		mapping: persistentMapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
 		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]statusEntry), slotNotify: make(chan struct{}),
@@ -122,6 +135,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		recoveryAbortedEnd:   recovered.ReservedBatchIDHighExclusive,
 		terminalStatusTotal:  recovered.TerminalStatusCount,
 		availableBytes:       defaultAvailableBytes,
+		spaceGuard:           spaceGuard,
 	}
 	requestSoftCheckpoint = store.requestCheckpoint
 	for _, id := range manifest.OpenBatchIDsAtCut {
@@ -179,6 +193,30 @@ func framePayloadLimits(h storeformat.HardLimits) (uint64, uint64, error) {
 	return maxFrame, maxPart, nil
 }
 
+type spaceAwareReserveWriter struct {
+	log   *appendlog.Sequencer
+	guard *diskspace.Guard
+}
+
+func (w spaceAwareReserveWriter) AppendReserve(ctx context.Context, typ storeformat.FrameType, payload storeformat.ReservePayload) error {
+	if typ != storeformat.FrameTypeIDReserve && typ != storeformat.FrameTypeBatchIDReserve {
+		return base.ErrInvalidConfig
+	}
+	encoded, err := storeformat.EncodeReservePayload(payload)
+	if err != nil {
+		return err
+	}
+	physical, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(encoded)))
+	if err != nil {
+		return err
+	}
+	if err := w.guard.Reserve(ctx, physical); err != nil {
+		return err
+	}
+	defer w.guard.Release()
+	return w.log.AppendReserve(ctx, typ, payload)
+}
+
 type segmentRecordReader struct{ segments *segment.Registry }
 
 func (r segmentRecordReader) ReadPutHeader(addr base.VAddr) (commit.RecordHeader, error) {
@@ -234,6 +272,13 @@ func (s *Store) checkAvailable() error {
 		return errors.Join(base.ErrReadOnly, s.fault)
 	}
 	return nil
+}
+
+func (s *Store) admitNewWrite(ctx context.Context, bytes uint64) error {
+	if s == nil || s.spaceGuard == nil {
+		return base.ErrClosed
+	}
+	return s.spaceGuard.Admit(ctx, bytes)
 }
 
 func (s *Store) signalSlotLocked() {

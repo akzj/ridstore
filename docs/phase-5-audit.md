@@ -19,7 +19,7 @@
 | Long fuzz/nightly | 未完成 | 每个 decoder 的 2s smoke gate | 长时 fuzz 未自然结束，也没有 nightly 产物 |
 | 72h steady-state soak | Harness 完成，证据未完成 | `ridstore-soak`、JSONL 资源时间序列、模型/Verify/FD/goroutine 收敛 gate、短 smoke | 尚无自然结束的 72h 报告及环境元数据 |
 | Same-durability benchmark | 未完成 | 单一 ridstore durable commit benchmark | 无 append baseline、Pebble/RocksDB 同 durability 稳定态对比和原始报告 |
-| Known limits/checklist | 进行中 | 本文 | 下列 P0/P1 未关闭，最终 Review 尚未完成 |
+| Known limits/checklist | 进行中 | 本文、前台 write-stop admission | 长时/环境证据及最终 Review 尚未完成 |
 
 ## 2. 当前实现审计发现
 
@@ -63,9 +63,11 @@ Backup artifact publication 现已覆盖 root/子目录 create，INCOMPLETE、�
 
 Restore artifact publication 现已覆盖 root/`.payload`/子目录 create，RESTORING、LOCK、payload、Segment Header UUID rewrite、Manifest replacement 的 write/file sync/rename/cleanup，prepared/rewrite/publish 两侧 directory sync，八个 payload entry rename、`.payload` remove、Marker remove/final sync 与补偿路径；各逻辑边界分别注入 `EIO/ENOSPC/EACCES`。第二个 Header rewrite 及第二至第八个布局 rename 失败证明部分变换仍由 RESTORING fail closed，Open/public Verify 拒绝且源 artifact 保持可 Inspect。审计同时修复布局 rename 只 sync 目标目录的问题：现在在 `.payload` 尚存在时先 sync source，随后 remove 并 sync destination。Manifest cleanup 和 Marker 补偿失败保留双重 cause。至此当前已识别的 Format v1 durable writer 代码级 syscall matrix 闭合，但不能替代 power-loss 或异机恢复证据。
 
-### P1：磁盘耗尽停止水位
+### 已修复：磁盘耗尽停止水位
 
-GC 有 copy/checkpoint admission 与真实 ENOSPC 传播，但没有独立的前台写停止水位或保留空间配额。极端磁盘耗尽仍依赖部署层预留和告警。
+当前实现增加 runtime `WriteStopFreeBytes` 与 `DiskSpaceCheckInterval`：Begin、ID Allocate、Put 在产生新的 reserve/payload append 前执行缓存式空间 admission，间隔内按获准物理字节保守扣减，并以共享 refresh gate 覆盖 admission 到 append 返回的窗口；低于水位返回 `ErrInsufficientSpace`，不 fault Store。已有 Batch 的 Commit/Abort、Get、Checkpoint 与 GC 保持可运行，避免保护机制阻塞收敛路径；空间恢复后新写可重试。指标导出最近 available 估计、水位、stopped、拒绝与检查错误。
+
+该水位是 admission signal 而非文件系统配额：其他进程以及门禁外的 Commit/Checkpoint/GC 可并发消耗空间，真实 write/fsync 仍可能 ENOSPC。部署层仍必须提供独立文件系统/配额、容量告警和基于最大并发 Batch 的余量；代码不把水位误称为绝对空间保证。
 
 ### P1：长时与对比证据
 
@@ -95,7 +97,7 @@ make verify
 - [x] Open recovery 不再全量扫描/保存历史 PutRecord；
 - [x] Status retention 与 recovery transient memory 有明确上界；
 - [x] 所有当前已识别的 Format v1 durable writer 完成 syscall error matrix；
-- [ ] write-stop/运维磁盘水位策略完成或由明确部署契约承接；
+- [x] write-stop 水位完成，并明确部署层配额/告警与并发余量契约；
 - [ ] long fuzz/nightly 自然结束且无未解释 failure；
 - [ ] 72h steady-state soak 自然结束，空间/RSS/FD/goroutine 收敛；
 - [ ] same-durability append/Pebble/RocksDB 对比保存原始结果；

@@ -40,6 +40,8 @@ type Config struct {
     GCBatchMutations      int
     GCMinFreeBytes        int64
     GCBytesPerSecond      int64
+    WriteStopFreeBytes    int64
+    DiskSpaceCheckInterval time.Duration
 }
 ```
 
@@ -67,6 +69,8 @@ type Config struct {
 | GCBatchMutations | 4,096 |
 | GCMinFreeBytes | SegmentSize |
 | GCBytesPerSecond | 64 MiB/s |
+| WriteStopFreeBytes | max(2 * SegmentSize, GCMinFreeBytes) |
+| DiskSpaceCheckInterval | 100 ms |
 
 这些是可运行的安全起点，不是性能承诺；基准可以改变后续默认值，但持久化 hard limits 的改变必须遵守 Open 兼容规则。
 
@@ -87,6 +91,8 @@ Create 先填充零值、再验证、最后把 8 个 FormatHardLimits 写入 INI
 - `GCBatchBytes <= MaxBatchBytes` 且 `GCBatchMutations <= MaxBatchMutations`；
 - `GCMinFreeBytes >= 0`；零值采用一个 Segment 的保留空间，不能用零值关闭预检；
 - `GCBytesPerSecond > 0`；零值采用 64 MiB/s；
+- `WriteStopFreeBytes >= GCMinFreeBytes`；零值采用两个 Segment 与 GC 保留线中的较大值；
+- `0 < DiskSpaceCheckInterval <= 1min`；零值采用 100ms，不能关闭或无限延迟前台水位；
 - 任何 runtime budget 不能解释为允许绕过持久化 hard limit。
 
 ## 4. Delta 计费
@@ -127,8 +133,26 @@ GC 受 `GCBatchBytes/GCBatchMutations`、`GCBytesPerSecond`、Delta reservation�
 
 Data GC 使用两段磁盘 admission。安装 Maintenance Journal 前按 exact live bytes、Relocation Descriptor、两个 rotation Segment 与 `GCMinFreeBytes` 检查 copy 阶段空间；copy 完成后，GC-required Checkpoint barrier 先冻结其实际 Delta layers，再按冻结 entry 数乘以每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment与 `GCMinFreeBytes` 重新检查。第二段失败时 Relocation 已是可恢复的 durable garbage/Delta，但源 Segment 和旧 checkpoint 仍保留，Journal 安全撤销。这样前台 Commit 可以继续运行，又不会把只按源 live 数得到的估计误称为整个 Checkpoint 上界。任一检查低于上界均返回 `ErrInsufficientSpace`。可用空间检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
 
-## 7. 可观测性与验收
+## 7. 前台新写停止水位
+
+`WriteStopFreeBytes` 是进程级前台 admission 水位。Begin、ID Allocate 和 Put 在产生新的
+reserve/payload append 前检查可用空间；低于“水位 + 本次保守物理字节估计”时返回
+`ErrInsufficientSpace`。拒绝不把 Store 标记为 fault/read-only，释放空间后可以重试。
+
+已有 Batch 的 Commit/Abort，以及 Get、Checkpoint、Data/Mapping GC 不受该门禁阻塞。
+它们是确认已写 payload、释放资源或推进恢复边界所需的收敛通道；但各自真实 write/fsync
+仍可能返回 ENOSPC 并遵守原协议。水位不是磁盘预留，也不能保证所有已打开 Batch 可以
+同时提交，部署方必须按最大并发 Batch/Checkpoint 和外部同文件系统写入量设置余量。
+
+为避免每个 Put 都执行 `statfs`，Guard 在 `DiskSpaceCheckInterval` 内缓存一次观察值，并对
+每个获准的新 payload/reserve 做保守扣减；间隔到期后重新读取文件系统。其他进程写入、
+Commit/Checkpoint/GC 的并发增长仍可能使观察值过时，因此所有底层 ENOSPC 处理保持不变。
+受控 payload/reserve 从 admission 到 append 返回期间持有共享 refresh gate，刷新不会覆盖
+仍在途的保守扣减；不同前台 append 之间仍可并发。
+导出最近估算 available bytes、水位、stopped gauge、拒绝次数和检查错误次数。
+
+## 8. 可观测性与验收
 
 至少导出：active/frozen/reserved Delta charge、soft/hard limit、backpressure waiters/time、Checkpoint working bytes、group batch/bytes/wait/fsync、GC throttled time。
 
-验收必须覆盖：所有 frozen layer 计费、reservation 取消归还、fsync 后 Publish 不被限额阻塞、Checkpoint 连续失败时内存不越 hard limit、极小/溢出/不相容配置拒绝，以及 Open 的 hard-limit mismatch。
+验收必须覆盖：所有 frozen layer 计费、reservation 取消归还、fsync 后 Publish 不被限额阻塞、Checkpoint 连续失败时内存不越 hard limit、极小/溢出/不相容配置拒绝、Open 的 hard-limit mismatch，以及低水位拒绝新 Put/Begin 但不阻塞已有 Batch Commit/Abort、Get 和 Checkpoint。

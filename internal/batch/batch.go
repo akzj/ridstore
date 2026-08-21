@@ -71,6 +71,11 @@ type Appender interface {
 	AppendAbort(context.Context, base.BatchID, storeformat.BatchAbortPayload) error
 }
 
+type PutAdmitter interface {
+	AdmitPut(context.Context, uint64) error
+	ReleasePut()
+}
+
 type IDAllocator interface {
 	Allocate(context.Context) (uint64, error)
 }
@@ -108,6 +113,12 @@ func (b *Batch) State() (State, base.CommitSeq) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.state, b.commitSeq
+}
+
+func (b *Batch) CheckOpen() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.requireOpen()
 }
 
 func (b *Batch) Allocate(ctx context.Context) (base.ID, error) {
@@ -153,6 +164,16 @@ func (b *Batch) Put(ctx context.Context, id base.ID, value []byte) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(value)))
+	if err != nil {
+		return err
+	}
+	if admitter, ok := b.appender.(PutAdmitter); ok {
+		if err := admitter.AdmitPut(ctx, physicalSize); err != nil {
+			return err
+		}
+		defer admitter.ReleasePut()
 	}
 	addr, frameSeq, physicalSize, err := b.appender.AppendPut(ctx, b.id, id, value)
 	if err != nil {

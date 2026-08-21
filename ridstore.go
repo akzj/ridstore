@@ -79,6 +79,7 @@ type Store struct {
 	checkpointPending bool
 	checkpointErr     error
 	availableBytes    func(string) (uint64, error)
+	spaceGuard        *diskspace.Guard
 }
 
 var defaultAvailableBytes = diskspace.Available
