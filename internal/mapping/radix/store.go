@@ -22,8 +22,10 @@ import (
 var ErrActivePoisoned = errors.New("ridstore: active mapping append state uncertain")
 
 const (
-	PointBeforeAppendWrite failpoint.Point = "mapping.before-append-write"
-	PointBeforeSync        failpoint.Point = "mapping.before-sync"
+	PointBeforeAppendWrite  failpoint.Point = "mapping.before-append-write"
+	PointBeforeSync         failpoint.Point = "mapping.before-sync"
+	PointBeforeTailTruncate failpoint.Point = "mapping.before-tail-truncate"
+	PointBeforeTailSync     failpoint.Point = "mapping.before-tail-sync"
 )
 
 type nodeStore struct {
@@ -65,17 +67,22 @@ type retiredMapFile struct {
 }
 
 func openNodeStore(root string, manifest storeformat.Manifest, catalog *catalog.Manager) (*nodeStore, error) {
-	return openNodeStoreMode(root, manifest, catalog, false)
+	return openNodeStoreWithHook(root, manifest, catalog, nil)
+}
+
+func openNodeStoreWithHook(root string, manifest storeformat.Manifest, catalog *catalog.Manager, hook failpoint.Hook) (*nodeStore, error) {
+	return openNodeStoreMode(root, manifest, catalog, false, hook)
 }
 
 func openNodeStoreReadOnly(root string, manifest storeformat.Manifest) (*nodeStore, error) {
-	return openNodeStoreMode(root, manifest, nil, true)
+	return openNodeStoreMode(root, manifest, nil, true, nil)
 }
 
-func openNodeStoreMode(root string, manifest storeformat.Manifest, catalog *catalog.Manager, readOnly bool) (*nodeStore, error) {
+func openNodeStoreMode(root string, manifest storeformat.Manifest, catalog *catalog.Manager, readOnly bool, hook failpoint.Hook) (*nodeStore, error) {
 	store := &nodeStore{
 		root: root, uuid: manifest.StoreUUID, segmentSize: manifest.HardLimits.SegmentSize,
 		activeID: manifest.ActiveMapSegmentID, nextNodeSeq: 1, sealed: make(map[base.MapSegmentID]sealedMapFile), retired: make(map[base.MapSegmentID]retiredMapFile), catalog: catalog, readOnly: readOnly,
+		hook: hook,
 	}
 	for _, summary := range manifest.SealedMappingSegments {
 		file, err := openMappingFile(root, manifest.StoreUUID, summary, true, manifest.HardLimits.SegmentSize)
@@ -119,12 +126,31 @@ func openNodeStoreMode(root string, manifest storeformat.Manifest, catalog *cata
 		_ = store.Close()
 		return nil, err
 	}
+	store.activeEnd = validEnd
+	store.activeFirst = base.NodeSeq(header.FirstSeq)
+	store.activeLast = lastSeq
+	store.activeCount = count
 	if validEnd != uint64(info.Size()) {
 		if readOnly {
 			_ = store.Close()
 			return nil, fmt.Errorf("active mapping tail is not fully valid: %w", base.ErrCorrupt)
 		}
+		// Repair is allowed only for unpublished tail bytes. Validate the full
+		// durable Root against validEnd before modifying the evidence on disk.
+		validator := &Mapping{store: store, cache: newNodeCache(64 << 10)}
+		if err := validator.WalkRoot(manifest.MappingRoot, manifest.CoveredCommitSeq, func(base.ID, base.VAddr) error { return nil }); err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("mapping root reaches invalid active tail: %w", errors.Join(err, base.ErrCorrupt))
+		}
+		if err := failpoint.Hit(store.hook, PointBeforeTailTruncate); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
 		if err := store.active.Truncate(int64(validEnd)); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+		if err := failpoint.Hit(store.hook, PointBeforeTailSync); err != nil {
 			_ = store.Close()
 			return nil, err
 		}
@@ -133,10 +159,6 @@ func openNodeStoreMode(root string, manifest storeformat.Manifest, catalog *cata
 			return nil, err
 		}
 	}
-	store.activeEnd = validEnd
-	store.activeFirst = base.NodeSeq(header.FirstSeq)
-	store.activeLast = lastSeq
-	store.activeCount = count
 	if lastSeq >= store.nextNodeSeq {
 		store.nextNodeSeq = lastSeq + 1
 	}
