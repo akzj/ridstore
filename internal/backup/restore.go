@@ -36,6 +36,42 @@ const (
 	PointRestoreLayoutVerified   failpoint.Point = "restore.layout-verified"
 	PointRestoreMarkerRemoved    failpoint.Point = "restore.marker-removed"
 	PointRestorePublished        failpoint.Point = "restore.published"
+
+	PointBeforeRestoreRootCreate             failpoint.Point = "restore.before-root-create"
+	PointBeforeRestoreMarkerWrite            failpoint.Point = "restore.before-marker-write"
+	PointBeforeRestoreMarkerFileSync         failpoint.Point = "restore.before-marker-file-sync"
+	PointBeforeRestorePreparedRootSync       failpoint.Point = "restore.before-prepared-root-sync"
+	PointBeforeRestoreParentSync             failpoint.Point = "restore.before-parent-sync"
+	PointBeforeRestorePayloadRootCreate      failpoint.Point = "restore.before-payload-root-create"
+	PointBeforeRestorePayloadDirectoryCreate failpoint.Point = "restore.before-payload-directory-create"
+	PointBeforeRestoreLockWrite              failpoint.Point = "restore.before-lock-write"
+	PointBeforeRestoreLockFileSync           failpoint.Point = "restore.before-lock-file-sync"
+	PointBeforeRestorePayloadWrite           failpoint.Point = "restore.before-payload-write"
+	PointBeforeRestorePayloadFileSync        failpoint.Point = "restore.before-payload-file-sync"
+	PointBeforeRestoreSegmentHeaderWrite     failpoint.Point = "restore.before-segment-header-write"
+	PointBeforeRestoreSegmentHeaderFileSync  failpoint.Point = "restore.before-segment-header-file-sync"
+	PointBeforeRestoreManifestWrite          failpoint.Point = "restore.before-manifest-write"
+	PointBeforeRestoreManifestFileSync       failpoint.Point = "restore.before-manifest-file-sync"
+	PointBeforeRestoreManifestRename         failpoint.Point = "restore.before-manifest-rename"
+	PointBeforeRestoreManifestCleanupRemove  failpoint.Point = "restore.before-manifest-cleanup-remove"
+	PointBeforeRestoreManifestDirectorySync  failpoint.Point = "restore.before-manifest-directory-sync"
+	PointBeforeRestorePreparedManifestSync   failpoint.Point = "restore.before-prepared-manifest-sync"
+	PointBeforeRestorePreparedDataSync       failpoint.Point = "restore.before-prepared-data-sync"
+	PointBeforeRestorePreparedMapSync        failpoint.Point = "restore.before-prepared-map-sync"
+	PointBeforeRestorePreparedJournalSync    failpoint.Point = "restore.before-prepared-journal-sync"
+	PointBeforeRestorePreparedTrashSync      failpoint.Point = "restore.before-prepared-trash-sync"
+	PointBeforeRestorePreparedTempSync       failpoint.Point = "restore.before-prepared-temp-sync"
+	PointBeforeRestorePreparedPayloadSync    failpoint.Point = "restore.before-prepared-payload-sync"
+	PointBeforeRestorePreparedLayoutSync     failpoint.Point = "restore.before-prepared-layout-sync"
+	PointBeforeRestorePayloadRename          failpoint.Point = "restore.before-payload-rename"
+	PointBeforeRestoreMovedPayloadSync       failpoint.Point = "restore.before-moved-payload-sync"
+	PointBeforeRestorePayloadRootRemove      failpoint.Point = "restore.before-payload-root-remove"
+	PointBeforeRestorePublishedLayoutSync    failpoint.Point = "restore.before-published-layout-sync"
+	PointBeforeRestoreMarkerRemove           failpoint.Point = "restore.before-marker-remove"
+	PointBeforeRestorePublishRootSync        failpoint.Point = "restore.before-publish-root-sync"
+	PointBeforeRestoreRecoveryMarkerWrite    failpoint.Point = "restore.before-recovery-marker-write"
+	PointBeforeRestoreRecoveryMarkerFileSync failpoint.Point = "restore.before-recovery-marker-file-sync"
+	PointBeforeRestoreRecoveryRootSync       failpoint.Point = "restore.before-recovery-root-sync"
 )
 
 type RestoreReport struct {
@@ -69,7 +105,7 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 	if err != nil {
 		return report, err
 	}
-	if err := createRestoreRoot(destinationAbs); err != nil {
+	if err := createRestoreRoot(destinationAbs, options.Hook); err != nil {
 		return report, err
 	}
 	if err := failpoint.Hit(options.Hook, PointRestorePrepared); err != nil {
@@ -77,18 +113,27 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 	}
 	payloadRoot := filepath.Join(destinationAbs, restorePayloadDirName)
 	for _, name := range []string{"manifests", "data", "mapping", "journal", "trash", "tmp"} {
+		if err := failpoint.Hit(options.Hook, PointBeforeRestorePayloadDirectoryCreate); err != nil {
+			return report, err
+		}
 		if err := os.Mkdir(filepath.Join(payloadRoot, name), 0o700); err != nil {
 			return report, err
 		}
 	}
-	if err := writeNewSynced(filepath.Join(payloadRoot, filelock.FileName), []byte{}, 0o600); err != nil {
+	if err := writeNewSyncedWithHook(
+		filepath.Join(payloadRoot, filelock.FileName), []byte{}, 0o600, options.Hook,
+		PointBeforeRestoreLockWrite, PointBeforeRestoreLockFileSync,
+	); err != nil {
 		return report, err
 	}
 	for _, entry := range metadata.Files {
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
-		size, digest, err := copyRegularFile(ctx, filepath.Join(artifactAbs, payloadDirName, entry.Path), filepath.Join(payloadRoot, entry.Path))
+		size, digest, err := copyRegularFileWithHook(
+			ctx, filepath.Join(artifactAbs, payloadDirName, entry.Path), filepath.Join(payloadRoot, entry.Path),
+			options.Hook, PointBeforeRestorePayloadWrite, PointBeforeRestorePayloadFileSync,
+		)
 		if err != nil {
 			return report, err
 		}
@@ -114,18 +159,27 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 				return report, err
 			}
 		}
-		if err := rewriteStoreUUID(payloadRoot, metadata.Files, sourceUUID, restoredUUID); err != nil {
+		if err := rewriteStoreUUID(payloadRoot, metadata.Files, sourceUUID, restoredUUID, options.Hook); err != nil {
 			return report, err
 		}
 	}
 	if err := failpoint.Hit(options.Hook, PointRestoreUUIDRewritten); err != nil {
 		return report, err
 	}
-	for _, dir := range []string{
-		filepath.Join(payloadRoot, "manifests"), filepath.Join(payloadRoot, "data"), filepath.Join(payloadRoot, "mapping"),
-		filepath.Join(payloadRoot, "journal"), filepath.Join(payloadRoot, "trash"), filepath.Join(payloadRoot, "tmp"), payloadRoot, destinationAbs,
+	for _, entry := range []struct {
+		dir   string
+		point failpoint.Point
+	}{
+		{filepath.Join(payloadRoot, "manifests"), PointBeforeRestorePreparedManifestSync},
+		{filepath.Join(payloadRoot, "data"), PointBeforeRestorePreparedDataSync},
+		{filepath.Join(payloadRoot, "mapping"), PointBeforeRestorePreparedMapSync},
+		{filepath.Join(payloadRoot, "journal"), PointBeforeRestorePreparedJournalSync},
+		{filepath.Join(payloadRoot, "trash"), PointBeforeRestorePreparedTrashSync},
+		{filepath.Join(payloadRoot, "tmp"), PointBeforeRestorePreparedTempSync},
+		{payloadRoot, PointBeforeRestorePreparedPayloadSync},
+		{destinationAbs, PointBeforeRestorePreparedLayoutSync},
 	} {
-		if err := syncDirectory(dir); err != nil {
+		if err := syncDirectoryWithHook(entry.dir, options.Hook, entry.point); err != nil {
 			return report, err
 		}
 	}
@@ -149,7 +203,7 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 	if err := failpoint.Hit(options.Hook, PointRestorePayloadVerified); err != nil {
 		return report, err
 	}
-	if err := publishRestorePayload(payloadRoot, destinationAbs); err != nil {
+	if err := publishRestorePayload(payloadRoot, destinationAbs, options.Hook); err != nil {
 		return report, err
 	}
 	if err := failpoint.Hit(options.Hook, PointRestorePayloadPublished); err != nil {
@@ -165,21 +219,18 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 	if err := failpoint.Hit(options.Hook, PointRestoreLayoutVerified); err != nil {
 		return report, err
 	}
+	if err := failpoint.Hit(options.Hook, PointBeforeRestoreMarkerRemove); err != nil {
+		return report, err
+	}
 	if err := os.Remove(filepath.Join(destinationAbs, initialize.RestoringMarkerFileName)); err != nil {
 		return report, err
 	}
 	if err := failpoint.Hit(options.Hook, PointRestoreMarkerRemoved); err != nil {
-		restoreErr := writeNewSynced(filepath.Join(destinationAbs, initialize.RestoringMarkerFileName), []byte("ridstore restore incomplete\n"), 0o600)
-		if restoreErr == nil {
-			restoreErr = syncDirectory(destinationAbs)
-		}
+		restoreErr := restoreRestoringMarker(destinationAbs, options.Hook)
 		return report, errors.Join(err, restoreErr)
 	}
-	if err := syncDirectory(destinationAbs); err != nil {
-		restoreErr := writeNewSynced(filepath.Join(destinationAbs, initialize.RestoringMarkerFileName), []byte("ridstore restore incomplete\n"), 0o600)
-		if restoreErr == nil {
-			restoreErr = syncDirectory(destinationAbs)
-		}
+	if err := syncDirectoryWithHook(destinationAbs, options.Hook, PointBeforeRestorePublishRootSync); err != nil {
+		restoreErr := restoreRestoringMarker(destinationAbs, options.Hook)
 		return report, errors.Join(err, restoreErr)
 	}
 	if err := failpoint.Hit(options.Hook, PointRestorePublished); err != nil {
@@ -199,7 +250,7 @@ func Restore(ctx context.Context, artifact, destination string, options RestoreO
 	return report, nil
 }
 
-func createRestoreRoot(root string) error {
+func createRestoreRoot(root string, hook failpoint.Hook) error {
 	parent := filepath.Dir(root)
 	info, err := os.Lstat(parent)
 	if err != nil {
@@ -208,16 +259,25 @@ func createRestoreRoot(root string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("restore parent is not a real directory: %w", base.ErrInvalidConfig)
 	}
+	if err := failpoint.Hit(hook, PointBeforeRestoreRootCreate); err != nil {
+		return err
+	}
 	if err := os.Mkdir(root, 0o700); err != nil {
 		return err
 	}
-	if err := writeNewSynced(filepath.Join(root, initialize.RestoringMarkerFileName), []byte("ridstore restore incomplete\n"), 0o600); err != nil {
+	if err := writeNewSyncedWithHook(
+		filepath.Join(root, initialize.RestoringMarkerFileName), []byte("ridstore restore incomplete\n"), 0o600, hook,
+		PointBeforeRestoreMarkerWrite, PointBeforeRestoreMarkerFileSync,
+	); err != nil {
 		return errors.Join(err, os.Remove(root))
 	}
-	if err := syncDirectory(root); err != nil {
+	if err := syncDirectoryWithHook(root, hook, PointBeforeRestorePreparedRootSync); err != nil {
 		return err
 	}
-	if err := syncDirectory(parent); err != nil {
+	if err := syncDirectoryWithHook(parent, hook, PointBeforeRestoreParentSync); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(hook, PointBeforeRestorePayloadRootCreate); err != nil {
 		return err
 	}
 	if err := os.Mkdir(filepath.Join(root, restorePayloadDirName), 0o700); err != nil {
@@ -226,20 +286,31 @@ func createRestoreRoot(root string) error {
 	return nil
 }
 
-func publishRestorePayload(payloadRoot, destination string) error {
+func publishRestorePayload(payloadRoot, destination string, hook failpoint.Hook) error {
 	entries := []string{"manifests", "data", "mapping", "journal", "trash", "tmp", manifest.CurrentFileName, filelock.FileName}
 	for _, name := range entries {
+		if err := failpoint.Hit(hook, PointBeforeRestorePayloadRename); err != nil {
+			return err
+		}
 		if err := os.Rename(filepath.Join(payloadRoot, name), filepath.Join(destination, name)); err != nil {
 			return err
 		}
 	}
+	// Renames change both directories. Make the source-side removals durable
+	// while .payload still exists, then remove it and sync the destination.
+	if err := syncDirectoryWithHook(payloadRoot, hook, PointBeforeRestoreMovedPayloadSync); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(hook, PointBeforeRestorePayloadRootRemove); err != nil {
+		return err
+	}
 	if err := os.Remove(payloadRoot); err != nil {
 		return err
 	}
-	return syncDirectory(destination)
+	return syncDirectoryWithHook(destination, hook, PointBeforeRestorePublishedLayoutSync)
 }
 
-func rewriteStoreUUID(root string, files []FileEntry, oldUUID, newUUID base.StoreUUID) error {
+func rewriteStoreUUID(root string, files []FileEntry, oldUUID, newUUID base.StoreUUID, hook failpoint.Hook) error {
 	current, err := manifest.LoadCurrent(root)
 	if err != nil {
 		return err
@@ -251,7 +322,7 @@ func rewriteStoreUUID(root string, files []FileEntry, oldUUID, newUUID base.Stor
 		if !stringsHasDirectory(entry.Path, "data") && !stringsHasDirectory(entry.Path, "mapping") {
 			continue
 		}
-		if err := rewriteSegmentHeader(filepath.Join(root, entry.Path), oldUUID, newUUID); err != nil {
+		if err := rewriteSegmentHeader(filepath.Join(root, entry.Path), oldUUID, newUUID, hook); err != nil {
 			return err
 		}
 	}
@@ -261,13 +332,13 @@ func rewriteStoreUUID(root string, files []FileEntry, oldUUID, newUUID base.Stor
 		return err
 	}
 	manifestPath := filepath.Join(root, manifest.ManifestDirName, manifest.ManifestFileName(current.Generation))
-	if err := replaceSynced(manifestPath, encoded); err != nil {
+	if err := replaceSynced(manifestPath, encoded, hook); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(manifestPath))
+	return syncDirectoryWithHook(filepath.Dir(manifestPath), hook, PointBeforeRestoreManifestDirectorySync)
 }
 
-func rewriteSegmentHeader(path string, oldUUID, newUUID base.StoreUUID) (resultErr error) {
+func rewriteSegmentHeader(path string, oldUUID, newUUID base.StoreUUID, hook failpoint.Hook) (resultErr error) {
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -301,15 +372,21 @@ func rewriteSegmentHeader(path string, oldUUID, newUUID base.StoreUUID) (resultE
 	if err != nil {
 		return err
 	}
+	if err := failpoint.Hit(hook, PointBeforeRestoreSegmentHeaderWrite); err != nil {
+		return err
+	}
 	if n, err := file.WriteAt(encoded[:], 0); err != nil {
 		return err
 	} else if n != len(encoded) {
 		return io.ErrShortWrite
 	}
+	if err := failpoint.Hit(hook, PointBeforeRestoreSegmentHeaderFileSync); err != nil {
+		return err
+	}
 	return file.Sync()
 }
 
-func replaceSynced(path string, data []byte) (resultErr error) {
+func replaceSynced(path string, data []byte, hook failpoint.Hook) (resultErr error) {
 	temp := path + ".restore"
 	file, err := os.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -321,13 +398,19 @@ func replaceSynced(path string, data []byte) (resultErr error) {
 			resultErr = errors.Join(resultErr, file.Close())
 		}
 		if resultErr != nil {
-			resultErr = errors.Join(resultErr, removeIfExists(temp))
+			resultErr = errors.Join(resultErr, removeIfExistsWithHook(temp, hook, PointBeforeRestoreManifestCleanupRemove))
 		}
 	}()
+	if err := failpoint.Hit(hook, PointBeforeRestoreManifestWrite); err != nil {
+		return err
+	}
 	if n, err := file.Write(data); err != nil {
 		return err
 	} else if n != len(data) {
 		return io.ErrShortWrite
+	}
+	if err := failpoint.Hit(hook, PointBeforeRestoreManifestFileSync); err != nil {
+		return err
 	}
 	if err := file.Sync(); err != nil {
 		return err
@@ -336,10 +419,23 @@ func replaceSynced(path string, data []byte) (resultErr error) {
 		return err
 	}
 	closed = true
+	if err := failpoint.Hit(hook, PointBeforeRestoreManifestRename); err != nil {
+		return err
+	}
 	if err := os.Rename(temp, path); err != nil {
 		return err
 	}
 	return nil
+}
+
+func restoreRestoringMarker(root string, hook failpoint.Hook) error {
+	if err := writeNewSyncedWithHook(
+		filepath.Join(root, initialize.RestoringMarkerFileName), []byte("ridstore restore incomplete\n"), 0o600, hook,
+		PointBeforeRestoreRecoveryMarkerWrite, PointBeforeRestoreRecoveryMarkerFileSync,
+	); err != nil {
+		return err
+	}
+	return syncDirectoryWithHook(root, hook, PointBeforeRestoreRecoveryRootSync)
 }
 
 func parseUUID(encoded string) (base.StoreUUID, error) {

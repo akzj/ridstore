@@ -113,6 +113,15 @@ sync 失败，Create 尝试重新 write/file-sync Marker 并 sync root；补偿�
 返回 publication 与补偿 cause，当前可见目录仍保持 INCOMPLETE。该矩阵证明 syscall
 错误传播和当前文件系统上的重试边界，不替代真实 power-loss 证据。
 
+Restore syscall matrix 覆盖目标 root/私有 `.payload`/子目录创建，RESTORING、LOCK、
+payload copy、Segment Header UUID rewrite、Manifest replace 的 write/file sync/rename/
+cleanup，各层 directory sync，`.payload` 到正式布局的八个 rename、空目录 remove，
+RESTORING remove、最终 publication root sync 和 Marker 补偿。多文件 UUID rewrite
+中途失败、第二至第八个布局 rename 失败均必须保留 RESTORING，使 Open 与 public
+Verify 返回 `ErrRecoveryRequired`；源 Backup 必须仍可 Inspect。布局 rename 同时改变
+`.payload` 与目标 root，因此实现必须在 `.payload` 尚存在时先 sync 源目录，再 remove
+它并 sync 目标 root。最终 Marker 删除后的 sync 与补偿失败语义和 Backup 相同。
+
 ## 5. 不提供的保证
 
 - 不做在线增量备份、hardlink/reflink snapshot、压缩、加密或远端传输；
