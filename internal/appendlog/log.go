@@ -22,6 +22,11 @@ type Log struct {
 	maxPartPayload  uint64
 	faulted         bool
 	hook            failpoint.Hook
+	rotator         Rotator
+}
+
+type Rotator interface {
+	Rotate(*segment.ActiveData, base.FrameSeq) (*segment.ActiveData, error)
 }
 
 const (
@@ -50,11 +55,15 @@ func New(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxFramePayload
 }
 
 func NewWithHook(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxFramePayload, maxPartPayload uint64, hook failpoint.Hook) (*Log, error) {
+	return NewWithRotator(active, nextFrameSeq, maxFramePayload, maxPartPayload, hook, nil)
+}
+
+func NewWithRotator(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxFramePayload, maxPartPayload uint64, hook failpoint.Hook, rotator Rotator) (*Log, error) {
 	if active == nil || nextFrameSeq == 0 || maxFramePayload < storeformat.DescriptorSealSize || maxPartPayload < storeformat.MutationEntrySize || maxPartPayload > maxFramePayload {
 		return nil, fmt.Errorf("append log configuration: %w", base.ErrInvalidConfig)
 	}
 	maxPartPayload -= maxPartPayload % storeformat.MutationEntrySize
-	return &Log{active: active, nextFrameSeq: nextFrameSeq, maxFramePayload: maxFramePayload, maxPartPayload: maxPartPayload, hook: hook}, nil
+	return &Log{active: active, nextFrameSeq: nextFrameSeq, maxFramePayload: maxFramePayload, maxPartPayload: maxPartPayload, hook: hook, rotator: rotator}, nil
 }
 
 func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
@@ -67,6 +76,13 @@ func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, v
 		return 0, 0, 0, err
 	}
 	if err := ctx.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	probe, err := storeformat.EncodeFrame(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: l.nextFrameSeq, BatchID: batchID, RecordID: id, Payload: value}, l.maxFramePayload)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if err := l.ensureCapacityLocked(uint64(len(probe))); err != nil {
 		return 0, 0, 0, err
 	}
 	seq := l.nextFrameSeq
@@ -101,7 +117,16 @@ func (l *Log) AppendAbort(ctx context.Context, batchID base.BatchID, payload sto
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, _, err = l.appendLocked(storeformat.Frame{Type: storeformat.FrameTypeBatchAbort, FrameSeq: l.nextFrameSeq, BatchID: batchID, Payload: encoded[:]})
+	frame := storeformat.Frame{Type: storeformat.FrameTypeBatchAbort, FrameSeq: l.nextFrameSeq, BatchID: batchID, Payload: encoded[:]}
+	frameBytes, err := storeformat.EncodeFrame(frame, l.maxFramePayload)
+	if err != nil {
+		return err
+	}
+	if err := l.ensureCapacityLocked(uint64(len(frameBytes))); err != nil {
+		return err
+	}
+	frame.FrameSeq = l.nextFrameSeq
+	_, _, err = l.appendLocked(frame)
 	if err != nil {
 		return err
 	}
@@ -131,7 +156,16 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, _, err := l.appendLocked(storeformat.Frame{Type: typ, FrameSeq: l.nextFrameSeq, Payload: encoded[:]}); err != nil {
+	frame := storeformat.Frame{Type: typ, FrameSeq: l.nextFrameSeq, Payload: encoded[:]}
+	frameBytes, err := storeformat.EncodeFrame(frame, l.maxFramePayload)
+	if err != nil {
+		return err
+	}
+	if err := l.ensureCapacityLocked(uint64(len(frameBytes))); err != nil {
+		return err
+	}
+	frame.FrameSeq = l.nextFrameSeq
+	if _, _, err := l.appendLocked(frame); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(l.hook, PointReserveWritten); err != nil {
@@ -169,25 +203,20 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 	if len(prepared) == 0 || len(prepared) != len(commitSeqs) {
 		return nil, fmt.Errorf("commit group size: %w", base.ErrInvalidConfig)
 	}
-	plans := make([]commitPlan, len(prepared))
-	next := l.nextFrameSeq
-	var totalBytes uint64
-	for i := range prepared {
-		if prepared[i].BatchID == 0 || commitSeqs[i] == 0 || (i != 0 && commitSeqs[i] <= commitSeqs[i-1]) {
-			return nil, fmt.Errorf("commit append identity or order: %w", base.ErrInvalidConfig)
-		}
-		plan, err := l.buildCommitPlan(prepared[i], commitSeqs[i], next)
-		if err != nil {
-			return nil, err
-		}
-		plans[i] = plan
-		next = plan.result.SealFrameSeq + 1
-		totalBytes, err = base.AddUint64(totalBytes, plan.bytes)
-		if err != nil {
-			return nil, err
-		}
+	plans, totalBytes, err := l.buildCommitGroup(prepared, commitSeqs)
+	if err != nil {
+		return nil, err
 	}
-	if totalBytes > l.active.Remaining() {
+	if err := l.ensureCapacityLocked(totalBytes); err != nil {
+		return make([]CommitAppendResult, len(prepared)), err
+	}
+	// Rotation consumes one FrameSeq for SegmentSeal, so plans must be rebuilt
+	// against the new sequence origin.
+	plans, totalBytes, err = l.buildCommitGroup(prepared, commitSeqs)
+	if err != nil {
+		return nil, err
+	}
+	if totalBytes+segmentSealReserve > l.active.Remaining() {
 		return make([]CommitAppendResult, len(prepared)), segment.ErrFull
 	}
 	results := make([]CommitAppendResult, len(plans))
@@ -222,6 +251,30 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 		return results, err
 	}
 	return results, nil
+}
+
+const segmentSealReserve = uint64(storeformat.FrameHeaderSize + 64)
+
+func (l *Log) buildCommitGroup(prepared []batch.Prepared, commitSeqs []base.CommitSeq) ([]commitPlan, uint64, error) {
+	plans := make([]commitPlan, len(prepared))
+	next := l.nextFrameSeq
+	var totalBytes uint64
+	for i := range prepared {
+		if prepared[i].BatchID == 0 || commitSeqs[i] == 0 || (i != 0 && commitSeqs[i] <= commitSeqs[i-1]) {
+			return nil, 0, fmt.Errorf("commit append identity or order: %w", base.ErrInvalidConfig)
+		}
+		plan, err := l.buildCommitPlan(prepared[i], commitSeqs[i], next)
+		if err != nil {
+			return nil, 0, err
+		}
+		plans[i] = plan
+		next = plan.result.SealFrameSeq + 1
+		totalBytes, err = base.AddUint64(totalBytes, plan.bytes)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return plans, totalBytes, nil
 }
 
 func (l *Log) buildCommitPlan(prepared batch.Prepared, commitSeq base.CommitSeq, next base.FrameSeq) (commitPlan, error) {
@@ -293,6 +346,33 @@ func (l *Log) appendLocked(frame storeformat.Frame) (base.VAddr, uint64, error) 
 	}
 	l.nextFrameSeq++
 	return addr, written, nil
+}
+
+func (l *Log) ensureCapacityLocked(required uint64) error {
+	if required > ^uint64(0)-segmentSealReserve {
+		return segment.ErrFull
+	}
+	if required+segmentSealReserve <= l.active.Remaining() {
+		return nil
+	}
+	if l.rotator == nil || l.active.End() == storeformat.SegmentHeaderSize {
+		return segment.ErrFull
+	}
+	active, err := l.rotator.Rotate(l.active, l.nextFrameSeq)
+	if err != nil {
+		l.faulted = true
+		return err
+	}
+	l.active = active
+	if l.nextFrameSeq == base.FrameSeq(math.MaxUint64) {
+		l.faulted = true
+		return base.ErrGenerationExhausted
+	}
+	l.nextFrameSeq++
+	if required+segmentSealReserve > l.active.Remaining() {
+		return segment.ErrFull
+	}
+	return nil
 }
 
 func (l *Log) commitParts(prepared batch.Prepared) ([][]byte, []storeformat.MutationEntry, error) {

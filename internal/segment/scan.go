@@ -23,6 +23,37 @@ func SealedDataFileName(id base.DataSegmentID) string {
 	return fmt.Sprintf("DATA-%08d.seg", id)
 }
 
+func LoadSealedDataSummary(root string, id base.DataSegmentID) (storeformat.FileSummary, error) {
+	if id == 0 {
+		return storeformat.FileSummary{}, base.ErrInvalidConfig
+	}
+	path := filepath.Join(root, "data", SealedDataFileName(id))
+	file, err := os.Open(path)
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	if info.Size() < storeformat.SegmentHeaderSize+storeformat.SegmentFooterSize {
+		return storeformat.FileSummary{}, fmt.Errorf("sealed segment too small: %w", base.ErrCorrupt)
+	}
+	footerBytes := make([]byte, storeformat.SegmentFooterSize)
+	if _, err := file.ReadAt(footerBytes, info.Size()-storeformat.SegmentFooterSize); err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	footer, err := storeformat.DecodeDataSegmentFooter(footerBytes)
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	if footer.SegmentID != id || uint64(info.Size()) != footer.ValidDataEnd+storeformat.SegmentFooterSize {
+		return storeformat.FileSummary{}, fmt.Errorf("sealed footer identity: %w", base.ErrCorrupt)
+	}
+	return storeformat.FileSummary{FileID: uint32(id), ValidEnd: footer.ValidDataEnd, FirstSeq: uint64(footer.FirstFrameSeq), LastSeq: uint64(footer.LastFrameSeq)}, nil
+}
+
 // ValidateSealedData performs a strict full-file scan. It never truncates or
 // repairs a sealed file.
 func ValidateSealedData(root string, uuid base.StoreUUID, summary storeformat.FileSummary, segmentSize, maxPayloadSize uint64) (retErr error) {

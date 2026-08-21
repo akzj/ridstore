@@ -40,9 +40,21 @@ type putRecord struct {
 }
 
 func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (Result, error) {
-	if active == nil || manifest.MappingRoot != 0 || manifest.ReplayStart.SegmentID() != active.SegmentID() ||
-		len(manifest.SealedDataSegments) != 0 {
-		return Result{}, fmt.Errorf("phase 1 recovery requires one active data segment: %w", base.ErrUnsupported)
+	return Recover(manifest, nil, active)
+}
+
+func Recover(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData) (Result, error) {
+	if active == nil || manifest.MappingRoot != 0 || len(sealed) != len(manifest.SealedDataSegments) {
+		return Result{}, fmt.Errorf("memory mapping recovery configuration: %w", base.ErrUnsupported)
+	}
+	for i := range sealed {
+		if sealed[i] == nil || uint32(sealed[i].SegmentID()) != manifest.SealedDataSegments[i].FileID {
+			return Result{}, fmt.Errorf("sealed recovery order: %w", base.ErrCorrupt)
+		}
+	}
+	replaySegment := manifest.ReplayStart.SegmentID()
+	if replaySegment > active.SegmentID() {
+		return Result{}, fmt.Errorf("replay start after active segment: %w", base.ErrCorrupt)
 	}
 	mapping, err := memory.New(api.Snapshot{CoveredCommitSeq: manifest.CoveredCommitSeq})
 	if err != nil {
@@ -58,7 +70,7 @@ func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (R
 	parts := make(map[base.BatchID][]storeformat.Frame)
 	lastCommit := manifest.CoveredCommitSeq
 	replayOffset := uint64(manifest.ReplayStart.Offset())
-	err = active.Scan(func(addr base.VAddr, frame storeformat.Frame) error {
+	visit := func(addr base.VAddr, frame storeformat.Frame) error {
 		if frame.FrameSeq >= result.NextFrameSeq {
 			if frame.FrameSeq == base.FrameSeq(math.MaxUint64) {
 				return fmt.Errorf("frame sequence exhausted on disk: %w", base.ErrCorrupt)
@@ -68,7 +80,7 @@ func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (R
 		if frame.Type == storeformat.FrameTypePutRecord {
 			puts[addr] = putRecord{RecordID: frame.RecordID, BatchID: frame.BatchID, Bytes: uint64(len(frame.Payload))}
 		}
-		if uint64(addr.Offset()) < replayOffset {
+		if addr.SegmentID() < replaySegment || (addr.SegmentID() == replaySegment && uint64(addr.Offset()) < replayOffset) {
 			return nil
 		}
 		switch frame.Type {
@@ -134,10 +146,19 @@ func RecoverPhase1(manifest storeformat.Manifest, active *segment.ActiveData) (R
 			}
 		case storeformat.FrameTypeRelocationPart, storeformat.FrameTypeRelocationSeal:
 			return fmt.Errorf("relocation during phase 1 recovery: %w", base.ErrUnsupported)
+		case storeformat.FrameTypeSegmentSeal:
+			if len(parts) != 0 {
+				return fmt.Errorf("incomplete descriptor at sealed boundary: %w", base.ErrCorrupt)
+			}
 		}
 		return nil
-	})
-	if err != nil {
+	}
+	for _, item := range sealed {
+		if err := item.Scan(visit); err != nil {
+			return Result{}, err
+		}
+	}
+	if err := active.Scan(visit); err != nil {
 		return Result{}, err
 	}
 	return result, nil

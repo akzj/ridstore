@@ -3,8 +3,10 @@ package ridstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -136,6 +138,58 @@ func TestPublicCommitGetStatusAndRecovery(t *testing.T) {
 	defer store.Close()
 	if _, err := store.Get(context.Background(), id); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("recovered delete error=%v", err)
+	}
+}
+
+func TestSegmentRotationPreservesReadsAndRecovery(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[ID]string)
+	for i := 0; i < 24; i++ {
+		b, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := b.Allocate(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := fmt.Sprintf("value-%02d-%s", i, strings.Repeat("x", 512))
+		if err := b.Put(context.Background(), id, []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		values[id] = value
+	}
+	if current := store.rotation.Current(); current.Generation <= 1 || len(current.SealedDataSegments) == 0 {
+		t.Fatalf("rotation did not advance manifest: %+v", current)
+	}
+	for id, want := range values {
+		got, err := store.Get(context.Background(), id)
+		if err != nil || string(got) != want {
+			t.Fatalf("before reopen id=%d error=%v", id, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for id, want := range values {
+		got, err := store.Get(context.Background(), id)
+		if err != nil || string(got) != want {
+			t.Fatalf("after reopen id=%d error=%v", id, err)
+		}
 	}
 }
 
