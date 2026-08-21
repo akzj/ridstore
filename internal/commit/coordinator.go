@@ -82,10 +82,11 @@ type Coordinator struct {
 	hook     failpoint.Hook
 	config   Config
 
-	submitMu sync.Mutex
-	closed   bool
-	requests chan request
-	done     chan struct{}
+	submitMu    sync.Mutex
+	closed      bool
+	requests    chan request
+	relocations chan request
+	done        chan struct{}
 }
 
 type request struct {
@@ -141,7 +142,7 @@ func NewGrouped(next base.CommitSeq, log CommitLog, mapping api.Mapping, reader 
 	}
 	c := &Coordinator{
 		next: next, log: log, mapping: mapping, reader: reader, hook: hook, config: config,
-		requests: make(chan request, config.QueueDepth), done: make(chan struct{}),
+		requests: make(chan request, config.QueueDepth), relocations: make(chan request, config.QueueDepth), done: make(chan struct{}),
 	}
 	go c.run()
 	return c, nil
@@ -242,7 +243,7 @@ func (c *Coordinator) Relocate(ctx context.Context, batchID base.BatchID, change
 		return RelocationResult{}, base.ErrClosed
 	}
 	select {
-	case c.requests <- request:
+	case c.relocations <- request:
 		c.submitMu.Unlock()
 		if request.softLimit && c.config.OnDeltaSoftLimit != nil {
 			c.config.OnDeltaSoftLimit()
@@ -259,17 +260,46 @@ func (c *Coordinator) Relocate(ctx context.Context, batchID base.BatchID, change
 func (c *Coordinator) run() {
 	defer close(c.done)
 	var pending *request
+	foreground, background := c.requests, c.relocations
 	for {
 		var first request
 		if pending != nil {
 			first, pending = *pending, nil
 		} else {
-			var ok bool
-			first, ok = <-c.requests
-			if !ok {
+			// Foreground Commit/Barrier requests always win when already queued.
+			// A selected Relocation remains a bounded atomic descriptor, so newly
+			// arriving foreground work waits for at most one GC batch.
+			if foreground != nil {
+				select {
+				case request, ok := <-foreground:
+					if !ok {
+						foreground = nil
+					} else {
+						first = request
+						goto selected
+					}
+				default:
+				}
+			}
+			if foreground == nil && background == nil {
 				return
 			}
+			select {
+			case request, ok := <-foreground:
+				if !ok {
+					foreground = nil
+					continue
+				}
+				first = request
+			case request, ok := <-background:
+				if !ok {
+					background = nil
+					continue
+				}
+				first = request
+			}
 		}
+	selected:
 		if first.barrier != nil {
 			err := first.ctx.Err()
 			if err == nil {
@@ -841,6 +871,7 @@ func (c *Coordinator) Close() error {
 	}
 	c.closed = true
 	close(c.requests)
+	close(c.relocations)
 	c.submitMu.Unlock()
 	<-c.done
 	return nil

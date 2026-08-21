@@ -251,6 +251,82 @@ func TestRelocationCASDoesNotOverwriteLaterUserCommit(t *testing.T) {
 	}
 }
 
+func TestQueuedUserCommitRunsBeforeQueuedRelocation(t *testing.T) {
+	coordinator, log, active, mapping := coordinatorFixture(t)
+	defer active.Close()
+	first := makeBatch(t, 7, log)
+	if err := first.Put(context.Background(), 1, []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Commit(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	oldAddr, _, _ := mapping.Lookup(1)
+	copyAddr, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	barrierDone := make(chan error, 1)
+	go func() {
+		barrierDone <- coordinator.Barrier(context.Background(), func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+	type relocationOutcome struct {
+		result RelocationResult
+		err    error
+	}
+	relocationDone := make(chan relocationOutcome, 1)
+	go func() {
+		result, err := coordinator.Relocate(context.Background(), 8, []api.Change{{RecordID: 1, ExpectedOldAddr: oldAddr, NewAddr: copyAddr}})
+		relocationDone <- relocationOutcome{result: result, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(coordinator.relocations) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("relocation was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	user := makeBatch(t, 9, log)
+	if err := user.Put(context.Background(), 1, []byte("user")); err != nil {
+		t.Fatal(err)
+	}
+	userDone := make(chan struct {
+		result Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := coordinator.Commit(context.Background(), user)
+		userDone <- struct {
+			result Result
+			err    error
+		}{result: result, err: err}
+	}()
+	for len(coordinator.requests) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("user commit was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	if err := <-barrierDone; err != nil {
+		t.Fatal(err)
+	}
+	userResult := <-userDone
+	relocationResult := <-relocationDone
+	if userResult.err != nil || userResult.result.CommitSeq != 2 {
+		t.Fatalf("user result=%+v error=%v", userResult.result, userResult.err)
+	}
+	if relocationResult.err != nil || relocationResult.result.CommitSeq != 3 || relocationResult.result.Applied != 0 || relocationResult.result.Skipped != 1 {
+		t.Fatalf("relocation result=%+v error=%v", relocationResult.result, relocationResult.err)
+	}
+}
+
 type recordingGroupLog struct {
 	mu    sync.Mutex
 	calls int
