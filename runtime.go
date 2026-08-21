@@ -29,7 +29,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, err
 	}
-	manifest, err = radix.RecoverMappingRotation(cfg.Dir, manifest)
+	manifest, err = radix.RecoverMappingRotationWithHook(cfg.Dir, manifest, hook)
 	if err != nil {
 		return nil, err
 	}

@@ -116,6 +116,8 @@ Active Mapping Checkpoint 对 Node `WriteAt` 和最终 Active file sync 注入 `
 
 Active Mapping Open tail repair 对 truncate 与随后的 file sync 注入相同三类错误，失败 Open 必须释放 writer lease并允许无 hook 重试。任何 truncate 前必须以扫描得到的 `validEnd` 完整遍历当前 Manifest Root；只有所有可达 Node 都在有效区域内才可截断。若 Root 或子 Node 指向损坏 tail，Open 返回 corruption 且保持文件大小不变，避免先破坏取证再失败。该矩阵仍不覆盖 Mapping rotation/GC。
 
+Mapping rotation 对旧 Active 的 pre-journal sync、Footer write/sync、sealed rename、mapping directory sync，以及新 Active Header write/sync/directory sync 注入 `EIO/ENOSPC/EACCES`。普通 rotation 和 Data GC phase-3 nested rotation 使用同一文件矩阵，但前者拥有并最终删除独立 Maintenance Journal，后者只能扩展父 Journal。任一运行时错误经 Checkpoint 使 Store fail closed；fresh Open 必须完成或确认 file-set rotation、保留已提交记录并通过再次 Checkpoint/Verify。恢复 writer 自身的 truncate、partial-destination remove、Footer/Header write/sync、rename/dir-sync 也注入相同三类错误；失败恢复释放资源后再次 Open 必须幂等完成。若恢复看到已存在的合法 sealed 或新 Active 文件，也必须重新 file sync 和 mapping-dir sync，不能以“当前进程可见”替代 durability。该矩阵不覆盖 Mapping GC temp/publish/trash writer。
+
 ## 4. Commit Crash Matrix
 
 每个 Case 至少验证旧值、新值、NotFound 和 Batch Status。
