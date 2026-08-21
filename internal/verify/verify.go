@@ -70,6 +70,21 @@ func Run(ctx context.Context, root string) (report Report, resultErr error) {
 		return report, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lock.Close()) }()
+	return RunUnderLease(ctx, abs)
+}
+
+// RunUnderLease performs verification without acquiring LOCK. The caller must
+// hold the exclusive Store lease for root for the entire call. It exists so an
+// offline operation can verify and then consume the exact same immutable file
+// set without a lease-release race between the two steps.
+func RunUnderLease(ctx context.Context, root string) (report Report, resultErr error) {
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return report, err
+	}
 	if dirty, err := dirtyArtifacts(abs); err != nil {
 		return report, err
 	} else if len(dirty) != 0 {
