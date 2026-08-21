@@ -127,6 +127,23 @@ func (s *Sequencer) AppendCommit(prepared batch.Prepared, seq base.CommitSeq) (C
 	return got.result, got.err
 }
 
+type commitGroupResult struct {
+	results []CommitAppendResult
+	err     error
+}
+
+func (s *Sequencer) AppendCommitGroup(prepared []batch.Prepared, seqs []base.CommitSeq) ([]CommitAppendResult, error) {
+	result, err := s.submit(context.Background(), func(log *Log) any {
+		got, err := log.AppendCommitGroup(prepared, seqs)
+		return commitGroupResult{results: got, err: err}
+	})
+	if err != nil {
+		return nil, err
+	}
+	got := result.(commitGroupResult)
+	return got.results, got.err
+}
+
 func (s *Sequencer) NextFrameSeq() base.FrameSeq { return s.log.NextFrameSeq() }
 func (s *Sequencer) Faulted() bool               { return s.log.Faulted() }
 
