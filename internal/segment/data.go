@@ -136,32 +136,7 @@ func (s *ActiveData) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
 	file := s.file
 	s.mu.Unlock()
 
-	offset := uint64(addr.Offset())
-	headerBytes := make([]byte, storeformat.FrameHeaderSize)
-	if _, err := file.ReadAt(headerBytes, int64(offset)); err != nil {
-		return storeformat.Frame{}, err
-	}
-	limits := storeformat.FrameLimits{MaxPayloadSize: s.maxPayloadSize, RemainingSegmentSize: end - offset}
-	header, err := storeformat.DecodeFrameHeader(headerBytes, limits)
-	if err != nil {
-		return storeformat.Frame{}, err
-	}
-	total, err := base.Uint64ToInt(header.TotalSize)
-	if err != nil {
-		return storeformat.Frame{}, fmt.Errorf("frame allocation: %w", base.ErrCorrupt)
-	}
-	encoded := make([]byte, total)
-	if _, err := file.ReadAt(encoded, int64(offset)); err != nil {
-		return storeformat.Frame{}, err
-	}
-	frame, consumed, err := storeformat.DecodeFrame(encoded, limits)
-	if err != nil {
-		return storeformat.Frame{}, err
-	}
-	if consumed != total {
-		return storeformat.Frame{}, fmt.Errorf("frame consumed size: %w", base.ErrCorrupt)
-	}
-	return frame, nil
+	return readFrameAt(file, uint64(addr.Offset()), end, s.maxPayloadSize)
 }
 
 func (s *ActiveData) Sync() error {
