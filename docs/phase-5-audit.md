@@ -43,7 +43,9 @@
 
 Manifest/CURRENT 已覆盖 write、file sync、rename、directory sync 的 `ENOSPC`/`EIO`/`EACCES` 注入，并在 publication outcome 不确定时要求 fresh Open。其他 durable writer 仍主要依赖操作完成后的 phase failpoint；它们证明 process-crash 恢复，但不等价于真实 syscall 返回错误的传播与清理。
 
-Active Data 主写路径现已增加 append/sync、seal/footer write+sync、rename 和 data directory sync 注入点。单元矩阵证明每个 seal 边界都能经 fresh recovery 收敛为严格 immutable Segment；Store 级测试证明 descriptor write 错误确定未提交、Seal 后 sync 错误返回 CommitUnknown、两者均保留 `EIO` cause 并 fail closed。Rotation Journal 的 install/remove write、sync、rename/remove、directory sync 也已覆盖三类错误；Open 会删除并 fsync 未发布 regular temp、拒绝 symlink，并幂等完成已发布 Journal。完整 writer 清单与剩余缺口见 `syscall-fault-matrix.md`；Maintenance Journal、Mapping、Data GC 文件操作、Initialize 和 Backup/Restore 尚未闭合，因此本 P0 仍保持未完成。
+Active Data 主写路径现已增加 append/sync、seal/footer write+sync、rename 和 data directory sync 注入点。单元矩阵证明每个 seal 边界都能经 fresh recovery 收敛为严格 immutable Segment；Store 级测试证明 descriptor write 错误确定未提交、Seal 后 sync 错误返回 CommitUnknown、两者均保留 `EIO` cause 并 fail closed。Rotation Journal 与 Maintenance Journal 的 install/remove write、sync、rename/remove、directory sync 也已覆盖三类错误；Open 会删除并 fsync 未发布 regular temp、拒绝 symlink，并幂等完成已发布 Journal。
+
+Maintenance Journal 另按 Data GC phase 验证所有七次 directory-sync publication：phase 1–3 失败且 Manifest 尚未证明 GC checkpoint 时允许撤销；Mapping Checkpoint Manifest 一旦 durable，运行时立即 fail closed，即使 phase-4 Journal rename 尚未成功，fresh Open 也会用 `MaintenanceGeneration`、精确 SegmentStats 和 ReplayStart 的共同证据补写 phase 4 后继续删除。嵌套 Mapping rotation 虽可提前推进相同 MaintenanceGeneration，但旧 source 仍在 SegmentStats 时只能撤销，不能误判为 GC checkpoint。checkpoint 前 Journal cleanup 自身失败也会 fail closed，由 fresh Open 收敛。完整 writer 清单与剩余缺口见 `syscall-fault-matrix.md`；Mapping、Data GC trash/delete、Initialize 和 Backup/Restore 尚未闭合，因此本 P0 仍保持未完成。
 
 ### P1：磁盘耗尽停止水位
 

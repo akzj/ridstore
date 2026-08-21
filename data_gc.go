@@ -432,9 +432,14 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 			return
 		}
 		if !checkpointDurable {
-			_ = session.cancel()
+			cancelErr := session.cancel()
+			var removeErr error
 			if journalInstalled {
-				_ = maintenance.Remove(s.config.Dir)
+				removeErr = maintenance.RemoveWithHook(s.config.Dir, s.hook)
+			}
+			if cleanupErr := errors.Join(cancelErr, removeErr); cleanupErr != nil {
+				resultErr = errors.Join(resultErr, cleanupErr)
+				s.setFault(resultErr)
 			}
 			return
 		}
@@ -464,14 +469,22 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 			ValidEnd: session.source.ValidEnd, FirstSeq: session.source.FirstSeq, LastSeq: session.source.LastSeq,
 		}},
 	}
-	if err := maintenance.Install(s.config.Dir, journal); err != nil {
+	if _, found, err := maintenance.Load(s.config.Dir); err != nil {
+		return DataGCResult{}, err
+	} else if found {
+		return DataGCResult{}, fmt.Errorf("maintenance journal already active: %w", base.ErrConflict)
+	}
+	// Even a failed install can leave a temp file or a renamed journal whose
+	// directory sync outcome is unknown. After proving no prior owner exists,
+	// the pre-checkpoint defer can safely own cleanup of both names.
+	journalInstalled = true
+	if err := maintenance.InstallWithHook(s.config.Dir, journal, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
-	journalInstalled = true
 	if err := failpoint.Hit(s.hook, pointDataGCPrepared); err != nil {
 		return DataGCResult{}, err
 	}
-	if err := advanceDataGCJournal(s.config.Dir, &journal, 2, 0); err != nil {
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 2, 0, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
 	if err := failpoint.Hit(s.hook, pointDataGCCopying); err != nil {
@@ -480,7 +493,7 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	if err := session.relocate(ctx); err != nil {
 		return DataGCResult{}, err
 	}
-	if err := advanceDataGCJournal(s.config.Dir, &journal, 3, 0); err != nil {
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 3, 0, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
 	if err := failpoint.Hit(s.hook, pointDataGCRelocations); err != nil {
@@ -493,6 +506,10 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 		}
 		return DataGCResult{}, err
 	}
+	// checkpointLocked returned only after Manifest publication. From here,
+	// validation or journal-publication errors are recovery-required failures;
+	// the operation must never remove its ownership journal in-process.
+	checkpointDurable = true
 	if err := validateDataGCCheckpoint(checkpointManifest, session); err != nil {
 		return DataGCResult{}, err
 	}
@@ -511,10 +528,12 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 		return DataGCResult{}, fmt.Errorf("data GC checkpoint journal identity: %w", base.ErrCorrupt)
 	}
 	journal = durableJournal
-	if err := advanceDataGCJournal(s.config.Dir, &journal, 4, checkpointManifest.Generation); err != nil {
+	// From this point the durable Manifest proves that no Mapping targets the
+	// source. Failure to publish phase 4 must fail closed; fresh Open infers the
+	// boundary from MaintenanceGeneration and resumes instead of rolling back.
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 4, checkpointManifest.Generation, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
-	checkpointDurable = true
 	if err := failpoint.Hit(s.hook, pointDataGCCheckpoint); err != nil {
 		return DataGCResult{}, err
 	}
@@ -523,7 +542,7 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 		return DataGCResult{}, err
 	}
 	session.cleaning = false
-	if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration); err != nil {
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
 	if err := failpoint.Hit(s.hook, pointDataGCRetired); err != nil {
@@ -559,7 +578,7 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
 		return DataGCResult{}, err
 	}
-	if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration); err != nil {
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
 	if err := failpoint.Hit(s.hook, pointDataGCTrashed); err != nil {
@@ -571,13 +590,13 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
 		return DataGCResult{}, err
 	}
-	if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration); err != nil {
+	if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
 	if err := failpoint.Hit(s.hook, pointDataGCDeleted); err != nil {
 		return DataGCResult{}, err
 	}
-	if err := maintenance.Remove(s.config.Dir); err != nil {
+	if err := maintenance.RemoveWithHook(s.config.Dir, s.hook); err != nil {
 		return DataGCResult{}, err
 	}
 	sourceBytes, err := base.AddUint64(session.source.ValidEnd, storeformat.SegmentFooterSize)
@@ -590,7 +609,7 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	}, nil
 }
 
-func advanceDataGCJournal(root string, journal *storeformat.MaintenanceJournal, phase uint16, newManifestGeneration uint64) error {
+func advanceDataGCJournal(root string, journal *storeformat.MaintenanceJournal, phase uint16, newManifestGeneration uint64, hook failpoint.Hook) error {
 	next := *journal
 	next.SourceFiles = append([]storeformat.JournalFileRef(nil), journal.SourceFiles...)
 	next.DestinationFiles = append([]storeformat.JournalFileRef(nil), journal.DestinationFiles...)
@@ -601,7 +620,7 @@ func advanceDataGCJournal(root string, journal *storeformat.MaintenanceJournal, 
 	if err := storeformat.ValidateMaintenanceTransition(*journal, next); err != nil {
 		return err
 	}
-	if err := maintenance.Install(root, next); err != nil {
+	if err := maintenance.InstallWithHook(root, next, hook); err != nil {
 		return err
 	}
 	*journal = next
@@ -675,7 +694,8 @@ func (s *Store) resumeDataGC() error {
 	if journal.StoreUUID != s.catalog.Snapshot().StoreUUID {
 		return fmt.Errorf("data GC recovery journal identity: %w", base.ErrCorrupt)
 	}
-	if _, err := dataGCSourceRef(journal); err != nil {
+	sourceRef, err := dataGCSourceRef(journal)
+	if err != nil {
 		return err
 	}
 	// Prepared/Copying/RelocationsDurable have not removed the source from the
@@ -683,7 +703,30 @@ func (s *Store) resumeDataGC() error {
 	// the cleaning work is deterministic and keeps Open available even if the
 	// nested checkpoint previously ran out of Mapping space.
 	if journal.Phase <= 3 {
-		return maintenance.Remove(s.config.Dir)
+		current := s.catalog.Snapshot()
+		if current.MaintenanceGeneration < journal.Generation {
+			return maintenance.Remove(s.config.Dir)
+		}
+		if current.MaintenanceGeneration != journal.Generation || journal.Phase != 3 {
+			return fmt.Errorf("data GC recovery checkpoint phase: %w", base.ErrCorrupt)
+		}
+		sourceID := base.DataSegmentID(sourceRef.FileID)
+		for _, stat := range current.SegmentStats {
+			if stat.SegmentID == sourceID {
+				// A nested Mapping rotation can publish the parent maintenance
+				// generation while the DataGC journal remains at phase 3. The
+				// still-live source statistic proves its checkpoint did not run.
+				return maintenance.Remove(s.config.Dir)
+			}
+		}
+		// The checkpoint Manifest won the race with phase-4 journal publication.
+		// Reconstruct the monotonic transition from durable Manifest evidence.
+		if err := validateRecoveredDataGCCheckpoint(current, journal, sourceID); err != nil {
+			return err
+		}
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 4, current.Generation, nil); err != nil {
+			return err
+		}
 	}
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
@@ -725,7 +768,7 @@ func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.Main
 		}
 		session.cleaning = false
 		retiredInRuntime = true
-		if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration); err != nil {
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 5, journal.NewManifestGeneration, nil); err != nil {
 			return err
 		}
 	}
@@ -768,7 +811,7 @@ func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.Main
 		if err := ensureDataGCTrashed(s.config.Dir, journal.OperationID, sourceID); err != nil {
 			return err
 		}
-		if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration); err != nil {
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 6, journal.NewManifestGeneration, nil); err != nil {
 			return err
 		}
 	}
@@ -783,7 +826,7 @@ func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.Main
 		if err := maintenance.SyncDirectory(filepath.Join(s.config.Dir, "trash")); err != nil {
 			return err
 		}
-		if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration); err != nil {
+		if err := advanceDataGCJournal(s.config.Dir, &journal, 7, journal.NewManifestGeneration, nil); err != nil {
 			return err
 		}
 	}
