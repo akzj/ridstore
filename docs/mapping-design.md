@@ -1,0 +1,375 @@
+# Mapping 设计
+
+状态：Development contract v1
+
+## 1. 目标
+
+Mapping 实现：
+
+```text
+uint64 ID -> latest Data VAddr | NotFound
+```
+
+它是 ridstore 的读取索引和运行时可见状态，但不是唯一持久化真相。它必须：
+
+- 覆盖完整 uint64 ID；
+- 不按历史 high watermark 分配；
+- 不要求 Open 时全量加载；
+- 内存占用受配置上限约束；
+- 支持 hot point lookup；
+- 支持 Batch 原子发布；
+- 支持 Delete 后真正移除 Mapping；
+- 支持 GC expected-old-VAddr CAS；
+- 支持增量 Checkpoint；
+- 崩溃后可以由 Root + Commit Log 恢复。
+
+## 2. 总体结构
+
+```text
+                 Atomic Mapping State
+                /                    \
+Committed Delta Overlay       Persistent Radix Root
+        │ hit                         │ miss
+        └──────── Lookup ─────────────┘
+                                      │
+                              Bounded Node Cache
+```
+
+### 2.1 Delta Overlay
+
+保存自最近 durable Mapping Checkpoint 之后的 committed 修改：
+
+```text
+ID -> {VAddr | Delete, CommitSeq}
+```
+
+特点：
+
+- 只保存最终状态，不保存历史版本；
+- 用户 Commit 发布后立即可查；
+- Checkpoint 使用双 Overlay 切换；
+- 大小达到阈值触发 Checkpoint/backpressure；
+- 不能无限增长；
+- 不持久化为独立随机写文件，持久化依据是 Data Log Commit Descriptor。
+
+### 2.2 Persistent Radix
+
+使用 9-bit stride、最多 8 层、512 fanout 的不可变 copy-on-write Radix：
+
+```text
+Level 7 ... Level 1 -> child MapAddr
+Level 0              -> Data VAddr
+```
+
+八层覆盖完整 uint64；最高层只使用最高 1 bit。Node 只在存在有效子项时创建，空 Node 剪枝，因此容量与有效 Mapping 分布相关，不与历史最大 ID 线性绑定。
+
+Persistent Radix 是 Mapping Checkpoint，不在每个用户 Commit 时写 Node。
+
+## 3. 为什么不直接使用 LSM Mapping
+
+Mapping 只处理 uint64 精确 Lookup，不需要任意 Key 排序、Range Scan 或 Level Compaction。第一版选择 Radix 的理由：
+
+- ID 位分解直接决定路径；
+- 上层节点可以长期缓存；
+- Lookup 不需要 Key Comparator；
+- Delete 后可以 COW 剪枝；
+- Checkpoint 只重写受影响路径；
+- 不引入另一个通用 LSM 引擎。
+
+如果原型证明 Radix 无法满足写放大或冷读要求，替换必须保持 Mapping 接口和 Commit Log 格式，不得扩张 ridstore 的外部 Key 模型。
+
+## 4. 内存状态
+
+```go
+type mappingState struct {
+    root         MapAddr
+    coveredSeq   CommitSeq
+    frozen       []*deltaTable // newest first, waiting for checkpoint install
+    activeDelta  *deltaTable
+}
+```
+
+`mappingState` 通过 atomic pointer 发布。另有独立的 `publishEpoch atomic.Uint64` 保护 active Delta 的原地全批发布；它不能放在 immutable `mappingState` 中。Node Cache、Delta Table 和 Root 都有独立生命周期引用。
+
+Delta Entry：
+
+```go
+type deltaEntry struct {
+    vaddr     VAddr // 0 means Delete
+    commitSeq CommitSeq
+}
+```
+
+第一版 Delta Table 使用分片 hash table；它不是磁盘格式，也不向外暴露。Active Delta 的每个 shard 有独立 RWMutex，普通 Go map 绝不能仅凭 epoch 做无锁并发读写。Frozen Delta 发布后不可变，不再需要 shard 写锁。分片数和 map 实现由基准决定。
+
+## 5. Lookup
+
+单次 Get Lookup：
+
+```text
+loop:
+  epoch1 = publishEpoch.Load()
+  if epoch1 is odd:
+      retry
+  state1 = atomic.LoadAndPin(mappingState)
+  read activeDelta shard under shard RLock
+  if miss, read immutable frozen deltas newest-to-oldest
+  epoch2 = publishEpoch.Load()
+  state2 = atomic.Load(mappingState)
+  if state1 != state2 || epoch1 != epoch2 || epoch2 is odd:
+      unpin state1
+      retry
+  if overlay hit:
+      unpin state1
+      return overlay result
+
+  // The stable overlay miss above is the Get linearization point.
+  // state1 pins the old Root even if a later Checkpoint installs a new Root.
+  result = persistentRadix.Lookup(state1.root, ID)
+  unpin state1
+  return result
+```
+
+这样 Checkpoint Root/Delta 切换不会返回两代状态混合结果。epoch 只覆盖内存 Overlay 检查，不跨越冷 Radix I/O；Overlay miss 验证成功后，即使随后有 Commit，返回旧 Root 的结果仍线性化在该 Commit 之前。
+
+Batch Publish 在 activeDelta 内必须全批可见。第一版采用短写锁：
+
+```text
+lock publishMu
+publishEpoch++ // odd
+lock affected activeDelta shards in ascending shard order
+apply all mutations
+unlock affected shards in reverse order
+publishEpoch++ // even
+unlock
+```
+
+Lookup 读取 `publishEpoch`，若为 odd 或前后变化则重试。Shard lock 只保护 Go 容器的内存安全，epoch 负责跨 shard 的 Batch 可见性。磁盘 Radix I/O 不持有 publishMu 或 shard lock。
+
+单次 Get 在并发 Commit 前后可以得到旧值或新值；不会看到同一 Batch 的内部部分状态。多个独立 Get 不自动形成 Snapshot。
+
+## 6. Persistent Radix Lookup
+
+给定 ID：
+
+1. 从 Root MapAddr 获取 Level 7 Node；
+2. 按对应 9-bit stride 选择 Slot；
+3. Internal Slot=0 返回 NotFound；
+4. 否则加载 child Node；
+5. 到 Level 0 后 Slot 保存 Data VAddr；
+6. 校验 Node Level、Prefix、CRC 和 Store UUID/File identity。
+
+Node Cache key 为 MapAddr。缓存项不可变，因此不同 Root 可以安全共享旧 Node。
+
+冷 Lookup 最坏可能读取 8 个 Node。实际运行中 Root 和高层 Node 必须常驻 Cache；常见冷读目标是 1 个 Leaf I/O 加 Data Record I/O。
+
+路径计算固定为：
+
+```text
+level 0 slot = (ID >> 0)  & 0x1ff
+level 1 slot = (ID >> 9)  & 0x1ff
+...
+level 6 slot = (ID >> 54) & 0x1ff
+level 7 slot = (ID >> 63) & 0x001
+node prefix  = level == 7 ? 0 : ID >> (9 * (level + 1))
+```
+
+Level 7 的 Slot 2..511 必须为 0。Node Header 的 Prefix 保存到达该 Node 之前已经消费的高位值；加载 child 时必须由 parent prefix、slot 和 child level 重新计算并校验，不能只相信磁盘指针。
+
+## 7. Node Cache
+
+Node Cache 使用字节容量而不是条目数量限制。要求：
+
+- Root 和配置指定的上层 Node pinned；
+- 其余 Node 使用 CLOCK/SLRU 类淘汰策略，具体算法由基准决定；
+- 正在 Lookup 的 Node 有引用计数，不能被释放；
+- Cache miss 合并同一 MapAddr 的并发加载；
+- CRC 失败不负缓存，Store fail closed；
+- Cache 统计 hit/miss/load latency/eviction/pinned bytes；
+- MappingCacheBytes 达到上限时仍可通过淘汰继续工作。
+
+第一版不依赖操作系统无限 Page Cache；基准同时报告 Library Cache 和进程 RSS。
+
+## 8. Batch Publish
+
+输入是已经 durable、同一 CommitSeq 的最终 Mutation 集合。
+
+用户 Batch 的 ExpectRevision/ExpectAbsent 已在生成 Seal 前由 Commit Coordinator 验证；Mapping Publisher 不重新验证条件，只发布已经 durable 的 admitted Batch。Recovery 同样只重放 Seal。LogicalRevision 是 PutRecord Header 的 OriginBatchID，不进入 Radix Slot；Relocation 更新 VAddr 时保留 OriginBatchID，因此不改变 Revision。
+
+规则：
+
+- 按 CommitSeq 严格递增发布；
+- Put 设置 ID->VAddr；
+- Delete 设置 Delta tombstone，覆盖 Persistent Root 中的旧值；
+- 同一 ID 的较大 CommitSeq 覆盖较小 CommitSeq；
+- Publish 完成前不回复 Commit 成功；
+- Publish 不执行文件 I/O；
+- 运行时 tombstone 只存在到下一次包含它的 Checkpoint。
+
+Checkpoint 把 Delete 合并进 Radix 后，对应 Leaf Slot 变为 0；Delta tombstone 随 captured overlay 释放。
+
+## 9. GC CAS
+
+GC Relocation Entry：
+
+```text
+ID, ExpectedOldVAddr, NewVAddr
+```
+
+发布时：
+
+```text
+current = Mapping.Lookup(ID)
+if current == ExpectedOldVAddr:
+    Mapping[ID] = NewVAddr
+else:
+    skip
+```
+
+CAS 结果必须与 Relocation CommitSeq 一起进入 Delta。失败的 NewVAddr 没有 Mapping 指向，后续成为垃圾。
+
+恢复重放 Relocation 必须执行同样 CAS，不能无条件覆盖。
+
+## 10. Checkpoint 双 Overlay
+
+触发条件：
+
+- Delta bytes 达到阈值；
+- Commit count/Log bytes 达到阈值；
+- 显式 `Checkpoint`；
+- Close 可触发，但正确性不依赖 Close；
+- GC 需要推进安全删除边界。
+
+同一时刻只运行一个 Mapping Checkpoint。Checkpoint 向 append/commit coordinator 提交 barrier 请求；coordinator 在 Commit publish 序列轮到该请求时进入以下临界阶段：
+
+```text
+publishMu.Lock
+C = latest fully published CommitSeq
+F = end of the confirmed-durable contiguous Data Log prefix
+ReplayStart = exact position after F
+captured = activeDelta
+activeDelta = new empty delta
+baseRoot = current root
+frozen.prepend(captured)
+publish new mappingState(baseRoot, frozen, activeDelta)
+merged = snapshot of all frozen layers, oldest-to-newest
+publishMu.Unlock
+```
+
+`(C, F, ReplayStart)` 的选取和 Delta 切换不可分离。更晚 Commit 只有在 `publishMu` 释放后才能发布到新 active Delta，因此 merged 中不会混入 `CommitSeq > C`。F 不能越过只 write 尚未 fsync 的 Active 尾部。
+
+新的 Commit 继续进入 activeDelta，不等待磁盘 Checkpoint。Lookup 顺序为 activeDelta、frozen newest-to-oldest、persistent root，因此 durable Root 安装前 captured 仍然可见。
+
+后台将 `merged` 中所有 frozen layer 按从旧到新的顺序折叠，每个 ID 只保留最新 mutation；再按 ID 排序、按 Leaf 分组，基于 `baseRoot` 构建新的 COW Radix Root。必须包含以前失败 Checkpoint 留下的 frozen layer，不能只合并本轮 captured。完成后：
+
+```text
+fsync mapping files
+publish Manifest(newRoot, CoveredCommitSeq=C, CutFrameSeq=F, ReplayStart)
+publishMu.Lock
+verify merged is still the complete frozen set selected by this checkpoint
+publish new mappingState(newRoot, coveredSeq=C, frozen without merged, current activeDelta)
+publishMu.Unlock
+release merged overlays after readers unpin
+```
+
+Lookup 在安装期间始终通过 `active + frozen + root` 得到正确结果；不能在 Root durable 前丢弃任何 merged layer。Root/frozen 的内存切换也必须发布一个新的 immutable `mappingState`，不能分别修改字段。Checkpoint 失败时所有 frozen layer 原样保留，下一次必须连同新 captured 一起合并。
+
+## 11. COW Radix 构建
+
+为避免每个 ID 重写八个 Node：
+
+1. merged entries 按 ID 排序；
+2. 同一 Leaf 的修改合并；
+3. 从旧 Leaf 按需读取并应用全部 slot 变化；
+4. Leaf 非空则 append 新 Leaf，空则返回 MapAddr 0；
+5. 将 child 变化按父 Prefix 分组；
+6. 自底向上每个受影响 Internal Node 只重写一次；
+7. 最终得到 NewRoot；
+8. 所有 Node append 后 fsync Mapping Segment；
+9. Manifest 原子安装 Root。
+
+Checkpoint 的写放大按“受影响 Node 数”衡量。必须记录：dirty IDs、dirty leaves、rewritten internal nodes、bytes written。
+
+## 12. Checkpoint 失败
+
+- 构建/写入失败：旧 Root + frozen/active Overlay 继续提供服务；
+- fsync 不确定：Store 停止新写，重启根据 Manifest 判定；
+- Manifest 发布前崩溃：旧 Root 仍有效，新 Mapping Nodes 为孤儿；
+- Manifest 发布后崩溃：新 Root 有效，恢复从新 ReplayStart 开始；
+- merged frozen layers 只有在确认新 Manifest durable 后才能释放；
+- Checkpoint 错误必须可观测，不能像成功一样推进 Log/GC 删除边界。
+
+MappingCheckpoint 的 Maintenance Journal phase 固定为：Prepared、NodesWritten、MappingFilesDurable、ManifestInstalled、Complete。ManifestInstalled 之前恢复使用旧 Root，并保留或清理不可达新 Node；之后恢复必须使用新 Manifest。Journal 只证明文件安装进度，内存 Mapping State 始终可由 Manifest + replay 重建。
+
+## 13. Mapping 文件 GC
+
+Mapping Segment rotation 只由 checkpoint/Mapping GC writer 执行，并作为当前 Maintenance Journal operation 的子阶段记录：seal/footer fsync、rename+directory fsync、new active header fsync、Manifest file-set install。MapAddr 只按 FileID 解析，`.active`/`.seg` 后缀不改变已有 Root 的可读性；Journal 未完成时 Open 必须先完成或回滚 rotation，不能猜测收编孤儿文件。
+
+COW 会产生不可达旧 Node。Mapping GC 独立于 Data GC：
+
+1. pin 当前 Root；
+2. 遍历可达 Node；
+3. 将可达 Node copy 到新 Mapping generation，重写 child MapAddr；
+4. fsync 新 Mapping files；
+5. 安装指向新 Root 的 Manifest；
+6. 等待旧 Root/Node Cache 引用释放；
+7. 将旧 Mapping files 移入 trash 并 fsync 目录；
+8. 删除 trash 文件。
+
+Mapping GC 不改变 ID->Data VAddr 内容。发生错误时保留旧 Root；不能删除旧文件后再发布新 Root。
+
+Mapping GC 与普通 Mapping Checkpoint 不能并发构建并互相安装过期 Root。第一版由 checkpoint coordinator 串行执行两者；最终 Manifest 仍通过全局安装串行器和 generation CAS 与 Data GC、Segment rotation 合并。
+
+MappingGC 的 Maintenance Journal phase 固定为：Prepared、Copied、MappingFilesDurable、ManifestInstalled、OldFilesTrashed、Deleted。ManifestInstalled 前旧文件不能移动；安装后先等待旧 Root/Cache pin 清零，再进入 trash/delete。
+
+第一版可以暂缓自动 Mapping GC，但必须暴露 unreachable mapping bytes，且长期 soak 前必须实现空间收敛。
+
+## 14. 内存与磁盘下界
+
+精确 Mapping 对 N 个独立有效 ID 至少需要 O(N) 位置信息。ridstore 不承诺 Mapping 与有效 ID 数无关。
+
+目标是：
+
+- 磁盘保存完整 Mapping；
+- 内存只保存 Delta 和有界 Cache；
+- 删除后的 ID 在 Checkpoint 后不保留永久 tombstone；
+- 历史 high watermark 不导致同等大小的空数组；
+- 冷 Lookup 用磁盘 I/O 换内存容量。
+
+## 15. Backpressure
+
+Checkpoint 速度若追不上 Commit，Delta 会增长。达到软/硬限制：
+
+- soft limit：提高 Checkpoint 优先级并记录告警；
+- hard limit：阻塞新的 Commit Publish，但允许 Get、Abort 和 Checkpoint；
+- 不允许 OOM 后由进程被杀作为流控；
+- 不允许丢弃 Delta，因为它承载最新可见 Mapping；
+- Context 取消等待中的 Commit 按 CommitUnknown 规则处理。
+
+## 16. 第一版实现顺序
+
+1. 先实现 `memoryMapping` 作为参考模型和 Commit/Recovery 验证；
+2. 定义统一 Mapping 接口和模型测试；
+3. 实现 Persistent Radix codec/golden vectors；
+4. 实现 Node Cache；
+5. 实现 Delta + Root Lookup；
+6. 实现双 Overlay Checkpoint；
+7. 实现 crash tests；
+8. 最后切换默认 Mapping；
+9. memoryMapping 保留在测试中作为 oracle，不作为生产默认。
+
+不得先让业务代码依赖 memoryMapping 的全量加载行为。
+
+## 17. 验收指标
+
+- 完整 uint64 高位 ID 正确 Lookup；
+- 稀疏 ID 不按 high watermark 分配；
+- Open 只加载 Root/必要上层 Node；
+- Mapping Cache 严格受预算限制；
+- Delta hard limit 能 backpressure；
+- Delete Checkpoint 后 Leaf/路径可剪枝；
+- 并发 Publish/Lookup 无 partial batch；
+- Checkpoint 与并发 Commit 不丢更新；
+- Manifest 任意崩溃点只选择旧 Root 或新 Root；
+- GC CAS 在运行和恢复中结果一致；
+- 长时间运行 Mapping 文件空间最终收敛。

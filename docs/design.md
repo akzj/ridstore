@@ -1,12 +1,12 @@
 # ridstore 总体设计
 
-状态：Draft v0.1，等待 Review
+状态：Accepted architecture v0.2
 
 范围：单机存储内核
 
-当前阶段：设计，不承诺磁盘格式兼容性
+当前阶段：详细规格完成，磁盘格式等待 Phase 0 Format Freeze
 
-项目与 LSM/RocksDB 的能力边界和性能判定标准见 [positioning-vs-lsm.md](positioning-vs-lsm.md)。该文档属于项目定位约束，而不是可随实现便利改变的优化建议。
+详细文档入口见 [README.md](README.md)。项目与 LSM/RocksDB 的能力边界和性能判定标准见 [positioning-vs-lsm.md](positioning-vs-lsm.md)。这些文档属于项目定位与开发契约，而不是可随实现便利改变的优化建议。
 
 ## 1. 项目定位
 
@@ -24,11 +24,14 @@ uint64 ID -> variable-length bytes
 
 底层通过顺序 append、Batch 合并和 group fsync 避免小块随机覆盖写。更新和删除不撤销既有物理写入；不可见记录由 GC 回收。
 
+第一阶段交付为嵌入式 Go Library：一个应用进程独占一个本地数据目录，多 goroutine 并发调用。独立 daemon、RPC、复制和分布式系统不属于当前项目范围，详见 [api-contract.md](api-contract.md)。
+
 ### 1.1 内核负责
 
 - 分配稳定、单调递增且永不复用的 ID；
 - Get、Put、Delete；
 - 多记录 Batch 原子提交；
+- 可选的 Batch 级乐观条件检查；
 - append-only Record Segment；
 - ID 到最新物理位置的 Mapping；
 - 崩溃恢复、Mapping Checkpoint；
@@ -79,9 +82,9 @@ Commit Marker、Record payload 和校验信息必须处于同一个有序 append
 
 Put/Delete 的物理写入可以逐条发生，但逻辑可见性以 Batch 为单位发布。读者不能观察到半个已发布 Batch。
 
-### I6：Mapping 是可重建状态，不是唯一真相
+### I6：Mapping Root 与剩余 Commit Log 共同构成权威状态
 
-Committed Record Log 是权威历史。Mapping Checkpoint 只缩短启动恢复时间，损坏或丢失时必须能够从受支持的 Log 历史恢复。
+当前 durable Mapping Root 加上 `ReplayStart` 之后的 Commit/Relocation Log，必须能够重建最新 Mapping。Checkpoint 覆盖之前的 Commit 历史只有在新 Root durable 后才能被 GC；一旦这些历史被回收，就不能宣称仅靠剩余 Record Log 从零重建 Mapping。ridstore 防止崩溃产生不一致，但不把磁盘介质同时损坏 Mapping Root 和已回收历史视为可自动恢复场景；这需要备份或上层冗余。
 
 ### I7：GC 不能改变逻辑内容
 
@@ -111,7 +114,7 @@ VAddr 是内部物理地址，不暴露给使用者。概念上至少包含：
 Segment identity + byte offset
 ```
 
-Record Length 保存在 Record Header 中，因此 Mapping 可以只保存紧凑 VAddr。VAddr 的最终位布局属于磁盘格式决策，目前保持开放。
+Record Length 保存在 Record Header 中，因此 Mapping 只保存紧凑 VAddr。第一版 VAddr 使用 `uint32 SegmentID + uint32 byte offset`，详见 [on-disk-format.md](on-disk-format.md)。
 
 ### 3.3 Record
 
@@ -137,7 +140,7 @@ record_crc
 - CRC 覆盖影响解析和语义的所有字段；
 - 尾部 torn write 可被确定识别；
 - 未知 format version 必须拒绝，不能猜测解析；
-- 具体二进制布局在实现前通过独立格式文档确定。
+- 第一版二进制布局见 [on-disk-format.md](on-disk-format.md)，在 Phase 0 Format Freeze 前仍可经 Review 修改。
 
 ### 3.4 Mapping Entry
 
@@ -150,43 +153,11 @@ ID -> NotFound
 
 Length、CRC 和类型从 Record Header 获取。Delete 被 Mapping Checkpoint 吸收后不保留永久 Tombstone；Mapping 空间应与当前有效 ID 相关，而不是与历史最大 ID 相关。
 
-## 4. 外部 API 草案
+## 4. 外部 API
 
-API 表达语义，不提前绑定 Go 的最终接口细节。
+第一版是嵌入式 Go Library。公开 Store/Batch、数据所有权、错误、Context、Close、大小限制和进程模型以 [api-contract.md](api-contract.md) 为准。
 
-```go
-type Store interface {
-    Get(ctx context.Context, id ID) (Record, error)
-    Begin(ctx context.Context) (Batch, error)
-    Close() error
-}
-
-type Batch interface {
-    Allocate() (ID, error)
-    Put(id ID, value []byte) error
-    Delete(id ID) error
-    Commit(ctx context.Context) error
-    Abort() error
-}
-
-type Record interface {
-    ID() ID
-    Bytes() []byte
-    Close() error
-}
-```
-
-`Record.Close` 为 Segment pin、mmap view 或 buffer 生命周期预留。第一版可以返回复制后的 `[]byte`，但接口不能阻止未来的零拷贝或流式读取。
-
-大 Value 接口保持开放。可能增加：
-
-```go
-PutReader(id ID, size uint64, src io.Reader) error
-Open(id ID) (io.ReadCloser, error)
-ReadAt(id ID, offset int64, dst []byte) error
-```
-
-这些接口不能改变 Batch 原子性。
+第一版 `Get` 返回独立复制的 `[]byte`；Put 在返回前消费输入；大 Value 直接 append，但仍受 `MaxValueSize` 和 Batch 配额约束。零拷贝 View、`PutReader`、`ReadAt` 和多 Get `ReadView` 延后单独设计，不能改变 Batch 原子性。
 
 ### 4.1 Allocate 的语义
 
@@ -199,11 +170,17 @@ Begin
 Commit
 ```
 
-只 Allocate 而未 Put 的 ID 在 Commit 后是否成为“存在的空 Record”目前不做隐式推断。第一版倾向要求显式 Put；未绑定内容的 ID 永久形成空洞。
+只 Allocate 而未 Put 的 ID 不产生可读 Record，并永久形成空洞。空 Value 必须显式 `Put(id, []byte{})`。
 
 ### 4.2 同一 Batch 重复修改同一 ID
 
 Batch 中可以多次 Put/Delete 同一 ID。提交后的最终 Mapping 只采用该 Batch 对 ID 的最后一个操作；此前物理 Record 自动成为 GC 候选。
+
+### 4.3 LogicalRevision 与冲突处理
+
+默认 Blind Put 按 CommitSeq Last-Writer-Wins。需要防止丢失更新时，调用者通过 `GetRecord` 获取 opaque LogicalRevision，并在 Batch 中声明 `ExpectRevision` 或 `ExpectAbsent`。Revision 复用 PutRecord Header 已有的 OriginBatchID，不增加 Record 格式空间；GC Relocation 只改变 VAddr并保留 OriginBatchID。
+
+全部条件在 Commit Coordinator 的全局提交顺序中原子验证。任一失败返回 `ErrConflict`，整个 Batch 确定未提交且不产生 CommitSeal。ridstore 不自动记录读集、不自动重试或合并，也不把条件检查扩张成 Snapshot/MVCC/Serializable 事务。
 
 ## 5. Batch 原子提交
 
@@ -212,6 +189,7 @@ Batch 中可以多次 Put/Delete 同一 ID。提交后的最终 Mapping 只采�
 ```text
 Open
  ├── Abort                         -> Aborted
+ ├── Commit + condition conflict   -> Aborted
  ├── Commit + durable fsync        -> Committed
  └── Commit durability uncertain   -> CommitUnknown
 ```
@@ -221,14 +199,14 @@ Open
 ### 5.2 正常提交
 
 ```text
-1. 为所有 Put/Delete 生成完整 Record Frame
-2. append BatchCommit(batch_id, mutation_count, batch_crc)
-3. 将一个或多个待提交 Batch 合并 write
-4. 执行一次 fsync/fdatasync
-5. 设置 Mapping publish barrier
-6. 应用本批全部 ID -> VAddr / NotFound
-7. 结束 publish barrier
-8. 返回 Commit 成功
+1. Put 阶段已生成完整 PutRecord Frame
+2. Coordinator 按 group 顺序验证可选条件
+3. 冲突 Batch 确定 Abort；通过者生成 Commit Descriptor
+4. 将一个或多个 Descriptor 合并 write
+5. 执行一次 fsync/fdatasync
+6. 设置 Mapping publish barrier
+7. 应用本批全部 ID -> VAddr / NotFound
+8. 结束 publish barrier并返回 Commit 成功
 ```
 
 多个 Batch 可以共享一次 fsync，但各自保留独立 BatchID、CRC 和原子可见性。
@@ -259,17 +237,11 @@ Commit Marker 可能 durable
 => CommitUnknown
 ```
 
-发生 CommitUnknown 后，第一版应将 Store 置为只读或故障状态，通过重新 Open 和恢复确认 BatchID。BatchID 必须支持查询或幂等重试；具体接口待定。
+发生 CommitUnknown 后，Store 置为只读故障状态，通过 `Status(BatchID)` 或重新 Open 后查询 durable CommitSeal。第一版不自动重放相同 BatchID。
 
-### 5.5 大 Batch 的写入调度是开放决策
+### 5.5 大 Batch 的写入调度
 
-需要在实现前比较：
-
-1. Batch 连续写入：恢复最简单，但一个大 Batch 可能阻塞其他写者；
-2. 多 Batch Record 交错：吞吐和流式写更好，但恢复需要维护 pending batch；
-3. 内存/临时文件 staging：提交日志连续，但可能产生内存压力或双写。
-
-无论采用哪一种，都必须满足：Commit Marker 排在该 Batch 所有 Record 之后，且 Marker durable 意味着此前 Record durable。
+第一版允许不同 Batch 的 PutRecord 物理交错。Put 时直接 append payload；Commit 时生成自包含最终 ID→VAddr/Delete 集合的 Commit Descriptor。CommitPart 与 CommitSeal 连续位于同一 Segment，多 Batch Descriptor 可以共享一次 fsync。完整协议见 [commit-recovery-protocol.md](commit-recovery-protocol.md)。
 
 ## 6. Mapping 架构
 
@@ -310,7 +282,7 @@ Bounded Mapping Page Cache
 
 启动时只加载 Manifest/Root。冷 Mapping Page 按需从磁盘读取，热点受容量限制地缓存在内存。
 
-Persistent Mapping 候选包括 Adaptive Radix、Sparse Radix、B+Tree 或其他分页索引。实现前用独立原型比较以下指标，不在总体设计中提前指定赢家：
+第一版目标 Persistent Mapping 已确定为 9-bit stride、最多八层、覆盖完整 uint64 的 copy-on-write Radix；最近提交保存在 Delta Overlay，冷 Node 进入有界 Cache。详细结构见 [mapping-design.md](mapping-design.md)。实现仍需持续测量：
 
 - 热 Lookup 延迟；
 - 冷 Lookup I/O 次数；
@@ -321,7 +293,7 @@ Persistent Mapping 候选包括 Adaptive Radix、Sparse Radix、B+Tree 或其他
 - Cache 命中率与内存预算；
 - 增量 Checkpoint 吞吐是否追得上提交速率。
 
-Leaf 可以根据实际密度选择 Dense、Bitmap 或 Sparse 编码；这是数据分布自适应，不属于业务语义。
+第一版 Node 使用固定 512 个 uint64 Slot；自适应 Leaf 编码只有在稳定态数据证明磁盘空间成为主要瓶颈后再设计，不能改变 Lookup 语义。
 
 ### 6.3 信息下界
 
@@ -352,7 +324,7 @@ fsync 成功后：
   unlock
 ```
 
-后续可以用 epoch/seqlock、COW Root 或不可变 Delta Set 优化，但必须提供相同的全批可见语义。跨多个 Get 的一致读视图是否进入内核 API，属于待决问题；上层数据结构不能默认多个独立 Get 自动形成 Snapshot。
+Phase 1 的 memoryMapping 可以用单一 RWMutex；Phase 3 的 Delta + Persistent Radix 使用独立 publish epoch、Delta shard lock 和 immutable Mapping State，在不让磁盘 I/O 持有 publish lock 的前提下提供相同的全批可见语义，详见 [mapping-design.md](mapping-design.md)。跨多个 Get 的一致读视图不进入第一版 API；上层数据结构不能默认多个独立 Get 自动形成 Snapshot。
 
 ## 7. Segment 与 Manifest
 
@@ -559,6 +531,7 @@ Mapping Lookup + Segment Pin + Record Header/Payload Read
 - durable single Put；
 - durable concurrent Put/group commit；
 - Batch Put；
+- conditional Batch：无冲突、热 Revision 冲突、冷 Revision 验证；
 - Abort large Put；
 - hot/cold Mapping Lookup；
 - recovery replay；
@@ -571,7 +544,8 @@ Mapping Lookup + Segment Pin + Record Header/Payload Read
 至少暴露：
 
 - allocated ID high watermark；
-- committed/aborted/unknown Batch 数量；
+- committed/aborted/conflict/unknown Batch 数量；
+- condition count、validation latency、cold Header reads；
 - append bytes、dead bytes、live bytes；
 - group commit batch size；
 - commit queue wait、write、fsync、publish latency；
@@ -660,7 +634,7 @@ Mapping Lookup + Segment Pin + Record Header/Payload Read
 - Mapping Root/Checkpoint；
 - 按需 Mapping Page Cache；
 - 完整 uint64、稀疏 ID、大量 Delete 测试；
-- 比较候选 Persistent Mapping 原型后再选择格式。
+- 实现并验证 Delta Overlay + Persistent COW Radix，保留 memoryMapping 作为模型 oracle。
 
 验收：Open 不全量加载 Mapping，内存受配置上限约束。
 
@@ -684,24 +658,26 @@ Mapping Lookup + Segment Pin + Record Header/Payload Read
 
 复制、主备和分布式 ID 不属于单机内核第一阶段；只有单机恢复语义稳定后再单独设计。
 
-## 16. 待 Review 的关键决策
+## 16. 第一版关键决策
 
-以下问题保持开放，不能在实现中偷偷决定：
+第一版已经固定：
 
-1. Batch Record 是否允许物理交错；
-2. 大 Value 采用直接 Record、分帧 Record，还是 staging；
-3. CommitUnknown 的查询和幂等重试 API；
-4. 单个 Value 的尺寸上限；
-5. Get 返回复制数据、pin view 还是流式 Reader；
-6. Mapping 第一版和最终实现之间的替换边界；
-7. Persistent Mapping 选择 Adaptive Radix、B+Tree 还是其他分页结构；
-8. Batch 发布是否只保证单次 Get，还是提供多 Get ReadView；
-9. GC Relocation 与普通 Batch 是否使用相同 Record 协议；
-10. Segment identity、offset 和 VAddr 的位布局；
-11. Segment 最大尺寸和 Seal 策略；
-12. ID 区间预留大小和 high-watermark 持久化方式。
+1. 交付为嵌入式单机 Go Library，目录单进程独占；
+2. PutRecord 允许跨 Batch 交错，Commit Descriptor 自包含最终 Mutation；
+3. CommitUnknown 通过 Batch Status/重启确认，不自动重放；
+4. 默认单 Value 64 MiB，硬上限小于 4 GiB Segment；
+5. Get 返回复制数据，不把 mmap 生命周期暴露给调用者；
+6. Phase 1 memoryMapping 只作 oracle，Phase 3 使用 Delta + Persistent Radix；
+7. Batch 只保证单次 Get 的原子可见，多 Get ReadView 延后；
+8. GC 使用独立 Relocation Descriptor，但共享 append/fsync/CommitSeq；
+9. VAddr 为 32-bit SegmentID + 32-bit Offset；
+10. 默认 Segment 1 GiB，最大 4 GiB；
+11. ID 通过 durable reserve range 发放，默认每次预留 1,048,576 个；
+12. BatchID 通过独立 durable reserve range 发放，默认每次预留 65,536 个；
+13. 第一版不提供 SyncNone production mode；
+14. 默认 Blind Put 使用 Last-Writer-Wins；可选 ExpectRevision/ExpectAbsent 在 Seal 前提供 Batch 级乐观冲突检测，Revision 复用 PutRecord OriginBatchID，Blind 路径不承担条件读取成本。
 
-这些决策需要通过失败时序、复杂度和实测数据共同确定，而不是仅凭局部性能直觉选择。
+这些决策的精确协议分别由 API、Format、Commit/Recovery、Mapping 和 GC 文档约束。修改任何一项必须进行跨文档 Review。
 
 ## 17. 第一版明确不做的事
 
