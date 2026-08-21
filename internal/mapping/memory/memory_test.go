@@ -61,6 +61,30 @@ func TestRelocationCAS(t *testing.T) {
 	}
 }
 
+func TestResolvedRelocationRejectsStaleSerializationPremise(t *testing.T) {
+	m := NewEmpty()
+	a1, a2, a3 := addr(t, 4096), addr(t, 8192), addr(t, 12288)
+	if _, err := m.Apply(1, api.ApplyUserCommit, []api.Change{{RecordID: 1, NewAddr: a1}}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := m.Resolve(api.ApplyRelocation, []api.Change{{RecordID: 1, NewAddr: a2, ExpectedOldAddr: a1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Changes) != 1 || !plan.Changes[0].Apply || plan.BaseCommitSeq != 1 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if _, err := m.Apply(2, api.ApplyUserCommit, []api.Change{{RecordID: 1, NewAddr: a3}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ApplyResolved(3, plan); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("stale plan error=%v", err)
+	}
+	if got, _, _ := m.Lookup(1); got != a3 {
+		t.Fatalf("stale plan changed mapping to %x", got)
+	}
+}
+
 func TestRejectsInvalidChangesAndSequenceRegression(t *testing.T) {
 	m := NewEmpty()
 	a := addr(t, 4096)

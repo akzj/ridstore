@@ -110,7 +110,14 @@ func (m *Mapping) Lookup(id base.ID) (base.VAddr, bool, error) {
 }
 
 func (m *Mapping) Apply(seq base.CommitSeq, kind api.ApplyKind, changes []api.Change) (api.ApplyResult, error) {
-	return m.apply(nil, seq, kind, changes)
+	if seq == 0 {
+		return api.ApplyResult{}, base.ErrInvalidConfig
+	}
+	plan, err := m.Resolve(kind, changes)
+	if err != nil {
+		return api.ApplyResult{}, err
+	}
+	return m.applyResolved(nil, seq, plan)
 }
 
 func (m *Mapping) ApplyReserved(reservation api.DeltaReservation, seq base.CommitSeq, kind api.ApplyKind, changes []api.Change) (api.ApplyResult, error) {
@@ -121,17 +128,83 @@ func (m *Mapping) ApplyReserved(reservation api.DeltaReservation, seq base.Commi
 		}
 		return api.ApplyResult{}, base.ErrInvalidConfig
 	}
-	return m.apply(reserved, seq, kind, changes)
+	if seq == 0 {
+		reservation.Release()
+		return api.ApplyResult{}, base.ErrInvalidConfig
+	}
+	plan, err := m.Resolve(kind, changes)
+	if err != nil {
+		reservation.Release()
+		return api.ApplyResult{}, err
+	}
+	return m.applyResolved(reserved, seq, plan)
 }
 
-func (m *Mapping) apply(reservation *deltaReservation, seq base.CommitSeq, kind api.ApplyKind, changes []api.Change) (api.ApplyResult, error) {
-	if seq == 0 || (kind != api.ApplyUserCommit && kind != api.ApplyRelocation) {
+func (m *Mapping) Resolve(kind api.ApplyKind, changes []api.Change) (api.ResolvedPlan, error) {
+	if err := validateChanges(kind, changes); err != nil {
+		return api.ResolvedPlan{}, err
+	}
+	plan := api.ResolvedPlan{Kind: kind, Changes: make([]api.ResolvedChange, len(changes))}
+	m.mu.RLock()
+	plan.BaseCommitSeq = m.runtimeSeq
+	unresolved := make([]int, 0, len(changes))
+	for i, change := range changes {
+		if kind == api.ApplyUserCommit {
+			plan.Changes[i] = api.ResolvedChange{Change: change, Apply: true}
+			continue
+		}
+		addr, exists, found := m.lookupOverlayLocked(change.RecordID)
+		if found {
+			plan.Changes[i] = api.ResolvedChange{Change: change, Apply: exists && addr == change.ExpectedOldAddr}
+			continue
+		}
+		plan.Changes[i].Change = change
+		unresolved = append(unresolved, i)
+	}
+	root, covered := m.root, m.rootCovered
+	if len(unresolved) != 0 && root != 0 {
+		m.readerMu.Lock()
+		m.readers[root]++
+		m.readerMu.Unlock()
+	}
+	m.mu.RUnlock()
+	if len(unresolved) != 0 && root != 0 {
+		defer m.releaseRoot(root)
+	}
+	for _, index := range unresolved {
+		change := changes[index]
+		addr, exists, err := m.lookupRoot(root, covered, change.RecordID)
+		if err != nil {
+			return api.ResolvedPlan{}, err
+		}
+		plan.Changes[index].Apply = exists && addr == change.ExpectedOldAddr
+	}
+	return plan, nil
+}
+
+func (m *Mapping) ApplyResolved(seq base.CommitSeq, plan api.ResolvedPlan) (api.ApplyResult, error) {
+	return m.applyResolved(nil, seq, plan)
+}
+
+func (m *Mapping) ApplyResolvedReserved(reservation api.DeltaReservation, seq base.CommitSeq, plan api.ResolvedPlan) (api.ApplyResult, error) {
+	reserved, ok := reservation.(*deltaReservation)
+	if !ok || reserved.budget != m.budget {
 		if reservation != nil {
 			reservation.Release()
 		}
 		return api.ApplyResult{}, base.ErrInvalidConfig
 	}
-	if err := validateChanges(kind, changes); err != nil {
+	return m.applyResolved(reserved, seq, plan)
+}
+
+func (m *Mapping) applyResolved(reservation *deltaReservation, seq base.CommitSeq, plan api.ResolvedPlan) (api.ApplyResult, error) {
+	if seq == 0 {
+		if reservation != nil {
+			reservation.Release()
+		}
+		return api.ApplyResult{}, base.ErrInvalidConfig
+	}
+	if err := validateResolvedPlan(plan); err != nil {
 		if reservation != nil {
 			reservation.Release()
 		}
@@ -139,6 +212,12 @@ func (m *Mapping) apply(reservation *deltaReservation, seq base.CommitSeq, kind 
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if plan.BaseCommitSeq != m.runtimeSeq {
+		if reservation != nil {
+			reservation.Release()
+		}
+		return api.ApplyResult{}, fmt.Errorf("stale resolved mapping plan: %w", base.ErrCorrupt)
+	}
 	if seq <= m.runtimeSeq {
 		if reservation != nil {
 			reservation.Release()
@@ -146,22 +225,14 @@ func (m *Mapping) apply(reservation *deltaReservation, seq base.CommitSeq, kind 
 		return api.ApplyResult{}, fmt.Errorf("mapping sequence regression: %w", base.ErrInvalidConfig)
 	}
 	result := api.ApplyResult{}
-	applied := make([]api.Change, 0, len(changes))
+	applied := make([]api.Change, 0, len(plan.Changes))
 	var newEntries uint64
-	for _, change := range changes {
-		if kind == api.ApplyRelocation {
-			current, exists, err := m.lookupLocked(change.RecordID)
-			if err != nil {
-				if reservation != nil {
-					reservation.Release()
-				}
-				return api.ApplyResult{}, err
-			}
-			if !exists || current != change.ExpectedOldAddr {
-				result.Skipped++
-				continue
-			}
+	for _, resolved := range plan.Changes {
+		if !resolved.Apply {
+			result.Skipped++
+			continue
 		}
+		change := resolved.Change
 		if _, exists := m.active[change.RecordID]; !exists {
 			newEntries++
 		}
@@ -434,16 +505,16 @@ func (m *Mapping) Close() error { return m.store.Close() }
 
 func (m *Mapping) SetHook(hook failpoint.Hook) { m.store.setHook(hook) }
 
-func (m *Mapping) lookupLocked(id base.ID) (base.VAddr, bool, error) {
+func (m *Mapping) lookupOverlayLocked(id base.ID) (base.VAddr, bool, bool) {
 	if entry, ok := m.active[id]; ok {
-		return entry.addr, entry.addr != 0, nil
+		return entry.addr, entry.addr != 0, true
 	}
 	for i := len(m.frozen) - 1; i >= 0; i-- {
 		if entry, ok := m.frozen[i][id]; ok {
-			return entry.addr, entry.addr != 0, nil
+			return entry.addr, entry.addr != 0, true
 		}
 	}
-	return m.lookupRoot(m.root, m.rootCovered, id)
+	return 0, false, false
 }
 
 func (m *Mapping) lookupRoot(root base.MapAddr, covered base.CommitSeq, id base.ID) (base.VAddr, bool, error) {
@@ -724,6 +795,9 @@ func applyLayer(entries map[base.ID]base.VAddr, layer map[base.ID]deltaEntry) {
 }
 
 func validateChanges(kind api.ApplyKind, changes []api.Change) error {
+	if kind != api.ApplyUserCommit && kind != api.ApplyRelocation {
+		return base.ErrInvalidConfig
+	}
 	var previous base.ID
 	for _, change := range changes {
 		if change.RecordID == 0 || (previous != 0 && change.RecordID <= previous) {
@@ -735,4 +809,15 @@ func validateChanges(kind api.ApplyKind, changes []api.Change) error {
 		previous = change.RecordID
 	}
 	return nil
+}
+
+func validateResolvedPlan(plan api.ResolvedPlan) error {
+	changes := make([]api.Change, len(plan.Changes))
+	for i, resolved := range plan.Changes {
+		if plan.Kind == api.ApplyUserCommit && !resolved.Apply {
+			return base.ErrInvalidConfig
+		}
+		changes[i] = resolved.Change
+	}
+	return validateChanges(plan.Kind, changes)
 }
