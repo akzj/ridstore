@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -195,6 +196,109 @@ func TestSegmentRotationPreservesReadsAndRecovery(t *testing.T) {
 			t.Fatalf("after reopen id=%d error=%v", id, err)
 		}
 	}
+}
+
+func TestConcurrentCommitsShareGroupsAndRemainRecoverable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.MaxOpenBatches = 64
+	cfg.IDReserveSize = 128
+	cfg.BatchIDReserveSize = 128
+	cfg.MaxGroupBatches = 64
+	cfg.MaxGroupDelay = 2 * time.Millisecond
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 64
+	batches := make([]*Batch, count)
+	ids := make([]ID, count)
+	for i := range batches {
+		b, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := b.Allocate(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put(context.Background(), id, []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		batches[i], ids[i] = b, id
+	}
+	start := make(chan struct{})
+	errCh := make(chan error, count)
+	var workers sync.WaitGroup
+	for _, b := range batches {
+		workers.Add(1)
+		go func(b *Batch) {
+			defer workers.Done()
+			<-start
+			_, err := b.Commit(context.Background())
+			errCh <- err
+		}(b)
+	}
+	close(start)
+	workers.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	metrics := store.Metrics()
+	if metrics.Committed != count || metrics.GroupBatches != count || metrics.CommitGroups >= count {
+		t.Fatalf("group metrics=%+v", metrics)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i, id := range ids {
+		value, err := store.Get(context.Background(), id)
+		if err != nil || string(value) != fmt.Sprintf("value-%d", i) {
+			t.Fatalf("id=%d value=%q error=%v", id, value, err)
+		}
+	}
+}
+
+func BenchmarkConcurrentDurableCommit(b *testing.B) {
+	cfg := smallTestConfig(filepath.Join(b.TempDir(), "store"))
+	cfg.MaxOpenBatches = 1024
+	cfg.IDReserveSize = 1 << 16
+	cfg.BatchIDReserveSize = 1 << 16
+	cfg.MaxGroupDelay = 200 * time.Microsecond
+	store, err := Create(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			batch, err := store.Begin(context.Background())
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			id, err := batch.Allocate(context.Background())
+			if err == nil {
+				err = batch.Put(context.Background(), id, []byte("benchmark"))
+			}
+			if err == nil {
+				_, err = batch.Commit(context.Background())
+			}
+			if err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
 }
 
 func TestPublicConditionalConflictAndOpenBatchBackpressure(t *testing.T) {
