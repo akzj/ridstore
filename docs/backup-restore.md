@@ -8,6 +8,12 @@
 `LOCK`，因此不会与 Commit、Checkpoint、Rotation 或 GC 并发。它不是在线
 snapshot，也不通过复制一个正在变化的 Active tail 来猜测一致性。
 
+```text
+go run ./cmd/ridstore-tool backup \
+  --source /path/to/offline-store \
+  --dest /path/to/new-backup
+```
+
 备份前必须通过与 `verify` 相同的只读完整性检查；存在 INITIALIZING、
 MAINTENANCE、ROTATION、invalid active tail、trash 文件或其他 corruption 时拒绝
 创建备份。operator 应先用匹配版本正常 Open/Close 完成恢复，再重试。
@@ -47,6 +53,7 @@ Acquire source LOCK
 -> derive exact file set from current Manifest
 -> create destination + INCOMPLETE
 -> copy each regular file, fsync, hash
+-> run full Verify against the copied payload
 -> write/fsync BACKUP.json
 -> fsync child directories and artifact root
 -> remove INCOMPLETE
