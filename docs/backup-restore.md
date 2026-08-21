@@ -104,6 +104,15 @@ published。marker 前崩溃必须保持明确 incomplete；marker 删除后必�
 Verify/Open 的 artifact 或 Store。该证据属于 process-crash，不等价于存储设备
 忽略 flush 的 power-loss 证明。
 
+Backup syscall matrix 在 artifact root/子目录创建，INCOMPLETE、临时 Verify LOCK、
+payload 与 BACKUP.json 的 write/file sync，Verify 临时项 remove，各层 directory sync，
+INCOMPLETE remove 和最终 publication root sync 前注入 `EIO/ENOSPC/EACCES`。
+root 创建前失败不得产生目标；此后直到 publication durable 前的任何失败都必须保留
+可见 INCOMPLETE，不能被 Inspect 当成完成 artifact。若 INCOMPLETE 已删除而最终 root
+sync 失败，Create 尝试重新 write/file-sync Marker 并 sync root；补偿自身失败时同时
+返回 publication 与补偿 cause，当前可见目录仍保持 INCOMPLETE。该矩阵证明 syscall
+错误传播和当前文件系统上的重试边界，不替代真实 power-loss 证据。
+
 ## 5. 不提供的保证
 
 - 不做在线增量备份、hardlink/reflink snapshot、压缩、加密或远端传输；
