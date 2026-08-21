@@ -13,6 +13,7 @@ import (
 	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/filelock"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/mapping/radix"
 	"github.com/akzj/ridstore/internal/metrics"
 	"github.com/akzj/ridstore/internal/recovery"
 	"github.com/akzj/ridstore/internal/rotation"
@@ -55,10 +56,14 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, errors.Join(err, active.Close(), closeSealed())
 	}
-	fail := func(err error) (*Store, error) {
+	persistentMapping, err := radix.Open(cfg.Dir, manifest, cfg.MappingCacheBytes)
+	if err != nil {
 		return nil, errors.Join(err, segments.Close())
 	}
-	recovered, err := recovery.Recover(manifest, sealed, active)
+	fail := func(err error) (*Store, error) {
+		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
+	}
+	recovered, err := recovery.RecoverInto(manifest, sealed, active, persistentMapping)
 	if err != nil {
 		return fail(err)
 	}
@@ -75,7 +80,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		return fail(err)
 	}
 	failWithLog := func(err error) (*Store, error) {
-		return nil, errors.Join(err, log.Close(), segments.Close())
+		return nil, errors.Join(err, log.Close(), persistentMapping.Close(), segments.Close())
 	}
 	idAllocator, err := allocator.New(allocator.RecordID, manifest.HardLimits.IDReserveSize, recovered.ReservedIDHighExclusive, log)
 	if err != nil {
@@ -86,7 +91,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		return failWithLog(err)
 	}
 	runtimeMetrics := &metrics.Runtime{}
-	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, recovered.Mapping, segmentRecordReader{segments: segments}, commit.Config{
+	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, persistentMapping, segmentRecordReader{segments: segments}, commit.Config{
 		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: uint64(cfg.MaxGroupBytes), MaxDelay: cfg.MaxGroupDelay,
 		Metrics: runtimeMetrics,
 	}, hook)
@@ -95,7 +100,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	}
 	store := &Store{
 		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, catalog: catalogManager, metrics: runtimeMetrics, log: log,
-		mapping: recovered.Mapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
+		mapping: persistentMapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
 		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]BatchStatus), slotNotify: make(chan struct{}, 1),
 		issuedBatchHigh:      recovered.ReservedBatchIDHighExclusive,
 		recoveryAbortedStart: manifest.IssuedBatchIDHighExclusiveAtCut,
