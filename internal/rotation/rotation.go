@@ -3,6 +3,7 @@ package rotation
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,10 +29,18 @@ type Manager struct {
 }
 
 const (
-	PointPrepared          failpoint.Point = "rotation.prepared"
-	PointOldSealed         failpoint.Point = "rotation.old-sealed"
-	PointNewCreated        failpoint.Point = "rotation.new-created"
-	PointManifestInstalled failpoint.Point = "rotation.manifest-installed"
+	PointPrepared                   failpoint.Point = "rotation.prepared"
+	PointOldSealed                  failpoint.Point = "rotation.old-sealed"
+	PointNewCreated                 failpoint.Point = "rotation.new-created"
+	PointManifestInstalled          failpoint.Point = "rotation.manifest-installed"
+	PointBeforeJournalWrite         failpoint.Point = "rotation.before-journal-write"
+	PointBeforeJournalSync          failpoint.Point = "rotation.before-journal-sync"
+	PointBeforeJournalRename        failpoint.Point = "rotation.before-journal-rename"
+	PointBeforeJournalDirSync       failpoint.Point = "rotation.before-journal-dir-sync"
+	PointBeforeJournalTempRemove    failpoint.Point = "rotation.before-journal-temp-remove"
+	PointBeforeJournalRemove        failpoint.Point = "rotation.before-journal-remove"
+	PointBeforeJournalRemoveTemp    failpoint.Point = "rotation.before-journal-remove-temp"
+	PointBeforeJournalRemoveDirSync failpoint.Point = "rotation.before-journal-remove-dir-sync"
 )
 
 func NewManager(root string, catalog *catalog.Manager, registry *segment.Registry, maxPayload uint64, hook failpoint.Hook) (*Manager, error) {
@@ -58,7 +67,7 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 		StoreUUID: current.StoreUUID, OldSegmentID: oldID, NewSegmentID: newID,
 		BaseManifestGeneration: current.Generation, Phase: 1,
 	}
-	if err := installJournal(m.root, journal); err != nil {
+	if err := installJournal(m.root, journal, m.hook); err != nil {
 		return nil, err
 	}
 	if err := failpoint.Hit(m.hook, PointPrepared); err != nil {
@@ -72,11 +81,11 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 		return nil, err
 	}
 	journal.Phase = 2
-	if err := installJournal(m.root, journal); err != nil {
+	if err := installJournal(m.root, journal, m.hook); err != nil {
 		return nil, err
 	}
 	journal.Phase = 3
-	if err := installJournal(m.root, journal); err != nil {
+	if err := installJournal(m.root, journal, m.hook); err != nil {
 		return nil, err
 	}
 	newActive, err := segment.CreateActiveData(m.root, current.StoreUUID, newID, nextFrameSeq+1, current.HardLimits.SegmentSize, m.maxPayload)
@@ -88,7 +97,7 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 		return nil, errors.Join(err, newActive.Close())
 	}
 	journal.Phase = 4
-	if err := installJournal(m.root, journal); err != nil {
+	if err := installJournal(m.root, journal, m.hook); err != nil {
 		return nil, errors.Join(err, newActive.Close())
 	}
 	sealed, err := segment.OpenSealedData(m.root, current.StoreUUID, summary, current.HardLimits.SegmentSize, m.maxPayload)
@@ -114,13 +123,13 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	}
 	journal.Phase = 5
 	journal.InstalledManifestGeneration = nextManifest.Generation
-	if err := installJournal(m.root, journal); err != nil {
+	if err := installJournal(m.root, journal, m.hook); err != nil {
 		return nil, errors.Join(err, sealed.Close(), newActive.Close())
 	}
 	if err := m.registry.ReplaceActive(oldID, sealed, newActive); err != nil {
 		return nil, errors.Join(err, sealed.Close(), newActive.Close())
 	}
-	if err := removeJournal(m.root); err != nil {
+	if err := removeJournal(m.root, m.hook); err != nil {
 		return nil, err
 	}
 	return newActive, nil
@@ -133,14 +142,17 @@ func (m *Manager) Current() storeformat.Manifest {
 // Recover completes an interrupted rotation before normal segment opening.
 func Recover(root string, current storeformat.Manifest, maxPayload uint64) (storeformat.Manifest, error) {
 	journal, found, err := loadJournal(root)
-	if err != nil || !found {
+	if err != nil {
 		return current, err
+	}
+	if !found {
+		return current, cleanupOrphanJournalTemp(root)
 	}
 	if journal.StoreUUID != current.StoreUUID {
 		return storeformat.Manifest{}, fmt.Errorf("rotation StoreUUID mismatch: %w", base.ErrCorrupt)
 	}
 	if current.ActiveDataSegmentID == journal.NewSegmentID && containsSummary(current.SealedDataSegments, journal.OldSegmentID) {
-		if err := removeJournal(root); err != nil {
+		if err := removeJournal(root, nil); err != nil {
 			return storeformat.Manifest{}, err
 		}
 		return current, nil
@@ -184,7 +196,7 @@ func Recover(root string, current storeformat.Manifest, maxPayload uint64) (stor
 	if err := (manifest.Installer{Dir: root}).Install(nextManifest); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := removeJournal(root); err != nil {
+	if err := removeJournal(root, nil); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	return nextManifest, nil
@@ -224,7 +236,7 @@ func rotatedManifest(current storeformat.Manifest, summary storeformat.FileSumma
 	return next, nil
 }
 
-func installJournal(root string, journal storeformat.RotationJournal) error {
+func installJournal(root string, journal storeformat.RotationJournal, hook failpoint.Hook) error {
 	encoded, err := storeformat.EncodeRotationJournal(journal)
 	if err != nil {
 		return err
@@ -232,6 +244,9 @@ func installJournal(root string, journal storeformat.RotationJournal) error {
 	dirPath := filepath.Join(root, "journal")
 	temp := filepath.Join(dirPath, ".ROTATION.tmp")
 	final := filepath.Join(dirPath, journalName)
+	if err := failpoint.Hit(hook, PointBeforeJournalTempRemove); err != nil {
+		return err
+	}
 	if err := os.Remove(temp); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -239,7 +254,16 @@ func installJournal(root string, journal storeformat.RotationJournal) error {
 	if err != nil {
 		return err
 	}
-	if _, err := file.Write(encoded); err != nil {
+	if err := failpoint.Hit(hook, PointBeforeJournalWrite); err != nil {
+		return errors.Join(err, file.Close())
+	}
+	if n, err := file.Write(encoded); err != nil || n != len(encoded) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return errors.Join(err, file.Close())
+	}
+	if err := failpoint.Hit(hook, PointBeforeJournalSync); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := file.Sync(); err != nil {
@@ -248,10 +272,35 @@ func installJournal(root string, journal storeformat.RotationJournal) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
+	if err := failpoint.Hit(hook, PointBeforeJournalRename); err != nil {
+		return err
+	}
 	if err := os.Rename(temp, final); err != nil {
 		return err
 	}
+	if err := failpoint.Hit(hook, PointBeforeJournalDirSync); err != nil {
+		return err
+	}
 	return syncDir(dirPath)
+}
+
+func cleanupOrphanJournalTemp(root string) error {
+	dir := filepath.Join(root, "journal")
+	temp := filepath.Join(dir, ".ROTATION.tmp")
+	info, err := os.Lstat(temp)
+	if errors.Is(err, os.ErrNotExist) {
+		return syncDir(dir)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("rotation temp is not a regular file: %w", base.ErrCorrupt)
+	}
+	if err := os.Remove(temp); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func loadJournal(root string) (storeformat.RotationJournal, bool, error) {
@@ -266,12 +315,21 @@ func loadJournal(root string) (storeformat.RotationJournal, bool, error) {
 	return journal, err == nil, err
 }
 
-func removeJournal(root string) error {
+func removeJournal(root string, hook failpoint.Hook) error {
 	dir := filepath.Join(root, "journal")
+	if err := failpoint.Hit(hook, PointBeforeJournalRemove); err != nil {
+		return err
+	}
 	if err := os.Remove(filepath.Join(dir, journalName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	if err := failpoint.Hit(hook, PointBeforeJournalRemoveTemp); err != nil {
+		return err
+	}
 	if err := os.Remove(filepath.Join(dir, ".ROTATION.tmp")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := failpoint.Hit(hook, PointBeforeJournalRemoveDirSync); err != nil {
 		return err
 	}
 	return syncDir(dir)

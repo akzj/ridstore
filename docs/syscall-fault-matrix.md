@@ -10,7 +10,7 @@
 | Active Data append/commit | `segment.before-append-write` | `segment.before-sync` | N/A | N/A | 已覆盖；write 错误 poison Active，Seal 已开始后的 sync 错误返回 CommitUnknown，Store fail closed |
 | Active Data seal/rotation | seal/footer write 已覆盖 | seal/footer sync 已覆盖 | seal rename 已覆盖 | data dir sync 已覆盖 | 已覆盖已有 Active 的 seal 主路径；每个失败点均可由 fresh recovery 得到严格 sealed 文件 |
 | Active Data create/tail repair | 未覆盖 | 未覆盖 | N/A | 未覆盖 | 待补；包括新 Active Header、repair truncate/fsync |
-| Rotation Journal | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；phase crash 已覆盖但 syscall error matrix 未闭合 |
+| Rotation Journal | 已覆盖 | 已覆盖 | 已覆盖 install/remove | 已覆盖 install/remove | 完整 syscall matrix；Phase 1–5 publication 均验证，未发布 temp 在 Open 时按 regular-file 规则删除并 fsync，已发布 Journal 幂等完成 rotation |
 | Maintenance Journal | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；影响 Data GC phase ownership |
 | Active Mapping append/checkpoint | 未覆盖 | 未覆盖 | N/A | N/A | 待补；优先级高 |
 | Mapping rotation/GC | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；已有 crash phase，但 syscall cause/cleanup 未系统验证 |
@@ -28,7 +28,7 @@
 
 ## 剩余推进顺序
 
-1. Rotation/Maintenance Journal 的 write→sync→rename→dir-sync；
+1. Maintenance Journal 的 write→sync→rename→dir-sync；
 2. Active Mapping、Mapping rotation 和 Mapping GC；
 3. Data GC trash/delete；
 4. Initialize 与 Backup/Restore。
