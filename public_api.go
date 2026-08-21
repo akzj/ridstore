@@ -44,18 +44,21 @@ type CommitResult struct {
 }
 
 type Metrics struct {
-	CommitQueued, CommitGroups, GroupBatches     uint64
-	Committed, Aborted, Conflicts, CommitUnknown uint64
-	QueueWaitNanos, ValidationNanos              uint64
-	WriteSyncNanos, PublishNanos                 uint64
-	DeltaChargedBytes, DeltaReservedBytes        uint64
-	DeltaSoftLimitBytes, DeltaHardLimitBytes     uint64
-	MappingCacheBytes                            uint64
-	GCStarted, GCCompleted, GCFailed             uint64
-	GCNoCandidate, GCInsufficientSpace           uint64
-	GCCopiedBytes, GCReclaimedBytes              uint64
-	GCRelocated, GCSkipped, GCDurationNanos      uint64
-	GCThrottledNanos                             uint64
+	CommitQueued, CommitGroups, GroupBatches       uint64
+	Committed, Aborted, Conflicts, CommitUnknown   uint64
+	QueueWaitNanos, ValidationNanos                uint64
+	WriteSyncNanos, PublishNanos                   uint64
+	DeltaChargedBytes, DeltaReservedBytes          uint64
+	DeltaSoftLimitBytes, DeltaHardLimitBytes       uint64
+	MappingCacheBytes                              uint64
+	DiskAvailableEstimateBytes, WriteStopFreeBytes uint64
+	WriteStopped                                   uint64
+	WriteStopRejections, DiskSpaceCheckErrors      uint64
+	GCStarted, GCCompleted, GCFailed               uint64
+	GCNoCandidate, GCInsufficientSpace             uint64
+	GCCopiedBytes, GCReclaimedBytes                uint64
+	GCRelocated, GCSkipped, GCDurationNanos        uint64
+	GCThrottledNanos                               uint64
 }
 
 const (
@@ -84,6 +87,14 @@ func (s *Store) Metrics() Metrics {
 	if s.mapping != nil {
 		result.DeltaChargedBytes, result.DeltaReservedBytes = s.mapping.DeltaBytes()
 		result.MappingCacheBytes = s.mapping.CacheBytes()
+	}
+	if s.spaceGuard != nil {
+		space := s.spaceGuard.Snapshot()
+		result.DiskAvailableEstimateBytes, result.WriteStopFreeBytes = space.AvailableBytes, space.MinFreeBytes
+		result.WriteStopRejections, result.DiskSpaceCheckErrors = space.Rejections, space.CheckErrors
+		if space.Stopped {
+			result.WriteStopped = 1
+		}
 	}
 	return result
 }
@@ -149,6 +160,12 @@ type batchAppender struct {
 	batch *Batch
 }
 
+func (a batchAppender) AdmitPut(ctx context.Context, bytes uint64) error {
+	return a.batch.store.spaceGuard.Reserve(ctx, bytes)
+}
+
+func (a batchAppender) ReleasePut() { a.batch.store.spaceGuard.Release() }
+
 func (a batchAppender) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
 	addr, seq, written, err := a.batch.store.log.AppendPut(ctx, batchID, id, value)
 	if err != nil {
@@ -172,6 +189,11 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		return nil, err
 	}
 	if err := s.waitForBatchSlot(ctx); err != nil {
+		return nil, err
+	}
+	if err := s.admitNewWrite(ctx, 0); err != nil {
+		s.releaseOpenSlot()
+		s.ops.RUnlock()
 		return nil, err
 	}
 	id, err := s.batchAllocator.Allocate(ctx)
@@ -588,6 +610,12 @@ func (b *Batch) Allocate(ctx context.Context) (ID, error) {
 	b.store.ops.RLock()
 	defer b.store.ops.RUnlock()
 	if err := b.store.checkAvailable(); err != nil {
+		return 0, err
+	}
+	if err := b.inner.CheckOpen(); err != nil {
+		return 0, err
+	}
+	if err := b.store.admitNewWrite(ctx, 0); err != nil {
 		return 0, err
 	}
 	id, err := b.inner.Allocate(ctx)

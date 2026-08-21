@@ -26,18 +26,20 @@ type Config struct {
 	IDReserveSize      uint64
 	BatchIDReserveSize uint64
 
-	MappingCacheBytes     int64
-	DeltaSoftLimitBytes   int64
-	DeltaHardLimitBytes   int64
-	CheckpointMemoryBytes int64
-	StatusRetention       int
-	MaxGroupBytes         int64
-	MaxGroupBatches       int
-	MaxGroupDelay         time.Duration
-	GCBatchBytes          int64
-	GCBatchMutations      int
-	GCMinFreeBytes        int64
-	GCBytesPerSecond      int64
+	MappingCacheBytes      int64
+	DeltaSoftLimitBytes    int64
+	DeltaHardLimitBytes    int64
+	CheckpointMemoryBytes  int64
+	StatusRetention        int
+	MaxGroupBytes          int64
+	MaxGroupBatches        int
+	MaxGroupDelay          time.Duration
+	GCBatchBytes           int64
+	GCBatchMutations       int
+	GCMinFreeBytes         int64
+	GCBytesPerSecond       int64
+	WriteStopFreeBytes     int64
+	DiskSpaceCheckInterval time.Duration
 }
 
 func normalizeCreateConfig(cfg Config) (Config, storeformat.HardLimits, error) {
@@ -131,6 +133,15 @@ func applyRuntimeDefaults(cfg *Config) {
 	if cfg.GCBytesPerSecond == 0 {
 		cfg.GCBytesPerSecond = 64 * mib
 	}
+	if cfg.WriteStopFreeBytes == 0 {
+		cfg.WriteStopFreeBytes = 2 * cfg.SegmentSize
+		if cfg.WriteStopFreeBytes < cfg.GCMinFreeBytes {
+			cfg.WriteStopFreeBytes = cfg.GCMinFreeBytes
+		}
+	}
+	if cfg.DiskSpaceCheckInterval == 0 {
+		cfg.DiskSpaceCheckInterval = 100 * time.Millisecond
+	}
 }
 
 func normalizeDir(cfg *Config) error {
@@ -168,7 +179,8 @@ func hardLimits(cfg Config) (storeformat.HardLimits, error) {
 func validateRuntime(cfg Config, hard storeformat.HardLimits) error {
 	if cfg.MappingCacheBytes <= 0 || cfg.DeltaSoftLimitBytes <= 0 || cfg.DeltaHardLimitBytes <= cfg.DeltaSoftLimitBytes ||
 		cfg.CheckpointMemoryBytes < 64<<10 || cfg.StatusRetention < cfg.MaxOpenBatches || cfg.MaxGroupBytes <= 0 || cfg.MaxGroupBatches <= 0 || cfg.MaxGroupDelay < 0 ||
-		cfg.GCBatchBytes <= 0 || uint64(cfg.GCBatchBytes) > hard.MaxBatchBytes || cfg.GCBatchMutations <= 0 || uint64(cfg.GCBatchMutations) > hard.MaxBatchMutations || cfg.GCMinFreeBytes < 0 || cfg.GCBytesPerSecond <= 0 {
+		cfg.GCBatchBytes <= 0 || uint64(cfg.GCBatchBytes) > hard.MaxBatchBytes || cfg.GCBatchMutations <= 0 || uint64(cfg.GCBatchMutations) > hard.MaxBatchMutations || cfg.GCMinFreeBytes < 0 || cfg.GCBytesPerSecond <= 0 ||
+		cfg.WriteStopFreeBytes < cfg.GCMinFreeBytes || cfg.DiskSpaceCheckInterval <= 0 || cfg.DiskSpaceCheckInterval > time.Minute {
 		return fmt.Errorf("invalid runtime budget: %w", base.ErrInvalidConfig)
 	}
 	return nil

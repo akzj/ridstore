@@ -249,6 +249,11 @@ Put/overwrite/delete/abort
 
 通过条件不是固定文件数，而是工作负载停止后维护过程最终稳定、trash 清空、FD/goroutine 回到基线附近、空间不继续增长。
 
+前台 write-stop 水位另以可控 available-bytes reader 验证：Begin、Allocate、Put 在低于
+水位时返回 `ErrInsufficientSpace` 且不 fault Store；已写 payload 的 Batch 仍可 Commit，
+已有 Batch 可 Abort，Get 与 Checkpoint 可继续；空间恢复后新写自动恢复。Guard 单元测试
+验证 refresh interval 内保守扣减、到期刷新、context 和 `statfs` 错误传播及指标计数。
+
 仓库提供 `ridstore-soak` 与 `make soak-72h`。工具只接受不存在的新 Store/report
 路径，输出 append-only JSONL sample；结束时逐 ID 校验模型、排空 Data GC、Compact
 Mapping、Close 并 offline Verify。`make test-soak-smoke` 只验证 harness 状态机和报告

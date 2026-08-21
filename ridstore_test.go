@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -376,6 +377,141 @@ func TestDeltaSoftLimitSchedulesCheckpointAfterCommit(t *testing.T) {
 	}
 	if value, err := store.Get(context.Background(), id); err != nil || string(value) != "soft-limit" {
 		t.Fatalf("value=%q error=%v", value, err)
+	}
+}
+
+func TestWriteStopRejectsNewPayloadButPreservesCompletionAndRecovery(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.WriteStopFreeBytes = cfg.SegmentSize
+	cfg.DiskSpaceCheckInterval = time.Nanosecond
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	available := uint64(1 << 30)
+	store.availableBytes = func(string) (uint64, error) { return available, nil }
+
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(context.Background(), id, []byte("durable")); err != nil {
+		t.Fatal(err)
+	}
+	abortable, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	available = uint64(cfg.WriteStopFreeBytes - 1)
+	if err := batch.Put(context.Background(), id, []byte("rejected")); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("low-space Put error=%v", err)
+	}
+	if _, err := store.Begin(context.Background()); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("low-space Begin error=%v", err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatalf("commit existing payload while stopped: %v", err)
+	}
+	if err := abortable.Abort(context.Background()); err != nil {
+		t.Fatalf("abort existing batch while stopped: %v", err)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatalf("checkpoint while stopped: %v", err)
+	}
+	if value, err := store.Get(context.Background(), id); err != nil || string(value) != "durable" {
+		t.Fatalf("value=%q error=%v", value, err)
+	}
+	metrics := store.Metrics()
+	if metrics.WriteStopped != 1 || metrics.WriteStopRejections != 2 || metrics.WriteStopFreeBytes != uint64(cfg.WriteStopFreeBytes) {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+	available = 1 << 30
+	if _, err := store.Begin(context.Background()); err != nil {
+		t.Fatalf("write stop did not recover: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if value, err := store.Get(context.Background(), id); err != nil || string(value) != "durable" {
+		t.Fatalf("reopened value=%q error=%v", value, err)
+	}
+}
+
+func TestWriteStopObservationErrorDoesNotFaultReadsOrExistingBatch(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.WriteStopFreeBytes = cfg.SegmentSize
+	cfg.DiskSpaceCheckInterval = time.Nanosecond
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.availableBytes = func(string) (uint64, error) { return 0, syscall.EIO }
+	if _, err := store.Begin(context.Background()); !errors.Is(err, syscall.EIO) || errors.Is(err, ErrReadOnly) {
+		t.Fatalf("Begin error=%v", err)
+	}
+	if _, err := store.Get(context.Background(), 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("read after observation error=%v", err)
+	}
+	if metrics := store.Metrics(); metrics.DiskSpaceCheckErrors != 1 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestWriteStopCoversDurableIDReserveFrames(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.IDReserveSize = 1
+	cfg.BatchIDReserveSize = 1
+	cfg.WriteStopFreeBytes = cfg.SegmentSize
+	cfg.DiskSpaceCheckInterval = time.Nanosecond
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	available := uint64(1 << 30)
+	store.availableBytes = func(string) (uint64, error) { return available, nil }
+	first, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Allocate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	available = uint64(cfg.WriteStopFreeBytes + 1)
+	if _, err := store.Begin(context.Background()); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("BatchID reserve error=%v", err)
+	}
+	available = 1 << 30
+	second, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	available = uint64(cfg.WriteStopFreeBytes + 1)
+	if _, err := second.Allocate(context.Background()); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("RecordID reserve error=%v", err)
+	}
+	if err := second.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := store.Metrics(); metrics.WriteStopRejections != 2 {
+		t.Fatalf("metrics=%+v", metrics)
 	}
 }
 
@@ -786,6 +922,9 @@ func TestConfigValidation(t *testing.T) {
 		{Dir: t.TempDir(), MaxGroupDelay: -1},
 		{Dir: t.TempDir(), GCMinFreeBytes: -1},
 		{Dir: t.TempDir(), GCBytesPerSecond: -1},
+		{Dir: t.TempDir(), GCMinFreeBytes: 4096, WriteStopFreeBytes: 2048},
+		{Dir: t.TempDir(), DiskSpaceCheckInterval: -1},
+		{Dir: t.TempDir(), DiskSpaceCheckInterval: time.Minute + 1},
 	}
 	for i, cfg := range cases {
 		if _, _, err := normalizeCreateConfig(cfg); !errors.Is(err, ErrInvalidConfig) {
@@ -801,5 +940,8 @@ func TestConfigAllowsExactFourGiBSegment(t *testing.T) {
 	}
 	if cfg.SegmentSize != int64(1)<<32 || hard.SegmentSize != uint64(1)<<32 {
 		t.Fatalf("config=%d hard=%d", cfg.SegmentSize, hard.SegmentSize)
+	}
+	if cfg.WriteStopFreeBytes != int64(2)<<32 || cfg.DiskSpaceCheckInterval != 100*time.Millisecond {
+		t.Fatalf("write-stop defaults=%d interval=%s", cfg.WriteStopFreeBytes, cfg.DiskSpaceCheckInterval)
 	}
 }
