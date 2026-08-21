@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
 
@@ -90,6 +92,63 @@ func TestInstallCrashStepsAreRetryable(t *testing.T) {
 			got, err := LoadCurrent(dir)
 			if err != nil || got.Generation != 1 {
 				t.Fatalf("load=%+v error=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestInstallSyscallErrorsAreClassifiedAndRetryable(t *testing.T) {
+	tests := []struct {
+		point             failpoint.Point
+		injected          error
+		visibleGeneration uint64
+	}{
+		{PointBeforeManifestWrite, syscall.ENOSPC, 1},
+		{PointBeforeManifestFileSync, syscall.EIO, 1},
+		{PointBeforeManifestRename, syscall.EACCES, 1},
+		{PointBeforeManifestDirSync, syscall.EIO, 1},
+		{PointBeforeCurrentWrite, syscall.ENOSPC, 1},
+		{PointBeforeCurrentFileSync, syscall.EIO, 1},
+		{PointBeforeCurrentRename, syscall.EACCES, 1},
+		{PointBeforeRootDirSync, syscall.EIO, 2},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(string(test.point), func(t *testing.T) {
+			dir := newStoreDir(t)
+			if err := (Installer{Dir: dir}).Install(validManifest(t, 1)); err != nil {
+				t.Fatal(err)
+			}
+			installer := Installer{Dir: dir, FailpointHook: failpoint.Func(func(point failpoint.Point) error {
+				if point == test.point {
+					return test.injected
+				}
+				return nil
+			})}
+			if err := installer.Install(validManifest(t, 2)); !errors.Is(err, test.injected) {
+				t.Fatalf("install error=%v want=%v", err, test.injected)
+			}
+			visible, err := LoadCurrent(dir)
+			if err != nil || visible.Generation != test.visibleGeneration {
+				t.Fatalf("visible generation=%d want=%d error=%v", visible.Generation, test.visibleGeneration, err)
+			}
+			if err := (Installer{Dir: dir}).Install(validManifest(t, 2)); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if err := CleanupInterruptedInstall(dir); err != nil {
+				t.Fatal(err)
+			}
+			current, err := LoadCurrent(dir)
+			if err != nil || current.Generation != 2 {
+				t.Fatalf("current=%+v error=%v", current, err)
+			}
+			for _, path := range []string{
+				filepath.Join(dir, ".CURRENT.tmp"),
+				filepath.Join(dir, ManifestDirName, ManifestFileName(2)+".tmp"),
+			} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("temporary artifact remains %s: %v", path, err)
+				}
 			}
 		})
 	}

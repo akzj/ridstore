@@ -468,6 +468,10 @@ func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint
 	})
 	if err != nil {
 		s.mapping.AbortCheckpoint()
+		// Installer errors can occur after a new Manifest final or CURRENT has
+		// reached the filesystem. The in-process Catalog deliberately does not
+		// guess which generation won; only a fresh Open may reconcile it.
+		s.setFault(err)
 		return err
 	}
 	if err := failpoint.Hit(s.hook, pointCheckpointManifestInstalled); err != nil {
