@@ -13,12 +13,24 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
 
 var (
 	ErrFull     = errors.New("ridstore: active segment full")
 	ErrPoisoned = errors.New("ridstore: active segment append state uncertain")
+)
+
+const (
+	PointBeforeAppendWrite failpoint.Point = "segment.before-append-write"
+	PointBeforeSync        failpoint.Point = "segment.before-sync"
+	PointBeforeSealWrite   failpoint.Point = "segment.before-seal-write"
+	PointBeforeSealSync    failpoint.Point = "segment.before-seal-sync"
+	PointBeforeFooterWrite failpoint.Point = "segment.before-footer-write"
+	PointBeforeFooterSync  failpoint.Point = "segment.before-footer-sync"
+	PointBeforeSealRename  failpoint.Point = "segment.before-seal-rename"
+	PointBeforeDataDirSync failpoint.Point = "segment.before-data-dir-sync"
 )
 
 type ActiveData struct {
@@ -31,6 +43,7 @@ type ActiveData struct {
 	end            uint64
 	poisoned       bool
 	closed         bool
+	hook           failpoint.Hook
 }
 
 func ActiveDataFileName(id base.DataSegmentID) string {
@@ -254,6 +267,10 @@ func (s *ActiveData) Append(frame storeformat.Frame) (base.VAddr, uint64, error)
 		return 0, 0, ErrFull
 	}
 	offset := s.end
+	if err := failpoint.Hit(s.hook, PointBeforeAppendWrite); err != nil {
+		s.poisoned = true
+		return 0, 0, err
+	}
 	written, err := writeFullAt(s.file, encoded, int64(offset))
 	s.end += uint64(written)
 	if err != nil {
@@ -310,7 +327,21 @@ func (s *ActiveData) Sync() error {
 	if s.poisoned {
 		return ErrPoisoned
 	}
-	return s.file.Sync()
+	if err := failpoint.Hit(s.hook, PointBeforeSync); err != nil {
+		s.poisoned = true
+		return err
+	}
+	if err := s.file.Sync(); err != nil {
+		s.poisoned = true
+		return err
+	}
+	return nil
+}
+
+func (s *ActiveData) SetHook(hook failpoint.Hook) {
+	s.mu.Lock()
+	s.hook = hook
+	s.mu.Unlock()
 }
 
 func (s *ActiveData) End() uint64 {
@@ -396,11 +427,19 @@ func (s *ActiveData) Seal(nextFrameSeq base.FrameSeq) (storeformat.FileSummary, 
 	if err != nil || uint64(len(encoded)) != sealFrameBytes {
 		return storeformat.FileSummary{}, errors.Join(err, base.ErrCorrupt)
 	}
+	if err := failpoint.Hit(s.hook, PointBeforeSealWrite); err != nil {
+		s.poisoned = true
+		return storeformat.FileSummary{}, err
+	}
 	written, err := writeFullAt(s.file, encoded, int64(s.end))
 	s.end += uint64(written)
 	if err != nil || uint64(written) != sealFrameBytes {
 		s.poisoned = true
 		return storeformat.FileSummary{}, errors.Join(err, io.ErrShortWrite)
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeSealSync); err != nil {
+		s.poisoned = true
+		return storeformat.FileSummary{}, err
 	}
 	if err := s.file.Sync(); err != nil {
 		s.poisoned = true
@@ -413,7 +452,15 @@ func (s *ActiveData) Seal(nextFrameSeq base.FrameSeq) (storeformat.FileSummary, 
 	if err != nil {
 		return storeformat.FileSummary{}, err
 	}
+	if err := failpoint.Hit(s.hook, PointBeforeFooterWrite); err != nil {
+		s.poisoned = true
+		return storeformat.FileSummary{}, err
+	}
 	if _, err := writeFullAt(s.file, footer[:], int64(sealEnd)); err != nil {
+		s.poisoned = true
+		return storeformat.FileSummary{}, err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeFooterSync); err != nil {
 		s.poisoned = true
 		return storeformat.FileSummary{}, err
 	}
@@ -428,11 +475,18 @@ func (s *ActiveData) Seal(nextFrameSeq base.FrameSeq) (storeformat.FileSummary, 
 	}
 	s.closed = true
 	sealedPath := filepath.Join(filepath.Dir(activePath), SealedDataFileName(s.segmentID))
+	if err := failpoint.Hit(s.hook, PointBeforeSealRename); err != nil {
+		return storeformat.FileSummary{}, err
+	}
 	if err := os.Rename(activePath, sealedPath); err != nil {
 		return storeformat.FileSummary{}, err
 	}
 	dir, err := os.Open(filepath.Dir(activePath))
 	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeDataDirSync); err != nil {
+		_ = dir.Close()
 		return storeformat.FileSummary{}, err
 	}
 	err = errors.Join(dir.Sync(), dir.Close())

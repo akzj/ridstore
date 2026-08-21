@@ -56,6 +56,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, errors.Join(err, closeSealed())
 	}
+	active.SetHook(hook)
 	segments, err := segment.NewRegistry(active, sealed)
 	if err != nil {
 		return nil, errors.Join(err, active.Close(), closeSealed())

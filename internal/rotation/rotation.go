@@ -83,6 +83,7 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	if err != nil {
 		return nil, err
 	}
+	newActive.SetHook(m.hook)
 	if err := failpoint.Hit(m.hook, PointNewCreated); err != nil {
 		return nil, errors.Join(err, newActive.Close())
 	}
