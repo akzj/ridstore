@@ -31,6 +31,7 @@ type nodeStore struct {
 	sealed      map[base.MapSegmentID]sealedMapFile
 	retired     map[base.MapSegmentID]retiredMapFile
 	closed      bool
+	readOnly    bool
 	catalog     *catalog.Manager
 	activeFirst base.NodeSeq
 	activeLast  base.NodeSeq
@@ -52,9 +53,17 @@ type retiredMapFile struct {
 }
 
 func openNodeStore(root string, manifest storeformat.Manifest, catalog *catalog.Manager) (*nodeStore, error) {
+	return openNodeStoreMode(root, manifest, catalog, false)
+}
+
+func openNodeStoreReadOnly(root string, manifest storeformat.Manifest) (*nodeStore, error) {
+	return openNodeStoreMode(root, manifest, nil, true)
+}
+
+func openNodeStoreMode(root string, manifest storeformat.Manifest, catalog *catalog.Manager, readOnly bool) (*nodeStore, error) {
 	store := &nodeStore{
 		root: root, uuid: manifest.StoreUUID, segmentSize: manifest.HardLimits.SegmentSize,
-		activeID: manifest.ActiveMapSegmentID, nextNodeSeq: 1, sealed: make(map[base.MapSegmentID]sealedMapFile), retired: make(map[base.MapSegmentID]retiredMapFile), catalog: catalog,
+		activeID: manifest.ActiveMapSegmentID, nextNodeSeq: 1, sealed: make(map[base.MapSegmentID]sealedMapFile), retired: make(map[base.MapSegmentID]retiredMapFile), catalog: catalog, readOnly: readOnly,
 	}
 	for _, summary := range manifest.SealedMappingSegments {
 		file, err := openMappingFile(root, manifest.StoreUUID, summary, true, manifest.HardLimits.SegmentSize)
@@ -68,7 +77,11 @@ func openNodeStore(root string, manifest storeformat.Manifest, catalog *catalog.
 		}
 	}
 	activePath := filepath.Join(root, "mapping", activeMapFileName(manifest.ActiveMapSegmentID))
-	fd, err := syscall.Open(activePath, syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	flags := syscall.O_RDWR | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	if readOnly {
+		flags = syscall.O_RDONLY | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	}
+	fd, err := syscall.Open(activePath, flags, 0)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -95,6 +108,10 @@ func openNodeStore(root string, manifest storeformat.Manifest, catalog *catalog.
 		return nil, err
 	}
 	if validEnd != uint64(info.Size()) {
+		if readOnly {
+			_ = store.Close()
+			return nil, fmt.Errorf("active mapping tail is not fully valid: %w", base.ErrCorrupt)
+		}
 		if err := store.active.Truncate(int64(validEnd)); err != nil {
 			_ = store.Close()
 			return nil, err
@@ -119,6 +136,9 @@ func (s *nodeStore) append(build storeformat.MappingNodeBuild) (base.MapAddr, er
 	defer s.mu.Unlock()
 	if s.closed {
 		return 0, base.ErrClosed
+	}
+	if s.readOnly {
+		return 0, base.ErrReadOnly
 	}
 	build.NodeSeq = s.nextNodeSeq
 	encoded, err := storeformat.EncodeMappingNode(build)
@@ -154,6 +174,9 @@ func (s *nodeStore) sync() error {
 	defer s.mu.Unlock()
 	if s.closed {
 		return base.ErrClosed
+	}
+	if s.readOnly {
+		return base.ErrReadOnly
 	}
 	return s.active.Sync()
 }

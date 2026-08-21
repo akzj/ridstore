@@ -95,6 +95,35 @@ func TestRadixCheckpointLookupDeleteAndReopen(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyRejectsAndPreservesInvalidActiveTail(t *testing.T) {
+	dir, manifest := radixFixture(t)
+	path := filepath.Join(dir, "mapping", activeMapFileName(manifest.ActiveMapSegmentID))
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("partial-node")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenReadOnly(dir, manifest, 4096); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("error=%v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("read-only open changed size from %d to %d", before.Size(), after.Size())
+	}
+}
+
 func TestCheckpointRewritesOnlyDirtyRadixPath(t *testing.T) {
 	dir, manifest := radixFixture(t)
 	mapping, err := Open(dir, manifest, 64<<10)
