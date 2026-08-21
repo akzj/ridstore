@@ -342,6 +342,12 @@ func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
 	if err := s.checkAvailable(); err != nil {
 		return err
 	}
+	return s.checkpointLocked(ctx, 0, nil)
+}
+
+// checkpointLocked requires checkpointMu to be held and an ops read lease.
+// maintenanceGeneration is non-zero only for the checkpoint nested in Data GC.
+func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint64, installedOut *storeformat.Manifest) error {
 	var (
 		barrier           appendlog.Barrier
 		checkpoint        *radix.Checkpoint
@@ -433,6 +439,9 @@ func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
 		next.NextFrameSeq = barrier.NextFrameSeq
 		next.NextCommitSeq = nextCommitSeq
 		next.SegmentStats = append([]storeformat.SegmentStatsEntry(nil), stats...)
+		if maintenanceGeneration != 0 {
+			next.MaintenanceGeneration = maintenanceGeneration
+		}
 		return nil
 	})
 	if err != nil {
@@ -456,6 +465,9 @@ func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
 	s.manifest = installed
 	s.recoveryAbortedStart = installed.IssuedBatchIDHighExclusiveAtCut
 	s.mu.Unlock()
+	if installedOut != nil {
+		*installedOut = installed
+	}
 	return nil
 }
 
