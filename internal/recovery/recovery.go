@@ -34,6 +34,11 @@ type Result struct {
 	Statuses                     map[base.BatchID]BatchStatus
 }
 
+type DataScanner interface {
+	SegmentID() base.DataSegmentID
+	Scan(func(base.VAddr, storeformat.Frame) error) error
+}
+
 type putRecord struct {
 	RecordID     base.ID
 	BatchID      base.BatchID
@@ -63,6 +68,22 @@ func Recover(manifest storeformat.Manifest, sealed []*segment.SealedData, active
 }
 
 func RecoverInto(manifest storeformat.Manifest, sealed []*segment.SealedData, active *segment.ActiveData, mapping api.Mapping) (Result, error) {
+	if active == nil {
+		return Result{}, fmt.Errorf("mapping recovery active scanner: %w", base.ErrInvalidConfig)
+	}
+	scanners := make([]DataScanner, len(sealed))
+	for i := range sealed {
+		if sealed[i] == nil {
+			return Result{}, fmt.Errorf("mapping recovery sealed scanner: %w", base.ErrInvalidConfig)
+		}
+		scanners[i] = sealed[i]
+	}
+	return RecoverIntoScanners(manifest, scanners, active, mapping)
+}
+
+// RecoverIntoScanners replays validated read-only scanners into Mapping. It is
+// shared by normal recovery and the offline verifier; it never mutates files.
+func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, active DataScanner, mapping api.Mapping) (Result, error) {
 	if active == nil || mapping == nil || mapping.CoveredCommitSeq() != manifest.CoveredCommitSeq || len(sealed) != len(manifest.SealedDataSegments) {
 		return Result{}, fmt.Errorf("mapping recovery configuration: %w", base.ErrInvalidConfig)
 	}

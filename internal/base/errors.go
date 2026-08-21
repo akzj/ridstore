@@ -26,6 +26,7 @@ var (
 	ErrCorrupt             = errors.New("ridstore: corruption detected")
 	ErrUnsupported         = errors.New("ridstore: unsupported format")
 	ErrInsufficientSpace   = errors.New("ridstore: insufficient free space")
+	ErrRecoveryRequired    = errors.New("ridstore: recovery required before offline operation")
 	ErrOverflow            = errors.New("ridstore: integer overflow")
 	ErrInvalidAddress      = errors.New("ridstore: invalid physical address")
 )

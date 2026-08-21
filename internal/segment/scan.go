@@ -19,6 +19,8 @@ type ScanSummary struct {
 	LastFrame     storeformat.Frame
 }
 
+type FrameVisitor func(base.VAddr, storeformat.Frame, uint64) error
+
 func SealedDataFileName(id base.DataSegmentID) string {
 	return fmt.Sprintf("DATA-%08d.seg", id)
 }
@@ -57,6 +59,12 @@ func LoadSealedDataSummary(root string, id base.DataSegmentID) (storeformat.File
 // ValidateSealedData performs a strict full-file scan. It never truncates or
 // repairs a sealed file.
 func ValidateSealedData(root string, uuid base.StoreUUID, summary storeformat.FileSummary, segmentSize, maxPayloadSize uint64) (retErr error) {
+	return InspectSealedData(root, uuid, summary, segmentSize, maxPayloadSize, nil)
+}
+
+// InspectSealedData strictly validates a sealed file and optionally visits
+// every CRC-validated Frame. It never truncates or repairs the file.
+func InspectSealedData(root string, uuid base.StoreUUID, summary storeformat.FileSummary, segmentSize, maxPayloadSize uint64, visit FrameVisitor) (retErr error) {
 	if uuid == (base.StoreUUID{}) || summary.FileID == 0 || summary.ValidEnd <= storeformat.SegmentHeaderSize ||
 		summary.ValidEnd+storeformat.SegmentFooterSize > segmentSize || maxPayloadSize == 0 {
 		return fmt.Errorf("sealed data configuration: %w", base.ErrInvalidConfig)
@@ -90,7 +98,7 @@ func ValidateSealedData(root string, uuid base.StoreUUID, summary storeformat.Fi
 	if header.Kind != storeformat.SegmentKindData || header.StoreUUID != uuid || header.FileID != summary.FileID || header.FirstSeq != summary.FirstSeq {
 		return fmt.Errorf("sealed data header identity: %w", base.ErrCorrupt)
 	}
-	validEnd, scanned, err := scanDataFrames(file, summary.ValidEnd, summary.ValidEnd, maxPayloadSize, base.FrameSeq(summary.FirstSeq), true, nil)
+	validEnd, scanned, err := scanDataFrames(file, summary.ValidEnd, summary.ValidEnd, maxPayloadSize, base.FrameSeq(summary.FirstSeq), true, frameVisitor(base.DataSegmentID(summary.FileID), visit))
 	if err != nil {
 		return err
 	}
@@ -118,6 +126,72 @@ func ValidateSealedData(root string, uuid base.StoreUUID, summary storeformat.Fi
 		return fmt.Errorf("segment seal/footer mismatch: %w", base.ErrCorrupt)
 	}
 	return nil
+}
+
+// InspectActiveData strictly validates the current physical active tail as-is.
+// Unlike normal Open it uses O_RDONLY and never truncates an incomplete Frame.
+func InspectActiveData(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, visit FrameVisitor) (retErr error) {
+	if uuid == (base.StoreUUID{}) || id == 0 || segmentSize <= storeformat.SegmentHeaderSize+storeformat.SegmentFooterSize || maxPayloadSize == 0 {
+		return fmt.Errorf("active data configuration: %w", base.ErrInvalidConfig)
+	}
+	path := filepath.Join(root, "data", ActiveDataFileName(id))
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return fmt.Errorf("open active data segment")
+	}
+	defer func() { retErr = errors.Join(retErr, file.Close()) }()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() < storeformat.SegmentHeaderSize || uint64(info.Size()) > segmentSize-storeformat.SegmentFooterSize {
+		return fmt.Errorf("active data file size: %w", base.ErrCorrupt)
+	}
+	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
+	if _, err := file.ReadAt(headerBytes, 0); err != nil {
+		return err
+	}
+	header, err := storeformat.DecodeSegmentHeader(headerBytes)
+	if err != nil {
+		return err
+	}
+	if header.Kind != storeformat.SegmentKindData || header.StoreUUID != uuid || header.FileID != uint32(id) {
+		return fmt.Errorf("active data header identity: %w", base.ErrCorrupt)
+	}
+	physicalEnd := uint64(info.Size())
+	validEnd, scanned, err := scanDataFrames(file, physicalEnd, segmentSize-storeformat.SegmentFooterSize, maxPayloadSize, base.FrameSeq(header.FirstSeq), true, frameVisitor(id, visit))
+	if err != nil {
+		return err
+	}
+	if validEnd != physicalEnd || (scanned.FrameCount != 0 && scanned.LastFrame.Type == storeformat.FrameTypeSegmentSeal) {
+		return fmt.Errorf("active data scan summary: %w", base.ErrCorrupt)
+	}
+	return nil
+}
+
+func frameVisitor(segmentID base.DataSegmentID, visit FrameVisitor) func(uint64, storeformat.Frame) error {
+	if visit == nil {
+		return nil
+	}
+	return func(offset uint64, frame storeformat.Frame) error {
+		if offset > uint64(^uint32(0)) {
+			return base.ErrInvalidAddress
+		}
+		addr, err := base.NewVAddr(segmentID, uint32(offset))
+		if err != nil {
+			return err
+		}
+		physical, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
+		if err != nil {
+			return err
+		}
+		return visit(addr, frame, physical)
+	}
 }
 
 func scanDataFrames(file *os.File, physicalEnd, contentLimit, maxPayloadSize uint64, firstSeq base.FrameSeq, strict bool, visit func(uint64, storeformat.Frame) error) (uint64, ScanSummary, error) {

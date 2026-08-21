@@ -76,6 +76,23 @@ func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs
 	if err != nil {
 		return nil, err
 	}
+	return newMappingFromStore(store, manifest, cacheBytes)
+}
+
+// OpenReadOnly validates Mapping files without truncating an invalid active
+// tail or installing recovery state. It is intended for offline verification.
+func OpenReadOnly(root string, manifest storeformat.Manifest, cacheBytes int64) (*Mapping, error) {
+	if cacheBytes <= 0 {
+		return nil, base.ErrInvalidConfig
+	}
+	store, err := openNodeStoreReadOnly(root, manifest)
+	if err != nil {
+		return nil, err
+	}
+	return newMappingFromStore(store, manifest, cacheBytes)
+}
+
+func newMappingFromStore(store *nodeStore, manifest storeformat.Manifest, cacheBytes int64) (*Mapping, error) {
 	mapping := &Mapping{
 		store: store, cache: newNodeCache(cacheBytes), root: manifest.MappingRoot,
 		rootCovered: manifest.CoveredCommitSeq, runtimeSeq: manifest.CoveredCommitSeq,
@@ -278,6 +295,16 @@ func (m *Mapping) CoveredCommitSeq() base.CommitSeq {
 }
 
 func (m *Mapping) Snapshot() api.Snapshot {
+	snapshot, err := m.Materialize()
+	if err != nil {
+		return api.Snapshot{CoveredCommitSeq: m.CoveredCommitSeq()}
+	}
+	return snapshot
+}
+
+// Materialize returns the current Root plus replay/runtime overlays and reports
+// any cold Root read failure instead of collapsing it into an empty Snapshot.
+func (m *Mapping) Materialize() (api.Snapshot, error) {
 	m.mu.RLock()
 	root, covered, runtime := m.root, m.rootCovered, m.runtimeSeq
 	if root != 0 {
@@ -293,12 +320,12 @@ func (m *Mapping) Snapshot() api.Snapshot {
 	}
 	entries, err := m.materializeRoot(root, covered)
 	if err != nil {
-		return api.Snapshot{CoveredCommitSeq: runtime}
+		return api.Snapshot{CoveredCommitSeq: runtime}, err
 	}
 	for _, layer := range append(layers, active) {
 		applyLayer(entries, layer)
 	}
-	return api.Snapshot{CoveredCommitSeq: runtime, Entries: entries}
+	return api.Snapshot{CoveredCommitSeq: runtime, Entries: entries}, nil
 }
 
 func (m *Mapping) releaseRoot(root base.MapAddr) {

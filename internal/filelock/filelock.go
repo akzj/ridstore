@@ -22,6 +22,17 @@ type Lock struct {
 }
 
 func Acquire(dir string) (*Lock, error) {
+	return acquire(dir, syscall.O_RDWR|syscall.O_CREAT)
+}
+
+// AcquireExisting obtains the writer lease without creating or opening LOCK
+// for writing. Offline read-only tools use it so a malformed store missing
+// LOCK remains byte-for-byte unchanged.
+func AcquireExisting(dir string) (*Lock, error) {
+	return acquire(dir, syscall.O_RDONLY)
+}
+
+func acquire(dir string, accessFlags int) (*Lock, error) {
 	info, err := os.Lstat(dir)
 	if err != nil {
 		return nil, err
@@ -30,7 +41,7 @@ func Acquire(dir string) (*Lock, error) {
 		return nil, fmt.Errorf("ridstore directory is not a real directory: %s: %w", dir, base.ErrInvalidConfig)
 	}
 	path := filepath.Join(dir, FileName)
-	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	fd, err := syscall.Open(path, accessFlags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("LOCK must not be a symlink: %w", base.ErrCorrupt)

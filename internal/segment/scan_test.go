@@ -89,3 +89,51 @@ func TestActiveScanVisitsFramesInPhysicalOrder(t *testing.T) {
 		t.Fatalf("sequences=%v", sequences)
 	}
 }
+
+func TestInspectActiveDataIsReadOnlyAndStrict(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	createActiveDataFile(t, root, uuid, 1)
+	active, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1, Payload: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := active.Close(); err != nil {
+		t.Fatal(err)
+	}
+	visited := 0
+	if err := InspectActiveData(root, uuid, 1, 1<<20, 1024, func(addr base.VAddr, frame storeformat.Frame, physical uint64) error {
+		visited++
+		if addr.SegmentID() != 1 || frame.RecordID != 1 || physical == 0 {
+			t.Fatalf("addr=%x frame=%+v physical=%d", addr, frame, physical)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if visited != 1 {
+		t.Fatalf("visited=%d", visited)
+	}
+	path := filepath.Join(root, "data", ActiveDataFileName(1))
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(path)
+	if err := InspectActiveData(root, uuid, 1, 1<<20, 1024, nil); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("error=%v", err)
+	}
+	after, _ := os.Stat(path)
+	if before.Size() != after.Size() {
+		t.Fatalf("inspect changed size from %d to %d", before.Size(), after.Size())
+	}
+}

@@ -26,4 +26,5 @@ var (
 	ErrCorrupt             = base.ErrCorrupt
 	ErrUnsupported         = base.ErrUnsupported
 	ErrInsufficientSpace   = base.ErrInsufficientSpace
+	ErrRecoveryRequired    = base.ErrRecoveryRequired
 )
