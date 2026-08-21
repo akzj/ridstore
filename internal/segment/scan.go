@@ -21,6 +21,59 @@ type ScanSummary struct {
 
 type FrameVisitor func(base.VAddr, storeformat.Frame, uint64) error
 
+// ReadSealedDataFrame validates the immutable file envelope and reads one
+// CRC-checked Frame without scanning unrelated historical payload.
+func ReadSealedDataFrame(root string, uuid base.StoreUUID, summary storeformat.FileSummary, segmentSize, maxPayloadSize uint64, addr base.VAddr) (frame storeformat.Frame, resultErr error) {
+	sealed, err := OpenSealedData(root, uuid, summary, segmentSize, maxPayloadSize)
+	if err != nil {
+		return storeformat.Frame{}, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, sealed.Close()) }()
+	return sealed.ReadFrame(addr)
+}
+
+// ReadActiveDataFrame opens the active file read-only and reads one
+// CRC-checked Frame. It never truncates or otherwise recovers the tail.
+func ReadActiveDataFrame(root string, uuid base.StoreUUID, id base.DataSegmentID, segmentSize, maxPayloadSize uint64, addr base.VAddr) (frame storeformat.Frame, resultErr error) {
+	if uuid == (base.StoreUUID{}) || id == 0 || addr.SegmentID() != id || segmentSize <= storeformat.SegmentHeaderSize+storeformat.SegmentFooterSize || maxPayloadSize == 0 {
+		return storeformat.Frame{}, fmt.Errorf("active data read configuration: %w", base.ErrInvalidConfig)
+	}
+	path := filepath.Join(root, "data", ActiveDataFileName(id))
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return storeformat.Frame{}, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return storeformat.Frame{}, fmt.Errorf("open active data segment")
+	}
+	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
+	info, err := file.Stat()
+	if err != nil {
+		return storeformat.Frame{}, err
+	}
+	if !info.Mode().IsRegular() || info.Size() < storeformat.SegmentHeaderSize || uint64(info.Size()) > segmentSize-storeformat.SegmentFooterSize {
+		return storeformat.Frame{}, fmt.Errorf("active data file size: %w", base.ErrCorrupt)
+	}
+	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
+	if _, err := file.ReadAt(headerBytes, 0); err != nil {
+		return storeformat.Frame{}, err
+	}
+	header, err := storeformat.DecodeSegmentHeader(headerBytes)
+	if err != nil {
+		return storeformat.Frame{}, err
+	}
+	if header.Kind != storeformat.SegmentKindData || header.StoreUUID != uuid || header.FileID != uint32(id) {
+		return storeformat.Frame{}, fmt.Errorf("active data header identity: %w", base.ErrCorrupt)
+	}
+	physicalEnd := uint64(info.Size())
+	if addr.Offset() < storeformat.SegmentHeaderSize || uint64(addr.Offset()) >= physicalEnd {
+		return storeformat.Frame{}, fmt.Errorf("read address outside active segment: %w", base.ErrInvalidAddress)
+	}
+	return readFrameAt(file, uint64(addr.Offset()), physicalEnd, maxPayloadSize)
+}
+
 func SealedDataFileName(id base.DataSegmentID) string {
 	return fmt.Sprintf("DATA-%08d.seg", id)
 }

@@ -442,27 +442,34 @@ func (s *ActiveData) Seal(nextFrameSeq base.FrameSeq) (storeformat.FileSummary, 
 	return storeformat.FileSummary{FileID: uint32(s.segmentID), ValidEnd: sealEnd, FirstSeq: uint64(firstSeq), LastSeq: uint64(nextFrameSeq)}, nil
 }
 
-// Scan visits every complete frame currently present in the Active segment.
-// The callback must not call methods on this ActiveData.
+// Scan visits the complete frame prefix present when the scan starts. It does
+// not hold the ActiveData mutex while decoding or invoking the callback, so a
+// recovery resolver may perform validated random reads from the same file.
 func (s *ActiveData) Scan(visit func(base.VAddr, storeformat.Frame) error) error {
 	if visit == nil {
 		return fmt.Errorf("nil scan visitor: %w", base.ErrInvalidConfig)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return base.ErrClosed
 	}
+	file := s.file
+	end := s.end
+	segmentID := s.segmentID
+	maxPayloadSize := s.maxPayloadSize
+	segmentSize := s.segmentSize
+	s.mu.Unlock()
 	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
-	if _, err := s.file.ReadAt(headerBytes, 0); err != nil {
+	if _, err := file.ReadAt(headerBytes, 0); err != nil {
 		return err
 	}
 	header, err := storeformat.DecodeSegmentHeader(headerBytes)
 	if err != nil {
 		return err
 	}
-	_, _, err = scanDataFrames(s.file, s.end, s.segmentSize-storeformat.SegmentFooterSize, s.maxPayloadSize, base.FrameSeq(header.FirstSeq), true, func(offset uint64, frame storeformat.Frame) error {
-		addr, err := base.NewVAddr(s.segmentID, uint32(offset))
+	_, _, err = scanDataFrames(file, end, segmentSize-storeformat.SegmentFooterSize, maxPayloadSize, base.FrameSeq(header.FirstSeq), true, func(offset uint64, frame storeformat.Frame) error {
+		addr, err := base.NewVAddr(segmentID, uint32(offset))
 		if err != nil {
 			return err
 		}

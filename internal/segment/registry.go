@@ -29,8 +29,10 @@ type SealedData struct {
 }
 
 func OpenSealedData(root string, uuid base.StoreUUID, summary storeformat.FileSummary, segmentSize, maxPayloadSize uint64) (*SealedData, error) {
-	if err := ValidateSealedData(root, uuid, summary, segmentSize, maxPayloadSize); err != nil {
-		return nil, err
+	if uuid == (base.StoreUUID{}) || summary.FileID == 0 || segmentSize <= storeformat.SegmentFooterSize ||
+		summary.ValidEnd < storeformat.SegmentHeaderSize+storeformat.FrameHeaderSize+64 ||
+		summary.ValidEnd > segmentSize-storeformat.SegmentFooterSize || maxPayloadSize == 0 {
+		return nil, fmt.Errorf("sealed data configuration: %w", base.ErrInvalidConfig)
 	}
 	path := filepath.Join(root, "data", SealedDataFileName(base.DataSegmentID(summary.FileID)))
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
@@ -42,7 +44,53 @@ func OpenSealedData(root string, uuid base.StoreUUID, summary storeformat.FileSu
 		_ = syscall.Close(fd)
 		return nil, fmt.Errorf("open sealed data segment")
 	}
-	return &SealedData{file: file, segmentID: base.DataSegmentID(summary.FileID), validEnd: summary.ValidEnd, maxPayloadSize: maxPayloadSize}, nil
+	fail := func(err error) (*SealedData, error) { return nil, errors.Join(err, file.Close()) }
+	info, err := file.Stat()
+	if err != nil {
+		return fail(err)
+	}
+	if !info.Mode().IsRegular() || uint64(info.Size()) != summary.ValidEnd+storeformat.SegmentFooterSize {
+		return fail(fmt.Errorf("sealed data file size: %w", base.ErrCorrupt))
+	}
+	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
+	if _, err := file.ReadAt(headerBytes, 0); err != nil {
+		return fail(err)
+	}
+	header, err := storeformat.DecodeSegmentHeader(headerBytes)
+	if err != nil {
+		return fail(err)
+	}
+	if header.Kind != storeformat.SegmentKindData || header.StoreUUID != uuid || header.FileID != summary.FileID || header.FirstSeq != summary.FirstSeq {
+		return fail(fmt.Errorf("sealed data header identity: %w", base.ErrCorrupt))
+	}
+	footerBytes := make([]byte, storeformat.SegmentFooterSize)
+	if _, err := file.ReadAt(footerBytes, int64(summary.ValidEnd)); err != nil {
+		return fail(err)
+	}
+	footer, err := storeformat.DecodeDataSegmentFooter(footerBytes)
+	if err != nil {
+		return fail(err)
+	}
+	id := base.DataSegmentID(summary.FileID)
+	if footer.SegmentID != id || footer.ValidDataEnd != summary.ValidEnd || uint64(footer.FirstFrameSeq) != summary.FirstSeq || uint64(footer.LastFrameSeq) != summary.LastSeq {
+		return fail(fmt.Errorf("sealed data footer summary: %w", base.ErrCorrupt))
+	}
+	const sealFrameBytes = uint64(storeformat.FrameHeaderSize + 64)
+	sealOffset := summary.ValidEnd - sealFrameBytes
+	sealFrame, err := readFrameAt(file, sealOffset, summary.ValidEnd, maxPayloadSize)
+	if err != nil {
+		return fail(err)
+	}
+	seal, err := storeformat.DecodeSegmentSealFrame(sealFrame)
+	if err != nil {
+		return fail(err)
+	}
+	if sealFrame.FrameSeq != footer.LastFrameSeq || seal.SegmentID != footer.SegmentID || seal.ValidDataEnd != footer.ValidDataEnd ||
+		seal.FirstFrameSeq != footer.FirstFrameSeq || seal.LastFrameSeq != footer.LastFrameSeq || seal.FrameCount != footer.FrameCount ||
+		seal.MinCommitSeq != footer.MinCommitSeq || seal.MaxCommitSeq != footer.MaxCommitSeq {
+		return fail(fmt.Errorf("sealed terminal seal/footer mismatch: %w", base.ErrCorrupt))
+	}
+	return &SealedData{file: file, segmentID: id, validEnd: summary.ValidEnd, maxPayloadSize: maxPayloadSize}, nil
 }
 
 func (s *SealedData) SegmentID() base.DataSegmentID { return s.segmentID }

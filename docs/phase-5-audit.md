@@ -23,15 +23,15 @@
 
 ## 2. 当前实现审计发现
 
-### P0：Open recovery 仍全量扫描 Data Log
+### 已修复：Open recovery 全量扫描 Data Log
 
-`recovery.RecoverIntoScanners` 当前依次扫描所有 sealed Segment 和 Active Segment；即使 Frame 位于 `ReplayStart` 前，也先把每个 PutRecord 加入 `puts map[VAddr]putRecord`，再跳过 replay。这会导致：
+基线审计发现 `recovery.RecoverIntoScanners` 依次扫描所有 sealed Segment 和 Active Segment；即使 Frame 位于 `ReplayStart` 前，也先把每个 PutRecord 加入 `puts map[VAddr]putRecord`，再跳过 replay。这会导致：
 
 - Open 时间与全部历史 Data bytes 相关，而不是 Root 后 replay window；
 - 恢复瞬时内存与全部历史 PutRecord 数相关；
 - 与 Phase 3“从 Persistent Root 启动、不全量加载”的验收结论不一致。
 
-修复方向必须保留旧 payload 引用语义：切点时 Open Batch 的 Commit Descriptor 可以在 ReplayStart 后引用切点前 PutRecord，Relocation 也可以引用旧 VAddr。因此不能简单丢弃旧 Segment；应跳过 replay segment 之前的顺序扫描，并通过受校验的随机 VAddr reader 按 Descriptor 引用读取 PutRecord。恢复只保存未完成 Descriptor 与有界近期 Status，不保存全历史 Put 元数据。
+当前实现已改为 lazy sealed envelope open，只顺序扫描 ReplayStart 所在 Segment及其后；切点时 Open Batch 的 Commit Descriptor 或 Relocation 引用更早 PutRecord 时，通过受校验的随机 VAddr reader 读取完整 Frame。自动化测试证明 pre-replay Segment 的 `Scan` 次数为 0、被引用 Record 精确随机读取一次，offline Verify 仍严格全扫。恢复不再保存全历史 Put 元数据。
 
 ### P0：Batch Status retention 无界
 
@@ -72,7 +72,7 @@ make verify
 - [x] Commit/Recovery、Checkpoint、Mapping/Data GC 主路径有阶段 Review；
 - [x] Offline Verify、Backup/Restore、Metrics、Migration planner 已实现；
 - [x] 本机 `make verify` 通过；
-- [ ] Open recovery 不再全量扫描/保存历史 PutRecord；
+- [x] Open recovery 不再全量扫描/保存历史 PutRecord；
 - [ ] Status retention 与 recovery transient memory 有明确上界；
 - [ ] 所有 durable writer 完成 syscall error matrix；
 - [ ] write-stop/运维磁盘水位策略完成或由明确部署契约承接；

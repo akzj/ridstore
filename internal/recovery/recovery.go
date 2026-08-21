@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"math"
 
@@ -37,6 +38,7 @@ type Result struct {
 type DataScanner interface {
 	SegmentID() base.DataSegmentID
 	Scan(func(base.VAddr, storeformat.Frame) error) error
+	ReadFrame(base.VAddr) (storeformat.Frame, error)
 }
 
 type putRecord struct {
@@ -102,29 +104,44 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 		ReservedBatchIDHighExclusive: manifest.ReservedBatchIDHighExclusive,
 		Statuses:                     make(map[base.BatchID]BatchStatus),
 	}
-	puts := make(map[base.VAddr]putRecord)
 	parts := make(map[base.BatchID][]storeformat.Frame)
+	readers := make(map[base.DataSegmentID]DataScanner, len(sealed)+1)
+	for _, scanner := range sealed {
+		readers[scanner.SegmentID()] = scanner
+	}
+	readers[active.SegmentID()] = active
+	readPut := func(addr base.VAddr) (putRecord, error) {
+		reader := readers[addr.SegmentID()]
+		if reader == nil {
+			return putRecord{}, fmt.Errorf("referenced PutRecord segment %d is absent: %w", addr.SegmentID(), base.ErrCorrupt)
+		}
+		frame, err := reader.ReadFrame(addr)
+		if err != nil {
+			return putRecord{}, fmt.Errorf("read referenced PutRecord %x: %w", addr, errors.Join(err, base.ErrCorrupt))
+		}
+		if frame.Type != storeformat.FrameTypePutRecord {
+			return putRecord{}, fmt.Errorf("referenced frame %x is not PutRecord: %w", addr, base.ErrCorrupt)
+		}
+		physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
+		if err != nil {
+			return putRecord{}, fmt.Errorf("put physical size: %w", base.ErrCorrupt)
+		}
+		return putRecord{
+			RecordID: frame.RecordID, BatchID: frame.BatchID, FrameSeq: frame.FrameSeq,
+			Bytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize, ValueDigest: sha256.Sum256(frame.Payload),
+		}, nil
+	}
 	lastCommit := manifest.CoveredCommitSeq
 	replayOffset := uint64(manifest.ReplayStart.Offset())
 	visit := func(addr base.VAddr, frame storeformat.Frame) error {
+		if addr.SegmentID() < replaySegment || (addr.SegmentID() == replaySegment && uint64(addr.Offset()) < replayOffset) {
+			return nil
+		}
 		if frame.FrameSeq >= result.NextFrameSeq {
 			if frame.FrameSeq == base.FrameSeq(math.MaxUint64) {
 				return fmt.Errorf("frame sequence exhausted on disk: %w", base.ErrCorrupt)
 			}
 			result.NextFrameSeq = frame.FrameSeq + 1
-		}
-		if frame.Type == storeformat.FrameTypePutRecord {
-			physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
-			if err != nil {
-				return fmt.Errorf("put physical size: %w", base.ErrCorrupt)
-			}
-			puts[addr] = putRecord{
-				RecordID: frame.RecordID, BatchID: frame.BatchID, FrameSeq: frame.FrameSeq,
-				Bytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize, ValueDigest: sha256.Sum256(frame.Payload),
-			}
-		}
-		if addr.SegmentID() < replaySegment || (addr.SegmentID() == replaySegment && uint64(addr.Offset()) < replayOffset) {
-			return nil
 		}
 		switch frame.Type {
 		case storeformat.FrameTypeCommitPart, storeformat.FrameTypeRelocationPart:
@@ -146,8 +163,11 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 			for i, entry := range decoded.Entries {
 				changes[i].RecordID = entry.RecordID
 				if entry.Operation == storeformat.MutationPut {
-					record, ok := puts[entry.NewVAddr]
-					if !ok || record.RecordID != entry.RecordID || record.BatchID != frame.BatchID || record.FrameSeq >= frame.FrameSeq {
+					record, readErr := readPut(entry.NewVAddr)
+					if readErr != nil {
+						return readErr
+					}
+					if record.RecordID != entry.RecordID || record.BatchID != frame.BatchID || record.FrameSeq >= frame.FrameSeq {
 						return fmt.Errorf("commit points to invalid PutRecord: %w", base.ErrCorrupt)
 					}
 					changes[i].NewAddr = entry.NewVAddr
@@ -184,9 +204,15 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 			changes := make([]api.Change, len(decoded.Entries))
 			var logicalBytes uint64
 			for i, entry := range decoded.Entries {
-				oldRecord, oldOK := puts[entry.ExpectedOldAddr]
-				newRecord, newOK := puts[entry.NewVAddr]
-				if !oldOK || !newOK || oldRecord.RecordID != entry.RecordID || newRecord.RecordID != entry.RecordID ||
+				oldRecord, readErr := readPut(entry.ExpectedOldAddr)
+				if readErr != nil {
+					return readErr
+				}
+				newRecord, readErr := readPut(entry.NewVAddr)
+				if readErr != nil {
+					return readErr
+				}
+				if oldRecord.RecordID != entry.RecordID || newRecord.RecordID != entry.RecordID ||
 					oldRecord.BatchID == 0 || oldRecord.BatchID != newRecord.BatchID || frame.BatchID == oldRecord.BatchID ||
 					oldRecord.Bytes != newRecord.Bytes || oldRecord.PhysicalSize != newRecord.PhysicalSize || oldRecord.ValueDigest != newRecord.ValueDigest ||
 					oldRecord.FrameSeq >= frame.FrameSeq || newRecord.FrameSeq >= frame.FrameSeq {
@@ -236,6 +262,9 @@ func RecoverIntoScanners(manifest storeformat.Manifest, sealed []DataScanner, ac
 		return nil
 	}
 	for _, item := range sealed {
+		if item.SegmentID() < replaySegment {
+			continue
+		}
 		if err := item.Scan(visit); err != nil {
 			return Result{}, err
 		}

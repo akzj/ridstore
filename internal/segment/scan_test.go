@@ -59,6 +59,20 @@ func TestValidateSealedData(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
+	sealed, err := OpenSealedData(root, uuid, summary, 1<<20, 1024)
+	if err != nil {
+		t.Fatalf("lazy envelope open rejected middle payload corruption: %v", err)
+	}
+	addr, err := base.NewVAddr(1, storeformat.SegmentHeaderSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sealed.ReadFrame(addr); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("lazy read corruption error=%v", err)
+	}
+	if err := sealed.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := ValidateSealedData(root, uuid, summary, 1<<20, 1024); !errors.Is(err, base.ErrCorrupt) {
 		t.Fatalf("corruption error=%v", err)
 	}
