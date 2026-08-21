@@ -82,7 +82,7 @@ func createWithOptions(cfg Config, opts initialize.Options) (*Store, error) {
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}
-	store, err := buildStore(normalized, m, lock)
+	store, err := buildStore(normalized, m, lock, opts.Hook)
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}
@@ -113,7 +113,7 @@ func Open(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}
-	store, err := buildStore(normalized, m, lock)
+	store, err := buildStore(normalized, m, lock, nil)
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}

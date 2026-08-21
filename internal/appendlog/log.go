@@ -9,6 +9,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/batch"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/segment"
 )
@@ -20,7 +21,18 @@ type Log struct {
 	maxFramePayload uint64
 	maxPartPayload  uint64
 	faulted         bool
+	hook            failpoint.Hook
 }
+
+const (
+	PointPutWritten        failpoint.Point = "appendlog.put-written"
+	PointAbortWritten      failpoint.Point = "appendlog.abort-written"
+	PointReserveWritten    failpoint.Point = "appendlog.reserve-written"
+	PointReserveSynced     failpoint.Point = "appendlog.reserve-synced"
+	PointCommitPartWritten failpoint.Point = "appendlog.commit-part-written"
+	PointCommitSealWritten failpoint.Point = "appendlog.commit-seal-written"
+	PointCommitSynced      failpoint.Point = "appendlog.commit-synced"
+)
 
 type CommitAppendResult struct {
 	SealFrameSeq base.FrameSeq
@@ -28,11 +40,15 @@ type CommitAppendResult struct {
 }
 
 func New(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxFramePayload, maxPartPayload uint64) (*Log, error) {
+	return NewWithHook(active, nextFrameSeq, maxFramePayload, maxPartPayload, nil)
+}
+
+func NewWithHook(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxFramePayload, maxPartPayload uint64, hook failpoint.Hook) (*Log, error) {
 	if active == nil || nextFrameSeq == 0 || maxFramePayload < storeformat.DescriptorSealSize || maxPartPayload < storeformat.MutationEntrySize || maxPartPayload > maxFramePayload {
 		return nil, fmt.Errorf("append log configuration: %w", base.ErrInvalidConfig)
 	}
 	maxPartPayload -= maxPartPayload % storeformat.MutationEntrySize
-	return &Log{active: active, nextFrameSeq: nextFrameSeq, maxFramePayload: maxFramePayload, maxPartPayload: maxPartPayload}, nil
+	return &Log{active: active, nextFrameSeq: nextFrameSeq, maxFramePayload: maxFramePayload, maxPartPayload: maxPartPayload, hook: hook}, nil
 }
 
 func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
@@ -56,6 +72,10 @@ func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, v
 		return 0, 0, written, err
 	}
 	l.nextFrameSeq++
+	if err := failpoint.Hit(l.hook, PointPutWritten); err != nil {
+		l.faulted = true
+		return 0, 0, written, err
+	}
 	return addr, seq, written, nil
 }
 
@@ -76,7 +96,14 @@ func (l *Log) AppendAbort(ctx context.Context, batchID base.BatchID, payload sto
 		return err
 	}
 	_, _, err = l.appendLocked(storeformat.Frame{Type: storeformat.FrameTypeBatchAbort, FrameSeq: l.nextFrameSeq, BatchID: batchID, Payload: encoded[:]})
-	return err
+	if err != nil {
+		return err
+	}
+	if err := failpoint.Hit(l.hook, PointAbortWritten); err != nil {
+		l.faulted = true
+		return err
+	}
+	return nil
 }
 
 func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payload storeformat.ReservePayload) error {
@@ -101,7 +128,15 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 	if _, _, err := l.appendLocked(storeformat.Frame{Type: typ, FrameSeq: l.nextFrameSeq, Payload: encoded[:]}); err != nil {
 		return err
 	}
+	if err := failpoint.Hit(l.hook, PointReserveWritten); err != nil {
+		l.faulted = true
+		return err
+	}
 	if err := l.active.Sync(); err != nil {
+		l.faulted = true
+		return err
+	}
+	if err := failpoint.Hit(l.hook, PointReserveSynced); err != nil {
 		l.faulted = true
 		return err
 	}
@@ -174,9 +209,20 @@ func (l *Log) AppendCommit(prepared batch.Prepared, commitSeq base.CommitSeq) (C
 		}
 		if i == len(frames)-1 {
 			result.SealStarted = true
+			if err := failpoint.Hit(l.hook, PointCommitSealWritten); err != nil {
+				l.faulted = true
+				return result, err
+			}
+		} else if err := failpoint.Hit(l.hook, PointCommitPartWritten); err != nil {
+			l.faulted = true
+			return result, err
 		}
 	}
 	if err := l.active.Sync(); err != nil {
+		l.faulted = true
+		return result, err
+	}
+	if err := failpoint.Hit(l.hook, PointCommitSynced); err != nil {
 		l.faulted = true
 		return result, err
 	}

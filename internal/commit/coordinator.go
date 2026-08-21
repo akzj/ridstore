@@ -10,6 +10,7 @@ import (
 	"github.com/akzj/ridstore/internal/appendlog"
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/batch"
+	"github.com/akzj/ridstore/internal/failpoint"
 	"github.com/akzj/ridstore/internal/mapping/api"
 	"github.com/akzj/ridstore/internal/segment"
 )
@@ -42,13 +43,23 @@ type Coordinator struct {
 	reader   RecordReader
 	faulted  bool
 	faultErr error
+	hook     failpoint.Hook
 }
 
+const (
+	PointMappingPublished failpoint.Point = "commit.mapping-published"
+	PointResultReady      failpoint.Point = "commit.result-ready"
+)
+
 func New(next base.CommitSeq, log CommitLog, mapping api.Mapping, reader RecordReader) (*Coordinator, error) {
+	return NewWithHook(next, log, mapping, reader, nil)
+}
+
+func NewWithHook(next base.CommitSeq, log CommitLog, mapping api.Mapping, reader RecordReader, hook failpoint.Hook) (*Coordinator, error) {
 	if next == 0 || log == nil || mapping == nil || reader == nil || next <= mapping.CoveredCommitSeq() {
 		return nil, fmt.Errorf("commit coordinator configuration: %w", base.ErrInvalidConfig)
 	}
-	return &Coordinator{next: next, log: log, mapping: mapping, reader: reader}, nil
+	return &Coordinator{next: next, log: log, mapping: mapping, reader: reader, hook: hook}, nil
 }
 
 func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error) {
@@ -121,11 +132,20 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 		c.fail(err)
 		return Result{}, errors.Join(base.ErrCommitUnknown, err)
 	}
+	if err := failpoint.Hit(c.hook, PointMappingPublished); err != nil {
+		_ = b.MarkCommitUnknown()
+		c.fail(err)
+		return Result{}, errors.Join(base.ErrCommitUnknown, err)
+	}
 	if err := b.MarkCommitted(commitSeq); err != nil {
 		c.fail(err)
 		return Result{}, errors.Join(base.ErrCommitUnknown, err)
 	}
 	c.next++
+	if err := failpoint.Hit(c.hook, PointResultReady); err != nil {
+		c.fail(err)
+		return Result{}, errors.Join(base.ErrCommitUnknown, err)
+	}
 	return Result{BatchID: prepared.BatchID, CommitSeq: commitSeq}, nil
 }
 
