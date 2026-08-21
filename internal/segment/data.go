@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -167,6 +168,118 @@ func (s *ActiveData) Remaining() uint64 {
 }
 
 func (s *ActiveData) SegmentID() base.DataSegmentID { return s.segmentID }
+
+// Seal appends the terminal SegmentSeal, persists the footer, and atomically
+// renames the file to its immutable name. The caller must serialize this with
+// all appends (the append sequencer does so in production).
+func (s *ActiveData) Seal(nextFrameSeq base.FrameSeq) (storeformat.FileSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return storeformat.FileSummary{}, base.ErrClosed
+	}
+	if s.poisoned {
+		return storeformat.FileSummary{}, ErrPoisoned
+	}
+	headerBytes := make([]byte, storeformat.SegmentHeaderSize)
+	if _, err := s.file.ReadAt(headerBytes, 0); err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	header, err := storeformat.DecodeSegmentHeader(headerBytes)
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	var minCommit, maxCommit base.CommitSeq
+	validEnd, scanned, err := scanDataFrames(s.file, s.end, s.segmentSize-storeformat.SegmentFooterSize, s.maxPayloadSize, base.FrameSeq(header.FirstSeq), true, func(_ uint64, frame storeformat.Frame) error {
+		if frame.Type != storeformat.FrameTypeCommitSeal && frame.Type != storeformat.FrameTypeRelocationSeal {
+			return nil
+		}
+		if len(frame.Payload) != storeformat.DescriptorSealSize {
+			return fmt.Errorf("descriptor seal size during rotation: %w", base.ErrCorrupt)
+		}
+		seq := base.CommitSeq(binary.LittleEndian.Uint64(frame.Payload[:8]))
+		if seq == 0 || (maxCommit != 0 && seq <= maxCommit) {
+			return fmt.Errorf("descriptor commit sequence during rotation: %w", base.ErrCorrupt)
+		}
+		if minCommit == 0 {
+			minCommit = seq
+		}
+		maxCommit = seq
+		return nil
+	})
+	if err != nil || validEnd != s.end {
+		return storeformat.FileSummary{}, err
+	}
+	firstSeq := base.FrameSeq(header.FirstSeq)
+	if scanned.FrameCount != 0 {
+		if nextFrameSeq <= scanned.LastFrameSeq {
+			return storeformat.FileSummary{}, fmt.Errorf("segment seal frame sequence: %w", base.ErrCorrupt)
+		}
+		firstSeq = scanned.FirstFrameSeq
+	} else if nextFrameSeq != firstSeq {
+		return storeformat.FileSummary{}, fmt.Errorf("empty segment first sequence: %w", base.ErrCorrupt)
+	}
+	const sealFrameBytes = uint64(storeformat.FrameHeaderSize + 64)
+	sealEnd, err := base.AddUint64(s.end, sealFrameBytes)
+	if err != nil || sealEnd > s.segmentSize-storeformat.SegmentFooterSize {
+		return storeformat.FileSummary{}, ErrFull
+	}
+	payload, err := storeformat.EncodeSegmentSealPayload(storeformat.SegmentSealPayload{
+		SegmentID: s.segmentID, ValidDataEnd: sealEnd, FirstFrameSeq: firstSeq, LastFrameSeq: nextFrameSeq,
+		FrameCount: scanned.FrameCount + 1, MinCommitSeq: minCommit, MaxCommitSeq: maxCommit,
+	})
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	encoded, err := storeformat.EncodeFrame(storeformat.Frame{Type: storeformat.FrameTypeSegmentSeal, FrameSeq: nextFrameSeq, Payload: payload[:]}, s.maxPayloadSize)
+	if err != nil || uint64(len(encoded)) != sealFrameBytes {
+		return storeformat.FileSummary{}, errors.Join(err, base.ErrCorrupt)
+	}
+	written, err := writeFullAt(s.file, encoded, int64(s.end))
+	s.end += uint64(written)
+	if err != nil || uint64(written) != sealFrameBytes {
+		s.poisoned = true
+		return storeformat.FileSummary{}, errors.Join(err, io.ErrShortWrite)
+	}
+	if err := s.file.Sync(); err != nil {
+		s.poisoned = true
+		return storeformat.FileSummary{}, err
+	}
+	footer, err := storeformat.EncodeDataSegmentFooter(storeformat.DataSegmentFooter{
+		SegmentID: s.segmentID, ValidDataEnd: sealEnd, FirstFrameSeq: firstSeq, LastFrameSeq: nextFrameSeq,
+		FrameCount: scanned.FrameCount + 1, MinCommitSeq: minCommit, MaxCommitSeq: maxCommit,
+	})
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	if _, err := writeFullAt(s.file, footer[:], int64(sealEnd)); err != nil {
+		s.poisoned = true
+		return storeformat.FileSummary{}, err
+	}
+	if err := s.file.Sync(); err != nil {
+		s.poisoned = true
+		return storeformat.FileSummary{}, err
+	}
+	activePath := s.file.Name()
+	if err := s.file.Close(); err != nil {
+		s.closed = true
+		return storeformat.FileSummary{}, err
+	}
+	s.closed = true
+	sealedPath := filepath.Join(filepath.Dir(activePath), SealedDataFileName(s.segmentID))
+	if err := os.Rename(activePath, sealedPath); err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	dir, err := os.Open(filepath.Dir(activePath))
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	err = errors.Join(dir.Sync(), dir.Close())
+	if err != nil {
+		return storeformat.FileSummary{}, err
+	}
+	return storeformat.FileSummary{FileID: uint32(s.segmentID), ValidEnd: sealEnd, FirstSeq: uint64(firstSeq), LastSeq: uint64(nextFrameSeq)}, nil
+}
 
 // Scan visits every complete frame currently present in the Active segment.
 // The callback must not call methods on this ActiveData.
