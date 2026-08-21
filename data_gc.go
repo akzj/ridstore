@@ -315,6 +315,18 @@ func (s *Store) CompactData(ctx context.Context) (result DataGCResult, resultErr
 	if checkpointManifest.MaintenanceGeneration != journal.Generation {
 		return DataGCResult{}, fmt.Errorf("data GC checkpoint maintenance generation: %w", base.ErrCorrupt)
 	}
+	// Mapping Segment rotation during the nested checkpoint extends the parent
+	// journal with its file-set changes. Reload that durable version before
+	// advancing the DataGC phase so those recovery records are never dropped.
+	durableJournal, found, err := maintenance.Load(s.config.Dir)
+	if err != nil {
+		return DataGCResult{}, err
+	}
+	if !found || durableJournal.Generation != journal.Generation || durableJournal.StoreUUID != journal.StoreUUID ||
+		durableJournal.OperationID != journal.OperationID || durableJournal.OperationType != storeformat.MaintenanceDataGC || durableJournal.Phase != 3 {
+		return DataGCResult{}, fmt.Errorf("data GC checkpoint journal identity: %w", base.ErrCorrupt)
+	}
+	journal = durableJournal
 	if err := advanceDataGCJournal(s.config.Dir, &journal, 4, checkpointManifest.Generation); err != nil {
 		return DataGCResult{}, err
 	}
@@ -476,8 +488,11 @@ func (s *Store) resumeDataGC() error {
 	if journal.OperationType != storeformat.MaintenanceDataGC {
 		return nil
 	}
-	if journal.StoreUUID != s.catalog.Snapshot().StoreUUID || len(journal.SourceFiles) != 1 || journal.SourceFiles[0].Kind != storeformat.FileKindData {
+	if journal.StoreUUID != s.catalog.Snapshot().StoreUUID {
 		return fmt.Errorf("data GC recovery journal identity: %w", base.ErrCorrupt)
+	}
+	if _, err := dataGCSourceRef(journal); err != nil {
+		return err
 	}
 	// Prepared/Copying/RelocationsDurable have not removed the source from the
 	// Manifest. Replayed relocation seals are safe, so abandoning and retrying
@@ -494,7 +509,10 @@ func (s *Store) resumeDataGC() error {
 }
 
 func (s *Store) resumeDataGCLocked(ctx context.Context, journal storeformat.MaintenanceJournal) error {
-	ref := journal.SourceFiles[0]
+	ref, err := dataGCSourceRef(journal)
+	if err != nil {
+		return err
+	}
 	source := storeformat.FileSummary{FileID: ref.FileID, ValidEnd: ref.ValidEnd, FirstSeq: ref.FirstSeq, LastSeq: ref.LastSeq}
 	sourceID := base.DataSegmentID(source.FileID)
 	session := &dataGCSession{store: s, source: source}
@@ -595,7 +613,10 @@ func validateRecoveredDataGCCheckpoint(manifest storeformat.Manifest, journal st
 	if manifest.MaintenanceGeneration != journal.Generation || manifest.Generation < journal.NewManifestGeneration || manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq {
 		return fmt.Errorf("recovered data GC checkpoint identity: %w", base.ErrCorrupt)
 	}
-	source := journal.SourceFiles[0]
+	source, err := dataGCSourceRef(journal)
+	if err != nil {
+		return err
+	}
 	if manifest.ReplayStart.SegmentID() < sourceID ||
 		(manifest.ReplayStart.SegmentID() == sourceID && uint64(manifest.ReplayStart.Offset()) < source.ValidEnd) {
 		return fmt.Errorf("recovered data GC replay boundary before source: %w", base.ErrCorrupt)
@@ -606,6 +627,23 @@ func validateRecoveredDataGCCheckpoint(manifest storeformat.Manifest, journal st
 		}
 	}
 	return nil
+}
+
+func dataGCSourceRef(journal storeformat.MaintenanceJournal) (storeformat.JournalFileRef, error) {
+	var source storeformat.JournalFileRef
+	for _, ref := range journal.SourceFiles {
+		if ref.Kind != storeformat.FileKindData {
+			continue
+		}
+		if source.FileID != 0 || ref.State != storeformat.FileStateSealed {
+			return storeformat.JournalFileRef{}, fmt.Errorf("data GC source journal refs: %w", base.ErrCorrupt)
+		}
+		source = ref
+	}
+	if source.FileID == 0 {
+		return storeformat.JournalFileRef{}, fmt.Errorf("data GC source journal ref missing: %w", base.ErrCorrupt)
+	}
+	return source, nil
 }
 
 func manifestHasDataSegment(manifest storeformat.Manifest, id base.DataSegmentID) bool {

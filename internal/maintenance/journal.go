@@ -16,13 +16,12 @@ func Install(root string, journal storeformat.MaintenanceJournal) error {
 	if current, found, err := Load(root); err != nil {
 		return err
 	} else if found {
-		if current.Generation != journal.Generation || current.StoreUUID != journal.StoreUUID || current.OperationID != journal.OperationID ||
-			current.OperationType != journal.OperationType || current.OldManifestGeneration != journal.OldManifestGeneration {
-			return fmt.Errorf("another maintenance operation is active: %w", base.ErrConflict)
-		}
-		if journal.Phase < current.Phase || journal.Phase > current.Phase+1 ||
-			(current.NewManifestGeneration != 0 && current.NewManifestGeneration != journal.NewManifestGeneration) {
-			return fmt.Errorf("maintenance journal transition: %w", base.ErrInvalidConfig)
+		if err := storeformat.ValidateMaintenanceTransition(current, journal); err != nil {
+			if current.Generation != journal.Generation || current.StoreUUID != journal.StoreUUID || current.OperationID != journal.OperationID ||
+				current.OperationType != journal.OperationType || current.OldManifestGeneration != journal.OldManifestGeneration {
+				return fmt.Errorf("another maintenance operation is active: %w", base.ErrConflict)
+			}
+			return fmt.Errorf("maintenance journal transition: %w", err)
 		}
 	}
 	encoded, err := storeformat.EncodeMaintenanceJournal(journal)
