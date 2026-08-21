@@ -21,6 +21,16 @@ const (
 	PointRotationOldSealed         failpoint.Point = "mapping-rotation.old-sealed"
 	PointRotationNewCreated        failpoint.Point = "mapping-rotation.new-created"
 	PointRotationManifestInstalled failpoint.Point = "mapping-rotation.manifest-installed"
+	PointBeforeRotationActiveSync  failpoint.Point = "mapping-rotation.before-active-sync"
+	PointBeforeRotationFooterWrite failpoint.Point = "mapping-rotation.before-footer-write"
+	PointBeforeRotationFooterSync  failpoint.Point = "mapping-rotation.before-footer-sync"
+	PointBeforeRotationRename      failpoint.Point = "mapping-rotation.before-rename"
+	PointBeforeRotationDirSync     failpoint.Point = "mapping-rotation.before-dir-sync"
+	PointBeforeRotationHeaderWrite failpoint.Point = "mapping-rotation.before-header-write"
+	PointBeforeRotationHeaderSync  failpoint.Point = "mapping-rotation.before-header-sync"
+	PointBeforeRotationCreateSync  failpoint.Point = "mapping-rotation.before-create-dir-sync"
+	PointBeforeRotationTruncate    failpoint.Point = "mapping-rotation.before-recovery-truncate"
+	PointBeforeRotationRemove      failpoint.Point = "mapping-rotation.before-recovery-remove"
 )
 
 func (s *nodeStore) rotateLocked() error {
@@ -57,10 +67,13 @@ func (s *nodeStore) rotateLocked() error {
 		DestinationFiles:      []storeformat.JournalFileRef{{Kind: storeformat.FileKindMapping, State: storeformat.FileStateTemporary, FileID: uint32(newID), ValidEnd: storeformat.SegmentHeaderSize, FirstSeq: uint64(s.nextNodeSeq), LastSeq: uint64(s.nextNodeSeq)}},
 		OldManifestGeneration: current.Generation,
 	}
+	if err := failpoint.Hit(s.hook, PointBeforeRotationActiveSync); err != nil {
+		return err
+	}
 	if err := s.active.Sync(); err != nil {
 		return err
 	}
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(s.hook, PointRotationPrepared); err != nil {
@@ -72,7 +85,13 @@ func (s *nodeStore) rotateLocked() error {
 	if err != nil {
 		return err
 	}
+	if err := failpoint.Hit(s.hook, PointBeforeRotationFooterWrite); err != nil {
+		return err
+	}
 	if _, err := writeFullAt(s.active, footer[:], int64(s.activeEnd)); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeRotationFooterSync); err != nil {
 		return err
 	}
 	if err := s.active.Sync(); err != nil {
@@ -83,7 +102,13 @@ func (s *nodeStore) rotateLocked() error {
 		return err
 	}
 	sealedPath := filepath.Join(s.root, "mapping", sealedMapFileName(s.activeID))
+	if err := failpoint.Hit(s.hook, PointBeforeRotationRename); err != nil {
+		return err
+	}
 	if err := os.Rename(activePath, sealedPath); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeRotationDirSync); err != nil {
 		return err
 	}
 	if err := syncDirectory(filepath.Join(s.root, "mapping")); err != nil {
@@ -94,10 +119,10 @@ func (s *nodeStore) rotateLocked() error {
 	}
 	journal.Phase = 2
 	journal.SourceFiles[0].State = storeformat.FileStateSealed
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return err
 	}
-	newActive, err := createActiveMap(s.root, s.uuid, newID, s.nextNodeSeq)
+	newActive, err := createActiveMapWithHook(s.root, s.uuid, newID, s.nextNodeSeq, s.hook)
 	if err != nil {
 		return err
 	}
@@ -106,7 +131,7 @@ func (s *nodeStore) rotateLocked() error {
 	}
 	journal.Phase = 3
 	journal.DestinationFiles[0].State = storeformat.FileStateActive
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return errors.Join(err, newActive.Close())
 	}
 	installed, err := s.catalog.Install(0, func(next *storeformat.Manifest) error {
@@ -130,7 +155,7 @@ func (s *nodeStore) rotateLocked() error {
 	}
 	journal.Phase = 4
 	journal.NewManifestGeneration = installed.Generation
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return errors.Join(err, newActive.Close())
 	}
 	sealedFile, err := openMappingFile(s.root, s.uuid, summary, true, s.segmentSize)
@@ -142,10 +167,10 @@ func (s *nodeStore) rotateLocked() error {
 	s.activeEnd = storeformat.SegmentHeaderSize
 	s.activeFirst, s.activeLast, s.activeCount = s.nextNodeSeq, 0, 0
 	journal.Phase = 5
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return err
 	}
-	return removeMaintenanceJournal(s.root)
+	return removeMaintenanceJournalWithHook(s.root, s.hook)
 }
 
 // rotateNestedDataGCLocked records Mapping file-set changes in the active
@@ -161,10 +186,13 @@ func (s *nodeStore) rotateNestedDataGCLocked(current storeformat.Manifest, journ
 	newRef := storeformat.JournalFileRef{Kind: storeformat.FileKindMapping, State: storeformat.FileStateTemporary, FileID: uint32(newID), ValidEnd: storeformat.SegmentHeaderSize, FirstSeq: uint64(s.nextNodeSeq), LastSeq: uint64(s.nextNodeSeq)}
 	journal.SourceFiles = upsertJournalRef(journal.SourceFiles, oldRef)
 	journal.DestinationFiles = upsertJournalRef(journal.DestinationFiles, newRef)
+	if err := failpoint.Hit(s.hook, PointBeforeRotationActiveSync); err != nil {
+		return err
+	}
 	if err := s.active.Sync(); err != nil {
 		return err
 	}
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(s.hook, PointRotationPrepared); err != nil {
@@ -176,7 +204,13 @@ func (s *nodeStore) rotateNestedDataGCLocked(current storeformat.Manifest, journ
 	if err != nil {
 		return err
 	}
+	if err := failpoint.Hit(s.hook, PointBeforeRotationFooterWrite); err != nil {
+		return err
+	}
 	if _, err := writeFullAt(s.active, footer[:], int64(s.activeEnd)); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeRotationFooterSync); err != nil {
 		return err
 	}
 	if err := s.active.Sync(); err != nil {
@@ -187,7 +221,13 @@ func (s *nodeStore) rotateNestedDataGCLocked(current storeformat.Manifest, journ
 		return err
 	}
 	sealedPath := filepath.Join(s.root, "mapping", sealedMapFileName(s.activeID))
+	if err := failpoint.Hit(s.hook, PointBeforeRotationRename); err != nil {
+		return err
+	}
 	if err := os.Rename(activePath, sealedPath); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(s.hook, PointBeforeRotationDirSync); err != nil {
 		return err
 	}
 	if err := syncDirectory(filepath.Join(s.root, "mapping")); err != nil {
@@ -198,10 +238,10 @@ func (s *nodeStore) rotateNestedDataGCLocked(current storeformat.Manifest, journ
 	}
 	oldRef.State = storeformat.FileStateSealed
 	journal.SourceFiles = upsertJournalRef(journal.SourceFiles, oldRef)
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return err
 	}
-	newActive, err := createActiveMap(s.root, s.uuid, newID, s.nextNodeSeq)
+	newActive, err := createActiveMapWithHook(s.root, s.uuid, newID, s.nextNodeSeq, s.hook)
 	if err != nil {
 		return err
 	}
@@ -210,7 +250,7 @@ func (s *nodeStore) rotateNestedDataGCLocked(current storeformat.Manifest, journ
 	}
 	newRef.State = storeformat.FileStateActive
 	journal.DestinationFiles = upsertJournalRef(journal.DestinationFiles, newRef)
-	if err := installMaintenanceJournal(s.root, journal); err != nil {
+	if err := installMaintenanceJournalWithHook(s.root, journal, s.hook); err != nil {
 		return errors.Join(err, newActive.Close())
 	}
 	_, err = s.catalog.Install(0, func(next *storeformat.Manifest) error {
@@ -269,6 +309,10 @@ func upsertJournalRef(refs []storeformat.JournalFileRef, ref storeformat.Journal
 }
 
 func RecoverMappingRotation(root string, current storeformat.Manifest) (storeformat.Manifest, error) {
+	return RecoverMappingRotationWithHook(root, current, nil)
+}
+
+func RecoverMappingRotationWithHook(root string, current storeformat.Manifest, hook failpoint.Hook) (storeformat.Manifest, error) {
 	journal, found, err := loadMaintenanceJournal(root)
 	if err != nil || !found {
 		return current, err
@@ -277,7 +321,7 @@ func RecoverMappingRotation(root string, current storeformat.Manifest) (storefor
 		return recoverMappingGC(root, current, journal)
 	}
 	if journal.OperationType == storeformat.MaintenanceDataGC {
-		return recoverNestedDataGCRotations(root, current, journal)
+		return recoverNestedDataGCRotations(root, current, journal, hook)
 	}
 	if journal.OperationType != storeformat.MaintenanceMappingCheckpoint {
 		return current, nil
@@ -291,7 +335,7 @@ func RecoverMappingRotation(root string, current storeformat.Manifest) (storefor
 		return storeformat.Manifest{}, base.ErrGenerationExhausted
 	}
 	if current.ActiveMapSegmentID == newID && hasMapSummary(current.SealedMappingSegments, oldID) {
-		if err := removeMaintenanceJournal(root); err != nil {
+		if err := removeMaintenanceJournalWithHook(root, hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 		return current, nil
@@ -300,10 +344,10 @@ func RecoverMappingRotation(root string, current storeformat.Manifest) (storefor
 		return storeformat.Manifest{}, base.ErrCorrupt
 	}
 	summary := storeformat.FileSummary{FileID: uint32(oldID), ValidEnd: oldRef.ValidEnd, FirstSeq: oldRef.FirstSeq, LastSeq: oldRef.LastSeq}
-	if err := ensureSealedMap(root, current, summary); err != nil {
+	if err := ensureSealedMapWithHook(root, current, summary, hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := ensureEmptyActiveMap(root, current.StoreUUID, newID, base.NodeSeq(newRef.FirstSeq)); err != nil {
+	if err := ensureEmptyActiveMapWithHook(root, current.StoreUUID, newID, base.NodeSeq(newRef.FirstSeq), hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	if current.Generation == ^uint64(0) {
@@ -318,16 +362,16 @@ func RecoverMappingRotation(root string, current storeformat.Manifest) (storefor
 	next.ActiveMapSegmentID = newID
 	next.NextMapSegmentID = newID + 1
 	next.MaintenanceGeneration = journal.Generation
-	if err := (manifest.Installer{Dir: root}).Install(next); err != nil {
+	if err := (manifest.Installer{Dir: root, FailpointHook: hook}).Install(next); err != nil {
 		return storeformat.Manifest{}, err
 	}
-	if err := removeMaintenanceJournal(root); err != nil {
+	if err := removeMaintenanceJournalWithHook(root, hook); err != nil {
 		return storeformat.Manifest{}, err
 	}
 	return next, nil
 }
 
-func recoverNestedDataGCRotations(root string, current storeformat.Manifest, journal storeformat.MaintenanceJournal) (storeformat.Manifest, error) {
+func recoverNestedDataGCRotations(root string, current storeformat.Manifest, journal storeformat.MaintenanceJournal, hook failpoint.Hook) (storeformat.Manifest, error) {
 	if journal.StoreUUID != current.StoreUUID || journal.Generation < current.MaintenanceGeneration {
 		return storeformat.Manifest{}, base.ErrCorrupt
 	}
@@ -360,10 +404,10 @@ func recoverNestedDataGCRotations(root string, current storeformat.Manifest, jou
 			return storeformat.Manifest{}, base.ErrCorrupt
 		}
 		summary := storeformat.FileSummary{FileID: uint32(oldID), ValidEnd: oldRef.ValidEnd, FirstSeq: oldRef.FirstSeq, LastSeq: oldRef.LastSeq}
-		if err := ensureSealedMap(root, current, summary); err != nil {
+		if err := ensureSealedMapWithHook(root, current, summary, hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
-		if err := ensureEmptyActiveMap(root, current.StoreUUID, newID, base.NodeSeq(newRef.FirstSeq)); err != nil {
+		if err := ensureEmptyActiveMapWithHook(root, current.StoreUUID, newID, base.NodeSeq(newRef.FirstSeq), hook); err != nil {
 			return storeformat.Manifest{}, err
 		}
 		if current.Generation == ^uint64(0) {
@@ -378,7 +422,7 @@ func recoverNestedDataGCRotations(root string, current storeformat.Manifest, jou
 		next.ActiveMapSegmentID = newID
 		next.NextMapSegmentID = newID + 1
 		next.MaintenanceGeneration = journal.Generation
-		if err := (manifest.Installer{Dir: root}).Install(next); err != nil {
+		if err := (manifest.Installer{Dir: root, FailpointHook: hook}).Install(next); err != nil {
 			return storeformat.Manifest{}, err
 		}
 		current = next
@@ -396,6 +440,10 @@ func journalMappingRef(refs []storeformat.JournalFileRef, id base.MapSegmentID) 
 }
 
 func ensureEmptyActiveMap(root string, uuid base.StoreUUID, id base.MapSegmentID, first base.NodeSeq) error {
+	return ensureEmptyActiveMapWithHook(root, uuid, id, first, nil)
+}
+
+func ensureEmptyActiveMapWithHook(root string, uuid base.StoreUUID, id base.MapSegmentID, first base.NodeSeq, hook failpoint.Hook) error {
 	path := filepath.Join(root, "mapping", activeMapFileName(id))
 	info, err := os.Lstat(path)
 	if err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
@@ -404,9 +452,9 @@ func ensureEmptyActiveMap(root string, uuid base.StoreUUID, id base.MapSegmentID
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	file, err := os.Open(path)
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if errors.Is(err, os.ErrNotExist) {
-		created, createErr := createActiveMap(root, uuid, id, first)
+		created, createErr := createActiveMapWithHook(root, uuid, id, first, hook)
 		if createErr != nil {
 			return createErr
 		}
@@ -417,23 +465,40 @@ func ensureEmptyActiveMap(root string, uuid base.StoreUUID, id base.MapSegmentID
 	}
 	info, statErr := file.Stat()
 	header, headerErr := readMapHeader(file)
-	closeErr := file.Close()
-	if closeErr != nil {
-		return closeErr
-	}
 	if statErr == nil && headerErr == nil && info.Size() == storeformat.SegmentHeaderSize && header.Kind == storeformat.SegmentKindMapping && header.StoreUUID == uuid && header.FileID == uint32(id) && header.FirstSeq == uint64(first) {
-		return nil
+		if err := failpoint.Hit(hook, PointBeforeRotationHeaderSync); err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if err := file.Sync(); err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		if err := failpoint.Hit(hook, PointBeforeRotationCreateSync); err != nil {
+			return err
+		}
+		return syncDirectory(filepath.Join(root, "mapping"))
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		return closeErr
 	}
 	// The destination is not referenced by the current Manifest yet. A crash
 	// during header creation may therefore leave a partial regular file; remove
 	// only that journal-named file, sync the directory, and recreate it.
+	if err := failpoint.Hit(hook, PointBeforeRotationRemove); err != nil {
+		return errors.Join(statErr, headerErr, err)
+	}
 	if err := os.Remove(path); err != nil {
 		return errors.Join(statErr, headerErr, err)
+	}
+	if err := failpoint.Hit(hook, PointBeforeRotationDirSync); err != nil {
+		return err
 	}
 	if err := syncDirectory(filepath.Join(root, "mapping")); err != nil {
 		return err
 	}
-	created, err := createActiveMap(root, uuid, id, first)
+	created, err := createActiveMapWithHook(root, uuid, id, first, hook)
 	if err != nil {
 		return err
 	}
@@ -441,13 +506,29 @@ func ensureEmptyActiveMap(root string, uuid base.StoreUUID, id base.MapSegmentID
 }
 
 func ensureSealedMap(root string, current storeformat.Manifest, summary storeformat.FileSummary) error {
+	return ensureSealedMapWithHook(root, current, summary, nil)
+}
+
+func ensureSealedMapWithHook(root string, current storeformat.Manifest, summary storeformat.FileSummary, hook failpoint.Hook) error {
 	sealedPath := filepath.Join(root, "mapping", sealedMapFileName(base.MapSegmentID(summary.FileID)))
 	if _, err := os.Stat(sealedPath); err == nil {
 		file, err := openMappingFile(root, current.StoreUUID, summary, true, current.HardLimits.SegmentSize)
 		if err != nil {
 			return err
 		}
-		return file.Close()
+		if err := failpoint.Hit(hook, PointBeforeRotationFooterSync); err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if err := file.Sync(); err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		if err := failpoint.Hit(hook, PointBeforeRotationDirSync); err != nil {
+			return err
+		}
+		return syncDirectory(filepath.Join(root, "mapping"))
 	}
 	activePath := filepath.Join(root, "mapping", activeMapFileName(base.MapSegmentID(summary.FileID)))
 	file, err := os.OpenFile(activePath, os.O_RDWR, 0)
@@ -456,6 +537,9 @@ func ensureSealedMap(root string, current storeformat.Manifest, summary storefor
 	}
 	_, _, count, err := scanNodes(file, summary.ValidEnd, summary.ValidEnd, base.NodeSeq(summary.FirstSeq), true)
 	if err != nil {
+		return errors.Join(err, file.Close())
+	}
+	if err := failpoint.Hit(hook, PointBeforeRotationTruncate); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := file.Truncate(int64(summary.ValidEnd)); err != nil {
@@ -468,7 +552,13 @@ func ensureSealedMap(root string, current storeformat.Manifest, summary storefor
 	if err != nil {
 		return errors.Join(err, file.Close())
 	}
+	if err := failpoint.Hit(hook, PointBeforeRotationFooterWrite); err != nil {
+		return errors.Join(err, file.Close())
+	}
 	if _, err := writeFullAt(file, footer[:], int64(summary.ValidEnd)); err != nil {
+		return errors.Join(err, file.Close())
+	}
+	if err := failpoint.Hit(hook, PointBeforeRotationFooterSync); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := file.Sync(); err != nil {
@@ -477,13 +567,23 @@ func ensureSealedMap(root string, current storeformat.Manifest, summary storefor
 	if err := file.Close(); err != nil {
 		return err
 	}
+	if err := failpoint.Hit(hook, PointBeforeRotationRename); err != nil {
+		return err
+	}
 	if err := os.Rename(activePath, sealedPath); err != nil {
+		return err
+	}
+	if err := failpoint.Hit(hook, PointBeforeRotationDirSync); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Join(root, "mapping"))
 }
 
 func createActiveMap(root string, uuid base.StoreUUID, id base.MapSegmentID, first base.NodeSeq) (*os.File, error) {
+	return createActiveMapWithHook(root, uuid, id, first, nil)
+}
+
+func createActiveMapWithHook(root string, uuid base.StoreUUID, id base.MapSegmentID, first base.NodeSeq, hook failpoint.Hook) (*os.File, error) {
 	header, err := storeformat.EncodeSegmentHeader(storeformat.SegmentHeader{
 		Kind: storeformat.SegmentKindMapping, StoreUUID: uuid, FileID: uint32(id), FirstSeq: uint64(first), CreatedUnixNano: uint64(time.Now().UnixNano()),
 	})
@@ -495,10 +595,19 @@ func createActiveMap(root string, uuid base.StoreUUID, id base.MapSegmentID, fir
 	if err != nil {
 		return nil, err
 	}
+	if err := failpoint.Hit(hook, PointBeforeRotationHeaderWrite); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
 	if _, err := writeFullAt(file, header[:], 0); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
+	if err := failpoint.Hit(hook, PointBeforeRotationHeaderSync); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
 	if err := file.Sync(); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	if err := failpoint.Hit(hook, PointBeforeRotationCreateSync); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
 	if err := syncDirectory(filepath.Join(root, "mapping")); err != nil {
@@ -511,12 +620,20 @@ func installMaintenanceJournal(root string, journal storeformat.MaintenanceJourn
 	return maintenance.Install(root, journal)
 }
 
+func installMaintenanceJournalWithHook(root string, journal storeformat.MaintenanceJournal, hook failpoint.Hook) error {
+	return maintenance.InstallWithHook(root, journal, hook)
+}
+
 func loadMaintenanceJournal(root string) (storeformat.MaintenanceJournal, bool, error) {
 	return maintenance.Load(root)
 }
 
 func removeMaintenanceJournal(root string) error {
 	return maintenance.Remove(root)
+}
+
+func removeMaintenanceJournalWithHook(root string, hook failpoint.Hook) error {
+	return maintenance.RemoveWithHook(root, hook)
 }
 
 func syncDirectory(path string) error {

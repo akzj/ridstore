@@ -47,9 +47,11 @@ Active Data 主写路径现已增加 append/sync、seal/footer write+sync、rena
 
 Maintenance Journal 另按 Data GC phase 验证所有七次 directory-sync publication：phase 1–3 失败且 Manifest 尚未证明 GC checkpoint 时允许撤销；Mapping Checkpoint Manifest 一旦 durable，运行时立即 fail closed，即使 phase-4 Journal rename 尚未成功，fresh Open 也会用 `MaintenanceGeneration`、精确 SegmentStats 和 ReplayStart 的共同证据补写 phase 4 后继续删除。嵌套 Mapping rotation 虽可提前推进相同 MaintenanceGeneration，但旧 source 仍在 SegmentStats 时只能撤销，不能误判为 GC checkpoint。checkpoint 前 Journal cleanup 自身失败也会 fail closed，由 fresh Open 收敛。完整 writer 清单与剩余缺口见 `syscall-fault-matrix.md`；Mapping、Data GC trash/delete、Initialize 和 Backup/Restore 尚未闭合，因此本 P0 仍保持未完成。
 
-Active Mapping Checkpoint 的 Node append 与最终 file sync 现已覆盖相同三类 syscall 错误。底层 `nodeStore` 在任一失败后 poisoned，Store 保留原始 cause 并停止写；fresh Open 采用旧 Manifest Root、忽略/截断未发布 tail、从 Commit Log replay 后可重新 Checkpoint，offline Verify clean。Mapping rotation/GC 的文件操作仍未覆盖，不能把本项扩大为整个 Mapping writer 已闭合。
+Active Mapping Checkpoint 的 Node append 与最终 file sync 现已覆盖相同三类 syscall 错误。底层 `nodeStore` 在任一失败后 poisoned，Store 保留原始 cause 并停止写；fresh Open 采用旧 Manifest Root、忽略/截断未发布 tail、从 Commit Log replay 后可重新 Checkpoint，offline Verify clean。Mapping GC 的文件操作仍未覆盖，不能把本项扩大为整个 Mapping writer 已闭合。
 
-Active Mapping Open tail repair 也已覆盖 truncate/sync 的三类错误，失败 Open 释放 lease 后可重试。审计同时修复了“先 truncate、后验证 Root”的取证破坏窗口：现在只有完整遍历 durable Root 并证明它不触及 invalid tail 后才允许修复；引用损坏 Node 时文件保持不变并返回 corruption。Mapping rotation/GC 仍是下一项缺口。
+Active Mapping Open tail repair 也已覆盖 truncate/sync 的三类错误，失败 Open 释放 lease 后可重试。审计同时修复了“先 truncate、后验证 Root”的取证破坏窗口：现在只有完整遍历 durable Root 并证明它不触及 invalid tail 后才允许修复；引用损坏 Node 时文件保持不变并返回 corruption。Mapping GC 仍是下一项缺口。
+
+Mapping rotation 已覆盖旧 Active sync、Footer write/sync、rename/dir-sync 与新 Active Header write/sync/dir-sync；三类错误均验证，Store 级各边界均 fail closed 并由 fresh Open 恢复。普通 rotation 的独立 Maintenance Journal 和 Data GC nested 的父 Journal 所有权分别验证。恢复 writer 的 truncate、partial remove、Footer/Header、rename/dir-sync 也完成三类错误矩阵并证明失败可重试。审计还修复了恢复仅验证“文件当前可见”却未补齐 durability 的问题：合法 sealed/new Active 已存在时仍重新 file sync 与 mapping-dir sync。Mapping GC 仍未覆盖，因此 Mapping writer 整体尚未闭合。
 
 ### P1：磁盘耗尽停止水位
 

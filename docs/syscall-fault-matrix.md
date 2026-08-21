@@ -14,7 +14,8 @@
 | Maintenance Journal | 已覆盖 | 已覆盖 | 已覆盖 install/remove | 已覆盖 install/remove | 完整 syscall matrix；checkpoint 前清理失败会 fail closed，checkpoint publication 与 phase-4 Journal 之间失败由 Manifest 证明并在 Open 时继续 Data GC |
 | Active Mapping append/checkpoint | `mapping.before-append-write` | `mapping.before-sync` | N/A | N/A | 已覆盖；任一错误 poison Active Mapping writer，Store fail closed，fresh Open 从旧 Manifest + Log replay 重建 |
 | Active Mapping open tail repair | N/A | `mapping.before-tail-sync` | truncate 已覆盖 | N/A | 已覆盖；truncate 前完整遍历 durable Root，引用损坏 tail 时拒绝 Open 且不修改文件；失败 Open 可重试 |
-| Mapping rotation/GC | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；已有 crash phase，但 syscall cause/cleanup 未系统验证 |
+| Mapping rotation | Footer/Header write 已覆盖 | Active/Footer/Header sync 已覆盖 | seal rename、recovery truncate/remove 已覆盖 | mapping dir sync 已覆盖 | 完整 runtime/recovery matrix；普通与 Data GC nested rotation 均恢复，Journal hook 同源传播；恢复失败可重试并补做已存在 sealed/new Active 的 file/dir sync |
+| Mapping GC | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；已有 crash phase，但 temp publish、old-file trash/delete 的 syscall cause/cleanup 未系统验证 |
 | Data GC trash/delete | N/A | N/A | 未覆盖 | 未覆盖 | 待补；必须分别证明删除前/后的 Manifest 与 Journal 收敛 |
 | Initialize marker/files | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；已有初始化 crash matrix |
 | Backup/Restore artifact publication | 未覆盖 | 未覆盖 | 未覆盖 | 未覆盖 | 待补；不影响已打开 Store，但影响可声明的离线运维完整性 |
@@ -29,7 +30,7 @@
 
 ## 剩余推进顺序
 
-1. Mapping rotation 和 Mapping GC；
+1. Mapping GC；
 2. Data GC trash/delete；
 3. Initialize 与 Backup/Restore。
 
