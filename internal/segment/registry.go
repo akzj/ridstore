@@ -93,17 +93,18 @@ func (s *SealedData) Close() error {
 // Registry resolves a VAddr without exposing Segment lifecycle to Mapping.
 // Removal is added by the GC phase; until then sealed entries are immutable.
 type Registry struct {
-	mu     sync.RWMutex
-	active *ActiveData
-	sealed map[base.DataSegmentID]*SealedData
-	closed bool
+	mu       sync.RWMutex
+	active   *ActiveData
+	sealed   map[base.DataSegmentID]*SealedData
+	openRefs map[base.DataSegmentID]uint64
+	closed   bool
 }
 
 func NewRegistry(active *ActiveData, sealed []*SealedData) (*Registry, error) {
 	if active == nil {
 		return nil, base.ErrInvalidConfig
 	}
-	r := &Registry{active: active, sealed: make(map[base.DataSegmentID]*SealedData, len(sealed))}
+	r := &Registry{active: active, sealed: make(map[base.DataSegmentID]*SealedData, len(sealed)), openRefs: make(map[base.DataSegmentID]uint64)}
 	for _, item := range sealed {
 		if item == nil || item.segmentID == active.SegmentID() {
 			return nil, base.ErrInvalidConfig
@@ -114,6 +115,43 @@ func NewRegistry(active *ActiveData, sealed []*SealedData) (*Registry, error) {
 		r.sealed[item.segmentID] = item
 	}
 	return r, nil
+}
+
+func (r *Registry) PinOpenBatch(id base.DataSegmentID) error {
+	if id == 0 {
+		return base.ErrInvalidAddress
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return base.ErrClosed
+	}
+	if (r.active == nil || r.active.SegmentID() != id) && r.sealed[id] == nil {
+		return base.ErrInvalidAddress
+	}
+	r.openRefs[id]++
+	return nil
+}
+
+func (r *Registry) UnpinOpenBatch(id base.DataSegmentID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := r.openRefs[id]
+	if count == 0 {
+		return fmt.Errorf("open batch segment ref underflow: %w", base.ErrCorrupt)
+	}
+	if count == 1 {
+		delete(r.openRefs, id)
+	} else {
+		r.openRefs[id] = count - 1
+	}
+	return nil
+}
+
+func (r *Registry) OpenBatchRefs(id base.DataSegmentID) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.openRefs[id]
 }
 
 func (r *Registry) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {
