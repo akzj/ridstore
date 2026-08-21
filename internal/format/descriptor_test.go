@@ -159,3 +159,14 @@ func FuzzDecodeMutationEntries(f *testing.F) {
 		_, _ = DecodeMutationEntries(DescriptorRelocation, data, 1024)
 	})
 }
+
+func FuzzDecodeDescriptorSeal(f *testing.F) {
+	addr, _ := base.NewVAddr(1, 4096)
+	part, _ := EncodeMutationEntries(DescriptorCommit, []MutationEntry{{RecordID: 1, Operation: MutationPut, NewVAddr: addr}})
+	seal, _ := EncodeDescriptorSealPayload(DescriptorSeal{CommitSeq: 1, PartCount: 1, MutationCount: 1, FirstPartFrameSeq: 1, LastPartFrameSeq: 1}, [][]byte{part})
+	f.Add(seal[:])
+	f.Add([]byte("short"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DecodeDescriptorSealPayload(data, [][]byte{part})
+	})
+}

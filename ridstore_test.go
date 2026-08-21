@@ -81,3 +81,13 @@ func TestConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigAllowsExactFourGiBSegment(t *testing.T) {
+	cfg, hard, err := normalizeCreateConfig(Config{Dir: t.TempDir(), SegmentSize: int64(1) << 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SegmentSize != int64(1)<<32 || hard.SegmentSize != uint64(1)<<32 {
+		t.Fatalf("config=%d hard=%d", cfg.SegmentSize, hard.SegmentSize)
+	}
+}

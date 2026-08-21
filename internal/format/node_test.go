@@ -48,6 +48,7 @@ func TestMappingNodeSparseDenseRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertGoldenSHA256(t, denseBytes, "c067d96eafcdc5ce27cb7a531a0e0eba2da0e6062088432326db408bd13b0537")
 	if len(denseBytes) != 4160 {
 		t.Fatalf("dense size=%d", len(denseBytes))
 	}

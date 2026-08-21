@@ -100,6 +100,12 @@ func TestManifestRejectsCrossFieldViolations(t *testing.T) {
 		func(m *Manifest) {
 			m.SegmentStats = []SegmentStatsEntry{{SegmentID: 9, ExactLiveBytes: 1, ExactLiveRecords: 1}}
 		},
+		func(m *Manifest) { m.ReplayStart, _ = base.NewLogPos(9, 4096) },
+		func(m *Manifest) { m.MappingRoot, _ = base.NewMapAddr(9, 4096) },
+		func(m *Manifest) {
+			m.NextDataSegmentID = 3
+			m.SealedDataSegments = []FileSummary{{FileID: 2, ValidEnd: m.HardLimits.SegmentSize, FirstSeq: 1, LastSeq: 1}}
+		},
 	}
 	for i, mutate := range tests {
 		m := testManifest()
@@ -107,6 +113,25 @@ func TestManifestRejectsCrossFieldViolations(t *testing.T) {
 		if _, err := EncodeManifest(m); !errors.Is(err, base.ErrInvalidConfig) {
 			t.Fatalf("case %d error=%v", i, err)
 		}
+	}
+}
+
+func TestManifestAllowsFourGiBSegmentAndListedAddressBounds(t *testing.T) {
+	t.Parallel()
+	m := testManifest()
+	m.HardLimits.SegmentSize = uint64(1) << 32
+	m.NextDataSegmentID, m.ActiveDataSegmentID = 3, 2
+	m.NextMapSegmentID, m.ActiveMapSegmentID = 3, 2
+	m.SealedDataSegments = []FileSummary{{FileID: 1, ValidEnd: 8192, FirstSeq: 1, LastSeq: 2}}
+	m.SealedMappingSegments = []FileSummary{{FileID: 1, ValidEnd: 8192, FirstSeq: 1, LastSeq: 1}}
+	m.ReplayStart, _ = base.NewLogPos(1, 8192)
+	m.MappingRoot, _ = base.NewMapAddr(1, 4096)
+	if _, err := EncodeManifest(m); err != nil {
+		t.Fatal(err)
+	}
+	m.MappingRoot, _ = base.NewMapAddr(1, 8192)
+	if _, err := EncodeManifest(m); !errors.Is(err, base.ErrInvalidConfig) {
+		t.Fatalf("root at valid end error=%v", err)
 	}
 }
 

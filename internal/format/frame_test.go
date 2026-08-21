@@ -222,3 +222,22 @@ func FuzzDecodeFrame(f *testing.F) {
 		})
 	})
 }
+
+func FuzzDecodeSystemPayloads(f *testing.F) {
+	abort, _ := EncodeBatchAbortPayload(BatchAbortPayload{Reason: AbortReasonCaller})
+	reserve, _ := EncodeReservePayload(ReservePayload{PreviousHighExclusive: 1, NewHighExclusive: 2, Generation: 1})
+	seal, _ := EncodeSegmentSealPayload(SegmentSealPayload{SegmentID: 1, ValidDataEnd: 8192, FirstFrameSeq: 1, LastFrameSeq: 1, FrameCount: 1})
+	f.Add(byte(0), abort[:])
+	f.Add(byte(1), reserve[:])
+	f.Add(byte(2), seal[:])
+	f.Fuzz(func(t *testing.T, kind byte, data []byte) {
+		switch kind % 3 {
+		case 0:
+			_, _ = DecodeBatchAbortPayload(data)
+		case 1:
+			_, _ = DecodeReservePayload(data)
+		case 2:
+			_, _ = DecodeSegmentSealPayload(data)
+		}
+	})
+}
