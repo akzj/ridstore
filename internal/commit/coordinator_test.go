@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/akzj/ridstore/internal/appendlog"
 	"github.com/akzj/ridstore/internal/base"
@@ -143,6 +145,88 @@ func TestDeleteAndEmptyCommit(t *testing.T) {
 	empty := makeBatch(t, 3, log)
 	if result, err := coordinator.Commit(context.Background(), empty); err != nil || result.CommitSeq != 3 {
 		t.Fatalf("empty result=%+v error=%v", result, err)
+	}
+}
+
+type recordingGroupLog struct {
+	mu    sync.Mutex
+	calls int
+	seqs  [][]base.CommitSeq
+}
+
+func (l *recordingGroupLog) AppendCommit(prepared batch.Prepared, seq base.CommitSeq) (appendlog.CommitAppendResult, error) {
+	results, err := l.AppendCommitGroup([]batch.Prepared{prepared}, []base.CommitSeq{seq})
+	return results[0], err
+}
+
+func (l *recordingGroupLog) AppendCommitGroup(_ []batch.Prepared, seqs []base.CommitSeq) ([]appendlog.CommitAppendResult, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	l.seqs = append(l.seqs, append([]base.CommitSeq(nil), seqs...))
+	results := make([]appendlog.CommitAppendResult, len(seqs))
+	for i := range results {
+		results[i].SealStarted = true
+	}
+	return results, nil
+}
+
+func TestGroupCommitUsesVirtualMappingAndSharedAppend(t *testing.T) {
+	addr, _ := base.NewVAddr(1, 4096)
+	log := &recordingGroupLog{}
+	mapping := memory.NewEmpty()
+	reader := fakeReader{records: map[base.VAddr]RecordHeader{
+		addr: {RecordID: 1, OriginBatch: 7, PhysicalSize: 64},
+	}}
+	coordinator, err := NewGrouped(1, log, mapping, reader, Config{
+		QueueDepth: 4, MaxBatches: 4, MaxBytes: 4096, MaxDelay: 50 * time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coordinator.Close()
+	b1, err := batch.New(7, batch.Limits{MaxValueSize: 16, MaxBatchBytes: 16, MaxBatchMutations: 2, MaxBatchConditions: 2}, fakeBatchAppender{addr}, &incrementAllocator{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Put(context.Background(), 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := batch.New(8, batch.Limits{MaxValueSize: 16, MaxBatchBytes: 16, MaxBatchMutations: 2, MaxBatchConditions: 2}, fakeBatchAppender{addr}, &incrementAllocator{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b2.ExpectRevision(1, 7); err != nil {
+		t.Fatal(err)
+	}
+	prepared1, err := b1.Prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared2, err := b2.Prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan response, 2)
+	coordinator.process([]request{
+		{ctx: context.Background(), batch: b1, prepared: prepared1, result: results},
+		{ctx: context.Background(), batch: b2, prepared: prepared2, result: results},
+	})
+	seen := make(map[base.BatchID]base.CommitSeq)
+	for i := 0; i < 2; i++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		seen[got.result.BatchID] = got.result.CommitSeq
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if log.calls != 1 || len(log.seqs) != 1 || len(log.seqs[0]) != 2 {
+		t.Fatalf("group calls=%d seqs=%v", log.calls, log.seqs)
+	}
+	if seen[7] == 0 || seen[8] == 0 || seen[7] >= seen[8] {
+		t.Fatalf("results=%v", seen)
 	}
 }
 

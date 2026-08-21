@@ -51,7 +51,9 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return failWithLog(err)
 	}
-	coordinator, err := commit.NewWithHook(recovered.NextCommitSeq, log, recovered.Mapping, activeRecordReader{active: active}, hook)
+	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, recovered.Mapping, activeRecordReader{active: active}, commit.Config{
+		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: uint64(cfg.MaxGroupBytes), MaxDelay: cfg.MaxGroupDelay,
+	}, hook)
 	if err != nil {
 		return failWithLog(err)
 	}
