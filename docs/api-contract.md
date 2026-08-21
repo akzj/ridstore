@@ -302,7 +302,7 @@ Close 返回成功不是恢复正确性的前提。所有 crash test 必须通�
 
 | 配置 | 默认值 | 硬约束 |
 |---|---:|---:|
-| SegmentSize | 1 GiB | `<= 4 GiB` |
+| SegmentSize | 256 MiB | `<= 4 GiB` |
 | MaxValueSize | 64 MiB | `< SegmentSize - metadata` |
 | MaxBatchBytes | 256 MiB | 可配置但受磁盘空间和恢复预算限制 |
 | MaxBatchMutations | 1,000,000 | Commit Descriptor 必须可分帧 |
