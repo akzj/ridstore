@@ -29,6 +29,10 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, err
 	}
+	manifest, err = radix.RecoverMappingRotation(cfg.Dir, manifest)
+	if err != nil {
+		return nil, err
+	}
 	catalogManager, err := catalog.New(cfg.Dir, manifest)
 	if err != nil {
 		return nil, err
@@ -56,10 +60,11 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, errors.Join(err, active.Close(), closeSealed())
 	}
-	persistentMapping, err := radix.Open(cfg.Dir, manifest, cfg.MappingCacheBytes)
+	persistentMapping, err := radix.Open(cfg.Dir, manifest, cfg.MappingCacheBytes, catalogManager)
 	if err != nil {
 		return nil, errors.Join(err, segments.Close())
 	}
+	persistentMapping.SetHook(hook)
 	fail := func(err error) (*Store, error) {
 		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
 	}
@@ -99,7 +104,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		return failWithLog(err)
 	}
 	store := &Store{
-		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, catalog: catalogManager, metrics: runtimeMetrics, log: log,
+		config: cfg, manifest: manifest, lock: lock, segments: segments, rotation: rotator, catalog: catalogManager, metrics: runtimeMetrics, hook: hook, log: log,
 		mapping: persistentMapping, coordinator: coordinator, idAllocator: idAllocator, batchAllocator: batchAllocator,
 		batches: make(map[BatchID]*Batch), statuses: make(map[BatchID]BatchStatus), slotNotify: make(chan struct{}, 1),
 		issuedBatchHigh:      recovered.ReservedBatchIDHighExclusive,

@@ -332,6 +332,53 @@ func TestCheckpointInstallsPersistentRootStatsAndReplayCut(t *testing.T) {
 	}
 }
 
+func TestCheckpointRotatesMappingSegments(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	cfg.MaxOpenBatches = 128
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]ID, 0, 80)
+	for i := 1; i <= 80; i++ {
+		id := ID(uint64(i) << 20)
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Put(context.Background(), id, []byte(fmt.Sprintf("sparse-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manifest := store.catalog.Snapshot()
+	if len(manifest.SealedMappingSegments) == 0 || manifest.ActiveMapSegmentID == 1 {
+		t.Fatalf("mapping rotation missing: %+v", manifest)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i, id := range ids {
+		value, err := store.Get(context.Background(), id)
+		if err != nil || string(value) != fmt.Sprintf("sparse-%d", i+1) {
+			t.Fatalf("id=%d value=%q error=%v", id, value, err)
+		}
+	}
+}
+
 func BenchmarkConcurrentDurableCommit(b *testing.B) {
 	cfg := smallTestConfig(filepath.Join(b.TempDir(), "store"))
 	cfg.MaxOpenBatches = 1024
