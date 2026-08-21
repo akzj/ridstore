@@ -72,6 +72,7 @@ type request struct {
 	prepared batch.Prepared
 	result   chan response
 	queuedAt time.Time
+	barrier  func() error
 }
 
 type response struct {
@@ -156,41 +157,59 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 
 func (c *Coordinator) run() {
 	defer close(c.done)
-	for first := range c.requests {
+	var pending *request
+	for {
+		var first request
+		if pending != nil {
+			first, pending = *pending, nil
+		} else {
+			var ok bool
+			first, ok = <-c.requests
+			if !ok {
+				return
+			}
+		}
+		if first.barrier != nil {
+			err := first.ctx.Err()
+			if err == nil {
+				err = first.barrier()
+			}
+			first.result <- response{err: err}
+			continue
+		}
 		group := []request{first}
 		groupBytes := requestBytes(first.prepared)
 		if c.config.MaxBatches > 1 {
-			group = c.collect(group, &groupBytes)
+			group, pending = c.collect(group, &groupBytes)
 		}
 		c.process(group)
 	}
 }
 
-func (c *Coordinator) collect(group []request, groupBytes *uint64) []request {
+func (c *Coordinator) collect(group []request, groupBytes *uint64) ([]request, *request) {
 	started := time.Now()
 	for len(group) < c.config.MaxBatches {
 		select {
 		case request, ok := <-c.requests:
 			if !ok {
-				return group
+				return group, nil
+			}
+			if request.barrier != nil {
+				return group, &request
 			}
 			bytes := requestBytes(request.prepared)
 			if wouldExceed(*groupBytes, bytes, c.config.MaxBytes) {
-				// Preserve FIFO without a secondary queue by processing the full
-				// prefix now and this oversized request as a one-item group.
-				c.process(group)
-				group = group[:0]
-				*groupBytes = 0
+				return group, &request
 			}
 			group = append(group, request)
 			*groupBytes += bytes
 			if *groupBytes >= c.config.MaxBytes {
-				return group
+				return group, nil
 			}
 		default:
 			wait := c.groupWait(group, started)
 			if wait <= 0 {
-				return group
+				return group, nil
 			}
 			timer := time.NewTimer(wait)
 			select {
@@ -199,22 +218,43 @@ func (c *Coordinator) collect(group []request, groupBytes *uint64) []request {
 					<-timer.C
 				}
 				if !ok {
-					return group
+					return group, nil
+				}
+				if request.barrier != nil {
+					return group, &request
 				}
 				bytes := requestBytes(request.prepared)
 				if wouldExceed(*groupBytes, bytes, c.config.MaxBytes) {
-					c.process(group)
-					group = group[:0]
-					*groupBytes = 0
+					return group, &request
 				}
 				group = append(group, request)
 				*groupBytes += bytes
 			case <-timer.C:
-				return group
+				return group, nil
 			}
 		}
 	}
-	return group
+	return group, nil
+}
+
+func (c *Coordinator) Barrier(ctx context.Context, barrier func() error) error {
+	if barrier == nil {
+		return base.ErrInvalidConfig
+	}
+	request := request{ctx: ctx, barrier: barrier, result: make(chan response, 1), queuedAt: time.Now()}
+	c.submitMu.Lock()
+	if c.closed {
+		c.submitMu.Unlock()
+		return base.ErrClosed
+	}
+	select {
+	case c.requests <- request:
+		c.submitMu.Unlock()
+	case <-ctx.Done():
+		c.submitMu.Unlock()
+		return ctx.Err()
+	}
+	return (<-request.result).err
 }
 
 func (c *Coordinator) groupWait(group []request, started time.Time) time.Duration {
