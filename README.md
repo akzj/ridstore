@@ -27,6 +27,7 @@ ridstore 只负责 Record，不内置 KV、Page、Blob、Stream、SQL 或业务�
 - [SegmentStats](docs/segment-stats-design.md)
 - [配置与 Backpressure](docs/runtime-config.md)
 - [验证计划](docs/verification-plan.md)
+- [Phase 5 全局审计与生产门禁](docs/phase-5-audit.md)
 - [实施计划](docs/implementation-plan.md)
 - [Backup/Restore](docs/backup-restore.md)
 - [Metrics Export](docs/metrics-export.md)
