@@ -354,6 +354,36 @@ func TestPublicConditionalConflictAndOpenBatchBackpressure(t *testing.T) {
 	}
 }
 
+func TestOpenBatchPinsAndReleasesReferencedSegments(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	store, err := Create(smallTestConfig(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	b, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := b.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put(context.Background(), id, []byte("pinned")); err != nil {
+		t.Fatal(err)
+	}
+	segmentID := store.segments.Active().SegmentID()
+	if refs := store.segments.OpenBatchRefs(segmentID); refs != 1 {
+		t.Fatalf("open refs=%d", refs)
+	}
+	if err := b.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if refs := store.segments.OpenBatchRefs(segmentID); refs != 0 {
+		t.Fatalf("released refs=%d", refs)
+	}
+}
+
 func TestCloseWakesBlockedBeginAndAbortsOpenBatch(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	cfg := smallTestConfig(dir)

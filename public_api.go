@@ -61,6 +61,28 @@ type Batch struct {
 	store *Store
 	inner *batchimpl.Batch
 	done  sync.Once
+	mu    sync.Mutex
+	pins  map[base.DataSegmentID]struct{}
+}
+
+type batchAppender struct {
+	batch *Batch
+}
+
+func (a batchAppender) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
+	addr, seq, written, err := a.batch.store.log.AppendPut(ctx, batchID, id, value)
+	if err != nil {
+		return addr, seq, written, err
+	}
+	if err := a.batch.pin(addr.SegmentID()); err != nil {
+		a.batch.store.setFault(err)
+		return 0, 0, written, err
+	}
+	return addr, seq, written, nil
+}
+
+func (a batchAppender) AppendAbort(ctx context.Context, batchID base.BatchID, payload storeformat.BatchAbortPayload) error {
+	return a.batch.store.log.AppendAbort(ctx, batchID, payload)
 }
 
 func (s *Store) Begin(ctx context.Context) (*Batch, error) {
@@ -103,16 +125,17 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		}
 		return nil, err
 	}
+	b := &Batch{store: s, pins: make(map[base.DataSegmentID]struct{})}
 	inner, err := batchimpl.New(base.BatchID(id), batchimpl.Limits{
 		MaxValueSize: uint64(s.config.MaxValueSize), MaxBatchBytes: uint64(s.config.MaxBatchBytes),
 		MaxBatchMutations: uint64(s.config.MaxBatchMutations), MaxBatchConditions: uint64(s.config.MaxBatchConditions),
-	}, s.log, s.idAllocator)
+	}, batchAppender{batch: b}, s.idAllocator)
 	if err != nil {
 		s.releaseOpenSlot()
 		s.ops.RUnlock()
 		return nil, err
 	}
-	b := &Batch{store: s, inner: inner}
+	b.inner = inner
 	s.mu.Lock()
 	s.batches[b.ID()] = b
 	if uint64(b.ID()) >= s.issuedBatchHigh {
@@ -315,6 +338,11 @@ func (b *Batch) Abort(ctx context.Context) error {
 func (b *Batch) finish(status BatchStatus) {
 	b.done.Do(func() {
 		s := b.store
+		for _, id := range b.takePins() {
+			if err := s.segments.UnpinOpenBatch(id); err != nil {
+				s.setFault(err)
+			}
+		}
 		s.mu.Lock()
 		delete(s.batches, b.ID())
 		s.statuses[b.ID()] = status
@@ -324,6 +352,30 @@ func (b *Batch) finish(status BatchStatus) {
 		s.signalSlotLocked()
 		s.mu.Unlock()
 	})
+}
+
+func (b *Batch) pin(id base.DataSegmentID) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, exists := b.pins[id]; exists {
+		return nil
+	}
+	if err := b.store.segments.PinOpenBatch(id); err != nil {
+		return err
+	}
+	b.pins[id] = struct{}{}
+	return nil
+}
+
+func (b *Batch) takePins() []base.DataSegmentID {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ids := make([]base.DataSegmentID, 0, len(b.pins))
+	for id := range b.pins {
+		ids = append(ids, id)
+	}
+	b.pins = nil
+	return ids
 }
 
 func (s *Store) releaseOpenSlot() {
