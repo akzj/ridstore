@@ -31,6 +31,7 @@
 - Store UUID/FileID 不匹配；
 - full uint64 ID 和边界 VAddr；
 - PutRecord 固定 64-byte Header、OriginBatchID revision、空 Value 和 Relocation revision preservation；
+- SparseBitmap/Dense512 Node golden bytes、EntryCount/NodeSize/bitmap rank 边界；
 - fuzz 所有不可信 decoder。
 
 ### 2.2 模型属性测试
@@ -53,6 +54,8 @@ map[ID]{value, revision} + atomic conditional batch
 - GC 前后逻辑状态相同；
 - Recovery 前后逻辑状态相同；
 - Mapping Checkpoint 前后状态相同；
+- 同一逻辑 Node 在 SparseBitmap/Dense512 编码下 Lookup 结果相同；
+- 随机稀疏完整 uint64 ID 的 Mapping bytes 不退化为每个 Leaf 固定 4160 bytes；
 - Blind Put 按 CommitSeq Last-Writer-Wins；
 - ExpectRevision/ExpectAbsent 全部满足才提交；
 - 任一条件冲突时所有 mutation 零生效且不产生 Seal；
@@ -138,6 +141,8 @@ Failpoint 必须位于真实 write/fsync/rename/dir sync/publish 操作两侧。
 - 新 Root 发布后旧 Cache View 仍在读；
 - Checkpoint 失败时 Delta 不丢失；
 - Delete 后空 Leaf/Internal 路径剪枝；
+- Sparse→Dense、Dense→Sparse 阈值两侧和 occupancy 1/503/504/512；
+- 变长 Node 跨 Mapping Segment 尾部时先 rotation，不允许跨文件写 Node；
 - Open 只加载 Root/上层，不全量加载；
 - Delta hard limit backpressure。
 
@@ -165,6 +170,7 @@ Failpoint 必须位于真实 write/fsync/rename/dir sync/publish 操作两侧。
 - Commit Descriptor Entry；
 - Segment Footer；
 - Mapping Node Slot/CRC；
+- Sparse bitmap、EntryCount、NodeSize、packed value 顺序和非法 Encoding；
 - Manifest/CURRENT；
 - INITIALIZING/ROTATION/Maintenance Journal。
 
@@ -221,6 +227,8 @@ Put/overwrite/delete/abort
 - mixed 50/50；
 - hot Mapping read；
 - cold Mapping read，dataset > cache；
+- 连续高 occupancy 与随机稀疏 ID 的 Mapping bytes/Lookup；
+- 大量 Delete 后 Dense→Sparse 的空间收敛；
 - foreground + checkpoint；
 - foreground + GC；
 - 不同 live ratio 稳定态。

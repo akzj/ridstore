@@ -302,32 +302,66 @@ Active Segment 没有 Footer。Open 可以截断 Active 尾部最后一个不完
 
 ## 11. Mapping Node 格式
 
-Persistent Mapping 使用 9-bit stride、最多 8 层的 copy-on-write radix。每个 Node 保存 512 个 64-bit Slot，Payload 固定 4096 bytes。
+Persistent Mapping 使用 9-bit stride、最多 8 层的 copy-on-write radix。每个 Node 表示 512 个逻辑 Slot，但磁盘格式根据 occupancy 使用 SparseBitmap 或 Dense512 编码，避免把空 Slot 全量写入文件。
 
-Mapping Node 由 64-byte Node Header + 4096-byte Slots 构成，8 字节对齐：
+两种编码共享固定 64-byte Node Header：
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 8 | Magic：`RIDNODE1` |
 | 8 | 2 | MajorVersion |
 | 10 | 1 | Level：0=Leaf，1..7=Internal |
-| 11 | 1 | Flags |
-| 12 | 4 | NodeSize，4160 |
+| 11 | 1 | Encoding：1=SparseBitmap，2=Dense512 |
+| 12 | 4 | NodeSize，含 Header 和 Payload，8 字节对齐 |
 | 16 | 8 | NodeSeq |
 | 24 | 8 | Prefix |
 | 32 | 8 | CoveredCommitSeq |
-| 40 | 4 | SlotsCRC32C |
-| 44 | 4 | HeaderCRC32C |
-| 48 | 16 | Reserved |
-| 64 | 4096 | `uint64 Slots[512]` |
+| 40 | 2 | EntryCount，1..512 |
+| 42 | 2 | Reserved |
+| 44 | 4 | PayloadCRC32C |
+| 48 | 4 | HeaderCRC32C，计算时本字段置 0 |
+| 52 | 4 | Flags |
+| 56 | 8 | Reserved |
 
-Leaf Slot 保存 Data VAddr；Internal Slot 保存 MapAddr；0 表示不存在。
+空 Node 不落盘，由父 Slot=0 表示。
 
-完整 uint64 ID 使用 8 层：最高层只使用 ID 的最高 1 bit，其余层依次使用 9 bit。实现必须拒绝不符合 Prefix/Level 的 Node，防止错误指针形成跨树引用。
+### 11.1 SparseBitmap 编码
 
-### 11.1 Mapping Segment 封口
+Payload：
 
-Mapping Node 只能顺序 append 到当前 `.active` Mapping Segment。文件达到阈值时追加固定 4096-byte Footer，fsync 后 rename 为 `.seg` 并 fsync `mapping` 目录。Footer 格式：
+```text
+uint64 OccupancyBitmap[8]  // 512 bits，按 Slot 0..511
+uint64 Values[EntryCount]  // 只保存非零值，按 Slot 升序紧密排列
+```
+
+`NodeSize = 64 + 64 + EntryCount*8`。EntryCount 必须等于 bitmap popcount，Values 不得包含 0。查找 Slot：
+
+```text
+word = slot / 64
+bit  = slot % 64             // uint64 word 的 LSB=bit 0
+if bitmap[slot] == 0:
+    return 0
+index = popcount(bitmap bits before slot)
+return Values[index]
+```
+
+单 Entry Node 为 136 bytes，而不是 4160 bytes。
+
+### 11.2 Dense512 编码
+
+Payload 固定为 `uint64 Slots[512]`，NodeSize=4160。EntryCount 必须等于非零 Slot 数。Dense512 适合高 occupancy Node，避免 bitmap rank 和间接寻址。
+
+Leaf value 保存 Data VAddr；Internal value 保存 MapAddr。两种编码的逻辑 Slot 语义完全相同，0 都表示不存在。
+
+Checkpoint Builder 第一版选择编码后 bytes 更小的形式：`EntryCount < 504` 使用 SparseBitmap，达到或超过 504 使用 Dense512（相等时选 Dense）。这是写入策略而不是读取兼容约束；Decoder 必须接受任意合法 occupancy 的两种编码。后续只有在基准证明 CPU/Cache 收益足以覆盖额外磁盘字节时，才可以调整写入阈值，且不需要修改格式版本。
+
+Decoder 必须验证 Encoding、NodeSize、EntryCount、bitmap 尾部、Payload CRC、Header CRC、Prefix/Level 和 Segment 边界。SparseBitmap NodeSize 必须与 EntryCount 精确一致；Dense512 NodeSize 必须为 4160。
+
+完整 uint64 ID 使用 8 层：最高层只使用 ID 的最高 1 bit，其余层依次使用 9 bit。Level 7 的 Slot/bitmap bit 2..511 必须为 0。实现必须拒绝不符合 Prefix/Level 的 Node，防止错误指针形成跨树引用。
+
+### 11.3 Mapping Segment 封口
+
+Mapping Node 只能完整地顺序 append 到当前 `.active` Mapping Segment，不允许跨 Segment。若 `NodeSize + FooterSize` 无法放入剩余空间，必须先 rotation，再把整个 Node 写入新 Segment。文件封口时追加固定 4096-byte Footer，fsync 后 rename 为 `.seg` 并 fsync `mapping` 目录。Footer 格式：
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -341,7 +375,7 @@ Mapping Node 只能顺序 append 到当前 `.active` Mapping Segment。文件达
 | 48 | 4 | FooterCRC32C |
 | 52 | 4044 | Reserved |
 
-Active Mapping Segment 没有 Footer。Open 只允许截断 Active 尾部不完整且尚未被当前 Manifest Root 引用的 Node；Sealed Mapping Segment 的边界、Node 或 Footer 损坏均为 corruption。任何 Root 可达 Node 都必须位于已 fsync 的有效范围内。
+Mapping Segment 中的 Node 变长排列，通过已验证的 NodeSize 定位下一 Node。Active Mapping Segment 没有 Footer。Open 只允许截断 Active 尾部不完整且尚未被当前 Manifest Root 引用的 Node；Sealed Mapping Segment 的边界、Node 或 Footer 损坏均为 corruption。任何 Root 可达 Node 都必须位于已 fsync 的有效范围内。
 
 ## 12. Mapping Manifest Root
 
