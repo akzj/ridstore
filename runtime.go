@@ -137,6 +137,9 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 			store.statuses[id] = BatchStatus{BatchID: id, State: BatchStateAborted}
 		}
 	}
+	if err := store.resumeDataGC(); err != nil {
+		return nil, errors.Join(err, store.Close())
+	}
 	if charged, _ := persistentMapping.DeltaBytes(); charged >= uint64(cfg.DeltaSoftLimitBytes) {
 		store.requestCheckpoint()
 	}

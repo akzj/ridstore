@@ -1,6 +1,7 @@
 package maintenance
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -31,5 +32,24 @@ func TestInstallLoadRemove(t *testing.T) {
 	}
 	if _, found, err := Load(root); err != nil || found {
 		t.Fatalf("found=%v error=%v", found, err)
+	}
+}
+
+func TestInstallRejectsDifferentConcurrentOperation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "journal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journal := storeformat.MaintenanceJournal{
+		Generation: 2, StoreUUID: base.StoreUUID{1}, OperationID: [16]byte{1},
+		OperationType: storeformat.MaintenanceDataGC, Phase: 1, OldManifestGeneration: 1,
+	}
+	if err := Install(root, journal); err != nil {
+		t.Fatal(err)
+	}
+	other := journal
+	other.OperationID = [16]byte{2}
+	if err := Install(root, other); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("error=%v", err)
 	}
 }

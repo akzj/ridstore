@@ -18,6 +18,7 @@ import (
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/initialize"
+	"github.com/akzj/ridstore/internal/maintenance"
 	"github.com/akzj/ridstore/internal/manifest"
 	"github.com/akzj/ridstore/internal/mapping/radix"
 	"github.com/akzj/ridstore/internal/rotation"
@@ -36,7 +37,104 @@ const (
 	checkpointCrashChildEnv = "RIDSTORE_CHECKPOINT_CRASH_CHILD"
 	checkpointCrashDirEnv   = "RIDSTORE_CHECKPOINT_CRASH_DIR"
 	checkpointCrashPointEnv = "RIDSTORE_CHECKPOINT_CRASH_POINT"
+	dataGCCrashChildEnv     = "RIDSTORE_DATA_GC_CRASH_CHILD"
+	dataGCCrashDirEnv       = "RIDSTORE_DATA_GC_CRASH_DIR"
+	dataGCCrashPointEnv     = "RIDSTORE_DATA_GC_CRASH_POINT"
 )
+
+func TestDataGCProcessCrashMatrix(t *testing.T) {
+	points := []failpoint.Point{
+		pointDataGCPrepared, pointDataGCCopying, pointDataGCRelocations, pointDataGCCheckpoint,
+		pointDataGCRetired, pointDataGCManifestRemoved, pointDataGCTrashed, pointDataGCDeleted,
+	}
+	for _, point := range points {
+		point := point
+		t.Run(string(point), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "store")
+			killDataGCChildAt(t, dir, point)
+			cfg := smallTestConfig(dir)
+			cfg.SegmentSize = 16 << 10
+			store, err := Open(cfg)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer store.Close()
+			record, err := store.GetRecord(context.Background(), 1)
+			if err != nil || string(record.Value) != "stable" || record.Revision != 1 {
+				t.Fatalf("record=%+v error=%v", record, err)
+			}
+			if _, found, err := maintenance.Load(dir); err != nil || found {
+				t.Fatalf("maintenance journal found=%v error=%v", found, err)
+			}
+		})
+	}
+}
+
+func killDataGCChildAt(t *testing.T, dir string, point failpoint.Point) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDataGCCrashChild$", "-test.count=1")
+	cmd.Env = append(os.Environ(), dataGCCrashChildEnv+"=1", dataGCCrashDirEnv+"="+dir, dataGCCrashPointEnv+"="+string(point))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			ready <- scanner.Text()
+			return
+		}
+		ready <- ""
+	}()
+	want := "RIDSTORE_FAILPOINT_READY " + string(point)
+	select {
+	case line := <-ready:
+		if line != want {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("child did not reach failpoint: line=%q stderr=%s", line, stderr.String())
+		}
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("timeout waiting for %s: stderr=%s", point, stderr.String())
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("SIGKILL child exited successfully")
+	}
+}
+
+func TestDataGCCrashChild(t *testing.T) {
+	if os.Getenv(dataGCCrashChildEnv) != "1" {
+		t.Skip("subprocess helper")
+	}
+	dir := os.Getenv(dataGCCrashDirEnv)
+	cfg := smallTestConfig(dir)
+	cfg.SegmentSize = 16 << 10
+	store, _, _ := prepareDataGCStore(t, cfg)
+	target := failpoint.Point(os.Getenv(dataGCCrashPointEnv))
+	store.hook = failpoint.Func(func(point failpoint.Point) error {
+		if point != target {
+			return nil
+		}
+		fmt.Printf("RIDSTORE_FAILPOINT_READY %s\n", point)
+		_ = os.Stdout.Sync()
+		select {}
+	})
+	if _, err := store.CompactData(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("data GC failpoint %s was not reached", target)
+}
 
 func TestCheckpointProcessCrashMatrix(t *testing.T) {
 	points := []failpoint.Point{
