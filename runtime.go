@@ -61,7 +61,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, errors.Join(err, active.Close(), closeSealed())
 	}
-	persistentMapping, err := radix.Open(cfg.Dir, manifest, cfg.MappingCacheBytes, catalogManager)
+	persistentMapping, err := radix.OpenWithHook(cfg.Dir, manifest, cfg.MappingCacheBytes, hook, catalogManager)
 	if err != nil {
 		return nil, errors.Join(err, segments.Close())
 	}
@@ -71,7 +71,6 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err := persistentMapping.SetCheckpointMemory(cfg.CheckpointMemoryBytes); err != nil {
 		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
 	}
-	persistentMapping.SetHook(hook)
 	fail := func(err error) (*Store, error) {
 		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
 	}

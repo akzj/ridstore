@@ -128,6 +128,10 @@ func createWithOptions(cfg Config, opts initialize.Options) (*Store, error) {
 // Open recovers and exclusively opens an existing Store. It never creates a
 // missing data directory or silently creates an empty Store.
 func Open(cfg Config) (*Store, error) {
+	return openWithHook(cfg, nil)
+}
+
+func openWithHook(cfg Config, hook failpoint.Hook) (*Store, error) {
 	if err := normalizeDir(&cfg); err != nil {
 		return nil, err
 	}
@@ -152,7 +156,7 @@ func Open(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}
-	store, err := buildStore(normalized, m, lock, nil)
+	store, err := buildStore(normalized, m, lock, hook)
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
 	}

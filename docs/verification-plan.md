@@ -112,7 +112,9 @@ Rotation Journal 对 install 的 temp-remove/write/file-sync/rename/dir-sync 和
 
 Maintenance Journal 对同一组 install/remove syscall 注入 `EIO/ENOSPC/EACCES`，并额外覆盖 Data GC phase 1–7 的 directory-sync 失败。GC checkpoint Manifest durable 前允许取消 cleaning 并删除 Journal；该清理任一 syscall 失败时 Store 必须 fail closed。Manifest durable 后不得因 phase-4 Journal publication 失败回滚：fresh Open 以 MaintenanceGeneration、source 不在精确 SegmentStats、ReplayStart 越过 source 三项共同证据恢复 phase 4 并继续协议。只有 MaintenanceGeneration 而 source 仍为 live 的情况属于嵌套 Mapping rotation，必须撤销而不能删除 source。恢复后 `.MAINTENANCE.tmp` 不得残留且 offline Verify 必须 clean；非 regular/symlink temp 必须拒绝。
 
-Active Mapping Checkpoint 对 Node `WriteAt` 和最终 Active file sync 注入 `EIO/ENOSPC/EACCES`。任一错误必须 poison `nodeStore`，后续 append/sync 返回 `ErrActivePoisoned`；Store 保留原始 cause 并 fail closed。fresh Open 只能采用旧 Manifest Root，扫描或截断未发布 tail，再由 Commit Log replay 重建 overlay；随后新 Checkpoint 和 offline Verify 必须成功。该矩阵不覆盖 Open tail truncate/sync、Mapping rotation 或 Mapping GC writer。
+Active Mapping Checkpoint 对 Node `WriteAt` 和最终 Active file sync 注入 `EIO/ENOSPC/EACCES`。任一错误必须 poison `nodeStore`，后续 append/sync 返回 `ErrActivePoisoned`；Store 保留原始 cause 并 fail closed。fresh Open 只能采用旧 Manifest Root，扫描或截断未发布 tail，再由 Commit Log replay 重建 overlay；随后新 Checkpoint 和 offline Verify 必须成功。该矩阵不覆盖 Mapping rotation 或 Mapping GC writer。
+
+Active Mapping Open tail repair 对 truncate 与随后的 file sync 注入相同三类错误，失败 Open 必须释放 writer lease并允许无 hook 重试。任何 truncate 前必须以扫描得到的 `validEnd` 完整遍历当前 Manifest Root；只有所有可达 Node 都在有效区域内才可截断。若 Root 或子 Node 指向损坏 tail，Open 返回 corruption 且保持文件大小不变，避免先破坏取证再失败。该矩阵仍不覆盖 Mapping rotation/GC。
 
 ## 4. Commit Crash Matrix
 

@@ -65,6 +65,10 @@ func (c *Checkpoint) EntryCount() uint64 {
 var _ api.Mapping = (*Mapping)(nil)
 
 func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs ...*catalog.Manager) (*Mapping, error) {
+	return OpenWithHook(root, manifest, cacheBytes, nil, catalogs...)
+}
+
+func OpenWithHook(root string, manifest storeformat.Manifest, cacheBytes int64, hook failpoint.Hook, catalogs ...*catalog.Manager) (*Mapping, error) {
 	if cacheBytes <= 0 {
 		return nil, base.ErrInvalidConfig
 	}
@@ -72,7 +76,7 @@ func Open(root string, manifest storeformat.Manifest, cacheBytes int64, catalogs
 	if len(catalogs) != 0 {
 		catalogManager = catalogs[0]
 	}
-	store, err := openNodeStore(root, manifest, catalogManager)
+	store, err := openNodeStoreWithHook(root, manifest, catalogManager, hook)
 	if err != nil {
 		return nil, err
 	}
