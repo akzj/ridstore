@@ -338,9 +338,7 @@ Mapping GC 不改变 ID->Data VAddr 内容。发生错误时保留旧 Root；不
 
 Mapping GC 与普通 Mapping Checkpoint 不能并发构建并互相安装过期 Root。第一版由 checkpoint coordinator 串行执行两者；最终 Manifest 仍通过全局安装串行器和 generation CAS 与 Data GC、Segment rotation 合并。
 
-MappingGC 的 Maintenance Journal phase 固定为：Prepared、Copied、MappingFilesDurable、ManifestInstalled、OldFilesTrashed、Deleted。ManifestInstalled 前旧文件不能移动；安装后先等待旧 Root/Cache pin 清零，再进入 trash/delete。
-
-第一版可以暂缓自动 Mapping GC，但必须暴露 unreachable mapping bytes，且长期 soak 前必须实现空间收敛。
+MappingGC 的 Maintenance Journal phase 固定为：Prepared、Copied、MappingFilesDurable、ManifestInstalled、OldFilesTrashed、Deleted。ManifestInstalled 前旧文件不能移动；安装后先等待旧 Root reader pin 清零，再进入 trash/delete。`CompactMapping` 提供显式触发，`MappingSpaceUsage` 提供 exact encoded reachable/unreachable bytes；自动调度可以基于该统计后续增加，但长期 soak 已能显式验证空间收敛。
 
 ## 14. 内存与磁盘下界
 

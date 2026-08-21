@@ -42,6 +42,8 @@ func TestCheckpointProcessCrashMatrix(t *testing.T) {
 	points := []failpoint.Point{
 		radix.PointRotationPrepared, radix.PointRotationOldSealed, radix.PointRotationNewCreated, radix.PointRotationManifestInstalled,
 		pointCheckpointMappingSynced, pointCheckpointManifestInstalled, pointCheckpointRuntimePublished,
+		radix.PointMappingGCPrepared, radix.PointMappingGCCopying, radix.PointMappingGCCopied, radix.PointMappingGCFilesDurable,
+		radix.PointMappingGCManifestInstalled, radix.PointMappingGCRuntimeInstalled, radix.PointMappingGCTrashed,
 	}
 	for _, point := range points {
 		point := point
@@ -145,6 +147,12 @@ func TestCheckpointCrashChild(t *testing.T) {
 	}
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if target == radix.PointMappingGCPrepared || target == radix.PointMappingGCCopying || target == radix.PointMappingGCCopied || target == radix.PointMappingGCFilesDurable ||
+		target == radix.PointMappingGCManifestInstalled || target == radix.PointMappingGCRuntimeInstalled || target == radix.PointMappingGCTrashed {
+		if err := store.CompactMapping(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Fatalf("checkpoint failpoint %s was not reached", target)
 }

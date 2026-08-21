@@ -139,8 +139,14 @@ func (s *nodeStore) rotateLocked() error {
 
 func RecoverMappingRotation(root string, current storeformat.Manifest) (storeformat.Manifest, error) {
 	journal, found, err := loadMaintenanceJournal(root)
-	if err != nil || !found || journal.OperationType != storeformat.MaintenanceMappingCheckpoint {
+	if err != nil || !found {
 		return current, err
+	}
+	if journal.OperationType == storeformat.MaintenanceMappingGC {
+		return recoverMappingGC(root, current, journal)
+	}
+	if journal.OperationType != storeformat.MaintenanceMappingCheckpoint {
+		return current, nil
 	}
 	if journal.StoreUUID != current.StoreUUID || len(journal.SourceFiles) != 1 || len(journal.DestinationFiles) != 1 {
 		return storeformat.Manifest{}, base.ErrCorrupt

@@ -75,6 +75,41 @@ func (s *Store) Metrics() Metrics {
 	return result
 }
 
+type MappingSpace struct {
+	TotalBytes       uint64
+	ReachableBytes   uint64
+	UnreachableBytes uint64
+}
+
+// MappingSpaceUsage walks the durable Mapping Root and reports exact encoded
+// Node bytes. It is an explicit maintenance operation rather than a cheap
+// Metrics snapshot.
+func (s *Store) MappingSpaceUsage(ctx context.Context) (MappingSpace, error) {
+	if s == nil {
+		return MappingSpace{}, base.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return MappingSpace{}, err
+	}
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	s.ops.RLock()
+	defer s.ops.RUnlock()
+	if err := s.checkAvailable(); err != nil {
+		return MappingSpace{}, err
+	}
+	total, reachable, err := s.mapping.SpaceUsage(ctx)
+	if err != nil {
+		return MappingSpace{}, err
+	}
+	result := MappingSpace{TotalBytes: total, ReachableBytes: reachable}
+	if total < reachable {
+		return MappingSpace{}, fmt.Errorf("mapping reachable bytes exceed total bytes: %w", base.ErrCorrupt)
+	}
+	result.UnreachableBytes = total - reachable
+	return result, nil
+}
+
 type Batch struct {
 	store *Store
 	inner *batchimpl.Batch
@@ -366,6 +401,36 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	s.mu.Lock()
 	s.manifest = installed
 	s.recoveryAbortedStart = installed.IssuedBatchIDHighExclusiveAtCut
+	s.mu.Unlock()
+	return nil
+}
+
+// CompactMapping rewrites the durable Mapping tree into a fresh file
+// generation and reclaims every older Mapping Segment. User commits may
+// continue into the active Delta while the immutable Root is copied.
+func (s *Store) CompactMapping(ctx context.Context) error {
+	if s == nil {
+		return base.ErrClosed
+	}
+	if err := s.Checkpoint(ctx); err != nil {
+		return err
+	}
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	s.ops.RLock()
+	defer s.ops.RUnlock()
+	if err := s.checkAvailable(); err != nil {
+		return err
+	}
+	installed, err := s.mapping.Compact(ctx)
+	if err != nil {
+		if !errors.Is(err, base.ErrConflict) {
+			s.setFault(err)
+		}
+		return err
+	}
+	s.mu.Lock()
+	s.manifest = installed
 	s.mu.Unlock()
 	return nil
 }
