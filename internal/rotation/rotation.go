@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/manifest"
 	"github.com/akzj/ridstore/internal/segment"
@@ -22,13 +23,21 @@ type Manager struct {
 	manifest   storeformat.Manifest
 	registry   *segment.Registry
 	maxPayload uint64
+	hook       failpoint.Hook
 }
 
-func NewManager(root string, current storeformat.Manifest, registry *segment.Registry, maxPayload uint64) (*Manager, error) {
+const (
+	PointPrepared          failpoint.Point = "rotation.prepared"
+	PointOldSealed         failpoint.Point = "rotation.old-sealed"
+	PointNewCreated        failpoint.Point = "rotation.new-created"
+	PointManifestInstalled failpoint.Point = "rotation.manifest-installed"
+)
+
+func NewManager(root string, current storeformat.Manifest, registry *segment.Registry, maxPayload uint64, hook failpoint.Hook) (*Manager, error) {
 	if root == "" || current.Generation == 0 || registry == nil || maxPayload == 0 {
 		return nil, base.ErrInvalidConfig
 	}
-	return &Manager{root: root, manifest: current, registry: registry, maxPayload: maxPayload}, nil
+	return &Manager{root: root, manifest: current, registry: registry, maxPayload: maxPayload, hook: hook}, nil
 }
 
 // Rotate runs under the append sequencer. No frame can be allocated between
@@ -50,8 +59,14 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	if err := installJournal(m.root, journal); err != nil {
 		return nil, err
 	}
+	if err := failpoint.Hit(m.hook, PointPrepared); err != nil {
+		return nil, err
+	}
 	summary, err := active.Seal(nextFrameSeq)
 	if err != nil {
+		return nil, err
+	}
+	if err := failpoint.Hit(m.hook, PointOldSealed); err != nil {
 		return nil, err
 	}
 	journal.Phase = 2
@@ -66,6 +81,9 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 	if err != nil {
 		return nil, err
 	}
+	if err := failpoint.Hit(m.hook, PointNewCreated); err != nil {
+		return nil, errors.Join(err, newActive.Close())
+	}
 	journal.Phase = 4
 	if err := installJournal(m.root, journal); err != nil {
 		return nil, errors.Join(err, newActive.Close())
@@ -79,6 +97,9 @@ func (m *Manager) Rotate(active *segment.ActiveData, nextFrameSeq base.FrameSeq)
 		return nil, errors.Join(err, sealed.Close(), newActive.Close())
 	}
 	if err := (manifest.Installer{Dir: m.root}).Install(nextManifest); err != nil {
+		return nil, errors.Join(err, sealed.Close(), newActive.Close())
+	}
+	if err := failpoint.Hit(m.hook, PointManifestInstalled); err != nil {
 		return nil, errors.Join(err, sealed.Close(), newActive.Close())
 	}
 	journal.Phase = 5
