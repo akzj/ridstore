@@ -42,11 +42,12 @@ type Result struct {
 }
 
 type Config struct {
-	QueueDepth int
-	MaxBatches int
-	MaxBytes   uint64
-	MaxDelay   time.Duration
-	Metrics    *metrics.Runtime
+	QueueDepth       int
+	MaxBatches       int
+	MaxBytes         uint64
+	MaxDelay         time.Duration
+	Metrics          *metrics.Runtime
+	OnDeltaSoftLimit func()
 }
 
 type Coordinator struct {
@@ -67,12 +68,14 @@ type Coordinator struct {
 }
 
 type request struct {
-	ctx      context.Context
-	batch    *batch.Batch
-	prepared batch.Prepared
-	result   chan response
-	queuedAt time.Time
-	barrier  func() error
+	ctx         context.Context
+	batch       *batch.Batch
+	prepared    batch.Prepared
+	result      chan response
+	queuedAt    time.Time
+	barrier     func() error
+	reservation api.DeltaReservation
+	softLimit   bool
 }
 
 type response struct {
@@ -131,11 +134,21 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 		_ = b.MarkAborted()
 		return Result{}, err
 	}
-	request := request{ctx: ctx, batch: b, prepared: prepared, result: make(chan response, 1), queuedAt: time.Now()}
+	var reservation api.DeltaReservation
+	var soft bool
+	if budget, ok := c.mapping.(api.DeltaBudget); ok {
+		reservation, soft, err = budget.ReserveDelta(ctx, uint64(len(prepared.Mutations)))
+		if err != nil {
+			_ = b.MarkAborted()
+			return Result{}, err
+		}
+	}
+	request := request{ctx: ctx, batch: b, prepared: prepared, result: make(chan response, 1), queuedAt: time.Now(), reservation: reservation, softLimit: soft}
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()
 		_ = b.MarkAborted()
+		releaseReservation(request)
 		return Result{}, base.ErrClosed
 	}
 	select {
@@ -144,9 +157,13 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 			c.config.Metrics.CommitQueued()
 		}
 		c.submitMu.Unlock()
+		if request.softLimit && c.config.OnDeltaSoftLimit != nil {
+			c.config.OnDeltaSoftLimit()
+		}
 	case <-ctx.Done():
 		c.submitMu.Unlock()
 		_ = b.MarkAborted()
+		releaseReservation(request)
 		return Result{}, ctx.Err()
 	}
 	// Once admitted to the queue the caller joins the result. Returning early
@@ -289,6 +306,7 @@ func (c *Coordinator) process(group []request) {
 		for _, request := range group {
 			_ = request.batch.MarkAborted()
 			c.recordAborted()
+			releaseReservation(request)
 			request.result <- response{err: errors.Join(base.ErrReadOnly, fault)}
 		}
 		return
@@ -302,18 +320,21 @@ func (c *Coordinator) process(group []request) {
 		if err := request.ctx.Err(); err != nil {
 			_ = request.batch.MarkAborted()
 			c.recordAborted()
+			releaseReservation(request)
 			request.result <- response{err: err}
 			continue
 		}
 		if next == base.CommitSeq(math.MaxUint64) {
 			_ = request.batch.MarkAborted()
 			c.recordAborted()
+			releaseReservation(request)
 			request.result <- response{err: base.ErrGenerationExhausted}
 			continue
 		}
 		if err := c.validatePutRecords(request.prepared); err != nil {
 			_ = request.batch.MarkAborted()
 			c.recordAborted()
+			releaseReservation(request)
 			c.fail(err)
 			request.result <- response{err: err}
 			c.rejectTail(group[i+1:], err)
@@ -323,6 +344,7 @@ func (c *Coordinator) process(group []request) {
 		if err != nil {
 			_ = request.batch.MarkAborted()
 			c.recordAborted()
+			releaseReservation(request)
 			c.fail(err)
 			request.result <- response{err: err}
 			c.rejectTail(group[i+1:], err)
@@ -330,6 +352,7 @@ func (c *Coordinator) process(group []request) {
 		}
 		if conflict {
 			_ = request.batch.MarkAborted()
+			releaseReservation(request)
 			if c.config.Metrics != nil {
 				c.config.Metrics.Conflict()
 			}
@@ -402,6 +425,7 @@ func (c *Coordinator) handleAppendError(admitted []admittedRequest, results []ap
 		c.fail(err)
 	}
 	for i, item := range admitted {
+		releaseReservation(item.request)
 		sealStarted := i < len(results) && results[i].SealStarted
 		if sealStarted {
 			_ = item.request.batch.MarkCommitUnknown()
@@ -417,7 +441,14 @@ func (c *Coordinator) handleAppendError(admitted []admittedRequest, results []ap
 
 func (c *Coordinator) publish(item admittedRequest) error {
 	changes := changesFor(item.request.prepared)
-	applyResult, err := c.mapping.Apply(item.seq, api.ApplyUserCommit, changes)
+	var applyResult api.ApplyResult
+	var err error
+	if budget, ok := c.mapping.(api.DeltaBudget); ok {
+		applyResult, err = budget.ApplyReserved(item.request.reservation, item.seq, api.ApplyUserCommit, changes)
+		item.request.reservation = nil
+	} else {
+		applyResult, err = c.mapping.Apply(item.seq, api.ApplyUserCommit, changes)
+	}
 	if err != nil || applyResult.Applied != uint32(len(changes)) || applyResult.Skipped != 0 {
 		if err == nil {
 			err = fmt.Errorf("mapping applied %d/%d changes: %w", applyResult.Applied, len(changes), base.ErrCorrupt)
@@ -537,6 +568,7 @@ func wouldExceed(current, added, limit uint64) bool {
 
 func (c *Coordinator) rejectTail(requests []request, cause error) {
 	for _, request := range requests {
+		releaseReservation(request)
 		_ = request.batch.MarkAborted()
 		c.recordAborted()
 		request.result <- response{err: errors.Join(base.ErrReadOnly, cause)}
@@ -545,9 +577,16 @@ func (c *Coordinator) rejectTail(requests []request, cause error) {
 
 func (c *Coordinator) rejectDurableTail(items []admittedRequest, cause error) {
 	for _, item := range items {
+		releaseReservation(item.request)
 		_ = item.request.batch.MarkCommitUnknown()
 		c.recordUnknown()
 		item.request.result <- response{err: errors.Join(base.ErrCommitUnknown, cause)}
+	}
+}
+
+func releaseReservation(request request) {
+	if request.reservation != nil {
+		request.reservation.Release()
 	}
 }
 

@@ -65,8 +65,10 @@ type Store struct {
 	recoveryAbortedStart uint64
 	recoveryAbortedEnd   uint64
 
-	closed bool
-	fault  error
+	closed            bool
+	fault             error
+	checkpointPending bool
+	checkpointErr     error
 }
 
 // Create initializes and exclusively opens a new Store. Interrupted

@@ -47,6 +47,8 @@ type Metrics struct {
 	Committed, Aborted, Conflicts, CommitUnknown uint64
 	QueueWaitNanos, ValidationNanos              uint64
 	WriteSyncNanos, PublishNanos                 uint64
+	DeltaChargedBytes, DeltaReservedBytes        uint64
+	DeltaSoftLimitBytes, DeltaHardLimitBytes     uint64
 }
 
 const (
@@ -60,12 +62,17 @@ func (s *Store) Metrics() Metrics {
 		return Metrics{}
 	}
 	snapshot := s.metrics.Snapshot()
-	return Metrics{
+	result := Metrics{
 		CommitQueued: snapshot.CommitQueued, CommitGroups: snapshot.CommitGroups, GroupBatches: snapshot.GroupBatches,
 		Committed: snapshot.Committed, Aborted: snapshot.Aborted, Conflicts: snapshot.Conflicts, CommitUnknown: snapshot.CommitUnknown,
 		QueueWaitNanos: snapshot.QueueWaitNanos, ValidationNanos: snapshot.ValidationNanos,
 		WriteSyncNanos: snapshot.WriteSyncNanos, PublishNanos: snapshot.PublishNanos,
+		DeltaSoftLimitBytes: uint64(s.config.DeltaSoftLimitBytes), DeltaHardLimitBytes: uint64(s.config.DeltaHardLimitBytes),
 	}
+	if s.mapping != nil {
+		result.DeltaChargedBytes, result.DeltaReservedBytes = s.mapping.DeltaBytes()
+	}
+	return result
 }
 
 type Batch struct {
@@ -361,6 +368,23 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	s.recoveryAbortedStart = installed.IssuedBatchIDHighExclusiveAtCut
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *Store) requestCheckpoint() {
+	s.mu.Lock()
+	if s.closed || s.checkpointPending {
+		s.mu.Unlock()
+		return
+	}
+	s.checkpointPending = true
+	s.mu.Unlock()
+	go func() {
+		err := s.Checkpoint(context.Background())
+		s.mu.Lock()
+		s.checkpointPending = false
+		s.checkpointErr = err
+		s.mu.Unlock()
+	}()
 }
 
 func (s *Store) buildSegmentStats(entries map[base.ID]base.VAddr) ([]storeformat.SegmentStatsEntry, error) {

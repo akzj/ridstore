@@ -64,6 +64,9 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return nil, errors.Join(err, segments.Close())
 	}
+	if err := persistentMapping.SetDeltaLimits(cfg.DeltaSoftLimitBytes, cfg.DeltaHardLimitBytes); err != nil {
+		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
+	}
 	persistentMapping.SetHook(hook)
 	fail := func(err error) (*Store, error) {
 		return nil, errors.Join(err, persistentMapping.Close(), segments.Close())
@@ -96,9 +99,14 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		return failWithLog(err)
 	}
 	runtimeMetrics := &metrics.Runtime{}
+	var requestSoftCheckpoint func()
 	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, persistentMapping, segmentRecordReader{segments: segments}, commit.Config{
 		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: uint64(cfg.MaxGroupBytes), MaxDelay: cfg.MaxGroupDelay,
-		Metrics: runtimeMetrics,
+		Metrics: runtimeMetrics, OnDeltaSoftLimit: func() {
+			if requestSoftCheckpoint != nil {
+				requestSoftCheckpoint()
+			}
+		},
 	}, hook)
 	if err != nil {
 		return failWithLog(err)
@@ -111,6 +119,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		recoveryAbortedStart: manifest.IssuedBatchIDHighExclusiveAtCut,
 		recoveryAbortedEnd:   recovered.ReservedBatchIDHighExclusive,
 	}
+	requestSoftCheckpoint = store.requestCheckpoint
 	for id, status := range recovered.Statuses {
 		converted := BatchStatus{BatchID: id}
 		if status.State == recovery.BatchCommitted {
@@ -124,6 +133,9 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		if _, exists := store.statuses[id]; !exists {
 			store.statuses[id] = BatchStatus{BatchID: id, State: BatchStateAborted}
 		}
+	}
+	if charged, _ := persistentMapping.DeltaBytes(); charged >= uint64(cfg.DeltaSoftLimitBytes) {
+		store.requestCheckpoint()
 	}
 	return store, nil
 }
