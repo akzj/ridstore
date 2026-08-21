@@ -267,6 +267,71 @@ func TestConcurrentCommitsShareGroupsAndRemainRecoverable(t *testing.T) {
 	}
 }
 
+func TestCheckpointInstallsPersistentRootStatsAndReplayCut(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]ID, 0, 8)
+	for i := 0; i < 8; i++ {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := batch.Allocate(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Put(context.Background(), id, []byte(fmt.Sprintf("checkpoint-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manifest := store.catalog.Snapshot()
+	if manifest.MappingRoot == 0 || manifest.CoveredCommitSeq != 8 || manifest.StatsCoveredCommitSeq != 8 || len(manifest.SegmentStats) == 0 || store.mapping.DeltaEntries() != 0 {
+		t.Fatalf("manifest=%+v delta=%d", manifest, store.mapping.DeltaEntries())
+	}
+	post, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	postID, err := post.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := post.Put(context.Background(), postID, []byte("after-cut")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := post.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i, id := range ids {
+		value, err := store.Get(context.Background(), id)
+		if err != nil || string(value) != fmt.Sprintf("checkpoint-%d", i) {
+			t.Fatalf("id=%d value=%q error=%v", id, value, err)
+		}
+	}
+	if value, err := store.Get(context.Background(), postID); err != nil || string(value) != "after-cut" {
+		t.Fatalf("post value=%q error=%v", value, err)
+	}
+}
+
 func BenchmarkConcurrentDurableCommit(b *testing.B) {
 	cfg := smallTestConfig(filepath.Join(b.TempDir(), "store"))
 	cfg.MaxOpenBatches = 1024

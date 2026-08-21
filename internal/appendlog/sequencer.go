@@ -144,6 +144,23 @@ func (s *Sequencer) AppendCommitGroup(prepared []batch.Prepared, seqs []base.Com
 	return got.results, got.err
 }
 
+type barrierResult struct {
+	barrier Barrier
+	err     error
+}
+
+func (s *Sequencer) Barrier(ctx context.Context) (Barrier, error) {
+	result, err := s.submit(ctx, func(log *Log) any {
+		barrier, err := log.Barrier()
+		return barrierResult{barrier: barrier, err: err}
+	})
+	if err != nil {
+		return Barrier{}, err
+	}
+	got := result.(barrierResult)
+	return got.barrier, got.err
+}
+
 func (s *Sequencer) NextFrameSeq() base.FrameSeq { return s.log.NextFrameSeq() }
 func (s *Sequencer) Faulted() bool               { return s.log.Faulted() }
 

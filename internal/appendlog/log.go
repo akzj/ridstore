@@ -44,6 +44,13 @@ type CommitAppendResult struct {
 	SealStarted  bool
 }
 
+type Barrier struct {
+	SegmentID    base.DataSegmentID
+	End          uint64
+	LastFrameSeq base.FrameSeq
+	NextFrameSeq base.FrameSeq
+}
+
 type commitPlan struct {
 	frames []storeformat.Frame
 	bytes  uint64
@@ -328,6 +335,23 @@ func (l *Log) NextFrameSeq() base.FrameSeq {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.nextFrameSeq
+}
+
+func (l *Log) Barrier() (Barrier, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.ready(); err != nil {
+		return Barrier{}, err
+	}
+	if err := l.active.Sync(); err != nil {
+		l.faulted = true
+		return Barrier{}, err
+	}
+	last := base.FrameSeq(0)
+	if l.nextFrameSeq > 1 {
+		last = l.nextFrameSeq - 1
+	}
+	return Barrier{SegmentID: l.active.SegmentID(), End: l.active.End(), LastFrameSeq: last, NextFrameSeq: l.nextFrameSeq}, nil
 }
 
 func (l *Log) Faulted() bool {
