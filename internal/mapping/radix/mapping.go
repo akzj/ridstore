@@ -35,6 +35,13 @@ type Checkpoint struct {
 	layers      []map[base.ID]deltaEntry
 }
 
+func (c *Checkpoint) CoveredCommitSeq() base.CommitSeq {
+	if c == nil {
+		return 0
+	}
+	return c.covered
+}
+
 var _ api.Mapping = (*Mapping)(nil)
 
 func Open(root string, manifest storeformat.Manifest, cacheBytes int64) (*Mapping, error) {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"sync"
 
 	"github.com/akzj/ridstore/internal/base"
@@ -221,7 +223,143 @@ func (s *Store) Status(ctx context.Context, id BatchID) (BatchStatus, error) {
 	return BatchStatus{}, base.ErrNotFound
 }
 
-func (s *Store) Checkpoint(context.Context) error { return base.ErrUnsupported }
+func (s *Store) Checkpoint(ctx context.Context) error {
+	if s == nil {
+		return base.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	s.ops.Lock()
+	if err := s.checkAvailable(); err != nil {
+		s.ops.Unlock()
+		return err
+	}
+	s.maintenance.Add(1)
+	barrier, err := s.log.Barrier(ctx)
+	if err != nil {
+		s.maintenance.Done()
+		s.ops.Unlock()
+		if s.log.Faulted() {
+			s.setFault(err)
+		}
+		return err
+	}
+	checkpoint, err := s.mapping.BeginCheckpoint()
+	if err != nil {
+		s.maintenance.Done()
+		s.ops.Unlock()
+		return err
+	}
+	cutCommitSeq := checkpoint.CoveredCommitSeq()
+	nextCommitSeq := s.coordinator.NextCommitSeq()
+	if cutCommitSeq+1 != nextCommitSeq {
+		s.mapping.AbortCheckpoint()
+		s.maintenance.Done()
+		s.ops.Unlock()
+		err := fmt.Errorf("checkpoint commit boundary mismatch: %w", base.ErrCorrupt)
+		s.setFault(err)
+		return err
+	}
+	s.mu.Lock()
+	openBatchIDs := make([]base.BatchID, 0, len(s.batches))
+	for id := range s.batches {
+		openBatchIDs = append(openBatchIDs, id)
+	}
+	issuedBatchHigh := s.issuedBatchHigh
+	s.mu.Unlock()
+	sort.Slice(openBatchIDs, func(i, j int) bool { return openBatchIDs[i] < openBatchIDs[j] })
+	reservedIDHigh := s.idAllocator.DurableHigh()
+	reservedBatchHigh := s.batchAllocator.DurableHigh()
+	s.ops.Unlock()
+	defer s.maintenance.Done()
+
+	root, entries, err := s.mapping.BuildCheckpoint(checkpoint)
+	if err != nil {
+		s.mapping.AbortCheckpoint()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		s.mapping.AbortCheckpoint()
+		return err
+	}
+	stats, err := s.buildSegmentStats(entries)
+	if err != nil {
+		s.mapping.AbortCheckpoint()
+		s.setFault(err)
+		return err
+	}
+	if barrier.End > math.MaxUint32 {
+		s.mapping.AbortCheckpoint()
+		return base.ErrInvalidAddress
+	}
+	replayStart, err := base.NewLogPos(barrier.SegmentID, uint32(barrier.End))
+	if err != nil {
+		s.mapping.AbortCheckpoint()
+		return err
+	}
+	installed, err := s.catalog.Install(0, func(next *storeformat.Manifest) error {
+		next.MappingRoot = root
+		next.CoveredCommitSeq = cutCommitSeq
+		next.StatsCoveredCommitSeq = cutCommitSeq
+		next.CutFrameSeq = barrier.LastFrameSeq
+		next.ReplayStart = replayStart
+		next.ReservedIDHighExclusive = reservedIDHigh
+		next.ReservedBatchIDHighExclusive = reservedBatchHigh
+		next.IssuedBatchIDHighExclusiveAtCut = issuedBatchHigh
+		next.OpenBatchIDsAtCut = append([]base.BatchID(nil), openBatchIDs...)
+		next.NextFrameSeq = barrier.NextFrameSeq
+		next.NextCommitSeq = nextCommitSeq
+		next.SegmentStats = append([]storeformat.SegmentStatsEntry(nil), stats...)
+		return nil
+	})
+	if err != nil {
+		s.mapping.AbortCheckpoint()
+		return err
+	}
+	if err := s.mapping.CompleteCheckpoint(checkpoint, root); err != nil {
+		s.setFault(err)
+		return err
+	}
+	s.mu.Lock()
+	s.manifest = installed
+	s.recoveryAbortedStart = installed.IssuedBatchIDHighExclusiveAtCut
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Store) buildSegmentStats(entries map[base.ID]base.VAddr) ([]storeformat.SegmentStatsEntry, error) {
+	bySegment := make(map[base.DataSegmentID]storeformat.SegmentStatsEntry)
+	for id, addr := range entries {
+		frame, err := s.segments.ReadFrame(addr)
+		if err != nil {
+			return nil, err
+		}
+		if frame.Type != storeformat.FrameTypePutRecord || frame.RecordID != id || frame.BatchID == 0 {
+			return nil, fmt.Errorf("checkpoint mapping target: %w", base.ErrCorrupt)
+		}
+		physical, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
+		if err != nil {
+			return nil, err
+		}
+		entry := bySegment[addr.SegmentID()]
+		entry.SegmentID = addr.SegmentID()
+		entry.ExactLiveBytes, err = base.AddUint64(entry.ExactLiveBytes, physical)
+		if err != nil {
+			return nil, err
+		}
+		entry.ExactLiveRecords++
+		bySegment[addr.SegmentID()] = entry
+	}
+	stats := make([]storeformat.SegmentStatsEntry, 0, len(bySegment))
+	for _, entry := range bySegment {
+		stats = append(stats, entry)
+	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].SegmentID < stats[j].SegmentID })
+	return stats, nil
+}
 
 func (b *Batch) ID() BatchID {
 	if b == nil || b.inner == nil {

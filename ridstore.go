@@ -38,8 +38,10 @@ type Revision = base.Revision
 
 // Store is an exclusively opened ridstore data directory.
 type Store struct {
-	ops sync.RWMutex
-	mu  sync.Mutex
+	ops          sync.RWMutex
+	mu           sync.Mutex
+	checkpointMu sync.Mutex
+	maintenance  sync.WaitGroup
 
 	config         Config
 	manifest       storeformat.Manifest
@@ -145,6 +147,7 @@ func (s *Store) Close() error {
 	}
 	s.signalSlotLocked()
 	s.mu.Unlock()
+	s.maintenance.Wait()
 	var result error
 	for _, b := range batches {
 		state, _ := b.inner.State()
