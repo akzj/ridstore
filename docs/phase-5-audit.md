@@ -16,7 +16,7 @@
 | Metrics adapter | 完成 | 固定 bounded samples、Prometheus adapter tests | dashboard/告警属于部署层 |
 | Migration skeleton | 完成 | 只读 planner、registry、非 v1 明确 `ErrUnsupported` | 没有可执行跨版本迁移；skeleton 不代表升级路径已存在 |
 | Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；当前已识别 Format v1 durable writer 的 `EIO/ENOSPC/EACCES` syscall-error matrix | 没有设备 power-loss 证据；代码级 syscall matrix 不能证明 flush 硬件语义 |
-| Long fuzz/nightly | 未完成 | 每个 decoder 的 2s smoke gate | 长时 fuzz 未自然结束，也没有 nightly 产物 |
+| Long fuzz/nightly | Harness 完成，证据未完成 | 8-target runner、每日/手动 workflow、原始日志/corpus/terminal marker、短 harness smoke | 尚无全部 target 自然结束的 long-fuzz artifact |
 | 72h steady-state soak | Harness 完成，证据未完成 | `ridstore-soak`、JSONL 资源时间序列、模型/Verify/FD/goroutine 收敛 gate、短 smoke | 尚无自然结束的 72h 报告及环境元数据 |
 | Same-durability benchmark | 未完成 | 单一 ridstore durable commit benchmark | 无 append baseline、Pebble/RocksDB 同 durability 稳定态对比和原始报告 |
 | Known limits/checklist | 进行中 | 本文、前台 write-stop admission | 长时/环境证据及最终 Review 尚未完成 |
@@ -71,7 +71,7 @@ Restore artifact publication 现已覆盖 root/`.payload`/子目录 create，RES
 
 ### P1：长时与对比证据
 
-72h soak、长期 fuzz、power-loss、异机 restore drill 和同 durability benchmark 都必须自然完成并保存原始产物。仓库现已提供 soak harness 和短 smoke，但当前本机短测试不能替代这些结论。
+72h soak、长期 fuzz、power-loss、异机 restore drill 和同 durability benchmark 都必须自然完成并保存原始产物。仓库现已提供 soak、long-fuzz/nightly harness 和短 smoke，但当前本机短测试不能替代这些结论。
 
 ## 3. 当前可重复门禁
 
@@ -86,7 +86,7 @@ make bench
 make verify
 ```
 
-`make verify` 聚合普通、race、vet、fuzz smoke、process-crash 和 integration。它不包含 benchmark、long fuzz、72h soak 或 power-loss，因此成功只能证明当前开发门禁通过。
+`make verify` 聚合普通、race、vet、fuzz smoke、long-fuzz harness smoke、process-crash 和 integration。它不包含自然 long fuzz、benchmark、72h soak 或 power-loss，因此成功只能证明当前开发门禁通过。
 
 ## 4. Production checklist
 

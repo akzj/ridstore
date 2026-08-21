@@ -23,6 +23,7 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 17. [Phase 5 全局审计](phase-5-audit.md)：requirement-to-evidence、当前 P0/P1 缺口和 production checklist。
 18. [72h Soak](soak.md)：长时工作负载、JSONL 资源样本和自然结束判定。
 19. [Durable Writer Syscall Fault Matrix](syscall-fault-matrix.md)：逐 writer 的 write/fsync/rename/dir-sync 覆盖与剩余缺口。
+20. [Long Fuzz 与 Nightly Evidence](long-fuzz.md)：长时 decoder fuzz runner、CI artifact 与证据判定。
 
 ## 文档状态
 
@@ -51,6 +52,7 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 | `phase-5-audit.md` | Phase 5 in progress | 全局证据矩阵与生产声明门禁 |
 | `syscall-fault-matrix.md` | Phase 5 in progress | durable writer syscall 错误覆盖与缺口 |
 | `soak.md` | Harness implemented | 72h steady-state 运行协议；自然结束证据仍未完成 |
+| `long-fuzz.md` | Harness implemented | 8-target long fuzz/nightly 协议；自然结束证据仍未完成 |
 
 磁盘格式已在 Phase 0 的 golden vectors、decoder fuzz 和初始化 crash harness 通过后冻结。后续非兼容修改必须提升 major version 并提供离线迁移。
 

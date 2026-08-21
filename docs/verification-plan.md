@@ -308,13 +308,15 @@ Mapping、Close 并 offline Verify。`make test-soak-smoke` 只验证 harness �
 make test
 make test-race
 make test-fuzz-smoke
+make test-fuzz-harness-smoke
+make test-fuzz-long FUZZ_REPORT_DIR=<new-report-dir>
 make test-crash
 make test-integration
 make bench
 make verify
 ```
 
-`test-fuzz-smoke` 对每个 Format decoder fuzz target 分别运行短时 fuzz（默认 `FUZZ_TIME=2s`、`FUZZ_PARALLEL=4`，CI/nightly 可覆盖）；`test-integration` 执行 Create→Commit→Checkpoint→离线 Verify→Backup→新 UUID Restore→Open 的跨模块生命周期；`bench` 只生成原始 benchmark，不是正确性门禁；`verify` 聚合普通、race、vet、fuzz smoke、process-crash 和 integration，仍不包含长期 fuzz、72h soak、power-loss 或跨引擎性能结论。
+`test-fuzz-smoke` 对每个 Format decoder fuzz target 分别运行短时 fuzz（默认 `FUZZ_TIME=2s`、`FUZZ_PARALLEL=4`）；`test-fuzz-harness-smoke` 以单 target/1 秒验证长时 runner 报告状态机；`test-fuzz-long` 默认逐 target 运行 30 分钟并保存环境、原始日志、corpus 和 terminal marker，CI/nightly 使用相同入口。`test-integration` 执行 Create→Commit→Checkpoint→离线 Verify→Backup→新 UUID Restore→Open 的跨模块生命周期；`bench` 只生成原始 benchmark，不是正确性门禁；`verify` 聚合普通、race、vet、fuzz smoke、runner smoke、process-crash 和 integration，仍不包含自然长期 fuzz、72h soak、power-loss 或跨引擎性能结论。
 
 Backup artifact syscall matrix 覆盖 root/子目录 create，INCOMPLETE、Verify LOCK、payload、metadata 的 write/file sync，Verify cleanup 与 Marker remove，以及 prepared root、parent、各 payload child、artifact root 和补偿路径的 directory sync；每个逻辑边界分别注入 `EIO/ENOSPC/EACCES`。root create 前失败不得留下目标，此后失败必须由 INCOMPLETE 使 Inspect 返回 `ErrRecoveryRequired`。最终 root sync 失败后的 Marker 补偿 write/file sync/root sync 也独立注入，要求原 publication cause 与补偿 cause 均可由 `errors.Is` 观察，且源 Store offline Verify 仍 clean。Restore 采用独立矩阵，不能用本项替代。
 

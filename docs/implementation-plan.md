@@ -2,7 +2,7 @@
 
 状态：Execution plan v1
 
-当前进度（2026-08-22）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1–4 分别通过 [Phase 1 Review](phase-1-review.md)、[Phase 2 Review](phase-2-review.md)、[Phase 3 Review](phase-3-review.md) 与 [Phase 4 Review](phase-4-review.md)。Phase 5 Verify/Scrub、[Backup/Restore](backup-restore.md)、[Metrics Export](metrics-export.md)、[Migration Skeleton](format-migration.md)、前台 write-stop 水位与 [72h soak harness](soak.md) 已实现；ID reserve、Abort、Backup/Restore、Checkpoint/GC 等 process-crash matrix，以及当前已识别 Format v1 durable writer 的 syscall-error matrix 已自动化。72h 自然结束、长期 fuzz、异机恢复、power-loss、同 durability benchmark 与最终 production checklist 仍未完成，项目未达到 production-ready。
+当前进度（2026-08-22）：Phase 0 已完成并通过 [Format Freeze Review](format-freeze-review.md)；Phase 1–4 分别通过 [Phase 1 Review](phase-1-review.md)、[Phase 2 Review](phase-2-review.md)、[Phase 3 Review](phase-3-review.md) 与 [Phase 4 Review](phase-4-review.md)。Phase 5 Verify/Scrub、[Backup/Restore](backup-restore.md)、[Metrics Export](metrics-export.md)、[Migration Skeleton](format-migration.md)、前台 write-stop 水位、[long-fuzz/nightly runner](long-fuzz.md) 与 [72h soak harness](soak.md) 已实现；ID reserve、Abort、Backup/Restore、Checkpoint/GC 等 process-crash matrix，以及当前已识别 Format v1 durable writer 的 syscall-error matrix 已自动化。72h 与 long-fuzz 自然结束、异机恢复、power-loss、同 durability benchmark 与最终 production checklist 仍未完成，项目未达到 production-ready。
 
 ## 1. 开发原则
 
