@@ -89,6 +89,9 @@ func createWithOptions(cfg Config, opts initialize.Options) (*Store, error) {
 	if err := prepareDirectory(normalized.Dir, true); err != nil {
 		return nil, err
 	}
+	if err := rejectRestoring(normalized.Dir); err != nil {
+		return nil, err
+	}
 	lock, err := filelock.Acquire(normalized.Dir)
 	if err != nil {
 		return nil, err
@@ -116,6 +119,9 @@ func Open(cfg Config) (*Store, error) {
 		}
 		return nil, err
 	}
+	if err := rejectRestoring(cfg.Dir); err != nil {
+		return nil, err
+	}
 	lock, err := filelock.Acquire(cfg.Dir)
 	if err != nil {
 		return nil, err
@@ -133,6 +139,15 @@ func Open(cfg Config) (*Store, error) {
 		return nil, errors.Join(err, lock.Close())
 	}
 	return store, nil
+}
+
+func rejectRestoring(dir string) error {
+	if _, err := os.Lstat(filepath.Join(dir, initialize.RestoringMarkerFileName)); err == nil {
+		return base.ErrRecoveryRequired
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Close releases the directory writer lease. Repeated Close returns ErrClosed.

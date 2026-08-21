@@ -71,6 +71,18 @@ Restore 只接受一个不存在的新目录。它先在目标目录的私有 `.
 `ridstore.Open` 和公开 `verify` 必须拒绝仍含 `RESTORING` 的目录。目标目录已存在
 时绝不覆盖或合并。
 
+```text
+go run ./cmd/ridstore-tool restore \
+  --backup /path/to/backup \
+  --dest /path/to/new-store
+
+# 仅用于确保旧 Store 不会重新成为 writer 的灾难替换
+go run ./cmd/ridstore-tool restore \
+  --backup /path/to/backup \
+  --dest /path/to/replacement-store \
+  --preserve-uuid
+```
+
 默认 Restore 生成新的 StoreUUID，并重写 Manifest 与所有 Data/Mapping Segment
 Header 的 UUID 和 CRC。Record Frame、Mapping Node、Footer、ID、Revision、
 CommitSeq 和 Manifest generation 不改变。新 UUID 防止原 Store 与可写 clone
@@ -80,9 +92,10 @@ CommitSeq 和 Manifest generation 不改变。新 UUID 防止原 Store 与可写
 但 operator 必须保证旧实例不会再次成为 writer。该选择必须出现在命令参数和
 restore report 中，不能由工具猜测。
 
-Restore 完成条件：artifact hashes 全部通过、payload Verify clean、发布后目标
-再次 Verify clean，并且 report 中 UUID 与选择的策略一致。任何失败都保留
-`RESTORING` marker，目标不能被正常 Open。
+Restore 完成条件：artifact hashes 全部通过、payload Verify clean、目标目录布局
+在仍持有 lease 且 `RESTORING` 尚存在时再次 Verify clean，并且 report 中 UUID 与
+选择的策略一致。最后才删除并同步 marker；此前任何失败都保留 `RESTORING`，
+目标不能被正常 Open。
 
 ## 5. 不提供的保证
 

@@ -31,7 +31,7 @@ const (
 	payloadDirName  = "files"
 	artifactFormat  = "ridstore-backup"
 	artifactVersion = uint32(1)
-	maxMetadataSize = int64(64 << 20)
+	maxMetadataSize = int64(512 << 20)
 )
 
 type FileEntry struct {

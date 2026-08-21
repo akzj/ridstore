@@ -65,6 +65,11 @@ func Run(ctx context.Context, root string) (report Report, resultErr error) {
 	if err != nil {
 		return report, err
 	}
+	if _, err := os.Lstat(filepath.Join(abs, initialize.RestoringMarkerFileName)); err == nil {
+		return report, base.ErrRecoveryRequired
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return report, err
+	}
 	lock, err := filelock.AcquireExisting(abs)
 	if err != nil {
 		return report, err
@@ -78,6 +83,17 @@ func Run(ctx context.Context, root string) (report Report, resultErr error) {
 // offline operation can verify and then consume the exact same immutable file
 // set without a lease-release race between the two steps.
 func RunUnderLease(ctx context.Context, root string) (report Report, resultErr error) {
+	return runUnderLease(ctx, root, false)
+}
+
+// RunRestoringUnderLease is restricted to Restore after it has created and
+// owns RESTORING plus the destination LOCK. All other recovery artifacts remain
+// fatal, and the public verifier never enables this exception.
+func RunRestoringUnderLease(ctx context.Context, root string) (report Report, resultErr error) {
+	return runUnderLease(ctx, root, true)
+}
+
+func runUnderLease(ctx context.Context, root string, allowRestoring bool) (report Report, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return report, err
 	}
@@ -85,7 +101,7 @@ func RunUnderLease(ctx context.Context, root string) (report Report, resultErr e
 	if err != nil {
 		return report, err
 	}
-	if dirty, err := dirtyArtifacts(abs); err != nil {
+	if dirty, err := dirtyArtifacts(abs, allowRestoring); err != nil {
 		return report, err
 	} else if len(dirty) != 0 {
 		report.Issues = append(report.Issues, "recovery artifacts: "+fmt.Sprint(dirty))
@@ -286,11 +302,14 @@ func compareCheckpointStats(want []storeformat.SegmentStatsEntry, got map[base.D
 	return nil
 }
 
-func dirtyArtifacts(root string) ([]string, error) {
+func dirtyArtifacts(root string, allowRestoring bool) ([]string, error) {
 	paths := []string{
 		initialize.MarkerFileName, ".INITIALIZING.tmp", ".CURRENT.tmp",
 		filepath.Join("journal", "MAINTENANCE"), filepath.Join("journal", ".MAINTENANCE.tmp"),
 		filepath.Join("journal", "ROTATION"), filepath.Join("journal", ".ROTATION.tmp"),
+	}
+	if !allowRestoring {
+		paths = append(paths, initialize.RestoringMarkerFileName)
 	}
 	var found []string
 	for _, name := range paths {
