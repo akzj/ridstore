@@ -17,7 +17,7 @@
 | Migration skeleton | 完成 | 只读 planner、registry、非 v1 明确 `ErrUnsupported` | 没有可执行跨版本迁移；skeleton 不代表升级路径已存在 |
 | Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；当前已识别 Format v1 durable writer 的 `EIO/ENOSPC/EACCES` syscall-error matrix | 没有设备 power-loss 证据；代码级 syscall matrix 不能证明 flush 硬件语义 |
 | Long fuzz/nightly | 未完成 | 每个 decoder 的 2s smoke gate | 长时 fuzz 未自然结束，也没有 nightly 产物 |
-| 72h steady-state soak | 未完成 | 现有短收敛测试 | 尚无 72h harness 报告、资源时间序列或自然结束证据 |
+| 72h steady-state soak | Harness 完成，证据未完成 | `ridstore-soak`、JSONL 资源时间序列、模型/Verify/FD/goroutine 收敛 gate、短 smoke | 尚无自然结束的 72h 报告及环境元数据 |
 | Same-durability benchmark | 未完成 | 单一 ridstore durable commit benchmark | 无 append baseline、Pebble/RocksDB 同 durability 稳定态对比和原始报告 |
 | Known limits/checklist | 进行中 | 本文 | 下列 P0/P1 未关闭，最终 Review 尚未完成 |
 
@@ -69,7 +69,7 @@ GC 有 copy/checkpoint admission 与真实 ENOSPC 传播，但没有独立的前
 
 ### P1：长时与对比证据
 
-72h soak、长期 fuzz、power-loss、异机 restore drill 和同 durability benchmark 都必须自然完成并保存原始产物。当前本机短测试不能替代这些结论。
+72h soak、长期 fuzz、power-loss、异机 restore drill 和同 durability benchmark 都必须自然完成并保存原始产物。仓库现已提供 soak harness 和短 smoke，但当前本机短测试不能替代这些结论。
 
 ## 3. 当前可重复门禁
 

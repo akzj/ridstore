@@ -249,6 +249,12 @@ Put/overwrite/delete/abort
 
 通过条件不是固定文件数，而是工作负载停止后维护过程最终稳定、trash 清空、FD/goroutine 回到基线附近、空间不继续增长。
 
+仓库提供 `ridstore-soak` 与 `make soak-72h`。工具只接受不存在的新 Store/report
+路径，输出 append-only JSONL sample；结束时逐 ID 校验模型、排空 Data GC、Compact
+Mapping、Close 并 offline Verify。`make test-soak-smoke` 只验证 harness 状态机和报告
+格式，不能作为 72h 证据。只有指定时长自然结束且最终 summary 同时包含
+`completed_naturally=true`、`verified_clean=true`，再结合环境元数据，才能进入审计。
+
 ## 10. 性能对比
 
 遵循 `positioning-vs-lsm.md` 的公平性约束。候选对照至少包括成熟 LSM 和一个简单 append baseline。
