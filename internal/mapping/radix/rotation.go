@@ -318,7 +318,7 @@ func RecoverMappingRotationWithHook(root string, current storeformat.Manifest, h
 		return current, err
 	}
 	if journal.OperationType == storeformat.MaintenanceMappingGC {
-		return recoverMappingGC(root, current, journal)
+		return recoverMappingGCWithHook(root, current, journal, hook)
 	}
 	if journal.OperationType == storeformat.MaintenanceDataGC {
 		return recoverNestedDataGCRotations(root, current, journal, hook)
