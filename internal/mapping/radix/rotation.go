@@ -12,10 +12,9 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/maintenance"
 	"github.com/akzj/ridstore/internal/manifest"
 )
-
-const maintenanceJournalName = "MAINTENANCE"
 
 const (
 	PointRotationPrepared          failpoint.Point = "mapping-rotation.prepared"
@@ -264,55 +263,15 @@ func createActiveMap(root string, uuid base.StoreUUID, id base.MapSegmentID, fir
 }
 
 func installMaintenanceJournal(root string, journal storeformat.MaintenanceJournal) error {
-	encoded, err := storeformat.EncodeMaintenanceJournal(journal)
-	if err != nil {
-		return err
-	}
-	dir := filepath.Join(root, "journal")
-	temp, final := filepath.Join(dir, ".MAINTENANCE.tmp"), filepath.Join(dir, maintenanceJournalName)
-	if err := os.Remove(temp); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	file, err := os.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := file.Write(encoded); err != nil {
-		return errors.Join(err, file.Close())
-	}
-	if err := file.Sync(); err != nil {
-		return errors.Join(err, file.Close())
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temp, final); err != nil {
-		return err
-	}
-	return syncDirectory(dir)
+	return maintenance.Install(root, journal)
 }
 
 func loadMaintenanceJournal(root string) (storeformat.MaintenanceJournal, bool, error) {
-	data, err := os.ReadFile(filepath.Join(root, "journal", maintenanceJournalName))
-	if errors.Is(err, os.ErrNotExist) {
-		return storeformat.MaintenanceJournal{}, false, nil
-	}
-	if err != nil {
-		return storeformat.MaintenanceJournal{}, false, err
-	}
-	journal, err := storeformat.DecodeMaintenanceJournal(data)
-	return journal, err == nil, err
+	return maintenance.Load(root)
 }
 
 func removeMaintenanceJournal(root string) error {
-	dir := filepath.Join(root, "journal")
-	if err := os.Remove(filepath.Join(dir, maintenanceJournalName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Remove(filepath.Join(dir, ".MAINTENANCE.tmp")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return syncDirectory(dir)
+	return maintenance.Remove(root)
 }
 
 func syncDirectory(path string) error {
