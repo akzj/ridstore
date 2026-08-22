@@ -127,6 +127,10 @@ func (b *Batch) Allocate(ctx context.Context) (base.ID, error) {
 	if err := b.requireOpen(); err != nil {
 		return 0, err
 	}
+	return b.allocateLocked(ctx)
+}
+
+func (b *Batch) allocateLocked(ctx context.Context) (base.ID, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -141,25 +145,63 @@ func (b *Batch) Allocate(ctx context.Context) (base.ID, error) {
 	return base.ID(id), nil
 }
 
+// Create allocates a never-reused ID and appends its first value. The ID is
+// consumed even when the later append fails; allocator gaps are intentional.
+func (b *Batch) Create(ctx context.Context, value []byte) (base.ID, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.requireOpen(); err != nil {
+		return 0, err
+	}
+	if err := b.validatePutLocked(0, value, true); err != nil {
+		return 0, err
+	}
+	id, err := b.allocateLocked(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := b.putLocked(ctx, id, value); err != nil {
+		return id, err
+	}
+	return id, nil
+}
+
 func (b *Batch) Put(ctx context.Context, id base.ID, value []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := b.requireOpen(); err != nil {
 		return err
 	}
-	if id == 0 {
-		return base.ErrInvalidID
+	return b.putLocked(ctx, id, value)
+}
+
+// Update appends a new value and atomically declares the logical revision that
+// must still be current when the batch reaches the commit serialization point.
+func (b *Batch) Update(ctx context.Context, id base.ID, expected base.Revision, value []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.requireOpen(); err != nil {
+		return err
 	}
-	if uint64(len(value)) > b.limits.MaxValueSize {
-		return base.ErrValueTooLarge
+	condition := Condition{RecordID: id, Kind: ConditionRevision, Revision: expected}
+	if err := b.validateConditionLocked(condition); err != nil {
+		return err
 	}
-	if uint64(len(b.mutations)) == b.limits.MaxBatchMutations {
-		if _, exists := b.mutations[id]; !exists {
-			return base.ErrBatchTooLarge
-		}
+	if err := b.putLocked(ctx, id, value); err != nil {
+		return err
+	}
+	b.conditions[id] = condition
+	return nil
+}
+
+func (b *Batch) putLocked(ctx context.Context, id base.ID, value []byte) error {
+	if err := b.validatePutLocked(id, value, false); err != nil {
+		return err
 	}
 	newPayloadBytes, err := base.AddUint64(b.appendedPayloadBytes, uint64(len(value)))
-	if err != nil || newPayloadBytes > b.limits.MaxBatchBytes {
+	// validatePutLocked checked this addition; retain the checked result used to
+	// update the batch after the append succeeds.
+	if err != nil {
 		return base.ErrBatchTooLarge
 	}
 	if err := ctx.Err(); err != nil {
@@ -190,6 +232,28 @@ func (b *Batch) Put(ctx context.Context, id base.ID, value []byte) error {
 	return nil
 }
 
+func (b *Batch) validatePutLocked(id base.ID, value []byte, idPendingAllocation bool) error {
+	if !idPendingAllocation && id == 0 {
+		return base.ErrInvalidID
+	}
+	if uint64(len(value)) > b.limits.MaxValueSize {
+		return base.ErrValueTooLarge
+	}
+	if !idPendingAllocation && uint64(len(b.mutations)) == b.limits.MaxBatchMutations {
+		if _, exists := b.mutations[id]; !exists {
+			return base.ErrBatchTooLarge
+		}
+	}
+	if idPendingAllocation && uint64(len(b.mutations)) == b.limits.MaxBatchMutations {
+		return base.ErrBatchTooLarge
+	}
+	newPayloadBytes, err := base.AddUint64(b.appendedPayloadBytes, uint64(len(value)))
+	if err != nil || newPayloadBytes > b.limits.MaxBatchBytes {
+		return base.ErrBatchTooLarge
+	}
+	return nil
+}
+
 func (b *Batch) Delete(id base.ID) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -205,6 +269,28 @@ func (b *Batch) Delete(id base.ID) error {
 		}
 	}
 	b.mutations[id] = Mutation{RecordID: id, Operation: Delete}
+	return nil
+}
+
+// DeleteIfRevision atomically records a delete and the logical revision that
+// must still be current when the batch reaches commit serialization.
+func (b *Batch) DeleteIfRevision(id base.ID, expected base.Revision) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.requireOpen(); err != nil {
+		return err
+	}
+	condition := Condition{RecordID: id, Kind: ConditionRevision, Revision: expected}
+	if err := b.validateConditionLocked(condition); err != nil {
+		return err
+	}
+	if uint64(len(b.mutations)) == b.limits.MaxBatchMutations {
+		if _, exists := b.mutations[id]; !exists {
+			return base.ErrBatchTooLarge
+		}
+	}
+	b.mutations[id] = Mutation{RecordID: id, Operation: Delete}
+	b.conditions[id] = condition
 	return nil
 }
 
@@ -225,8 +311,19 @@ func (b *Batch) addCondition(condition Condition) error {
 	if err := b.requireOpen(); err != nil {
 		return err
 	}
+	if err := b.validateConditionLocked(condition); err != nil {
+		return err
+	}
+	b.conditions[condition.RecordID] = condition
+	return nil
+}
+
+func (b *Batch) validateConditionLocked(condition Condition) error {
 	if condition.RecordID == 0 {
 		return base.ErrInvalidID
+	}
+	if condition.Kind == ConditionRevision && condition.Revision == 0 {
+		return base.ErrInvalidRevision
 	}
 	if old, exists := b.conditions[condition.RecordID]; exists {
 		if old == condition {
@@ -238,7 +335,6 @@ func (b *Batch) addCondition(condition Condition) error {
 	if uint64(len(b.conditions)) == b.limits.MaxBatchConditions {
 		return base.ErrBatchTooLarge
 	}
-	b.conditions[condition.RecordID] = condition
 	return nil
 }
 

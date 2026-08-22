@@ -114,8 +114,12 @@ type Batch struct { /* private */ }
 
 func (b *Batch) ID() BatchID
 func (b *Batch) Allocate(ctx context.Context) (ID, error)
-func (b *Batch) Put(ctx context.Context, id ID, value []byte) error
+func (b *Batch) Create(ctx context.Context, value []byte) (ID, error)
+func (b *Batch) Upsert(ctx context.Context, id ID, value []byte) error
+func (b *Batch) Put(ctx context.Context, id ID, value []byte) error // Upsert compatibility spelling
+func (b *Batch) Update(ctx context.Context, id ID, expected Revision, value []byte) error
 func (b *Batch) Delete(ctx context.Context, id ID) error
+func (b *Batch) DeleteIfRevision(ctx context.Context, id ID, expected Revision) error
 func (b *Batch) ExpectRevision(id ID, revision Revision) error
 func (b *Batch) ExpectAbsent(id ID) error
 func (b *Batch) Commit(ctx context.Context) (CommitResult, error)
@@ -138,6 +142,7 @@ type CommitResult struct {
 - `ID(0)` 永远无效；
 - `Allocate` 返回全局唯一、单调递增、永不复用的 ID；
 - ID 只有在成功 `Put` 并 Commit 后才对应可读取 Record；
+- `Create` 将 Allocate 与第一次 Put 组合起来，表达“不读取旧 Mapping 的新对象创建”；
 - Allocate 后 Abort、进程崩溃或从未 Put 都会形成永久空洞；
 - Delete 后 ID 不可重新绑定成另一个逻辑对象，但允许对同一逻辑 ID 再次 Put；
 - Library 不解释 ID 的业务含义。
@@ -171,9 +176,19 @@ Committing -> CommitUnknown
 
 Batch 不提供跨 Store 原子性。
 
-## 6. Put 与数据所有权
+## 6. Create、Update、Upsert 与数据所有权
 
-`Put` 在返回前消费 `value` 的全部内容。返回后调用者可以安全修改或释放原 slice。
+`Create`、`Update`、`Upsert`/`Put` 在返回前消费 `value` 的全部内容。返回后调用者可以安全修改或释放原 slice。
+
+这些入口明确区分调用意图，但不改变 Commit Descriptor 或 Mapping 格式：
+
+- `Create(value)` 分配一个永不复用的新 ID 并写入首个值；不读取旧 Mapping，失败或 Abort 后 ID 仍永久消耗；
+- `Update(id, expectedRevision, value)` 原子登记 `ExpectRevision` 和 Put；提交点 Revision 不匹配则整个 Batch 冲突；
+- `DeleteIfRevision(id, expectedRevision)` 原子登记 `ExpectRevision` 和 Delete；
+- `Upsert(id, value)` 是明确的无条件覆盖，采用 commit-order last-writer-wins；
+- `Put` 保留为 `Upsert` 的兼容拼写，新上层数据结构不应把它误当成条件更新。
+
+“原子登记”表示 helper 不会在条件容量/条件冲突已经确定时先 append PutRecord；它不表示调用方法时数据已经 durable。多个显式操作仍只在整个 Batch Commit 后共同可见。
 
 第一版 Put 会把 Record append 到 Active Segment，但不会执行 durable fsync，也不会发布 Mapping。这样大 Batch 不需要把所有 payload 留在内存中。
 
@@ -239,6 +254,22 @@ ExpectAbsent(ID)              // 当前必须为 NotFound
 
 条件始终针对应用本 Batch mutation 之前的 committed/virtual 状态，与调用 Expect/Put/Delete 的先后顺序无关；验证通过后才原子应用本 Batch 的全部最终 mutation。
 
+### 8.1 上层结构的使用边界
+
+上层 B-link tree、B+Tree 或其他 page structure 把稳定 Record ID 当作 PageID，Page 内只保存其他稳定 PageID，不保存 VAddr。新 Page 使用 `Create`；已有 Page 使用 `Update` 或 `DeleteIfRevision`。一次 split 中新 right page、旧 left page 与 parent page 可以放进同一 Batch，并对所有已读取的旧 Page 声明 Revision：
+
+```text
+left, leftRevision     = GetRecord(leftID)
+parent, parentRevision = GetRecord(parentID)
+
+rightID = batch.Create(encodedRight)
+batch.Update(leftID, leftRevision, encodedLeft)
+batch.Update(parentID, parentRevision, encodedParent)
+batch.Commit()
+```
+
+任一旧 Page 已变化则整个结构修改返回 `ErrConflict` 并由上层重试。ridstore 不自动跟踪普通 `GetRecord` 的 read-set；未通过显式 Revision 条件声明的读取，不参与冲突检查。点查询和 B-link 导航可由上层协议处理并发变化；需要跨多次读取的一致遍历时仍须单独设计 `ReadView`。
+
 同一 ID 最多有一个条件；重复的相同条件幂等，冲突条件使 Batch Failed。Revision 0 无效。条件只提供乐观并发控制，不提供 Snapshot、读集自动跟踪、Serializable 隔离、自动重试或自动 merge。
 
 条件数量受 `MaxBatchConditions` 限制；条件 ID 在提交前排序，验证所需内存和冷读次数必须有界。
@@ -249,7 +280,7 @@ GC Relocation 使用内部 expected-old-VAddr CAS，不改变用户并发语义�
 
 ## 9. Context 与取消
 
-- Begin/Allocate/Put 在进入不可撤销内部动作前响应取消；
+- Begin/Allocate/Create/Upsert/Update 在进入不可撤销内部动作前响应取消；
 - Put 已成功 append 后收到取消，该 Record 仍是当前 Open Batch 的一部分；调用者应 Abort；
 - Commit 一旦写入 Commit Seal 就不能因 Context 取消而宣告 Abort；
 - Conditional Commit 在生成任何 CommitPart/Seal 前取消，属于确定未提交并进入 Aborted；

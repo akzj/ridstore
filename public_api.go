@@ -625,7 +625,30 @@ func (b *Batch) Allocate(ctx context.Context) (ID, error) {
 	return id, err
 }
 
-func (b *Batch) Put(ctx context.Context, id ID, value []byte) error {
+// Create allocates a globally unique, never-reused ID and appends its first
+// value to this Batch. A returned ID remains consumed if the Batch later aborts.
+func (b *Batch) Create(ctx context.Context, value []byte) (ID, error) {
+	if b == nil || b.store == nil {
+		return 0, base.ErrBatchClosed
+	}
+	b.store.ops.RLock()
+	defer b.store.ops.RUnlock()
+	if err := b.store.checkAvailable(); err != nil {
+		return 0, err
+	}
+	if err := b.store.admitNewWrite(ctx, 0); err != nil {
+		return 0, err
+	}
+	id, err := b.inner.Create(ctx, value)
+	if err != nil && b.store.log.Faulted() {
+		b.store.setFault(err)
+	}
+	return id, err
+}
+
+// Upsert appends value and unconditionally makes it the latest value for id if
+// the Batch commits. Concurrent updates use commit-order last-writer-wins.
+func (b *Batch) Upsert(ctx context.Context, id ID, value []byte) error {
 	if b == nil || b.store == nil {
 		return base.ErrBatchClosed
 	}
@@ -635,6 +658,30 @@ func (b *Batch) Put(ctx context.Context, id ID, value []byte) error {
 		return err
 	}
 	err := b.inner.Put(ctx, id, value)
+	if err != nil && b.store.log.Faulted() {
+		b.store.setFault(err)
+	}
+	return err
+}
+
+// Put is the compatibility spelling of Upsert. Callers that depend on a
+// previously read value should use Update instead.
+func (b *Batch) Put(ctx context.Context, id ID, value []byte) error {
+	return b.Upsert(ctx, id, value)
+}
+
+// Update appends value and requires expectedRevision to still be current at
+// the Batch commit serialization point.
+func (b *Batch) Update(ctx context.Context, id ID, expectedRevision Revision, value []byte) error {
+	if b == nil || b.store == nil {
+		return base.ErrBatchClosed
+	}
+	b.store.ops.RLock()
+	defer b.store.ops.RUnlock()
+	if err := b.store.checkAvailable(); err != nil {
+		return err
+	}
+	err := b.inner.Update(ctx, id, expectedRevision, value)
 	if err != nil && b.store.log.Faulted() {
 		b.store.setFault(err)
 	}
@@ -654,6 +701,23 @@ func (b *Batch) Delete(ctx context.Context, id ID) error {
 		return err
 	}
 	return b.inner.Delete(id)
+}
+
+// DeleteIfRevision deletes id only when expectedRevision is still current at
+// the Batch commit serialization point.
+func (b *Batch) DeleteIfRevision(ctx context.Context, id ID, expectedRevision Revision) error {
+	if b == nil || b.store == nil {
+		return base.ErrBatchClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.store.ops.RLock()
+	defer b.store.ops.RUnlock()
+	if err := b.store.checkAvailable(); err != nil {
+		return err
+	}
+	return b.inner.DeleteIfRevision(id, expectedRevision)
 }
 
 func (b *Batch) ExpectRevision(id ID, revision Revision) error {

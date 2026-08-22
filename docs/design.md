@@ -165,10 +165,11 @@ Allocate 只产生 ID，不立即写入空内容。常见使用方式：
 
 ```text
 Begin
-  id = Allocate
-  Put(id, value)
+  id = Create(value)
 Commit
 ```
+
+`Allocate` + `Put` 仍作为分离的底层操作保留；新上层数据结构优先使用 `Create` 表达新 ID 不需要旧 Mapping 冲突读取。`Update(id, expectedRevision, value)` 和 `DeleteIfRevision` 表达对已有逻辑对象的条件修改，`Upsert`/兼容入口 `Put` 才表示无条件 last-writer-wins。操作意图只影响提交前 admission/冲突检查；Commit durable 后都归一化为 ID 到新 VAddr 或 Delete 的 Mapping mutation，不改变 Format v1。
 
 只 Allocate 而未 Put 的 ID 不产生可读 Record，并永久形成空洞。空 Value 必须显式 `Put(id, []byte{})`。
 
@@ -178,7 +179,7 @@ Batch 中可以多次 Put/Delete 同一 ID。提交后的最终 Mapping 只采�
 
 ### 4.3 LogicalRevision 与冲突处理
 
-默认 Blind Put 按 CommitSeq Last-Writer-Wins。需要防止丢失更新时，调用者通过 `GetRecord` 获取 opaque LogicalRevision，并在 Batch 中声明 `ExpectRevision` 或 `ExpectAbsent`。Revision 复用 PutRecord Header 已有的 OriginBatchID，不增加 Record 格式空间；GC Relocation 只改变 VAddr并保留 OriginBatchID。
+默认 `Upsert`（以及兼容拼写 `Put`）按 CommitSeq Last-Writer-Wins。需要防止丢失更新时，调用者通过 `GetRecord` 获取 opaque LogicalRevision，并使用 `Update`/`DeleteIfRevision`，或在 Batch 中显式声明 `ExpectRevision`/`ExpectAbsent`。Revision 复用 PutRecord Header 已有的 OriginBatchID，不增加 Record 格式空间；GC Relocation 只改变 VAddr并保留 OriginBatchID。
 
 全部条件在 Commit Coordinator 的全局提交顺序中原子验证。任一失败返回 `ErrConflict`，整个 Batch 确定未提交且不产生 CommitSeal。ridstore 不自动记录读集、不自动重试或合并，也不把条件检查扩张成 Snapshot/MVCC/Serializable 事务。
 
@@ -677,7 +678,7 @@ Mapping Lookup + Segment Pin + Record Header/Payload Read
 11. ID 通过 durable reserve range 发放，默认每次预留 1,048,576 个；
 12. BatchID 通过独立 durable reserve range 发放，默认每次预留 65,536 个；
 13. 第一版不提供 SyncNone production mode；
-14. 默认 Blind Put 使用 Last-Writer-Wins；可选 ExpectRevision/ExpectAbsent 在 Seal 前提供 Batch 级乐观冲突检测，Revision 复用 PutRecord OriginBatchID，Blind 路径不承担条件读取成本；
+14. 默认 Upsert/兼容 Put 使用 Last-Writer-Wins；Update/DeleteIfRevision 或显式 ExpectRevision/ExpectAbsent 在 Seal 前提供 Batch 级乐观冲突检测，Revision 复用 PutRecord OriginBatchID，Blind 路径不承担条件读取成本；
 15. Mapping Node 逻辑 fanout 固定 512，Format v1 同时支持 SparseBitmap/Dense512，Builder 按 occupancy 选择编码。
 
 这些决策的精确协议分别由 API、Format、Commit/Recovery、Mapping 和 GC 文档约束。修改任何一项必须进行跨文档 Review。

@@ -10,7 +10,7 @@ uint64 ID -> variable-length bytes
 
 逻辑 ID 稳定且永不复用，物理记录只追加写入。更新产生新的物理记录，删除只改变可见映射，旧记录由后台 GC 回收。多个 Put/Delete 可以组成一个原子 Batch，并通过一次或合并后的 fsync 持久化。
 
-默认并发覆盖按 CommitSeq Last-Writer-Wins；需要防止丢失更新时，可使用 LogicalRevision 和 Batch 级 `ExpectRevision`/`ExpectAbsent` 做显式乐观冲突检查。
+`Create` 明确创建新 ID，`Update`/`DeleteIfRevision` 使用 LogicalRevision 做显式乐观冲突检查；`Upsert`（兼容拼写 `Put`）才采用 CommitSeq Last-Writer-Wins。
 
 ridstore 只负责 Record，不内置 KV、Page、Blob、Stream、SQL 或业务保留策略。这些能力应当构建在稳定 ID 和原子 Batch 之上。
 

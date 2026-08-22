@@ -131,6 +131,62 @@ func TestAllocateAndAbort(t *testing.T) {
 	}
 }
 
+func TestExplicitCreateUpdateAndDeleteRevision(t *testing.T) {
+	appender := &fakeAppender{}
+	created := newTestBatch(t, appender, Limits{})
+	id, err := created.Create(context.Background(), []byte("new"))
+	if err != nil || id != 1 {
+		t.Fatalf("create id=%d error=%v", id, err)
+	}
+	prepared, err := created.Prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.Mutations) != 1 || prepared.Mutations[0].RecordID != id || len(prepared.Conditions) != 0 {
+		t.Fatalf("create prepared=%+v", prepared)
+	}
+
+	updated := newTestBatch(t, appender, Limits{})
+	if err := updated.Update(context.Background(), 9, 11, []byte("updated")); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err = updated.Prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.Mutations) != 1 || prepared.Mutations[0].Operation != Put || len(prepared.Conditions) != 1 ||
+		prepared.Conditions[0] != (Condition{RecordID: 9, Kind: ConditionRevision, Revision: 11}) {
+		t.Fatalf("update prepared=%+v", prepared)
+	}
+
+	deleted := newTestBatch(t, appender, Limits{})
+	if err := deleted.DeleteIfRevision(9, 11); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err = deleted.Prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.Mutations) != 1 || prepared.Mutations[0].Operation != Delete || len(prepared.Conditions) != 1 ||
+		prepared.Conditions[0] != (Condition{RecordID: 9, Kind: ConditionRevision, Revision: 11}) {
+		t.Fatalf("delete prepared=%+v", prepared)
+	}
+}
+
+func TestExplicitUpdateValidatesConditionBeforeAppend(t *testing.T) {
+	appender := &fakeAppender{}
+	b := newTestBatch(t, appender, Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 2, MaxBatchConditions: 1})
+	if err := b.ExpectAbsent(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Update(context.Background(), 2, 7, []byte("must-not-append")); !errors.Is(err, base.ErrBatchTooLarge) {
+		t.Fatalf("update error=%v", err)
+	}
+	if len(appender.puts) != 0 {
+		t.Fatalf("appended puts=%+v", appender.puts)
+	}
+}
+
 func TestLimitsAndConflictingConditions(t *testing.T) {
 	b := newTestBatch(t, &fakeAppender{}, Limits{MaxValueSize: 3, MaxBatchBytes: 4, MaxBatchMutations: 1, MaxBatchConditions: 1})
 	if err := b.Put(context.Background(), 1, []byte("long")); !errors.Is(err, base.ErrValueTooLarge) {

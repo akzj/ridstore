@@ -135,7 +135,7 @@ Data GC 使用两段磁盘 admission。安装 Maintenance Journal 前按 exact l
 
 ## 7. 前台新写停止水位
 
-`WriteStopFreeBytes` 是进程级前台 admission 水位。Begin、ID Allocate 和 Put 在产生新的
+`WriteStopFreeBytes` 是进程级前台 admission 水位。Begin、ID Allocate 和所有 Create/Upsert/Update 写入在产生新的
 reserve/payload append 前检查可用空间；低于“水位 + 本次保守物理字节估计”时返回
 `ErrInsufficientSpace`。拒绝不把 Store 标记为 fault/read-only，释放空间后可以重试。
 

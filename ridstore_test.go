@@ -825,6 +825,142 @@ func TestPublicConditionalConflictAndOpenBatchBackpressure(t *testing.T) {
 	}
 }
 
+func TestPublicExplicitCreateUpdateAndDeleteIfRevision(t *testing.T) {
+	store, err := Create(smallTestConfig(filepath.Join(t.TempDir(), "store")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	createBatch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := createBatch.Create(context.Background(), []byte("page-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := createBatch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	original, err := store.GetRecord(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	winner, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := winner.Update(context.Background(), id, original.Revision, []byte("page-v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.Update(context.Background(), id, original.Revision, []byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := winner.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.Commit(context.Background()); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale update error=%v", err)
+	}
+
+	current, err := store.GetRecord(context.Background(), id)
+	if err != nil || string(current.Value) != "page-v2" || current.Revision == original.Revision {
+		t.Fatalf("current=%+v error=%v", current, err)
+	}
+	deleteBatch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteBatch.DeleteIfRevision(context.Background(), id, current.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deleteBatch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(context.Background(), id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted get error=%v", err)
+	}
+}
+
+func TestBLinkStyleSplitConflictPublishesNothing(t *testing.T) {
+	store, err := Create(smallTestConfig(filepath.Join(t.TempDir(), "store")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	seed, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftID, err := seed.Create(context.Background(), []byte("left-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID, err := seed.Create(context.Background(), []byte("parent-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	left, err := store.GetRecord(context.Background(), leftID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := store.GetRecord(context.Background(), parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	split, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightID, err := split.Create(context.Background(), []byte("right-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := split.Update(context.Background(), leftID, left.Revision, []byte("left-split")); err != nil {
+		t.Fatal(err)
+	}
+	if err := split.Update(context.Background(), parentID, parent.Revision, []byte("parent-split")); err != nil {
+		t.Fatal(err)
+	}
+
+	concurrent, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := concurrent.Update(context.Background(), parentID, parent.Revision, []byte("parent-v2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := concurrent.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := split.Commit(context.Background()); !errors.Is(err, ErrConflict) {
+		t.Fatalf("split error=%v", err)
+	}
+
+	if _, err := store.Get(context.Background(), rightID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("right page became visible: %v", err)
+	}
+	leftValue, err := store.Get(context.Background(), leftID)
+	if err != nil || string(leftValue) != "left-v1" {
+		t.Fatalf("left=%q error=%v", leftValue, err)
+	}
+	parentValue, err := store.Get(context.Background(), parentID)
+	if err != nil || string(parentValue) != "parent-v2" {
+		t.Fatalf("parent=%q error=%v", parentValue, err)
+	}
+}
+
 func TestOpenBatchPinsAndReleasesReferencedSegments(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	store, err := Create(smallTestConfig(dir))
