@@ -448,15 +448,7 @@ func (s *Store) checkpointLocked(ctx context.Context, maintenanceGeneration uint
 		s.setFault(err)
 		return err
 	}
-	if barrier.End > math.MaxUint32 {
-		s.mapping.AbortCheckpoint()
-		return base.ErrInvalidAddress
-	}
-	replayStart, err := base.NewLogPos(barrier.SegmentID, uint32(barrier.End))
-	if err != nil {
-		s.mapping.AbortCheckpoint()
-		return err
-	}
+	replayStart := barrier.CheckpointCut
 	installed, err := s.catalog.Install(0, func(next *storeformat.Manifest) error {
 		next.MappingRoot = root
 		next.CoveredCommitSeq = cutCommitSeq

@@ -23,6 +23,19 @@ type Log struct {
 	faulted         bool
 	hook            failpoint.Hook
 	rotator         Rotator
+	buffered        bool
+	maxBufferFrames int
+	maxBufferBytes  uint64
+	pending         []pendingFrame
+	pendingBytes    uint64
+	pendingByAddr   map[base.VAddr]int
+	durablePos      base.LogPos
+}
+
+type pendingFrame struct {
+	frame storeformat.Frame
+	addr  base.VAddr
+	size  uint64
 }
 
 type Rotator interface {
@@ -47,10 +60,15 @@ type CommitAppendResult struct {
 }
 
 type Barrier struct {
-	SegmentID    base.DataSegmentID
-	End          uint64
-	LastFrameSeq base.FrameSeq
-	NextFrameSeq base.FrameSeq
+	CheckpointCut base.LogPos
+	LastFrameSeq  base.FrameSeq
+	NextFrameSeq  base.FrameSeq
+}
+
+type Watermarks struct {
+	ReservedPos base.LogPos
+	WrittenPos  base.LogPos
+	DurablePos  base.LogPos
 }
 
 type putRequest struct {
@@ -86,16 +104,72 @@ func NewWithRotator(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxF
 		return nil, fmt.Errorf("append log configuration: %w", base.ErrInvalidConfig)
 	}
 	maxPartPayload -= maxPartPayload % storeformat.MutationEntrySize
-	return &Log{active: active, nextFrameSeq: nextFrameSeq, maxFramePayload: maxFramePayload, maxPartPayload: maxPartPayload, hook: hook, rotator: rotator}, nil
+	durablePos, err := logPos(active.SegmentID(), active.End())
+	if err != nil {
+		return nil, fmt.Errorf("active data position: %w", err)
+	}
+	return &Log{active: active, nextFrameSeq: nextFrameSeq, maxFramePayload: maxFramePayload, maxPartPayload: maxPartPayload, hook: hook, rotator: rotator, durablePos: durablePos}, nil
 }
 
 func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
+	l.mu.Lock()
+	if l.buffered {
+		result := l.reservePutLocked(ctx, batchID, id, value)
+		l.mu.Unlock()
+		return result.Addr, result.Seq, result.Written, result.Err
+	}
+	l.mu.Unlock()
 	results := l.appendPutGroup([]putRequest{{Context: ctx, BatchID: batchID, RecordID: id, Value: value}})
 	if len(results) != 1 {
 		return 0, 0, 0, base.ErrCorrupt
 	}
 	result := results[0]
 	return result.Addr, result.Seq, result.Written, result.Err
+}
+
+func (l *Log) enableBuffer(maxFrames int, maxBytes uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.buffered || len(l.pending) != 0 || maxFrames <= 0 || maxBytes == 0 {
+		return base.ErrInvalidConfig
+	}
+	l.buffered = true
+	l.maxBufferFrames = maxFrames
+	l.maxBufferBytes = maxBytes
+	l.pendingByAddr = make(map[base.VAddr]int)
+	return nil
+}
+
+func (l *Log) reservePutLocked(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) putAppendResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return putAppendResult{Err: err}
+	}
+	if err := l.ready(); err != nil {
+		return putAppendResult{Err: err}
+	}
+	frame := storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: l.nextFrameSeq, BatchID: batchID, RecordID: id, Payload: value}
+	size, err := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
+	if err != nil {
+		return putAppendResult{Err: err}
+	}
+	if err := l.flushForBudgetLocked(size); err != nil {
+		return putAppendResult{Err: err}
+	}
+	plannedAt := l.nextFrameSeq
+	if err := l.ensureBufferedCapacityLocked(size); err != nil {
+		return putAppendResult{Err: err}
+	}
+	if l.nextFrameSeq != plannedAt {
+		frame.FrameSeq = l.nextFrameSeq
+	}
+	addr, err := l.stageFrameLocked(frame, size)
+	if err != nil {
+		return putAppendResult{Err: err}
+	}
+	return putAppendResult{Addr: addr, Seq: frame.FrameSeq, Written: size}
 }
 
 // appendPutGroup appends adjacent Put requests using one write per maximal
@@ -277,13 +351,26 @@ func (l *Log) AppendAbort(ctx context.Context, batchID base.BatchID, payload sto
 	if err != nil {
 		return err
 	}
-	if err := l.ensureCapacityLocked(frameSize); err != nil {
+	if l.buffered {
+		if err := l.flushForBudgetLocked(frameSize); err != nil {
+			return err
+		}
+	}
+	ensureCapacity := l.ensureCapacityLocked
+	if l.buffered {
+		ensureCapacity = l.ensureBufferedCapacityLocked
+	}
+	if err := ensureCapacity(frameSize); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(l.hook, PointAbortPrepared); err != nil {
 		return err
 	}
 	frame.FrameSeq = l.nextFrameSeq
+	if l.buffered {
+		_, err := l.stageFrameLocked(frame, frameSize)
+		return err
+	}
 	_, _, err = l.appendLocked(frame)
 	if err != nil {
 		return err
@@ -319,13 +406,26 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 	if err != nil {
 		return err
 	}
-	if err := l.ensureCapacityLocked(frameSize); err != nil {
+	ensureCapacity := l.ensureCapacityLocked
+	if l.buffered {
+		ensureCapacity = l.ensureBufferedCapacityLocked
+	}
+	if err := ensureCapacity(frameSize); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(l.hook, PointReservePrepared); err != nil {
 		return err
 	}
 	frame.FrameSeq = l.nextFrameSeq
+	if l.buffered {
+		if _, err := l.stageFrameLocked(frame, frameSize); err != nil {
+			return err
+		}
+		if _, err := l.syncPendingLocked(); err != nil {
+			return err
+		}
+		return nil
+	}
 	if _, _, err := l.appendLocked(frame); err != nil {
 		return err
 	}
@@ -335,6 +435,9 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 	}
 	if err := l.active.Sync(); err != nil {
 		l.faulted = true
+		return err
+	}
+	if err := l.markDurableLocked(); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(l.hook, PointReserveSynced); err != nil {
@@ -361,7 +464,11 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 		return nil, err
 	}
 	plannedAt := l.nextFrameSeq
-	if err := l.ensureCapacityLocked(totalBytes); err != nil {
+	ensureCapacity := l.ensureCapacityLocked
+	if l.buffered {
+		ensureCapacity = l.ensureBufferedCapacityLocked
+	}
+	if err := ensureCapacity(totalBytes); err != nil {
 		return make([]CommitAppendResult, len(prepared)), err
 	}
 	if l.nextFrameSeq != plannedAt {
@@ -375,6 +482,39 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 	results := make([]CommitAppendResult, len(plans))
 	for planIndex, plan := range plans {
 		results[planIndex].SealFrameSeq = plan.result.SealFrameSeq
+	}
+	if l.buffered {
+		prefixBytes := l.pendingBytes
+		for _, plan := range plans {
+			for _, frame := range plan.frames {
+				size, sizeErr := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
+				if sizeErr != nil {
+					l.faulted = true
+					return results, sizeErr
+				}
+				if _, stageErr := l.stageFrameLocked(frame, size); stageErr != nil {
+					l.faulted = true
+					return results, stageErr
+				}
+			}
+		}
+		written, appendErr := l.flushPendingLocked()
+		var planOffset uint64
+		for planIndex, plan := range plans {
+			results[planIndex].SealStarted = written > prefixBytes+planOffset+plan.bytes-descriptorSealFrameSize
+			planOffset += plan.bytes
+		}
+		if appendErr != nil {
+			return results, appendErr
+		}
+		if err := l.active.Sync(); err != nil {
+			l.faulted = true
+			return results, err
+		}
+		if err := l.markDurableLocked(); err != nil {
+			return results, err
+		}
+		return results, nil
 	}
 	if l.hook == nil {
 		frames := flattenPlanFrames(plans)
@@ -394,6 +534,9 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 	}
 	if err := l.active.Sync(); err != nil {
 		l.faulted = true
+		return results, err
+	}
+	if err := l.markDurableLocked(); err != nil {
 		return results, err
 	}
 	if err := failpoint.Hit(l.hook, PointCommitSynced); err != nil {
@@ -553,15 +696,41 @@ func (l *Log) Barrier() (Barrier, error) {
 	if err := l.ready(); err != nil {
 		return Barrier{}, err
 	}
-	if err := l.active.Sync(); err != nil {
+	if l.buffered {
+		if _, err := l.syncPendingLocked(); err != nil {
+			return Barrier{}, err
+		}
+	} else if err := l.active.Sync(); err != nil {
 		l.faulted = true
+		return Barrier{}, err
+	}
+	if err := l.markDurableLocked(); err != nil {
 		return Barrier{}, err
 	}
 	last := base.FrameSeq(0)
 	if l.nextFrameSeq > 1 {
 		last = l.nextFrameSeq - 1
 	}
-	return Barrier{SegmentID: l.active.SegmentID(), End: l.active.End(), LastFrameSeq: last, NextFrameSeq: l.nextFrameSeq}, nil
+	return Barrier{CheckpointCut: l.durablePos, LastFrameSeq: last, NextFrameSeq: l.nextFrameSeq}, nil
+}
+
+func (l *Log) Watermarks() (Watermarks, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	writtenEnd := l.active.End()
+	written, err := logPos(l.active.SegmentID(), writtenEnd)
+	if err != nil {
+		return Watermarks{}, err
+	}
+	reservedEnd, err := base.AddUint64(writtenEnd, l.pendingBytes)
+	if err != nil {
+		return Watermarks{}, err
+	}
+	reserved, err := logPos(l.active.SegmentID(), reservedEnd)
+	if err != nil {
+		return Watermarks{}, err
+	}
+	return Watermarks{ReservedPos: reserved, WrittenPos: written, DurablePos: l.durablePos}, nil
 }
 
 func (l *Log) Faulted() bool {
@@ -609,10 +778,34 @@ func (l *Log) ensureCapacityLocked(required uint64) error {
 		return base.ErrGenerationExhausted
 	}
 	l.nextFrameSeq++
+	if err := l.markDurableLocked(); err != nil {
+		return err
+	}
 	if required+segmentSealReserve > l.active.Remaining() {
 		return l.capacityErrorLocked(required)
 	}
 	return nil
+}
+
+func (l *Log) markDurableLocked() error {
+	pos, err := logPos(l.active.SegmentID(), l.active.End())
+	if err != nil {
+		l.faulted = true
+		return err
+	}
+	if pos < l.durablePos {
+		l.faulted = true
+		return fmt.Errorf("append durable position regressed: %w", base.ErrCorrupt)
+	}
+	l.durablePos = pos
+	return nil
+}
+
+func logPos(segmentID base.DataSegmentID, end uint64) (base.LogPos, error) {
+	if end > math.MaxUint32 {
+		return 0, base.ErrGenerationExhausted
+	}
+	return base.NewLogPos(segmentID, uint32(end))
 }
 
 func (l *Log) capacityErrorLocked(required uint64) error {

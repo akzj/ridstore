@@ -21,10 +21,11 @@ type Sequencer struct {
 	log *Log
 	cfg SequencerConfig
 
-	mu     sync.Mutex
-	closed bool
-	reqs   chan sequenceRequest
-	done   chan struct{}
+	mu       sync.Mutex
+	closed   bool
+	closeErr error
+	reqs     chan sequenceRequest
+	done     chan struct{}
 }
 
 type sequenceRequest struct {
@@ -75,6 +76,13 @@ func NewSequencer(log *Log, cfg SequencerConfig) (*Sequencer, error) {
 	if log == nil || cfg.QueueDepth <= 0 || cfg.MaxFrames <= 0 || cfg.MaxBytes == 0 {
 		return nil, base.ErrInvalidConfig
 	}
+	// Per-frame failpoint tests require exact physical write boundaries. The
+	// production path has no Log hook and uses the buffered engine.
+	if log.hook == nil {
+		if err := log.enableBuffer(cfg.MaxFrames, cfg.MaxBytes); err != nil {
+			return nil, err
+		}
+	}
 	s := &Sequencer{
 		log: log, cfg: cfg, reqs: make(chan sequenceRequest, cfg.QueueDepth), done: make(chan struct{}),
 	}
@@ -84,58 +92,18 @@ func NewSequencer(log *Log, cfg SequencerConfig) (*Sequencer, error) {
 
 func (s *Sequencer) run() {
 	defer close(s.done)
-	var pending *sequenceRequest
-	for {
-		var request sequenceRequest
-		if pending != nil {
-			request, pending = *pending, nil
-		} else {
-			var ok bool
-			request, ok = <-s.reqs
-			if !ok {
-				return
-			}
-		}
-		if request.kind != requestPut {
-			request.result <- s.execute(request)
+	for request := range s.reqs {
+		if request.kind == requestPut {
+			addr, seq, written, err := s.log.AppendPut(request.ctx, request.batchID, request.recordID, request.value)
+			request.result <- sequenceResult{put: putAppendResult{Addr: addr, Seq: seq, Written: written, Err: err}}
 			continue
 		}
-
-		group := []sequenceRequest{request}
-		bytes := putRequestBytes(request)
-	collect:
-		for len(group) < s.cfg.MaxFrames && bytes < s.cfg.MaxBytes {
-			var next sequenceRequest
-			var ok bool
-			select {
-			case next, ok = <-s.reqs:
-				if !ok {
-					break collect
-				}
-			default:
-				break collect
-			}
-			if next.kind != requestPut {
-				pending = &next
-				break
-			}
-			nextBytes := putRequestBytes(next)
-			if nextBytes > s.cfg.MaxBytes-bytes {
-				pending = &next
-				break
-			}
-			group = append(group, next)
-			bytes += nextBytes
-		}
-		puts := make([]putRequest, len(group))
-		for i := range group {
-			puts[i] = putRequest{Context: group[i].ctx, BatchID: group[i].batchID, RecordID: group[i].recordID, Value: group[i].value}
-		}
-		results := s.log.appendPutGroup(puts)
-		for i := range group {
-			group[i].result <- sequenceResult{put: results[i]}
-		}
+		request.result <- s.execute(request)
 	}
+	err := s.log.closePending()
+	s.mu.Lock()
+	s.closeErr = err
+	s.mu.Unlock()
 }
 
 func (s *Sequencer) execute(request sequenceRequest) sequenceResult {
@@ -156,16 +124,6 @@ func (s *Sequencer) execute(request sequenceRequest) sequenceResult {
 	default:
 		return sequenceResult{err: base.ErrCorrupt}
 	}
-}
-
-func putRequestBytes(request sequenceRequest) uint64 {
-	// Frame encoding is 8-byte aligned. Config validation bounds Value well
-	// below uint64 overflow, but saturating keeps this queue admission helper
-	// independent from persisted hard limits.
-	if uint64(len(request.value)) > ^uint64(0)-storeformat.FrameHeaderSize-7 {
-		return ^uint64(0)
-	}
-	return (uint64(len(request.value)) + storeformat.FrameHeaderSize + 7) &^ 7
 }
 
 func (s *Sequencer) submit(ctx context.Context, request sequenceRequest) (sequenceResult, error) {
@@ -242,6 +200,15 @@ func (s *Sequencer) Barrier(ctx context.Context) (Barrier, error) {
 
 func (s *Sequencer) NextFrameSeq() base.FrameSeq { return s.log.NextFrameSeq() }
 func (s *Sequencer) Faulted() bool               { return s.log.Faulted() }
+func (s *Sequencer) Watermarks() (Watermarks, error) {
+	return s.log.Watermarks()
+}
+
+// ReadPendingFrame returns a safe copy of a reserved frame that has not yet
+// reached the active segment. Disk readers should try this before Registry.
+func (s *Sequencer) ReadPendingFrame(addr base.VAddr) (storeformat.Frame, bool) {
+	return s.log.readPendingFrame(addr)
+}
 
 // Close rejects new requests and waits until every accepted request has left
 // the sequencer. The underlying Data Segment remains owned by Store.
@@ -255,5 +222,8 @@ func (s *Sequencer) Close() error {
 	close(s.reqs)
 	s.mu.Unlock()
 	<-s.done
-	return nil
+	s.mu.Lock()
+	err := s.closeErr
+	s.mu.Unlock()
+	return err
 }

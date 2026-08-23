@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/failpoint"
+	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/mapping/radix"
 )
 
@@ -512,6 +513,36 @@ func TestWriteStopCoversDurableIDReserveFrames(t *testing.T) {
 	}
 	if metrics := store.Metrics(); metrics.WriteStopRejections != 2 {
 		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestWriteStopObservationDeductsBufferedAppendBytes(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	cfg := smallTestConfig(dir)
+	cfg.WriteStopFreeBytes = cfg.SegmentSize
+	cfg.DiskSpaceCheckInterval = time.Nanosecond
+	store, err := Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	available := uint64(1 << 30)
+	store.availableBytes = func(string) (uint64, error) { return available, nil }
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(context.Background(), id, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	physicalBytes := (uint64(storeformat.FrameHeaderSize) + 1 + 7) &^ 7
+	available = uint64(cfg.WriteStopFreeBytes) + physicalBytes
+	if err := batch.Put(context.Background(), id, []byte("b")); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("second Put ignored buffered bytes: %v", err)
 	}
 }
 

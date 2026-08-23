@@ -1,117 +1,134 @@
 # Append Engine
 
-本文定义 ridstore 的物理追加路径、批量边界和故障语义。它描述的是 Format v1
-之上的运行时实现；批量写不改变磁盘 Frame 格式、Commit 协议或恢复规则。
+本文定义 ridstore 的物理追加路径、批量边界和故障语义。批量写不改变 Format v1
+Frame、Commit Descriptor 或恢复协议。
 
-## 1. 目标与当前实现
-
-ridstore 的主要结构性优势是 Value 与 Descriptor 都只追加。写路径应尽量把多个
-小 Frame 合并为较大的顺序写，使瓶颈接近设备带宽，而不是每条记录一次系统调用。
-
-当前第一阶段已经实现：
+## 1. 分层
 
 ```text
-concurrent Put callers
+Commit Coordinator     CommitSeq、冲突验证、Mapping publish
         |
-        v
-bounded Sequencer queue
+Append Log protocol    构造 Put/Reserve/Commit/Relocation Frame
         |
-        +-- drain adjacent queued Put requests
-        |   stop at Commit / Abort / Reserve / Barrier
-        v
-Log.appendPutGroup
+Append Sequencer       唯一拥有请求顺序和 FrameSeq
         |
-        +-- assign consecutive FrameSeq
-        +-- split at Data Segment boundary
-        v
-ActiveData.AppendBatch
+Buffered append path   reserve -> write -> sync，维护三个水位
         |
-        +-- encode complete Frames into one contiguous buffer
-        +-- one WriteAt for one segment-local group
+ActiveData             编码连续 Frame，一次 WriteAt
 ```
 
-Commit Coordinator 已形成的整个 CommitGroup 同样通过一次
-`ActiveData.AppendBatch` 写入所有 CommitPart/CommitSeal，然后执行一次 Sync；单个
-Relocation Descriptor 的 Part/Seal 也采用相同路径。因此“一条 Record 一个 Batch”在
-并发成组后，不再为每个 Descriptor Frame 单独调用 `WriteAt`。依赖注入的 failpoint
-测试路径仍逐 Frame 写入，以保留 `PartWritten` 与 `SealWritten` 的精确崩溃边界；生产
-路径不安装 Hook，使用合并写。
+物理追加路径不判断 Batch 是否提交，也不决定 Mapping 可见性。它只接受已经构造并排好序的
+Frame，分配稳定的 `VAddr = SegmentID + Offset`，按要求推进 write/sync 水位。Commit
+Coordinator 仍是唯一分配 CommitSeq 和发布 Mapping 的组件。
 
-这一阶段只合并已经并发排队的 Put。`AppendPut` 返回时，其完整 Frame 已经交给内核
-写入，但尚未因为 Put 本身执行 `fsync`。同一调用者同步地逐条 Put 不会被主动延迟来
-凑批，也不会获得 batching；这是第二阶段要解决的问题。
+生产路径由 `Sequencer` 启用有界 buffer。依赖注入 Log failpoint 的 crash-test 路径仍逐
+Frame 写入，以保留 `PutWritten`、`PartWritten` 与 `SealWritten` 的精确进程崩溃边界；这条
+测试路径不用于性能结论。
 
-## 2. 不变量
+## 2. 正常写路径
 
-- Sequencer 是 Frame 顺序的唯一拥有者；批量不能越过非 Put 请求。
-- 每个成功 Put 获得唯一且连续的 `FrameSeq`，取消或编码失败的请求不消耗序号。
-- 一个 Frame 永远不跨 Data Segment。空间不足时，Log 先完成 Rotation，再在新
-  Segment 分配 Put 的 `FrameSeq`；一个输入 group 可以被拆成多个物理写。
-- `segment.ErrFull` 仅是无 Rotator 的底层测试/组件控制信号。生产 Put 路径必须在
-  Log 内消化它；Commit、Relocation、Abort、Reserve 同样遵守该约束。若配置了
-  Rotation 但空 Segment 仍容纳不下已通过校验的 Frame 或 Descriptor，说明
-  容量不变量已破坏，Log fail-closed 并返回 `ErrCorrupt`，不能把内部错误泄漏给用户。
-- `ActiveData.AppendBatch` 在写前完成整组编码和容量检查。容量不足不写入任何字节。
-- 一次批量写发生错误或短写后，Active Segment 与 Log 都进入 poisoned/faulted
-  状态；该进程不能继续发布该组的任何地址，必须通过重新 Open 扫描完整 Frame 前缀。
-- `PointPutWritten` 仍对每个完整写入的 Put 触发；Segment 的 append-write hook 对
-  每个物理 group 只触发一次。
-- Commit Coordinator 仍是唯一分配 CommitSeq 并发布 Mapping 的组件；append Log
-  通过 `AppendCommitGroup` 构造 CommitSeal 并执行 durable sync。Put batching 不赋予
-  Value 可见性。
-- 队列、Frame 数和聚合字节数均有界。单个允许的大 Value 即使超过 group 字节预算，
-  也必须能够独立执行。
-
-## 3. 顺序与边界
-
-Sequencer 收到第一个 Put 后，只提取队列中紧邻的 Put。以下任一条件立即封闭 group：
-
-- 达到 `MaxGroupBatches`（在 append 层作为最大 Put Frame 数）；
-- 达到 `MaxGroupBytes`；
-- 队首是 Commit、Relocation、Abort、Reserve 或 Barrier；
-- 当前队列中已没有请求。
-
-生产路径不会为了 Put batching 主动等待 `MaxGroupDelay`，避免在已有 Group Commit
-等待窗口之外再次增加延迟。`MaxGroupDelay` 仍只控制 Commit Coordinator。
-
-格式层统一计算 `DataAppendCapacity`：扣除 Segment Header、Footer 和最终 128-byte
-SegmentSeal。最大合法 Put Frame 与最大合法 Descriptor（32-byte Mutation Entry、每个
-Part 的 64-byte Frame Header、128-byte Descriptor Seal）都必须独立落入该容量，否则
-Create/Open 拒绝 HardLimits。运行时将有效 group byte 上限收紧到
-`min(MaxGroupBytes, DataAppendCapacity)`；单个超过 group 预算但符合 HardLimits 的
-Value/Descriptor 仍可独立执行。
-
-调用者在请求进入有界队列以前可以因 Context 取消而返回。一旦请求被队列接受，
-调用者必须等待 Sequencer 给出结果，因此调用者的 `Value` 在此之前始终归 append
-路径安全引用。执行前已经取消的请求返回 Context error，不占用 FrameSeq。
-
-## 4. 三个物理边界
-
-要让同一调用者的连续 Put 也能合并，后续 staging 设计必须把一个 `end` 拆成：
+Put 不再立即执行系统调用：
 
 ```text
-reservedEnd <= writtenEnd <= durableEnd  (含义按区间边界表达时反向理解)
-
-reservedEnd : 已在有界内存 staging 中保留的逻辑尾部
-writtenEnd  : 已完成完整 WriteAt、可以从当前进程读取的尾部
-durableEnd  : 已由 fsync/fdatasync 建立持久性的尾部
+AppendPut
+  -> 校验并计算完整 Frame 大小
+  -> 必要时 flush 已满 buffer 或 rotate
+  -> 复制 payload 到 appendlog 自己拥有的内存
+  -> 分配 FrameSeq 与稳定 VAddr
+  -> 推进 reservedPos
+  -> 返回 receipt
 ```
 
-更准确的不变量是 `durableEnd <= writtenEnd <= reservedEnd`。三者相等时没有待刷数据。
-Put 可以在复制进 staging 后返回，但 Commit、Abort、Barrier、Rotation 和 Close 必须
-等待其依赖范围达到相应的 written/durable 边界。内存预算、唤醒、错误广播、Context
-取消后的 buffer ownership 和进程崩溃恢复都必须明确后，才能启用该语义。
+CommitGroup 将已验证 Batch 的所有 CommitPart/CommitSeal 追加到同一 pending buffer：
 
-第二阶段尚未实现。当前 `ActiveData.End()` 同时表示本进程已经完成写系统调用的尾部，
-durability 仍由 Commit/Reserve/Barrier 的显式 Sync 建立。
+```text
+Put1 Put2 ... PutN CommitPart... CommitSeal...
+  -> ActiveData.AppendBatch      // 一个连续 buffer、一次 WriteAt
+  -> ActiveData.Sync             // 一次 fsync
+  -> Mapping publish
+```
 
-## 5. 验证与观测
+因此，即使每个 Batch 只修改一条 Record，同一 CommitGroup 的 Put 与 Descriptor 也能共享
+一次 write 和一次 fsync。超过 buffer Frame/byte 预算时可提前 write，但不提前 sync；后续
+durable request 的 Sync 覆盖此前 written 前缀。单个合法大 Frame 可以超过聚合预算独立存在，
+但仍受 Format HardLimit 和 Segment 容量约束。
 
-自动化测试覆盖：连续地址与可读性、整组容量预检、错误后 poison、取消不分配序号，
-以及多个已排队 Put 只触发一次 Segment append-write hook。基准测试应分别比较单 Frame
-与不同 group size，并同时记录 bytes/op、allocs/op 和 append syscall 数；只有在真实
-文件系统与目标设备上的结果才能用于选择默认预算。
+尚未落盘的 Put 需要参与 Commit 校验和 GC relocation 校验。RecordReader 先查询 pending
+address index，未命中再读取 Segment Registry。pending 查询返回 payload 副本，不能把可变
+buffer 暴露给上层。
 
-后续加入 staging 时，需要新增 queue wait、staging wait、write syscall duration、
-sync duration、group frames/bytes 以及各边界积压量。等待时间与 write/sync 时间的比例
-是判断系统压力来自 CPU、队列、系统调用还是设备持久化延迟的核心证据。
+## 3. 三个水位
+
+Append Engine 对外暴露：
+
+```text
+durablePos <= writtenPos <= reservedPos
+
+reservedPos : 已分配稳定地址、且 payload 已由 appendlog 持有的尾部
+writtenPos  : 已完整完成 WriteAt、本进程可从 Segment 读取的尾部
+durablePos  : 已完成 Sync 的尾部
+```
+
+Put receipt 只要求到达 `reservedPos`。Commit、Reserve、Relocation 和 Barrier 要求自己的范围
+到达 `durablePos`。Abort 本身不承诺独立 fsync，但可与后续 durable request 一起落盘；Close
+必须 flush/sync 尚存的 pending Frame，不能静默丢失已经成功返回的 reservation。
+
+一次 write 可以覆盖多个逻辑请求，一次 sync 也可以覆盖此前多个 write。水位是
+`LogPos(SegmentID, endOffset)`，而不是记录地址；它表示扫描边界。
+
+## 4. Barrier 与 CheckpointCut
+
+Barrier 是零 payload 的同步标记语义，不需要写额外 Frame：Sequencer 中的请求顺序本身确定
+marker 所在位置。Barrier flush 当前 pending、执行 Sync，并返回当时的 `CheckpointCut`、
+`LastFrameSeq` 和 `NextFrameSeq`。
+
+`CheckpointCut` 与“稍后观察到的最新 DurablePos”是两个概念。若未来允许 Barrier 后的数据
+与其一起物理 write/sync，Manifest 的 `ReplayStart` 仍必须使用 marker 自己的 cut；否则可能
+跳过尚未进入 Mapping checkpoint 的 durable Commit。
+
+当前 Sequencer 串行完成 Barrier，因此返回时不会有后续 Frame 越过 cut。更高层 checkpoint
+还必须保证 allocator high、open batches 和 terminal status 等外部状态取自同一 cut。若未来
+允许这些状态在 Barrier 后继续发布，必须增加 completion publication fence 或按 cut 版本化
+快照，不能用最新值拼接旧的 `CheckpointCut`。
+
+## 5. Segment 边界
+
+- Frame 永远不跨 Segment，pending buffer 也不能跨 Segment。
+- 可用空间按 `ActiveData.Remaining - pendingBytes - SegmentSealReserve` 计算。
+- 空间不足时先 flush pending，随后 seal/sync 旧 Segment，再创建新 Active Segment。
+- Rotation 的 SegmentSeal 消耗一个 FrameSeq；新 Segment 上的计划必须用新起点重新编码。
+- 地址一旦返回就不能因 flush 或 rotation 移动。
+- 配置 Rotator 后，空 Segment 仍放不下合法请求属于容量不变量破坏：Log fail-closed 并返回
+  `ErrCorrupt`，不能把内部 `segment.ErrFull` 泄漏给用户。
+- Segment 边界可能强制额外 write/sync；“一次 write、一次 fsync”只保证同一 Segment 内的
+  正常 CommitGroup 主路径。
+
+## 6. 错误与所有权
+
+- Context 在 reservation 前取消，不消耗 FrameSeq 或地址。
+- reservation 成功后，调用者可以立即复用原始 value buffer；appendlog 已持有副本。
+- `ActiveData.AppendBatch` 在写前完成全组编码和容量检查。
+- write 错误、短写、预分配地址不匹配或 Sync 错误都会 poison Active Segment 并 fault Log；
+  当前进程不能移动/复用已返回地址，也不能继续发布结果，必须重新 Open 扫描完整 Frame 前缀。
+- flush 时 `nextFrameSeq` 不再推进；序号已在 reservation 时分配。
+- pending index 只包含尚未完成 write 的 Frame；flush 成功后立即移除，读取自然退回 Registry。
+- 磁盘空间观测必须从 `statfs` 可用量中再扣除 `reservedPos-writtenPos`；pending bytes 尚未
+  反映在文件系统中，若刷新 Guard 时忽略它们，会重复发放同一份空间额度。
+
+## 7. 验证与观测
+
+自动化测试必须覆盖：
+
+- Put reservation 不触发 write/sync，且调用者修改原 value 不影响 pending payload；
+- 多个 Put 与 CommitGroup 形成一次 append write、一次 sync；
+- `durablePos <= writtenPos <= reservedPos`，Commit/Barrier 后三个水位收敛；
+- buffer 满时提前 write 但不错误推进 durable 水位；
+- rotation 后地址、FrameSeq 和水位保持单调；
+- canceled Put 不分配序号；Close flush pending；
+- write/short-write/sync failure 后所有等待者得到确定错误且 Log fail-closed；
+- pending-first RecordReader 覆盖用户 Commit 与 GC relocation；
+- race、crash matrix 和 recovery replay。
+
+后续 metrics 应加入 reserved bytes、written-not-durable bytes、group frames/bytes、write/syscall
+次数、sync 次数、queue wait、write duration 和 sync duration。等待时间与 write/sync 时间的
+比例用于判断压力来自 CPU、排队、系统调用还是设备持久化延迟。

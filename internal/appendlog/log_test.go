@@ -94,6 +94,54 @@ func TestAppendPutGroupSplitsAtRotationAndAccountsForSealSequence(t *testing.T) 
 	}
 }
 
+func TestBufferedPutFlushesBeforeRotationAndKeepsReservedAddress(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	uuid := base.StoreUUID{1}
+	segmentSize := uint64(storeformat.SegmentHeaderSize + storeformat.SegmentFooterSize + segmentSealReserve + storeformat.FrameHeaderSize)
+	active, err := segment.CreateActiveData(root, uuid, 1, 1, segmentSize, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := NewWithRotator(active, 1, 1024, 64, nil, &testPutRotator{root: root, uuid: uuid, segmentSize: segmentSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := NewSequencer(log, SequencerConfig{QueueDepth: 4, MaxFrames: 4, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAddr, firstSeq, _, err := sequencer.AppendPut(context.Background(), 1, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAddr, secondSeq, _, err := sequencer.AppendPut(context.Background(), 1, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAddr.SegmentID() != 1 || firstSeq != 1 || secondAddr.SegmentID() != 2 || secondSeq != 3 {
+		t.Fatalf("first=(%d,%d) second=(%d,%d)", firstAddr.SegmentID(), firstSeq, secondAddr.SegmentID(), secondSeq)
+	}
+	watermarks, err := sequencer.Watermarks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watermarks.DurablePos.SegmentID() != 2 || watermarks.WrittenPos != watermarks.DurablePos || watermarks.ReservedPos <= watermarks.WrittenPos {
+		t.Fatalf("rotation watermarks=%+v", watermarks)
+	}
+	if _, err := sequencer.Barrier(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sequencer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.active.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAppendPutDoesNotLeakErrFullWhenRotationCannotMakeProgress(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {

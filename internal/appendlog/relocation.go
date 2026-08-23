@@ -40,7 +40,11 @@ func (l *Log) AppendRelocation(prepared RelocationPrepared, commitSeq base.Commi
 		return CommitAppendResult{}, err
 	}
 	plannedAt := l.nextFrameSeq
-	if err := l.ensureCapacityLocked(plan.bytes); err != nil {
+	ensureCapacity := l.ensureCapacityLocked
+	if l.buffered {
+		ensureCapacity = l.ensureBufferedCapacityLocked
+	}
+	if err := ensureCapacity(plan.bytes); err != nil {
 		return CommitAppendResult{}, err
 	}
 	if l.nextFrameSeq != plannedAt {
@@ -51,6 +55,33 @@ func (l *Log) AppendRelocation(prepared RelocationPrepared, commitSeq base.Commi
 		}
 	}
 	result := plan.result
+	if l.buffered {
+		prefixBytes := l.pendingBytes
+		for _, frame := range plan.frames {
+			size, sizeErr := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
+			if sizeErr != nil {
+				l.faulted = true
+				return result, sizeErr
+			}
+			if _, stageErr := l.stageFrameLocked(frame, size); stageErr != nil {
+				l.faulted = true
+				return result, stageErr
+			}
+		}
+		written, appendErr := l.flushPendingLocked()
+		result.SealStarted = written > prefixBytes+plan.bytes-descriptorSealFrameSize
+		if appendErr != nil {
+			return result, appendErr
+		}
+		if err := l.active.Sync(); err != nil {
+			l.faulted = true
+			return result, err
+		}
+		if err := l.markDurableLocked(); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
 	if l.hook == nil {
 		written, appendErr := l.appendFrameBatchLocked(plan.frames)
 		result.SealStarted = written > plan.bytes-descriptorSealFrameSize
@@ -80,6 +111,9 @@ func (l *Log) AppendRelocation(prepared RelocationPrepared, commitSeq base.Commi
 	}
 	if err := l.active.Sync(); err != nil {
 		l.faulted = true
+		return result, err
+	}
+	if err := l.markDurableLocked(); err != nil {
 		return result, err
 	}
 	if err := failpoint.Hit(l.hook, PointRelocationSynced); err != nil {

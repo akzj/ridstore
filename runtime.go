@@ -107,7 +107,22 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		if store == nil {
 			return defaultAvailableBytes(path)
 		}
-		return store.availableBytes(path)
+		available, err := store.availableBytes(path)
+		if err != nil {
+			return 0, err
+		}
+		watermarks, err := log.Watermarks()
+		if err != nil {
+			return 0, err
+		}
+		if watermarks.ReservedPos.SegmentID() != watermarks.WrittenPos.SegmentID() || watermarks.ReservedPos.Offset() < watermarks.WrittenPos.Offset() {
+			return 0, fmt.Errorf("append watermarks are not segment-local and monotonic: %w", base.ErrCorrupt)
+		}
+		pendingBytes := uint64(watermarks.ReservedPos.Offset() - watermarks.WrittenPos.Offset())
+		if pendingBytes >= available {
+			return 0, nil
+		}
+		return available - pendingBytes, nil
 	})
 	if err != nil {
 		return failWithLog(err)
@@ -123,7 +138,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	}
 	runtimeMetrics := &metrics.Runtime{}
 	var requestSoftCheckpoint func()
-	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, persistentMapping, segmentRecordReader{segments: segments}, commit.Config{
+	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, persistentMapping, segmentRecordReader{segments: segments, log: log}, commit.Config{
 		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: groupBytes, MaxPartPayload: maxPartPayload, MaxDelay: cfg.MaxGroupDelay,
 		Metrics: runtimeMetrics, OnDeltaSoftLimit: func() {
 			if requestSoftCheckpoint != nil {
@@ -195,9 +210,17 @@ func (w spaceAwareReserveWriter) AppendReserve(ctx context.Context, typ storefor
 	return w.log.AppendReserve(ctx, typ, payload)
 }
 
-type segmentRecordReader struct{ segments *segment.Registry }
+type segmentRecordReader struct {
+	segments *segment.Registry
+	log      *appendlog.Sequencer
+}
 
 func (r segmentRecordReader) ReadPutHeader(addr base.VAddr) (commit.RecordHeader, error) {
+	if r.log != nil {
+		if frame, ok := r.log.ReadPendingFrame(addr); ok {
+			return putRecordHeader(frame)
+		}
+	}
 	header, err := r.segments.ReadFrameHeader(addr)
 	if err != nil {
 		return commit.RecordHeader{}, err
@@ -212,21 +235,41 @@ func (r segmentRecordReader) ReadPutHeader(addr base.VAddr) (commit.RecordHeader
 }
 
 func (r segmentRecordReader) ReadPutRecord(addr base.VAddr) (commit.PutRecord, error) {
-	frame, err := r.segments.ReadFrame(addr)
+	var (
+		frame storeformat.Frame
+		err   error
+	)
+	if r.log != nil {
+		var ok bool
+		frame, ok = r.log.ReadPendingFrame(addr)
+		if !ok {
+			frame, err = r.segments.ReadFrame(addr)
+		}
+	} else {
+		frame, err = r.segments.ReadFrame(addr)
+	}
 	if err != nil {
 		return commit.PutRecord{}, err
 	}
+	header, err := putRecordHeader(frame)
+	if err != nil {
+		return commit.PutRecord{}, err
+	}
+	return commit.PutRecord{Header: header, Value: frame.Payload}, nil
+}
+
+func putRecordHeader(frame storeformat.Frame) (commit.RecordHeader, error) {
 	if frame.Type != storeformat.FrameTypePutRecord {
-		return commit.PutRecord{}, fmt.Errorf("mapping target is not PutRecord: %w", base.ErrCorrupt)
+		return commit.RecordHeader{}, fmt.Errorf("mapping target is not PutRecord: %w", base.ErrCorrupt)
 	}
 	physicalSize, err := base.Align8(storeformat.FrameHeaderSize + uint64(len(frame.Payload)))
 	if err != nil {
-		return commit.PutRecord{}, err
+		return commit.RecordHeader{}, err
 	}
-	return commit.PutRecord{Header: commit.RecordHeader{
+	return commit.RecordHeader{
 		RecordID: frame.RecordID, OriginBatch: frame.BatchID,
 		ValueBytes: uint64(len(frame.Payload)), PhysicalSize: physicalSize,
-	}, Value: frame.Payload}, nil
+	}, nil
 }
 
 func (s *Store) setFault(err error) {

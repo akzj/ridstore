@@ -127,11 +127,12 @@ Header validation 按 `(SegmentID, offset)` 排序并使用有界窗口；生成
 
 ## 6. Group Commit 与 GC 调度
 
-`MaxGroupBytes` 分别限制 Append Sequencer 的 queued Put group，以及待写
-Commit Descriptor group 与 coordinator buffer；两个阶段不会把字节相加保留在
-同一个 buffer 中。`MaxGroupBatches` 在 append 层作为 Put Frame 数上限，在 commit 层
-作为 Batch 数上限。Append Sequencer 只 opportunistically drain 已经排队的 Put，不使用
-主动 delay；`MaxGroupDelay` 只作用于 Commit Coordinator。详见
+`MaxGroupBytes` 限制 Append Sequencer 的 pending Frame buffer，并同时作为 Commit
+Coordinator 的 group admission 预算。Put 与随后形成的 Commit Descriptor 可以共存于
+同一物理 append buffer；达到 Frame/byte 上限时 append 层允许提前 write，但不提前 fsync。
+`MaxGroupBatches` 在 append 层作为 pending Frame 数软上限，在 commit 层作为 Batch 数
+上限；单个合法 Frame 或完整 Descriptor 可以超过聚合预算独立执行。Append Sequencer
+不使用主动 delay；`MaxGroupDelay` 只作用于 Commit Coordinator。详见
 [Append Engine](append-engine.md)。
 
 有效 group byte 上限为 `min(MaxGroupBytes, DataAppendCapacity)`，其中后者已经扣除
