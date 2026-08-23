@@ -141,6 +141,10 @@ func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
 			continue
 		}
 		if err := l.ensureCapacityLocked(probeSize); err != nil {
+			if errors.Is(err, segment.ErrFull) && l.rotator != nil {
+				l.faulted = true
+				err = fmt.Errorf("put frame cannot fit an empty data segment: %w", base.ErrCorrupt)
+			}
 			results[start].Err = err
 			start++
 			if l.faulted {
@@ -152,12 +156,23 @@ func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
 			continue
 		}
 
-		remaining := l.active.Remaining() - segmentSealReserve
+		activeRemaining := l.active.Remaining()
+		if activeRemaining < segmentSealReserve {
+			l.faulted = true
+			err := fmt.Errorf("active data segment lost seal reserve: %w", base.ErrCorrupt)
+			for i := start; i < len(results); i++ {
+				results[i].Err = err
+			}
+			break
+		}
+		remaining := activeRemaining - segmentSealReserve
 		frames := make([]storeformat.Frame, 0, len(requests)-start)
 		frameSizes := make([]uint64, 0, len(requests)-start)
 		indexes := make([]int, 0, len(requests)-start)
 		var bytes uint64
-		for i := start; i < len(requests); i++ {
+		next := start
+		for ; next < len(requests); next++ {
+			i := next
 			ctx := requests[i].Context
 			if ctx == nil {
 				ctx = context.Background()
@@ -176,7 +191,7 @@ func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
 				results[i].Err = err
 				continue
 			}
-			if size > remaining-bytes {
+			if size > remaining || bytes > remaining-size {
 				break
 			}
 			frames = append(frames, frame)
@@ -185,14 +200,24 @@ func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
 			bytes += size
 		}
 		if len(frames) == 0 {
-			// Only canceled/invalid requests were encountered after start.
-			start++
+			if next == start {
+				l.faulted = true
+				err := fmt.Errorf("preflighted put does not fit active data segment: %w", base.ErrCorrupt)
+				for i := start; i < len(results); i++ {
+					results[i].Err = err
+				}
+				break
+			}
+			// Every request before next was canceled or invalid. next is either
+			// the first request that needs rotation, or len(requests).
+			start = next
 			continue
 		}
 		appended, written, err := l.active.AppendBatch(frames)
 		if err != nil {
-			if !errors.Is(err, segment.ErrFull) {
-				l.faulted = true
+			l.faulted = true
+			if errors.Is(err, segment.ErrFull) {
+				err = fmt.Errorf("planned put group no longer fits active data segment: %w", base.ErrCorrupt)
 			}
 			remainingWritten := written
 			for i, index := range indexes {
@@ -230,7 +255,7 @@ func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
 				return results
 			}
 		}
-		start = indexes[len(indexes)-1] + 1
+		start = next
 	}
 	return results
 }
@@ -362,24 +387,21 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 	results := make([]CommitAppendResult, len(plans))
 	for planIndex, plan := range plans {
 		results[planIndex].SealFrameSeq = plan.result.SealFrameSeq
-		for frameIndex, frame := range plan.frames {
-			_, written, err := l.appendLocked(frame)
-			if err != nil {
-				if frameIndex == len(plan.frames)-1 && written != 0 {
-					results[planIndex].SealStarted = true
-				}
-				return results, err
-			}
-			if frameIndex == len(plan.frames)-1 {
-				results[planIndex].SealStarted = true
-				if err := failpoint.Hit(l.hook, PointCommitSealWritten); err != nil {
-					l.faulted = true
-					return results, err
-				}
-			} else if err := failpoint.Hit(l.hook, PointCommitPartWritten); err != nil {
-				l.faulted = true
-				return results, err
-			}
+	}
+	if l.hook == nil {
+		frames := flattenPlanFrames(plans)
+		written, appendErr := l.appendFrameBatchLocked(frames)
+		var planOffset uint64
+		for planIndex, plan := range plans {
+			results[planIndex].SealStarted = written > planOffset+plan.bytes-descriptorSealFrameSize
+			planOffset += plan.bytes
+		}
+		if appendErr != nil {
+			return results, appendErr
+		}
+	} else {
+		if err := l.appendCommitPlansWithHooksLocked(plans, results); err != nil {
+			return results, err
 		}
 	}
 	if err := l.active.Sync(); err != nil {
@@ -393,7 +415,74 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 	return results, nil
 }
 
-const segmentSealReserve = uint64(storeformat.FrameHeaderSize + 64)
+// appendCommitPlansWithHooksLocked retains per-Frame fault boundaries. Hooks
+// are dependency-injected test instrumentation; production uses one batch
+// append above so Descriptor Frames share one write syscall.
+func (l *Log) appendCommitPlansWithHooksLocked(plans []commitPlan, results []CommitAppendResult) error {
+	for planIndex, plan := range plans {
+		for frameIndex, frame := range plan.frames {
+			_, written, err := l.appendLocked(frame)
+			if err != nil {
+				if frameIndex == len(plan.frames)-1 && written != 0 {
+					results[planIndex].SealStarted = true
+				}
+				return err
+			}
+			if frameIndex == len(plan.frames)-1 {
+				results[planIndex].SealStarted = true
+				if err := failpoint.Hit(l.hook, PointCommitSealWritten); err != nil {
+					l.faulted = true
+					return err
+				}
+			} else if err := failpoint.Hit(l.hook, PointCommitPartWritten); err != nil {
+				l.faulted = true
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+const (
+	segmentSealReserve      = uint64(storeformat.FrameHeaderSize + 64)
+	descriptorSealFrameSize = uint64(storeformat.FrameHeaderSize + storeformat.DescriptorSealSize)
+)
+
+func flattenPlanFrames(plans []commitPlan) []storeformat.Frame {
+	count := 0
+	for _, plan := range plans {
+		count += len(plan.frames)
+	}
+	frames := make([]storeformat.Frame, 0, count)
+	for _, plan := range plans {
+		frames = append(frames, plan.frames...)
+	}
+	return frames
+}
+
+func (l *Log) appendFrameBatchLocked(frames []storeformat.Frame) (uint64, error) {
+	_, written, err := l.active.AppendBatch(frames)
+	if err == nil {
+		l.nextFrameSeq += base.FrameSeq(len(frames))
+		return written, nil
+	}
+	l.faulted = true
+	complete := 0
+	remaining := written
+	for _, frame := range frames {
+		size, sizeErr := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
+		if sizeErr != nil || remaining < size {
+			break
+		}
+		remaining -= size
+		complete++
+	}
+	l.nextFrameSeq += base.FrameSeq(complete)
+	if errors.Is(err, segment.ErrFull) {
+		err = fmt.Errorf("preflighted descriptor group does not fit active data segment: %w", base.ErrCorrupt)
+	}
+	return written, err
+}
 
 func (l *Log) buildCommitGroup(prepared []batch.Prepared, commitSeqs []base.CommitSeq) ([]commitPlan, uint64, error) {
 	plans := make([]commitPlan, len(prepared))
@@ -452,11 +541,11 @@ func (l *Log) buildCommitPlan(prepared batch.Prepared, commitSeq base.CommitSeq,
 	frames = append(frames, storeformat.Frame{Type: storeformat.FrameTypeCommitSeal, FrameSeq: sealSeq, BatchID: prepared.BatchID, Payload: sealPayload[:]})
 	var totalBytes uint64
 	for _, frame := range frames {
-		encoded, err := storeformat.EncodeFrame(frame, l.maxFramePayload)
+		size, err := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
 		if err != nil {
 			return commitPlan{}, err
 		}
-		totalBytes, err = base.AddUint64(totalBytes, uint64(len(encoded)))
+		totalBytes, err = base.AddUint64(totalBytes, size)
 		if err != nil {
 			return commitPlan{}, err
 		}

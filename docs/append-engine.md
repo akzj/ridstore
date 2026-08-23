@@ -30,6 +30,13 @@ ActiveData.AppendBatch
         +-- one WriteAt for one segment-local group
 ```
 
+Commit Coordinator 已形成的整个 CommitGroup 同样通过一次
+`ActiveData.AppendBatch` 写入所有 CommitPart/CommitSeal，然后执行一次 Sync；单个
+Relocation Descriptor 的 Part/Seal 也采用相同路径。因此“一条 Record 一个 Batch”在
+并发成组后，不再为每个 Descriptor Frame 单独调用 `WriteAt`。依赖注入的 failpoint
+测试路径仍逐 Frame 写入，以保留 `PartWritten` 与 `SealWritten` 的精确崩溃边界；生产
+路径不安装 Hook，使用合并写。
+
 这一阶段只合并已经并发排队的 Put。`AppendPut` 返回时，其完整 Frame 已经交给内核
 写入，但尚未因为 Put 本身执行 `fsync`。同一调用者同步地逐条 Put 不会被主动延迟来
 凑批，也不会获得 batching；这是第二阶段要解决的问题。
@@ -40,6 +47,9 @@ ActiveData.AppendBatch
 - 每个成功 Put 获得唯一且连续的 `FrameSeq`，取消或编码失败的请求不消耗序号。
 - 一个 Frame 永远不跨 Data Segment。空间不足时，Log 先完成 Rotation，再在新
   Segment 分配 Put 的 `FrameSeq`；一个输入 group 可以被拆成多个物理写。
+- `segment.ErrFull` 仅是无 Rotator 的底层测试/组件控制信号。生产 Put 路径必须在
+  Log 内消化它；若配置了 Rotation 但空 Segment 仍容纳不下已通过校验的 Frame，说明
+  容量不变量已破坏，Log fail-closed 并返回 `ErrCorrupt`，不能把内部错误泄漏给用户。
 - `ActiveData.AppendBatch` 在写前完成整组编码和容量检查。容量不足不写入任何字节。
 - 一次批量写发生错误或短写后，Active Segment 与 Log 都进入 poisoned/faulted
   状态；该进程不能继续发布该组的任何地址，必须通过重新 Open 扫描完整 Frame 前缀。

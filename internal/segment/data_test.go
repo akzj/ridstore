@@ -96,6 +96,26 @@ func TestActiveDataAppendBatchPreflightAndPoison(t *testing.T) {
 	}
 }
 
+func TestActiveDataAppendBatchRejectsEndBeyondContentLimit(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	createActiveDataFile(t, root, uuid, 1)
+	active, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+
+	active.end = active.segmentSize - storeformat.SegmentFooterSize + 1
+	frame := storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1}
+	if _, _, err := active.AppendBatch([]storeformat.Frame{frame}); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("invalid end error=%v", err)
+	}
+	if _, _, err := active.AppendBatch([]storeformat.Frame{frame}); !errors.Is(err, ErrPoisoned) {
+		t.Fatalf("append after invalid end=%v", err)
+	}
+}
+
 func createActiveDataFile(t *testing.T, root string, uuid base.StoreUUID, id base.DataSegmentID) {
 	t.Helper()
 	if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {

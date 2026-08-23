@@ -94,6 +94,31 @@ func TestAppendPutGroupSplitsAtRotationAndAccountsForSealSequence(t *testing.T) 
 	}
 }
 
+func TestAppendPutDoesNotLeakErrFullWhenRotationCannotMakeProgress(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	uuid := base.StoreUUID{1}
+	segmentSize := uint64(storeformat.SegmentHeaderSize + storeformat.SegmentFooterSize + segmentSealReserve)
+	active, err := segment.CreateActiveData(root, uuid, 1, 1, segmentSize, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	log, err := NewWithRotator(active, 1, 1024, 64, nil, &testPutRotator{root: root, uuid: uuid, segmentSize: segmentSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = log.AppendPut(context.Background(), 1, 1, nil)
+	if !errors.Is(err, base.ErrCorrupt) || errors.Is(err, segment.ErrFull) {
+		t.Fatalf("append error=%v", err)
+	}
+	if !log.Faulted() {
+		t.Fatal("log did not fault after impossible empty-segment capacity")
+	}
+}
+
 func newActive(t *testing.T, segmentSize uint64) (*segment.ActiveData, base.StoreUUID) {
 	t.Helper()
 	root := t.TempDir()
@@ -183,25 +208,40 @@ func TestCommitPreflightNoSpaceWritesNothing(t *testing.T) {
 func TestAppendCommitGroupPreflightsAndOrdersDescriptors(t *testing.T) {
 	active, _ := newActive(t, 1<<20)
 	defer active.Close()
+	var appendWrites atomic.Int32
+	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		if point == segment.PointBeforeAppendWrite {
+			appendWrites.Add(1)
+		}
+		return nil
+	}))
 	log, err := New(active, 1, 1024, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
 	results, err := log.AppendCommitGroup(
-		[]batch.Prepared{{BatchID: 7}, {BatchID: 8}},
+		[]batch.Prepared{
+			{BatchID: 7, Mutations: []batch.Mutation{{RecordID: 1, Operation: batch.Delete}}},
+			{BatchID: 8, Mutations: []batch.Mutation{{RecordID: 2, Operation: batch.Delete}}},
+		},
 		[]base.CommitSeq{11, 12},
 	)
-	if err != nil || len(results) != 2 || results[0].SealFrameSeq != 1 || results[1].SealFrameSeq != 2 || !results[0].SealStarted || !results[1].SealStarted {
+	if err != nil || len(results) != 2 || results[0].SealFrameSeq != 2 || results[1].SealFrameSeq != 4 || !results[0].SealStarted || !results[1].SealStarted {
 		t.Fatalf("results=%+v error=%v", results, err)
 	}
 	var commits []base.CommitSeq
+	var parts []storeformat.Frame
 	if err := active.Scan(func(_ base.VAddr, frame storeformat.Frame) error {
-		if frame.Type == storeformat.FrameTypeCommitSeal {
-			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorCommit, nil, frame, 10)
+		switch frame.Type {
+		case storeformat.FrameTypeCommitPart:
+			parts = append(parts, frame)
+		case storeformat.FrameTypeCommitSeal:
+			decoded, err := storeformat.ValidateDescriptorFrames(storeformat.DescriptorCommit, parts, frame, 10)
 			if err != nil {
 				return err
 			}
 			commits = append(commits, decoded.Seal.CommitSeq)
+			parts = nil
 		}
 		return nil
 	}); err != nil {
@@ -209,6 +249,9 @@ func TestAppendCommitGroupPreflightsAndOrdersDescriptors(t *testing.T) {
 	}
 	if len(commits) != 2 || commits[0] != 11 || commits[1] != 12 {
 		t.Fatalf("commits=%v", commits)
+	}
+	if appendWrites.Load() != 1 {
+		t.Fatalf("descriptor append writes=%d", appendWrites.Load())
 	}
 }
 
@@ -235,6 +278,13 @@ func TestAppendLogRejectsCancellationAndInvalidReserve(t *testing.T) {
 func TestAppendRelocationDescriptor(t *testing.T) {
 	active, _ := newActive(t, 1<<20)
 	defer active.Close()
+	var appendWrites atomic.Int32
+	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		if point == segment.PointBeforeAppendWrite {
+			appendWrites.Add(1)
+		}
+		return nil
+	}))
 	log, err := New(active, 1, 1024, 64)
 	if err != nil {
 		t.Fatal(err)
@@ -270,6 +320,9 @@ func TestAppendRelocationDescriptor(t *testing.T) {
 	if err != nil || decoded.BatchID != 91 || decoded.Seal.CommitSeq != 12 || decoded.Seal.LogicalPayloadBytes != 17 || len(decoded.Entries) != 2 ||
 		decoded.Entries[0].ExpectedOldAddr != old1 || decoded.Entries[1].NewVAddr != new2 {
 		t.Fatalf("descriptor=%+v error=%v", decoded, err)
+	}
+	if appendWrites.Load() != 1 {
+		t.Fatalf("relocation descriptor append writes=%d", appendWrites.Load())
 	}
 }
 

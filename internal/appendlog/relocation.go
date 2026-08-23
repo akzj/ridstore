@@ -52,23 +52,31 @@ func (l *Log) AppendRelocation(prepared RelocationPrepared, commitSeq base.Commi
 		return CommitAppendResult{}, segment.ErrFull
 	}
 	result := plan.result
-	for i, frame := range plan.frames {
-		_, written, appendErr := l.appendLocked(frame)
+	if l.hook == nil {
+		written, appendErr := l.appendFrameBatchLocked(plan.frames)
+		result.SealStarted = written > plan.bytes-descriptorSealFrameSize
 		if appendErr != nil {
-			if i == len(plan.frames)-1 && written != 0 {
-				result.SealStarted = true
-			}
 			return result, appendErr
 		}
-		if i == len(plan.frames)-1 {
-			result.SealStarted = true
-			if err := failpoint.Hit(l.hook, PointRelocationSealWritten); err != nil {
+	} else {
+		for i, frame := range plan.frames {
+			_, written, appendErr := l.appendLocked(frame)
+			if appendErr != nil {
+				if i == len(plan.frames)-1 && written != 0 {
+					result.SealStarted = true
+				}
+				return result, appendErr
+			}
+			if i == len(plan.frames)-1 {
+				result.SealStarted = true
+				if err := failpoint.Hit(l.hook, PointRelocationSealWritten); err != nil {
+					l.faulted = true
+					return result, err
+				}
+			} else if err := failpoint.Hit(l.hook, PointRelocationPartWritten); err != nil {
 				l.faulted = true
 				return result, err
 			}
-		} else if err := failpoint.Hit(l.hook, PointRelocationPartWritten); err != nil {
-			l.faulted = true
-			return result, err
 		}
 	}
 	if err := l.active.Sync(); err != nil {
@@ -114,11 +122,11 @@ func (l *Log) buildRelocationPlan(prepared RelocationPrepared, commitSeq base.Co
 	frames = append(frames, storeformat.Frame{Type: storeformat.FrameTypeRelocationSeal, FrameSeq: sealSeq, BatchID: prepared.BatchID, Payload: sealPayload[:]})
 	var totalBytes uint64
 	for _, frame := range frames {
-		encoded, err := storeformat.EncodeFrame(frame, l.maxFramePayload)
+		size, err := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
 		if err != nil {
 			return commitPlan{}, err
 		}
-		totalBytes, err = base.AddUint64(totalBytes, uint64(len(encoded)))
+		totalBytes, err = base.AddUint64(totalBytes, size)
 		if err != nil {
 			return commitPlan{}, err
 		}

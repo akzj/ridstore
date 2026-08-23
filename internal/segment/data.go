@@ -370,7 +370,12 @@ func (s *ActiveData) AppendBatch(frames []storeformat.Frame) ([]AppendResult, ui
 		total += size
 	}
 	contentLimit := s.segmentSize - storeformat.SegmentFooterSize
-	if total > contentLimit-s.end {
+	if s.end > contentLimit {
+		s.poisoned = true
+		return nil, 0, fmt.Errorf("active data end %d exceeds content limit %d: %w", s.end, contentLimit, base.ErrCorrupt)
+	}
+	remaining := contentLimit - s.end
+	if total > remaining {
 		return nil, 0, ErrFull
 	}
 	offset := s.end
