@@ -233,6 +233,148 @@ func TestSequencerCoalescesReservedPutsAndCommitIntoOneWriteAndSync(t *testing.T
 	}
 }
 
+func TestSequencerCoalescesAdjacentDurableRequests(t *testing.T) {
+	active, _ := newActive(t, 1<<20)
+	defer active.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var blockFirstSync sync.Once
+	var appendWrites atomic.Int32
+	var syncs atomic.Int32
+	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		switch point {
+		case segment.PointBeforeAppendWrite:
+			appendWrites.Add(1)
+		case segment.PointBeforeSync:
+			syncs.Add(1)
+			blockFirstSync.Do(func() {
+				close(started)
+				<-release
+			})
+		}
+		return nil
+	}))
+	log, err := New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := NewSequencer(log, SequencerConfig{QueueDepth: 8, MaxFrames: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+
+	barrierDone := make(chan error, 1)
+	go func() {
+		_, err := sequencer.Barrier(context.Background())
+		barrierDone <- err
+	}()
+	<-started
+	results := make(chan error, 2)
+	go func() {
+		results <- sequencer.AppendReserve(context.Background(), storeformat.FrameTypeIDReserve, storeformat.ReservePayload{PreviousHighExclusive: 1, NewHighExclusive: 2, Generation: 1})
+	}()
+	go func() {
+		results <- sequencer.AppendReserve(context.Background(), storeformat.FrameTypeBatchIDReserve, storeformat.ReservePayload{PreviousHighExclusive: 1, NewHighExclusive: 2, Generation: 1})
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(sequencer.reqs) != 2 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if len(sequencer.reqs) != 2 {
+		t.Fatalf("queued durable requests=%d", len(sequencer.reqs))
+	}
+	close(release)
+	if err := <-barrierDone; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if appendWrites.Load() != 1 || syncs.Load() != 2 {
+		t.Fatalf("physical I/O writes=%d syncs=%d", appendWrites.Load(), syncs.Load())
+	}
+}
+
+func TestBarrierMarkerSharesPriorSyncAndCutsBeforeLaterRequests(t *testing.T) {
+	active, _ := newActive(t, 1<<20)
+	defer active.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var blockFirstSync sync.Once
+	var appendWrites atomic.Int32
+	var syncs atomic.Int32
+	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		switch point {
+		case segment.PointBeforeAppendWrite:
+			appendWrites.Add(1)
+		case segment.PointBeforeSync:
+			syncs.Add(1)
+			blockFirstSync.Do(func() {
+				close(started)
+				<-release
+			})
+		}
+		return nil
+	}))
+	log, err := New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := NewSequencer(log, SequencerConfig{QueueDepth: 8, MaxFrames: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+
+	initialBarrier := make(chan error, 1)
+	go func() {
+		_, err := sequencer.Barrier(context.Background())
+		initialBarrier <- err
+	}()
+	<-started
+	reserveResult := make(chan sequenceResult, 1)
+	barrierResult := make(chan sequenceResult, 1)
+	putResult := make(chan sequenceResult, 1)
+	sequencer.reqs <- sequenceRequest{
+		kind: requestReserve, durability: completeDurable, ctx: context.Background(), result: reserveResult,
+		frameType: storeformat.FrameTypeIDReserve,
+		reserve:   storeformat.ReservePayload{PreviousHighExclusive: 1, NewHighExclusive: 2, Generation: 1},
+	}
+	sequencer.reqs <- sequenceRequest{kind: requestBarrier, durability: completeDurable, marker: true, ctx: context.Background(), result: barrierResult}
+	sequencer.reqs <- sequenceRequest{kind: requestPut, durability: completeReserved, ctx: context.Background(), result: putResult, batchID: 1, recordID: 1, value: []byte("later")}
+	close(release)
+	if err := <-initialBarrier; err != nil {
+		t.Fatal(err)
+	}
+	if result := <-reserveResult; result.err != nil {
+		t.Fatal(result.err)
+	}
+	marker := <-barrierResult
+	if marker.err != nil {
+		t.Fatal(marker.err)
+	}
+	put := <-putResult
+	if put.put.Err != nil {
+		t.Fatal(put.put.Err)
+	}
+	if base.LogPos(put.put.Addr) != marker.barrier.CheckpointCut {
+		t.Fatalf("later addr=%d marker cut=%d", put.put.Addr, marker.barrier.CheckpointCut)
+	}
+	watermarks, err := sequencer.Watermarks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watermarks.DurablePos != marker.barrier.CheckpointCut || watermarks.WrittenPos != marker.barrier.CheckpointCut || watermarks.ReservedPos <= marker.barrier.CheckpointCut {
+		t.Fatalf("marker=%+v watermarks=%+v", marker.barrier, watermarks)
+	}
+	if appendWrites.Load() != 1 || syncs.Load() != 2 {
+		t.Fatalf("physical I/O writes=%d syncs=%d", appendWrites.Load(), syncs.Load())
+	}
+}
+
 func TestSequencerBufferLimitWritesWithoutAdvancingDurability(t *testing.T) {
 	active, _ := newActive(t, 1<<20)
 	defer active.Close()

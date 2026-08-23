@@ -39,19 +39,27 @@ AppendPut
   -> 返回 receipt
 ```
 
-CommitGroup 将已验证 Batch 的所有 CommitPart/CommitSeal 追加到同一 pending buffer：
+Sequencer 从当前队列提取一个有界 append cycle。每个请求只负责校验、构造并 stage Frame；
+`Reserve`、`CommitGroup` 和 `Relocation` 只声明自己需要 durable completion，不在各自方法中
+调用 write/fsync。cycle 中任一请求要求 durability 时，Sequencer 在全部请求 stage 后统一：
 
 ```text
-Put1 Put2 ... PutN CommitPart... CommitSeal...
+Put1 Commit1 Reserve Put2 Commit2 Relocation ...
   -> ActiveData.AppendBatch      // 一个连续 buffer、一次 WriteAt
   -> ActiveData.Sync             // 一次 fsync
-  -> Mapping publish
+  -> 逐请求完成 durable result
 ```
 
 因此，即使每个 Batch 只修改一条 Record，同一 CommitGroup 的 Put 与 Descriptor 也能共享
-一次 write 和一次 fsync。超过 buffer Frame/byte 预算时可提前 write，但不提前 sync；后续
-durable request 的 Sync 覆盖此前 written 前缀。单个合法大 Frame 可以超过聚合预算独立存在，
-但仍受 Format HardLimit 和 Segment 容量约束。
+一次 write 和一次 fsync；相邻的多个独立 durable request 也可以共享同一个 cycle fsync。
+`applyRequest` 不完成物理持久化，它只产生 request result 和 completion 条件。超过 buffer
+Frame/byte 预算时可提前 write，但不提前 sync；后续 durable request 的 Sync 覆盖此前
+written 前缀。单个合法大 Frame 可以超过聚合预算独立存在，但仍受 Format HardLimit 和
+Segment 容量约束。
+
+是否需要 fsync 是请求上的显式 `requestDurability`，而不是 Sequencer 根据业务名称临时推断：
+Put/Abort 在 reservation 后即可完成，Reserve/Commit/Relocation 要等 cycle durable。请求类型
+仍负责构造对应 Frame，但物理引擎只消费 Frame、completion level 和 marker cut。
 
 尚未落盘的 Put 需要参与 Commit 校验和 GC relocation 校验。RecordReader 先查询 pending
 address index，未命中再读取 Segment Registry。pending 查询返回 payload 副本，不能把可变
@@ -86,7 +94,8 @@ marker 所在位置。Barrier flush 当前 pending、执行 Sync，并返回当�
 与其一起物理 write/sync，Manifest 的 `ReplayStart` 仍必须使用 marker 自己的 cut；否则可能
 跳过尚未进入 Mapping checkpoint 的 durable Commit。
 
-当前 Sequencer 串行完成 Barrier，因此返回时不会有后续 Frame 越过 cut。更高层 checkpoint
+Barrier 当前是 append cycle 的逻辑边界：它与 marker 之前已经进入 cycle 的请求共享一次
+write/fsync，但不提取 marker 后面的请求。这样返回时不会有后续 Frame 越过 cut。更高层 checkpoint
 还必须保证 allocator high、open batches 和 terminal status 等外部状态取自同一 cut。若未来
 允许这些状态在 Barrier 后继续发布，必须增加 completion publication fence 或按 cut 版本化
 快照，不能用最新值拼接旧的 `CheckpointCut`。

@@ -10,11 +10,19 @@ import (
 	"github.com/akzj/ridstore/internal/segment"
 )
 
+type cycleOutcome struct {
+	writtenSegment base.DataSegmentID
+	writtenEnd     uint64
+}
+
 // stageFrameLocked reserves a stable address in the active segment without
 // issuing I/O. The caller must have preflighted capacity for size.
 func (l *Log) stageFrameLocked(frame storeformat.Frame, size uint64) (base.VAddr, error) {
 	if !l.buffered || frame.FrameSeq != l.nextFrameSeq || size == 0 {
 		return 0, base.ErrCorrupt
+	}
+	if err := l.flushForBudgetLocked(size); err != nil {
+		return 0, err
 	}
 	if l.pendingBytes > math.MaxUint64-l.active.End() {
 		return 0, base.ErrGenerationExhausted
@@ -37,6 +45,24 @@ func (l *Log) stageFrameLocked(frame storeformat.Frame, size uint64) (base.VAddr
 	l.pendingBytes += size
 	l.nextFrameSeq++
 	return addr, nil
+}
+
+func (l *Log) stageFramesLocked(frames []storeformat.Frame) (base.VAddr, error) {
+	var last base.VAddr
+	for _, frame := range frames {
+		size, err := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
+		if err != nil {
+			return 0, err
+		}
+		last, err = l.stageFrameLocked(frame, size)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if last == 0 {
+		return 0, base.ErrInvalidConfig
+	}
+	return last, nil
 }
 
 func (l *Log) flushForBudgetLocked(required uint64) error {
@@ -116,6 +142,27 @@ func (l *Log) syncPendingLocked() (uint64, error) {
 		return written, err
 	}
 	return written, nil
+}
+
+func (l *Log) syncCycle() (cycleOutcome, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.ready(); err != nil {
+		return l.cycleOutcomeLocked(), err
+	}
+	_, syncErr := l.syncPendingLocked()
+	outcome := l.cycleOutcomeLocked()
+	if syncErr != nil {
+		return outcome, syncErr
+	}
+	if _, err := l.watermarksLocked(); err != nil {
+		return outcome, err
+	}
+	return outcome, nil
+}
+
+func (l *Log) cycleOutcomeLocked() cycleOutcome {
+	return cycleOutcome{writtenSegment: l.active.SegmentID(), writtenEnd: l.active.End()}
 }
 
 func (l *Log) closePending() error {

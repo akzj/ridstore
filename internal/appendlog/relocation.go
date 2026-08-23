@@ -27,8 +27,9 @@ const (
 	PointRelocationSynced      failpoint.Point = "appendlog.relocation-synced"
 )
 
-// AppendRelocation appends one relocation descriptor and durably orders it in
-// the same FrameSeq/CommitSeq stream as user commits.
+// AppendRelocation orders one relocation descriptor in the same
+// FrameSeq/CommitSeq stream as user commits. The Sequencer's append cycle
+// supplies durability for buffered Logs.
 func (l *Log) AppendRelocation(prepared RelocationPrepared, commitSeq base.CommitSeq) (CommitAppendResult, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -56,30 +57,12 @@ func (l *Log) AppendRelocation(prepared RelocationPrepared, commitSeq base.Commi
 	}
 	result := plan.result
 	if l.buffered {
-		prefixBytes := l.pendingBytes
-		for _, frame := range plan.frames {
-			size, sizeErr := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
-			if sizeErr != nil {
-				l.faulted = true
-				return result, sizeErr
-			}
-			if _, stageErr := l.stageFrameLocked(frame, size); stageErr != nil {
-				l.faulted = true
-				return result, stageErr
-			}
-		}
-		written, appendErr := l.flushPendingLocked()
-		result.SealStarted = written > prefixBytes+plan.bytes-descriptorSealFrameSize
-		if appendErr != nil {
-			return result, appendErr
-		}
-		if err := l.active.Sync(); err != nil {
+		sealAddr, stageErr := l.stageFramesLocked(plan.frames)
+		if stageErr != nil {
 			l.faulted = true
-			return result, err
+			return result, stageErr
 		}
-		if err := l.markDurableLocked(); err != nil {
-			return result, err
-		}
+		result.sealPos = base.LogPos(sealAddr)
 		return result, nil
 	}
 	if l.hook == nil {
