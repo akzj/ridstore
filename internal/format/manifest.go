@@ -202,7 +202,7 @@ func validateManifest(m Manifest) error {
 		m.ActiveDataSegmentID == 0 || m.ActiveMapSegmentID == 0 || m.NextFrameSeq == 0 || m.NextCommitSeq == 0 {
 		return fmt.Errorf("manifest identity: %w", base.ErrInvalidConfig)
 	}
-	if err := validateHardLimits(m.HardLimits); err != nil {
+	if err := ValidateHardLimits(m.HardLimits); err != nil {
 		return err
 	}
 	if uint64(len(m.SealedDataSegments)) > math.MaxUint32 || uint64(len(m.SealedMappingSegments)) > math.MaxUint32 ||
@@ -252,19 +252,78 @@ func validateManifest(m Manifest) error {
 	return nil
 }
 
-func validateHardLimits(h HardLimits) error {
+// ValidateHardLimits validates persisted limits, including the physical
+// single-Segment capacity required by the append protocol.
+func ValidateHardLimits(h HardLimits) error {
 	values := [...]uint64{h.SegmentSize, h.MaxValueSize, h.MaxBatchBytes, h.MaxBatchMutations, h.MaxBatchConditions, h.MaxOpenBatches, h.IDReserveSize, h.BatchIDReserveSize}
 	for _, value := range values {
 		if value == 0 {
 			return fmt.Errorf("zero hard limit: %w", base.ErrInvalidConfig)
 		}
 	}
-	frameEnd, err := base.AddUint64(h.MaxValueSize, FrameHeaderSize+SegmentHeaderSize+SegmentFooterSize)
-	if err != nil || h.SegmentSize > uint64(math.MaxUint32)+1 || h.MaxValueSize > h.MaxBatchBytes || frameEnd > h.SegmentSize ||
+	if h.SegmentSize > uint64(math.MaxUint32)+1 || h.MaxValueSize > h.MaxBatchBytes ||
 		h.MaxBatchMutations > math.MaxUint32 || h.MaxBatchConditions > math.MaxUint32 || h.MaxOpenBatches > math.MaxUint32 {
 		return fmt.Errorf("inconsistent hard limits: %w", base.ErrInvalidConfig)
 	}
+	if _, _, err := FramePayloadLimits(h); err != nil {
+		return fmt.Errorf("inconsistent hard limits: %w", err)
+	}
 	return nil
+}
+
+// DataAppendCapacity is the maximum number of bytes one normal append may
+// occupy in an otherwise empty Data Segment while retaining space for the
+// terminal SegmentSeal and fixed footer.
+func DataAppendCapacity(segmentSize uint64) (uint64, error) {
+	const fixed = uint64(SegmentHeaderSize + SegmentFooterSize + FrameHeaderSize + 64)
+	if segmentSize <= fixed {
+		return 0, fmt.Errorf("data segment capacity: %w", base.ErrInvalidConfig)
+	}
+	return segmentSize - fixed, nil
+}
+
+// FramePayloadLimits derives the persisted Frame decoder limit and descriptor
+// part size from HardLimits. It also proves that the largest legal Put and
+// Commit/Relocation descriptor each fit wholly within one Data Segment.
+func FramePayloadLimits(h HardLimits) (uint64, uint64, error) {
+	appendCapacity, err := DataAppendCapacity(h.SegmentSize)
+	if err != nil {
+		return 0, 0, err
+	}
+	descriptorBytes, err := base.MulUint64(h.MaxBatchMutations, MutationEntrySize)
+	if err != nil || descriptorBytes == 0 {
+		return 0, 0, fmt.Errorf("descriptor payload capacity: %w", base.ErrInvalidConfig)
+	}
+	if appendCapacity <= FrameHeaderSize {
+		return 0, 0, fmt.Errorf("frame payload capacity: %w", base.ErrInvalidConfig)
+	}
+	framePayloadCapacity := appendCapacity - FrameHeaderSize
+	maxPart := descriptorBytes
+	if maxPart > framePayloadCapacity {
+		maxPart = framePayloadCapacity - framePayloadCapacity%MutationEntrySize
+	}
+	if maxPart < MutationEntrySize {
+		return 0, 0, fmt.Errorf("descriptor part capacity: %w", base.ErrInvalidConfig)
+	}
+	largestDescriptor, err := DescriptorPhysicalSize(h.MaxBatchMutations, maxPart)
+	if err != nil || largestDescriptor > appendCapacity {
+		return 0, 0, fmt.Errorf("descriptor exceeds data segment: %w", base.ErrInvalidConfig)
+	}
+	largestPut, err := base.AddUint64(FrameHeaderSize, h.MaxValueSize)
+	if err == nil {
+		largestPut, err = base.Align8(largestPut)
+	}
+	if err != nil || largestPut > appendCapacity {
+		return 0, 0, fmt.Errorf("put exceeds data segment: %w", base.ErrInvalidConfig)
+	}
+	maxFrame := h.MaxValueSize
+	if maxPart > maxFrame {
+		maxFrame = maxPart
+	}
+	if maxFrame < DescriptorSealSize {
+		maxFrame = DescriptorSealSize
+	}
+	return maxFrame, maxPart, nil
 }
 
 func validateManifestAddresses(m Manifest) error {

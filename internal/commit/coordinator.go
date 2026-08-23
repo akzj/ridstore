@@ -13,6 +13,7 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/batch"
 	"github.com/akzj/ridstore/internal/failpoint"
+	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/mapping/api"
 	"github.com/akzj/ridstore/internal/metrics"
 	"github.com/akzj/ridstore/internal/segment"
@@ -32,21 +33,11 @@ type PutRecord struct {
 
 type RecordReader interface {
 	ReadPutHeader(base.VAddr) (RecordHeader, error)
-}
-
-type RelocationRecordReader interface {
 	ReadPutRecord(base.VAddr) (PutRecord, error)
 }
 
 type CommitLog interface {
-	AppendCommit(batch.Prepared, base.CommitSeq) (appendlog.CommitAppendResult, error)
-}
-
-type GroupCommitLog interface {
 	AppendCommitGroup([]batch.Prepared, []base.CommitSeq) ([]appendlog.CommitAppendResult, error)
-}
-
-type RelocationLog interface {
 	AppendRelocation(appendlog.RelocationPrepared, base.CommitSeq) (appendlog.CommitAppendResult, error)
 }
 
@@ -66,6 +57,7 @@ type Config struct {
 	QueueDepth       int
 	MaxBatches       int
 	MaxBytes         uint64
+	MaxPartPayload   uint64
 	MaxDelay         time.Duration
 	Metrics          *metrics.Runtime
 	OnDeltaSoftLimit func()
@@ -133,12 +125,13 @@ func New(next base.CommitSeq, log CommitLog, mapping api.Mapping, reader RecordR
 }
 
 func NewWithHook(next base.CommitSeq, log CommitLog, mapping api.Mapping, reader RecordReader, hook failpoint.Hook) (*Coordinator, error) {
-	return NewGrouped(next, log, mapping, reader, Config{QueueDepth: 1, MaxBatches: 1, MaxBytes: math.MaxUint64}, hook)
+	return NewGrouped(next, log, mapping, reader, Config{QueueDepth: 1, MaxBatches: 1, MaxBytes: math.MaxUint64, MaxPartPayload: math.MaxUint32 &^ (storeformat.MutationEntrySize - 1)}, hook)
 }
 
 func NewGrouped(next base.CommitSeq, log CommitLog, mapping api.Mapping, reader RecordReader, config Config, hook failpoint.Hook) (*Coordinator, error) {
 	if next == 0 || log == nil || mapping == nil || reader == nil || next <= mapping.CoveredCommitSeq() ||
-		config.QueueDepth <= 0 || config.MaxBatches <= 0 || config.MaxBytes == 0 || config.MaxDelay < 0 {
+		config.QueueDepth <= 0 || config.MaxBatches <= 0 || config.MaxBytes == 0 || config.MaxPartPayload < storeformat.MutationEntrySize ||
+		config.MaxPartPayload%storeformat.MutationEntrySize != 0 || config.MaxDelay < 0 {
 		return nil, fmt.Errorf("commit coordinator configuration: %w", base.ErrInvalidConfig)
 	}
 	c := &Coordinator{
@@ -208,12 +201,6 @@ func (c *Coordinator) Commit(ctx context.Context, b *batch.Batch) (Result, error
 func (c *Coordinator) Relocate(ctx context.Context, batchID base.BatchID, changes []api.Change) (RelocationResult, error) {
 	if batchID == 0 || len(changes) == 0 {
 		return RelocationResult{}, base.ErrInvalidConfig
-	}
-	if _, ok := c.log.(RelocationLog); !ok {
-		return RelocationResult{}, base.ErrUnsupported
-	}
-	if _, ok := c.reader.(RelocationRecordReader); !ok {
-		return RelocationResult{}, base.ErrUnsupported
 	}
 	if err := validateRelocationChanges(changes); err != nil {
 		return RelocationResult{}, err
@@ -314,7 +301,7 @@ func (c *Coordinator) run() {
 			continue
 		}
 		group := []request{first}
-		groupBytes := requestBytes(first.prepared)
+		groupBytes := requestBytes(first.prepared, c.config.MaxPartPayload)
 		if c.config.MaxBatches > 1 {
 			group, pending = c.collect(group, &groupBytes)
 		}
@@ -333,7 +320,7 @@ func (c *Coordinator) collect(group []request, groupBytes *uint64) ([]request, *
 			if request.barrier != nil || request.relocation != nil {
 				return group, &request
 			}
-			bytes := requestBytes(request.prepared)
+			bytes := requestBytes(request.prepared, c.config.MaxPartPayload)
 			if wouldExceed(*groupBytes, bytes, c.config.MaxBytes) {
 				return group, &request
 			}
@@ -359,7 +346,7 @@ func (c *Coordinator) collect(group []request, groupBytes *uint64) ([]request, *
 				if request.barrier != nil || request.relocation != nil {
 					return group, &request
 				}
-				bytes := requestBytes(request.prepared)
+				bytes := requestBytes(request.prepared, c.config.MaxPartPayload)
 				if wouldExceed(*groupBytes, bytes, c.config.MaxBytes) {
 					return group, &request
 				}
@@ -498,7 +485,7 @@ func (c *Coordinator) process(group []request) {
 		prepared[i], seqs[i] = admitted[i].request.prepared, admitted[i].seq
 	}
 	writeStarted := time.Now()
-	appendResults, err := c.appendGroup(prepared, seqs)
+	appendResults, err := c.log.AppendCommitGroup(prepared, seqs)
 	if c.config.Metrics != nil {
 		c.config.Metrics.AddWriteSync(uint64(time.Since(writeStarted)))
 	}
@@ -557,17 +544,16 @@ func (c *Coordinator) processRelocation(request request) {
 		failBeforeSeal(err, true)
 		return
 	}
-	appendResult, err := c.log.(RelocationLog).AppendRelocation(prepared, seq)
+	appendResult, err := c.log.AppendRelocation(prepared, seq)
 	if err != nil {
+		err = appendFailure(err)
 		releaseReservation(request)
 		if appendResult.SealStarted {
 			c.fail(err)
 			request.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
 			return
 		}
-		if !errors.Is(err, segment.ErrFull) {
-			c.fail(err)
-		}
+		c.fail(err)
 		request.result <- response{err: err}
 		return
 	}
@@ -607,7 +593,7 @@ func (c *Coordinator) processRelocation(request request) {
 }
 
 func (c *Coordinator) prepareRelocation(request relocationRequest) (appendlog.RelocationPrepared, []api.Change, error) {
-	reader := c.reader.(RelocationRecordReader)
+	reader := c.reader
 	prepared := appendlog.RelocationPrepared{BatchID: request.batchID, Entries: make([]appendlog.RelocationEntry, len(request.changes))}
 	changes := append([]api.Change(nil), request.changes...)
 	for i, change := range changes {
@@ -646,25 +632,9 @@ func validateRelocationChanges(changes []api.Change) error {
 	return nil
 }
 
-func (c *Coordinator) appendGroup(prepared []batch.Prepared, seqs []base.CommitSeq) ([]appendlog.CommitAppendResult, error) {
-	if groupLog, ok := c.log.(GroupCommitLog); ok {
-		return groupLog.AppendCommitGroup(prepared, seqs)
-	}
-	results := make([]appendlog.CommitAppendResult, len(prepared))
-	for i := range prepared {
-		result, err := c.log.AppendCommit(prepared[i], seqs[i])
-		results[i] = result
-		if err != nil {
-			return results, err
-		}
-	}
-	return results, nil
-}
-
 func (c *Coordinator) handleAppendError(admitted []admittedRequest, results []appendlog.CommitAppendResult, err error) {
-	if !errors.Is(err, segment.ErrFull) {
-		c.fail(err)
-	}
+	err = appendFailure(err)
+	c.fail(err)
 	for i, item := range admitted {
 		releaseReservation(item.request)
 		sealStarted := i < len(results) && results[i].SealStarted
@@ -678,6 +648,13 @@ func (c *Coordinator) handleAppendError(admitted []admittedRequest, results []ap
 			item.request.result <- response{err: err}
 		}
 	}
+}
+
+func appendFailure(err error) error {
+	if errors.Is(err, segment.ErrFull) {
+		return fmt.Errorf("append log leaked internal capacity result: %w", base.ErrCorrupt)
+	}
+	return err
 }
 
 func (c *Coordinator) publish(item admittedRequest) error {
@@ -795,9 +772,9 @@ func changesFor(prepared batch.Prepared) []api.Change {
 	return changes
 }
 
-func requestBytes(prepared batch.Prepared) uint64 {
-	bytes := uint64(len(prepared.Mutations))*24 + 64
-	if bytes < 64 {
+func requestBytes(prepared batch.Prepared, maxPartPayload uint64) uint64 {
+	bytes, err := storeformat.DescriptorPhysicalSize(uint64(len(prepared.Mutations)), maxPartPayload)
+	if err != nil {
 		return math.MaxUint64
 	}
 	return bytes

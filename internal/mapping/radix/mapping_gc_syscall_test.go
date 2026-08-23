@@ -326,7 +326,7 @@ func mappingGCSyscallFixture(t *testing.T, forceSealedOutput bool, hook failpoin
 	}
 	hard := storeformat.HardLimits{
 		SegmentSize: segmentSize, MaxValueSize: 1024, MaxBatchBytes: 1 << 20,
-		MaxBatchMutations: 256, MaxBatchConditions: 64, MaxOpenBatches: 64,
+		MaxBatchMutations: 128, MaxBatchConditions: 64, MaxOpenBatches: 64,
 		IDReserveSize: 64, BatchIDReserveSize: 64,
 	}
 	initial, err := initialize.Create(dir, hard)

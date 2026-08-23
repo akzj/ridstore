@@ -19,7 +19,7 @@ bounded Sequencer queue
         +-- drain adjacent queued Put requests
         |   stop at Commit / Abort / Reserve / Barrier
         v
-Log.AppendPutGroup
+Log.appendPutGroup
         |
         +-- assign consecutive FrameSeq
         +-- split at Data Segment boundary
@@ -48,15 +48,18 @@ Relocation Descriptor 的 Part/Seal 也采用相同路径。因此“一条 Reco
 - 一个 Frame 永远不跨 Data Segment。空间不足时，Log 先完成 Rotation，再在新
   Segment 分配 Put 的 `FrameSeq`；一个输入 group 可以被拆成多个物理写。
 - `segment.ErrFull` 仅是无 Rotator 的底层测试/组件控制信号。生产 Put 路径必须在
-  Log 内消化它；若配置了 Rotation 但空 Segment 仍容纳不下已通过校验的 Frame，说明
+  Log 内消化它；Commit、Relocation、Abort、Reserve 同样遵守该约束。若配置了
+  Rotation 但空 Segment 仍容纳不下已通过校验的 Frame 或 Descriptor，说明
   容量不变量已破坏，Log fail-closed 并返回 `ErrCorrupt`，不能把内部错误泄漏给用户。
 - `ActiveData.AppendBatch` 在写前完成整组编码和容量检查。容量不足不写入任何字节。
 - 一次批量写发生错误或短写后，Active Segment 与 Log 都进入 poisoned/faulted
   状态；该进程不能继续发布该组的任何地址，必须通过重新 Open 扫描完整 Frame 前缀。
 - `PointPutWritten` 仍对每个完整写入的 Put 触发；Segment 的 append-write hook 对
   每个物理 group 只触发一次。
-- Commit Coordinator 仍是唯一生成 CommitSeal、分配 CommitSeq、执行 durable sync
-  并发布 Mapping 的组件。Put batching 不赋予 Value 可见性。
+- Commit Coordinator 仍是唯一分配 CommitSeq 并发布 Mapping 的组件；append Log
+  按其请求构造 CommitSeal 并执行 durable sync。Coordinator 只依赖强制的
+  `AppendCommitGroup` 接口，不存在逐 Batch append fallback；Put batching 不赋予
+  Value 可见性。
 - 队列、Frame 数和聚合字节数均有界。单个允许的大 Value 即使超过 group 字节预算，
   也必须能够独立执行。
 
@@ -71,6 +74,13 @@ Sequencer 收到第一个 Put 后，只提取队列中紧邻的 Put。以下任�
 
 生产路径不会为了 Put batching 主动等待 `MaxGroupDelay`，避免在已有 Group Commit
 等待窗口之外再次增加延迟。`MaxGroupDelay` 仍只控制 Commit Coordinator。
+
+格式层统一计算 `DataAppendCapacity`：扣除 Segment Header、Footer 和最终 128-byte
+SegmentSeal。最大合法 Put Frame 与最大合法 Descriptor（32-byte Mutation Entry、每个
+Part 的 64-byte Frame Header、128-byte Descriptor Seal）都必须独立落入该容量，否则
+Create/Open 拒绝 HardLimits。运行时将有效 group byte 上限收紧到
+`min(MaxGroupBytes, DataAppendCapacity)`；单个超过 group 预算但符合 HardLimits 的
+Value/Descriptor 仍可独立执行。
 
 调用者在请求进入有界队列以前可以因 Context 取消而返回。一旦请求被队列接受，
 调用者必须等待 Sequencer 给出结果，因此调用者的 `Value` 在此之前始终归 append

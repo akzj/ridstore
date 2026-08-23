@@ -3,7 +3,6 @@ package appendlog
 import (
 	"context"
 	"sync"
-	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/batch"
@@ -29,31 +28,51 @@ type Sequencer struct {
 }
 
 type sequenceRequest struct {
-	put    *putSequenceRequest
-	run    func(*Log) any
-	result chan any
+	kind sequenceRequestKind
+	ctx  context.Context
+
+	batchID  base.BatchID
+	recordID base.ID
+	value    []byte
+
+	frameType     storeformat.FrameType
+	abort         storeformat.BatchAbortPayload
+	reserve       storeformat.ReservePayload
+	prepared      []batch.Prepared
+	commitSeqs    []base.CommitSeq
+	relocation    RelocationPrepared
+	relocationSeq base.CommitSeq
+
+	result chan sequenceResult
 }
 
-type putSequenceRequest struct {
-	ctx     context.Context
-	batchID base.BatchID
-	id      base.ID
-	value   []byte
+type sequenceRequestKind uint8
+
+const (
+	requestPut sequenceRequestKind = iota + 1
+	requestAbort
+	requestReserve
+	requestCommitGroup
+	requestRelocation
+	requestBarrier
+)
+
+type sequenceResult struct {
+	put        putAppendResult
+	commits    []CommitAppendResult
+	descriptor CommitAppendResult
+	barrier    Barrier
+	err        error
 }
 
 type SequencerConfig struct {
 	QueueDepth int
 	MaxFrames  int
 	MaxBytes   uint64
-	MaxDelay   time.Duration
 }
 
-func NewSequencer(log *Log, queueDepth int) (*Sequencer, error) {
-	return NewBatchedSequencer(log, SequencerConfig{QueueDepth: queueDepth, MaxFrames: 1, MaxBytes: ^uint64(0)})
-}
-
-func NewBatchedSequencer(log *Log, cfg SequencerConfig) (*Sequencer, error) {
-	if log == nil || cfg.QueueDepth <= 0 || cfg.MaxFrames <= 0 || cfg.MaxBytes == 0 || cfg.MaxDelay < 0 {
+func NewSequencer(log *Log, cfg SequencerConfig) (*Sequencer, error) {
+	if log == nil || cfg.QueueDepth <= 0 || cfg.MaxFrames <= 0 || cfg.MaxBytes == 0 {
 		return nil, base.ErrInvalidConfig
 	}
 	s := &Sequencer{
@@ -77,19 +96,13 @@ func (s *Sequencer) run() {
 				return
 			}
 		}
-		if request.put == nil {
-			request.result <- request.run(s.log)
+		if request.kind != requestPut {
+			request.result <- s.execute(request)
 			continue
 		}
 
 		group := []sequenceRequest{request}
-		bytes := putRequestBytes(request.put)
-		var timer *time.Timer
-		var timeout <-chan time.Time
-		if s.cfg.MaxDelay > 0 && len(group) < s.cfg.MaxFrames && bytes < s.cfg.MaxBytes {
-			timer = time.NewTimer(s.cfg.MaxDelay)
-			timeout = timer.C
-		}
+		bytes := putRequestBytes(request)
 	collect:
 		for len(group) < s.cfg.MaxFrames && bytes < s.cfg.MaxBytes {
 			var next sequenceRequest
@@ -99,26 +112,14 @@ func (s *Sequencer) run() {
 				if !ok {
 					break collect
 				}
-			case <-timeout:
-				break collect
 			default:
-				if timeout == nil {
-					break collect
-				}
-				select {
-				case next, ok = <-s.reqs:
-					if !ok {
-						break collect
-					}
-				case <-timeout:
-					break collect
-				}
+				break collect
 			}
-			if next.put == nil {
+			if next.kind != requestPut {
 				pending = &next
 				break
 			}
-			nextBytes := putRequestBytes(next.put)
+			nextBytes := putRequestBytes(next)
 			if nextBytes > s.cfg.MaxBytes-bytes {
 				pending = &next
 				break
@@ -126,25 +127,38 @@ func (s *Sequencer) run() {
 			group = append(group, next)
 			bytes += nextBytes
 		}
-		if timer != nil && !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		puts := make([]PutRequest, len(group))
+		puts := make([]putRequest, len(group))
 		for i := range group {
-			puts[i] = PutRequest{Context: group[i].put.ctx, BatchID: group[i].put.batchID, RecordID: group[i].put.id, Value: group[i].put.value}
+			puts[i] = putRequest{Context: group[i].ctx, BatchID: group[i].batchID, RecordID: group[i].recordID, Value: group[i].value}
 		}
-		results := s.log.AppendPutGroup(puts)
+		results := s.log.appendPutGroup(puts)
 		for i := range group {
-			result := results[i]
-			group[i].result <- putResult{addr: result.Addr, seq: result.Seq, written: result.Written, err: result.Err}
+			group[i].result <- sequenceResult{put: results[i]}
 		}
 	}
 }
 
-func putRequestBytes(request *putSequenceRequest) uint64 {
+func (s *Sequencer) execute(request sequenceRequest) sequenceResult {
+	switch request.kind {
+	case requestAbort:
+		return sequenceResult{err: s.log.AppendAbort(request.ctx, request.batchID, request.abort)}
+	case requestReserve:
+		return sequenceResult{err: s.log.AppendReserve(request.ctx, request.frameType, request.reserve)}
+	case requestCommitGroup:
+		results, err := s.log.AppendCommitGroup(request.prepared, request.commitSeqs)
+		return sequenceResult{commits: results, err: err}
+	case requestRelocation:
+		result, err := s.log.AppendRelocation(request.relocation, request.relocationSeq)
+		return sequenceResult{descriptor: result, err: err}
+	case requestBarrier:
+		barrier, err := s.log.Barrier()
+		return sequenceResult{barrier: barrier, err: err}
+	default:
+		return sequenceResult{err: base.ErrCorrupt}
+	}
+}
+
+func putRequestBytes(request sequenceRequest) uint64 {
 	// Frame encoding is 8-byte aligned. Config validation bounds Value well
 	// below uint64 overflow, but saturating keeps this queue admission helper
 	// independent from persisted hard limits.
@@ -154,141 +168,76 @@ func putRequestBytes(request *putSequenceRequest) uint64 {
 	return (uint64(len(request.value)) + storeformat.FrameHeaderSize + 7) &^ 7
 }
 
-func (s *Sequencer) submit(ctx context.Context, run func(*Log) any) (any, error) {
+func (s *Sequencer) submit(ctx context.Context, request sequenceRequest) (sequenceResult, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return sequenceResult{}, err
 	}
-	request := sequenceRequest{run: run, result: make(chan any, 1)}
+	request.ctx = ctx
+	request.result = make(chan sequenceResult, 1)
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return nil, base.ErrClosed
+		return sequenceResult{}, base.ErrClosed
 	}
 	select {
 	case s.reqs <- request:
 		s.mu.Unlock()
 	case <-ctx.Done():
 		s.mu.Unlock()
-		return nil, ctx.Err()
+		return sequenceResult{}, ctx.Err()
 	}
 	return <-request.result, nil
-}
-
-type putResult struct {
-	addr    base.VAddr
-	seq     base.FrameSeq
-	written uint64
-	err     error
 }
 
 func (s *Sequencer) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, 0, 0, err
 	}
-	request := sequenceRequest{
-		put:    &putSequenceRequest{ctx: ctx, batchID: batchID, id: id, value: value},
-		result: make(chan any, 1),
+	result, err := s.submit(ctx, sequenceRequest{kind: requestPut, batchID: batchID, recordID: id, value: value})
+	if err != nil {
+		return 0, 0, 0, err
 	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, 0, 0, base.ErrClosed
-	}
-	select {
-	case s.reqs <- request:
-		s.mu.Unlock()
-	case <-ctx.Done():
-		s.mu.Unlock()
-		return 0, 0, 0, ctx.Err()
-	}
-	result := <-request.result
-	got := result.(putResult)
-	return got.addr, got.seq, got.written, got.err
+	return result.put.Addr, result.put.Seq, result.put.Written, result.put.Err
 }
 
 func (s *Sequencer) AppendAbort(ctx context.Context, batchID base.BatchID, payload storeformat.BatchAbortPayload) error {
-	result, err := s.submit(ctx, func(log *Log) any { return log.AppendAbort(ctx, batchID, payload) })
+	result, err := s.submit(ctx, sequenceRequest{kind: requestAbort, batchID: batchID, abort: payload})
 	if err != nil {
 		return err
 	}
-	if result == nil {
-		return nil
-	}
-	return result.(error)
+	return result.err
 }
 
 func (s *Sequencer) AppendReserve(ctx context.Context, typ storeformat.FrameType, payload storeformat.ReservePayload) error {
-	result, err := s.submit(ctx, func(log *Log) any { return log.AppendReserve(ctx, typ, payload) })
+	result, err := s.submit(ctx, sequenceRequest{kind: requestReserve, frameType: typ, reserve: payload})
 	if err != nil {
 		return err
 	}
-	if result == nil {
-		return nil
-	}
-	return result.(error)
-}
-
-type commitResult struct {
-	result CommitAppendResult
-	err    error
-}
-
-func (s *Sequencer) AppendCommit(prepared batch.Prepared, seq base.CommitSeq) (CommitAppendResult, error) {
-	result, err := s.submit(context.Background(), func(log *Log) any {
-		got, err := log.AppendCommit(prepared, seq)
-		return commitResult{result: got, err: err}
-	})
-	if err != nil {
-		return CommitAppendResult{}, err
-	}
-	got := result.(commitResult)
-	return got.result, got.err
-}
-
-type commitGroupResult struct {
-	results []CommitAppendResult
-	err     error
+	return result.err
 }
 
 func (s *Sequencer) AppendRelocation(prepared RelocationPrepared, seq base.CommitSeq) (CommitAppendResult, error) {
-	result, err := s.submit(context.Background(), func(log *Log) any {
-		got, err := log.AppendRelocation(prepared, seq)
-		return commitResult{result: got, err: err}
-	})
+	result, err := s.submit(context.Background(), sequenceRequest{kind: requestRelocation, relocation: prepared, relocationSeq: seq})
 	if err != nil {
 		return CommitAppendResult{}, err
 	}
-	got := result.(commitResult)
-	return got.result, got.err
+	return result.descriptor, result.err
 }
 
 func (s *Sequencer) AppendCommitGroup(prepared []batch.Prepared, seqs []base.CommitSeq) ([]CommitAppendResult, error) {
-	result, err := s.submit(context.Background(), func(log *Log) any {
-		got, err := log.AppendCommitGroup(prepared, seqs)
-		return commitGroupResult{results: got, err: err}
-	})
+	result, err := s.submit(context.Background(), sequenceRequest{kind: requestCommitGroup, prepared: prepared, commitSeqs: seqs})
 	if err != nil {
 		return nil, err
 	}
-	got := result.(commitGroupResult)
-	return got.results, got.err
-}
-
-type barrierResult struct {
-	barrier Barrier
-	err     error
+	return result.commits, result.err
 }
 
 func (s *Sequencer) Barrier(ctx context.Context) (Barrier, error) {
-	result, err := s.submit(ctx, func(log *Log) any {
-		barrier, err := log.Barrier()
-		return barrierResult{barrier: barrier, err: err}
-	})
+	result, err := s.submit(ctx, sequenceRequest{kind: requestBarrier})
 	if err != nil {
 		return Barrier{}, err
 	}
-	got := result.(barrierResult)
-	return got.barrier, got.err
+	return result.barrier, result.err
 }
 
 func (s *Sequencer) NextFrameSeq() base.FrameSeq { return s.log.NextFrameSeq() }

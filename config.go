@@ -162,18 +162,15 @@ func hardLimits(cfg Config) (storeformat.HardLimits, error) {
 		cfg.IDReserveSize == 0 || cfg.BatchIDReserveSize == 0 {
 		return storeformat.HardLimits{}, fmt.Errorf("non-positive hard limit: %w", base.ErrInvalidConfig)
 	}
-	if uint64(cfg.SegmentSize) > uint64(math.MaxUint32)+1 || cfg.MaxValueSize > cfg.MaxBatchBytes ||
-		uint64(cfg.MaxValueSize)+storeformat.FrameHeaderSize+2*storeformat.SegmentHeaderSize > uint64(cfg.SegmentSize) {
-		return storeformat.HardLimits{}, fmt.Errorf("incompatible segment/value limits: %w", base.ErrInvalidConfig)
-	}
-	if uint64(cfg.MaxBatchMutations) > math.MaxUint32 || uint64(cfg.MaxBatchConditions) > math.MaxUint32 || uint64(cfg.MaxOpenBatches) > math.MaxUint32 {
-		return storeformat.HardLimits{}, fmt.Errorf("hard limit exceeds format count: %w", base.ErrInvalidConfig)
-	}
-	return storeformat.HardLimits{
+	hard := storeformat.HardLimits{
 		SegmentSize: uint64(cfg.SegmentSize), MaxValueSize: uint64(cfg.MaxValueSize), MaxBatchBytes: uint64(cfg.MaxBatchBytes),
 		MaxBatchMutations: uint64(cfg.MaxBatchMutations), MaxBatchConditions: uint64(cfg.MaxBatchConditions), MaxOpenBatches: uint64(cfg.MaxOpenBatches),
 		IDReserveSize: cfg.IDReserveSize, BatchIDReserveSize: cfg.BatchIDReserveSize,
-	}, nil
+	}
+	if err := storeformat.ValidateHardLimits(hard); err != nil {
+		return storeformat.HardLimits{}, err
+	}
+	return hard, nil
 }
 
 func validateRuntime(cfg Config, hard storeformat.HardLimits) error {

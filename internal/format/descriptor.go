@@ -11,6 +11,32 @@ import (
 
 const DescriptorSealSize = 64
 
+// DescriptorPhysicalSize returns the exact bytes occupied by one descriptor
+// for the supplied part payload limit. Mutation entries and descriptor Frames
+// are naturally 8-byte aligned, so no additional padding is required.
+func DescriptorPhysicalSize(mutationCount, maxPartPayload uint64) (uint64, error) {
+	if maxPartPayload < MutationEntrySize || maxPartPayload%MutationEntrySize != 0 || mutationCount > math.MaxUint32 {
+		return 0, fmt.Errorf("descriptor size limits: %w", base.ErrInvalidConfig)
+	}
+	entryBytes, err := base.MulUint64(mutationCount, MutationEntrySize)
+	if err != nil {
+		return 0, err
+	}
+	partCount := uint64(0)
+	if entryBytes != 0 {
+		partCount = (entryBytes-1)/maxPartPayload + 1
+	}
+	partHeaders, err := base.MulUint64(partCount, FrameHeaderSize)
+	if err != nil {
+		return 0, err
+	}
+	physical, err := base.AddUint64(entryBytes, partHeaders)
+	if err != nil {
+		return 0, err
+	}
+	return base.AddUint64(physical, FrameHeaderSize+DescriptorSealSize)
+}
+
 type MutationOperation uint8
 
 const (

@@ -333,11 +333,6 @@ type recordingGroupLog struct {
 	seqs  [][]base.CommitSeq
 }
 
-func (l *recordingGroupLog) AppendCommit(prepared batch.Prepared, seq base.CommitSeq) (appendlog.CommitAppendResult, error) {
-	results, err := l.AppendCommitGroup([]batch.Prepared{prepared}, []base.CommitSeq{seq})
-	return results[0], err
-}
-
 func (l *recordingGroupLog) AppendCommitGroup(_ []batch.Prepared, seqs []base.CommitSeq) ([]appendlog.CommitAppendResult, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -350,6 +345,24 @@ func (l *recordingGroupLog) AppendCommitGroup(_ []batch.Prepared, seqs []base.Co
 	return results, nil
 }
 
+func TestRequestBytesMatchesDescriptorEncoding(t *testing.T) {
+	for _, count := range []int{0, 1, 2, 3, 17} {
+		prepared := batch.Prepared{Mutations: make([]batch.Mutation, count)}
+		got := requestBytes(prepared, 64)
+		want, err := storeformat.DescriptorPhysicalSize(uint64(count), 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("count=%d bytes=%d want=%d", count, got, want)
+		}
+	}
+}
+
+func (l *recordingGroupLog) AppendRelocation(appendlog.RelocationPrepared, base.CommitSeq) (appendlog.CommitAppendResult, error) {
+	return appendlog.CommitAppendResult{}, base.ErrUnsupported
+}
+
 func TestGroupCommitUsesVirtualMappingAndSharedAppend(t *testing.T) {
 	addr, _ := base.NewVAddr(1, 4096)
 	log := &recordingGroupLog{}
@@ -358,7 +371,7 @@ func TestGroupCommitUsesVirtualMappingAndSharedAppend(t *testing.T) {
 		addr: {RecordID: 1, OriginBatch: 7, PhysicalSize: 64},
 	}}
 	coordinator, err := NewGrouped(1, log, mapping, reader, Config{
-		QueueDepth: 4, MaxBatches: 4, MaxBytes: 4096, MaxDelay: 50 * time.Millisecond,
+		QueueDepth: 4, MaxBatches: 4, MaxBytes: 4096, MaxPartPayload: 64, MaxDelay: 50 * time.Millisecond,
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -419,7 +432,7 @@ func TestBarrierOrdersPublishedCommits(t *testing.T) {
 		addr2: {RecordID: 2, OriginBatch: 8, PhysicalSize: 64},
 	}}
 	coordinator, err := NewGrouped(1, log, mapping, reader, Config{
-		QueueDepth: 8, MaxBatches: 8, MaxBytes: 4096, MaxDelay: time.Millisecond,
+		QueueDepth: 8, MaxBatches: 8, MaxBytes: 4096, MaxPartPayload: 64, MaxDelay: time.Millisecond,
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -513,8 +526,15 @@ type fakeCommitLog struct {
 	err    error
 }
 
-func (l fakeCommitLog) AppendCommit(batch.Prepared, base.CommitSeq) (appendlog.CommitAppendResult, error) {
-	return l.result, l.err
+func (l fakeCommitLog) AppendCommitGroup(prepared []batch.Prepared, seqs []base.CommitSeq) ([]appendlog.CommitAppendResult, error) {
+	if len(prepared) != 1 || len(seqs) != 1 {
+		return nil, base.ErrInvalidConfig
+	}
+	return []appendlog.CommitAppendResult{l.result}, l.err
+}
+
+func (l fakeCommitLog) AppendRelocation(appendlog.RelocationPrepared, base.CommitSeq) (appendlog.CommitAppendResult, error) {
+	return appendlog.CommitAppendResult{}, base.ErrUnsupported
 }
 
 type fakeReader struct{ records map[base.VAddr]RecordHeader }
@@ -525,6 +545,14 @@ func (r fakeReader) ReadPutHeader(addr base.VAddr) (RecordHeader, error) {
 		return RecordHeader{}, base.ErrCorrupt
 	}
 	return header, nil
+}
+
+func (r fakeReader) ReadPutRecord(addr base.VAddr) (PutRecord, error) {
+	header, err := r.ReadPutHeader(addr)
+	if err != nil {
+		return PutRecord{}, err
+	}
+	return PutRecord{Header: header}, nil
 }
 
 type fakeBatchAppender struct{ addr base.VAddr }
@@ -556,7 +584,7 @@ func TestCommitErrorClassificationAndCancellation(t *testing.T) {
 		state batch.State
 		fault bool
 	}{
-		{"no-space", fakeCommitLog{err: segment.ErrFull}, segment.ErrFull, batch.StateAborted, false},
+		{"no-space-contract-violation", fakeCommitLog{err: segment.ErrFull}, base.ErrCorrupt, batch.StateAborted, true},
 		{"part-write", fakeCommitLog{err: errors.New("write")}, nil, batch.StateAborted, true},
 		{"seal-write", fakeCommitLog{result: appendlog.CommitAppendResult{SealStarted: true}, err: errors.New("sync")}, base.ErrCommitUnknown, batch.StateCommitUnknown, true},
 	} {

@@ -10,17 +10,24 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/batch"
 	"github.com/akzj/ridstore/internal/failpoint"
+	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/segment"
 )
 
 func TestSequencerBatchesQueuedPutsAndSkipsCanceled(t *testing.T) {
 	active, _ := newActive(t, 1<<20)
 	defer active.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
 	var appendWrites atomic.Int32
 	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
 		if point == segment.PointBeforeAppendWrite {
 			appendWrites.Add(1)
+		} else if point == segment.PointBeforeSync {
+			close(started)
+			<-release
 		}
 		return nil
 	}))
@@ -28,21 +35,15 @@ func TestSequencerBatchesQueuedPutsAndSkipsCanceled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sequencer, err := NewBatchedSequencer(log, SequencerConfig{QueueDepth: 8, MaxFrames: 8, MaxBytes: 1 << 20})
+	sequencer, err := NewSequencer(log, SequencerConfig{QueueDepth: 8, MaxFrames: 8, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sequencer.Close()
 
-	started := make(chan struct{})
-	release := make(chan struct{})
 	blockDone := make(chan error, 1)
 	go func() {
-		_, err := sequencer.submit(context.Background(), func(*Log) any {
-			close(started)
-			<-release
-			return nil
-		})
+		_, err := sequencer.Barrier(context.Background())
 		blockDone <- err
 	}()
 	<-started
@@ -91,6 +92,65 @@ func TestSequencerBatchesQueuedPutsAndSkipsCanceled(t *testing.T) {
 	}
 }
 
+func TestSequencerExecutesEveryCommandInStreamOrder(t *testing.T) {
+	active, _ := newActive(t, 1<<20)
+	defer active.Close()
+	log, err := New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := NewSequencer(log, SequencerConfig{QueueDepth: 8, MaxFrames: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+
+	addr, putSeq, _, err := sequencer.AppendPut(context.Background(), 1, 1, []byte("v"))
+	if err != nil || putSeq != 1 {
+		t.Fatalf("put seq=%d error=%v", putSeq, err)
+	}
+	if err := sequencer.AppendAbort(context.Background(), 2, storeformat.BatchAbortPayload{Reason: storeformat.AbortReasonCaller}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sequencer.AppendReserve(context.Background(), storeformat.FrameTypeIDReserve, storeformat.ReservePayload{PreviousHighExclusive: 1, NewHighExclusive: 2, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	commits, err := sequencer.AppendCommitGroup([]batch.Prepared{{BatchID: 1, Mutations: []batch.Mutation{{RecordID: 1, Operation: batch.Put, Addr: addr, ValueBytes: 1}}}}, []base.CommitSeq{1})
+	if err != nil || len(commits) != 1 || commits[0].SealFrameSeq != 5 {
+		t.Fatalf("commits=%+v error=%v", commits, err)
+	}
+	old, _ := base.NewVAddr(2, storeformat.SegmentHeaderSize)
+	relocation, err := sequencer.AppendRelocation(RelocationPrepared{BatchID: 3, Entries: []RelocationEntry{{RecordID: 1, ExpectedOldAddr: old, NewAddr: addr}}}, 2)
+	if err != nil || relocation.SealFrameSeq != 7 {
+		t.Fatalf("relocation=%+v error=%v", relocation, err)
+	}
+	barrier, err := sequencer.Barrier(context.Background())
+	if err != nil || barrier.LastFrameSeq != 7 || barrier.NextFrameSeq != 8 {
+		t.Fatalf("barrier=%+v error=%v", barrier, err)
+	}
+
+	var types []storeformat.FrameType
+	if err := active.Scan(func(_ base.VAddr, frame storeformat.Frame) error {
+		types = append(types, frame.Type)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []storeformat.FrameType{
+		storeformat.FrameTypePutRecord, storeformat.FrameTypeBatchAbort, storeformat.FrameTypeIDReserve,
+		storeformat.FrameTypeCommitPart, storeformat.FrameTypeCommitSeal,
+		storeformat.FrameTypeRelocationPart, storeformat.FrameTypeRelocationSeal,
+	}
+	if len(types) != len(want) {
+		t.Fatalf("types=%v want=%v", types, want)
+	}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Fatalf("types=%v want=%v", types, want)
+		}
+	}
+}
+
 func TestSequencerOwnsConcurrentFrameOrderAndClose(t *testing.T) {
 	active, _ := newActive(t, 1<<20)
 	defer active.Close()
@@ -98,7 +158,7 @@ func TestSequencerOwnsConcurrentFrameOrderAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sequencer, err := NewSequencer(log, 4)
+	sequencer, err := NewSequencer(log, SequencerConfig{QueueDepth: 4, MaxFrames: 4, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}

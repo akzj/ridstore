@@ -128,11 +128,17 @@ Header validation 按 `(SegmentID, offset)` 排序并使用有界窗口；生成
 ## 6. Group Commit 与 GC 调度
 
 `MaxGroupBytes` 分别限制 Append Sequencer 的 queued Put group，以及待写
-Commit/Relocation Descriptor 与 coordinator buffer；两个阶段不会把字节相加保留在
+Commit Descriptor group 与 coordinator buffer；两个阶段不会把字节相加保留在
 同一个 buffer 中。`MaxGroupBatches` 在 append 层作为 Put Frame 数上限，在 commit 层
 作为 Batch 数上限。Append Sequencer 只 opportunistically drain 已经排队的 Put，不使用
 主动 delay；`MaxGroupDelay` 只作用于 Commit Coordinator。详见
 [Append Engine](append-engine.md)。
+
+有效 group byte 上限为 `min(MaxGroupBytes, DataAppendCapacity)`，其中后者已经扣除
+Segment Header、Footer 与 terminal SegmentSeal。Descriptor 预算按真实 v1 编码计算：
+每个 mutation 32 bytes，加实际 Part Frame Header 和 DescriptorSeal Frame；不使用逻辑
+Value bytes 或近似的 entry 大小。单个合法请求可以超过 group 预算，但必须由持久化
+HardLimits 保证它自身能完整落入空 Segment。
 
 GC 受 `GCBatchBytes/GCBatchMutations`、`GCBytesPerSecond`、Delta reservation、前台队列优先级和可用磁盘共同限制。每个 durable Relocation Batch 后按本轮累计 copied bytes 对 wall clock 做 Context-aware pacing；已经排队的用户 Commit 优先于下一批 Relocation，已经选中的单个有限 Relocation Batch 不被拆开。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
 

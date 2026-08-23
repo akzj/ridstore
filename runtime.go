@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 
 	"github.com/akzj/ridstore/internal/allocator"
 	"github.com/akzj/ridstore/internal/appendlog"
@@ -23,7 +22,7 @@ import (
 )
 
 func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, hook failpoint.Hook) (*Store, error) {
-	maxFramePayload, maxPartPayload, err := framePayloadLimits(manifest.HardLimits)
+	maxFramePayload, maxPartPayload, err := storeformat.FramePayloadLimits(manifest.HardLimits)
 	if err != nil {
 		return nil, err
 	}
@@ -87,13 +86,15 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return fail(err)
 	}
-	log, err := appendlog.NewBatchedSequencer(physicalLog, appendlog.SequencerConfig{
+	appendCapacity, err := storeformat.DataAppendCapacity(manifest.HardLimits.SegmentSize)
+	if err != nil {
+		return fail(err)
+	}
+	groupBytes := min(uint64(cfg.MaxGroupBytes), appendCapacity)
+	log, err := appendlog.NewSequencer(physicalLog, appendlog.SequencerConfig{
 		QueueDepth: cfg.MaxOpenBatches + cfg.MaxGroupBatches,
 		MaxFrames:  cfg.MaxGroupBatches,
-		MaxBytes:   uint64(cfg.MaxGroupBytes),
-		// Phase 1 only drains Put requests that are already queued. Reusing the
-		// commit delay here would add a second latency window before Commit.
-		MaxDelay: 0,
+		MaxBytes:   groupBytes,
 	})
 	if err != nil {
 		return fail(err)
@@ -123,7 +124,7 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	runtimeMetrics := &metrics.Runtime{}
 	var requestSoftCheckpoint func()
 	coordinator, err := commit.NewGrouped(recovered.NextCommitSeq, log, persistentMapping, segmentRecordReader{segments: segments}, commit.Config{
-		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: uint64(cfg.MaxGroupBytes), MaxDelay: cfg.MaxGroupDelay,
+		QueueDepth: cfg.MaxOpenBatches, MaxBatches: cfg.MaxGroupBatches, MaxBytes: groupBytes, MaxPartPayload: maxPartPayload, MaxDelay: cfg.MaxGroupDelay,
 		Metrics: runtimeMetrics, OnDeltaSoftLimit: func() {
 			if requestSoftCheckpoint != nil {
 				requestSoftCheckpoint()
@@ -168,36 +169,6 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 		store.requestCheckpoint()
 	}
 	return store, nil
-}
-
-func framePayloadLimits(h storeformat.HardLimits) (uint64, uint64, error) {
-	descriptorBytes, err := base.MulUint64(h.MaxBatchMutations, storeformat.MutationEntrySize)
-	if err != nil {
-		return 0, 0, err
-	}
-	contentBytes := h.SegmentSize - storeformat.SegmentHeaderSize - storeformat.SegmentFooterSize
-	if contentBytes <= storeformat.FrameHeaderSize {
-		return 0, 0, fmt.Errorf("segment frame capacity: %w", base.ErrInvalidConfig)
-	}
-	frameCapacity := contentBytes - storeformat.FrameHeaderSize
-	if frameCapacity > uint64(math.MaxUint32)-storeformat.FrameHeaderSize {
-		frameCapacity = uint64(math.MaxUint32) - storeformat.FrameHeaderSize
-	}
-	maxPart := descriptorBytes
-	if maxPart > frameCapacity {
-		maxPart = frameCapacity - frameCapacity%storeformat.MutationEntrySize
-	}
-	maxFrame := h.MaxValueSize
-	if maxPart > maxFrame {
-		maxFrame = maxPart
-	}
-	if maxFrame < storeformat.DescriptorSealSize {
-		maxFrame = storeformat.DescriptorSealSize
-	}
-	if maxFrame > frameCapacity || maxPart < storeformat.MutationEntrySize {
-		return 0, 0, fmt.Errorf("frame payload limits: %w", base.ErrInvalidConfig)
-	}
-	return maxFrame, maxPart, nil
 }
 
 type spaceAwareReserveWriter struct {

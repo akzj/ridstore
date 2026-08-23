@@ -53,14 +53,14 @@ type Barrier struct {
 	NextFrameSeq base.FrameSeq
 }
 
-type PutRequest struct {
+type putRequest struct {
 	Context  context.Context
 	BatchID  base.BatchID
 	RecordID base.ID
 	Value    []byte
 }
 
-type PutAppendResult struct {
+type putAppendResult struct {
 	Addr    base.VAddr
 	Seq     base.FrameSeq
 	Written uint64
@@ -90,7 +90,7 @@ func NewWithRotator(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxF
 }
 
 func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
-	results := l.AppendPutGroup([]PutRequest{{Context: ctx, BatchID: batchID, RecordID: id, Value: value}})
+	results := l.appendPutGroup([]putRequest{{Context: ctx, BatchID: batchID, RecordID: id, Value: value}})
 	if len(results) != 1 {
 		return 0, 0, 0, base.ErrCorrupt
 	}
@@ -98,11 +98,11 @@ func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, v
 	return result.Addr, result.Seq, result.Written, result.Err
 }
 
-// AppendPutGroup appends adjacent Put requests using one write per maximal
+// appendPutGroup appends adjacent Put requests using one write per maximal
 // segment-local group. Canceled or invalid requests consume no FrameSeq. A
 // rotation may split the input into more than one physical write.
-func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
-	results := make([]PutAppendResult, len(requests))
+func (l *Log) appendPutGroup(requests []putRequest) []putAppendResult {
+	results := make([]putAppendResult, len(requests))
 	if len(requests) == 0 {
 		return results
 	}
@@ -141,10 +141,6 @@ func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
 			continue
 		}
 		if err := l.ensureCapacityLocked(probeSize); err != nil {
-			if errors.Is(err, segment.ErrFull) && l.rotator != nil {
-				l.faulted = true
-				err = fmt.Errorf("put frame cannot fit an empty data segment: %w", base.ErrCorrupt)
-			}
 			results[start].Err = err
 			start++
 			if l.faulted {
@@ -240,14 +236,14 @@ func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
 		}
 		l.nextFrameSeq += base.FrameSeq(len(frames))
 		for i, index := range indexes {
-			results[index] = PutAppendResult{Addr: appended[i].Addr, Seq: frames[i].FrameSeq, Written: appended[i].Size}
+			results[index] = putAppendResult{Addr: appended[i].Addr, Seq: frames[i].FrameSeq, Written: appended[i].Size}
 		}
 		for i, index := range indexes {
 			if err := failpoint.Hit(l.hook, PointPutWritten); err != nil {
 				l.faulted = true
-				results[index] = PutAppendResult{Written: appended[i].Size, Err: err}
+				results[index] = putAppendResult{Written: appended[i].Size, Err: err}
 				for restIndex, rest := range indexes[i+1:] {
-					results[rest] = PutAppendResult{Written: appended[i+1+restIndex].Size, Err: segment.ErrPoisoned}
+					results[rest] = putAppendResult{Written: appended[i+1+restIndex].Size, Err: segment.ErrPoisoned}
 				}
 				for rest := indexes[len(indexes)-1] + 1; rest < len(results); rest++ {
 					results[rest].Err = segment.ErrPoisoned
@@ -277,11 +273,11 @@ func (l *Log) AppendAbort(ctx context.Context, batchID base.BatchID, payload sto
 		return err
 	}
 	frame := storeformat.Frame{Type: storeformat.FrameTypeBatchAbort, FrameSeq: l.nextFrameSeq, BatchID: batchID, Payload: encoded[:]}
-	frameBytes, err := storeformat.EncodeFrame(frame, l.maxFramePayload)
+	frameSize, err := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
 	if err != nil {
 		return err
 	}
-	if err := l.ensureCapacityLocked(uint64(len(frameBytes))); err != nil {
+	if err := l.ensureCapacityLocked(frameSize); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(l.hook, PointAbortPrepared); err != nil {
@@ -319,11 +315,11 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 		return err
 	}
 	frame := storeformat.Frame{Type: typ, FrameSeq: l.nextFrameSeq, Payload: encoded[:]}
-	frameBytes, err := storeformat.EncodeFrame(frame, l.maxFramePayload)
+	frameSize, err := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
 	if err != nil {
 		return err
 	}
-	if err := l.ensureCapacityLocked(uint64(len(frameBytes))); err != nil {
+	if err := l.ensureCapacityLocked(frameSize); err != nil {
 		return err
 	}
 	if err := failpoint.Hit(l.hook, PointReservePrepared); err != nil {
@@ -372,17 +368,17 @@ func (l *Log) AppendCommitGroup(prepared []batch.Prepared, commitSeqs []base.Com
 	if err != nil {
 		return nil, err
 	}
+	plannedAt := l.nextFrameSeq
 	if err := l.ensureCapacityLocked(totalBytes); err != nil {
 		return make([]CommitAppendResult, len(prepared)), err
 	}
-	// Rotation consumes one FrameSeq for SegmentSeal, so plans must be rebuilt
-	// against the new sequence origin.
-	plans, totalBytes, err = l.buildCommitGroup(prepared, commitSeqs)
-	if err != nil {
-		return nil, err
-	}
-	if totalBytes+segmentSealReserve > l.active.Remaining() {
-		return make([]CommitAppendResult, len(prepared)), segment.ErrFull
+	if l.nextFrameSeq != plannedAt {
+		// Rotation consumes one FrameSeq for SegmentSeal, so only that case
+		// requires rebuilding descriptors against the new sequence origin.
+		plans, _, err = l.buildCommitGroup(prepared, commitSeqs)
+		if err != nil {
+			return nil, err
+		}
 	}
 	results := make([]CommitAppendResult, len(plans))
 	for planIndex, plan := range plans {
@@ -585,7 +581,10 @@ func (l *Log) Faulted() bool {
 func (l *Log) appendLocked(frame storeformat.Frame) (base.VAddr, uint64, error) {
 	addr, written, err := l.active.Append(frame)
 	if err != nil {
-		if !errors.Is(err, segment.ErrFull) {
+		if errors.Is(err, segment.ErrFull) && l.rotator != nil {
+			l.faulted = true
+			err = fmt.Errorf("preflighted frame no longer fits active data segment: %w", base.ErrCorrupt)
+		} else if !errors.Is(err, segment.ErrFull) {
 			l.faulted = true
 		}
 		return 0, written, err
@@ -596,13 +595,16 @@ func (l *Log) appendLocked(frame storeformat.Frame) (base.VAddr, uint64, error) 
 
 func (l *Log) ensureCapacityLocked(required uint64) error {
 	if required > ^uint64(0)-segmentSealReserve {
-		return segment.ErrFull
+		return l.capacityErrorLocked(required)
 	}
 	if required+segmentSealReserve <= l.active.Remaining() {
 		return nil
 	}
-	if l.rotator == nil || l.active.End() == storeformat.SegmentHeaderSize {
+	if l.rotator == nil {
 		return segment.ErrFull
+	}
+	if l.active.End() == storeformat.SegmentHeaderSize {
+		return l.capacityErrorLocked(required)
 	}
 	active, err := l.rotator.Rotate(l.active, l.nextFrameSeq)
 	if err != nil {
@@ -616,9 +618,17 @@ func (l *Log) ensureCapacityLocked(required uint64) error {
 	}
 	l.nextFrameSeq++
 	if required+segmentSealReserve > l.active.Remaining() {
-		return segment.ErrFull
+		return l.capacityErrorLocked(required)
 	}
 	return nil
+}
+
+func (l *Log) capacityErrorLocked(required uint64) error {
+	if l.rotator == nil {
+		return segment.ErrFull
+	}
+	l.faulted = true
+	return fmt.Errorf("append requirement %d cannot fit an empty data segment: %w", required, base.ErrCorrupt)
 }
 
 func (l *Log) commitParts(prepared batch.Prepared) ([][]byte, []storeformat.MutationEntry, error) {

@@ -7,7 +7,6 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
-	"github.com/akzj/ridstore/internal/segment"
 )
 
 type RelocationEntry struct {
@@ -40,16 +39,16 @@ func (l *Log) AppendRelocation(prepared RelocationPrepared, commitSeq base.Commi
 	if err != nil {
 		return CommitAppendResult{}, err
 	}
+	plannedAt := l.nextFrameSeq
 	if err := l.ensureCapacityLocked(plan.bytes); err != nil {
 		return CommitAppendResult{}, err
 	}
-	// Rotation consumes a FrameSeq, so rebuild against the new sequence origin.
-	plan, err = l.buildRelocationPlan(prepared, commitSeq, l.nextFrameSeq)
-	if err != nil {
-		return CommitAppendResult{}, err
-	}
-	if plan.bytes+segmentSealReserve > l.active.Remaining() {
-		return CommitAppendResult{}, segment.ErrFull
+	if l.nextFrameSeq != plannedAt {
+		// Rotation consumes a FrameSeq, so rebuild against the new origin.
+		plan, err = l.buildRelocationPlan(prepared, commitSeq, l.nextFrameSeq)
+		if err != nil {
+			return CommitAppendResult{}, err
+		}
 	}
 	result := plan.result
 	if l.hook == nil {

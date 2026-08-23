@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -442,32 +441,9 @@ func inspectTrash(root string, report *Report) error {
 }
 
 func maxFramePayload(h storeformat.HardLimits) (uint64, error) {
-	descriptorBytes, err := base.MulUint64(h.MaxBatchMutations, storeformat.MutationEntrySize)
+	maxFrame, _, err := storeformat.FramePayloadLimits(h)
 	if err != nil {
-		return 0, err
-	}
-	minimumSegmentBytes := uint64(storeformat.SegmentHeaderSize + storeformat.SegmentFooterSize + storeformat.FrameHeaderSize)
-	if h.SegmentSize <= minimumSegmentBytes {
-		return 0, base.ErrCorrupt
-	}
-	contentBytes := h.SegmentSize - storeformat.SegmentHeaderSize - storeformat.SegmentFooterSize
-	frameCapacity := contentBytes - storeformat.FrameHeaderSize
-	if frameCapacity > uint64(math.MaxUint32)-storeformat.FrameHeaderSize {
-		frameCapacity = uint64(math.MaxUint32) - storeformat.FrameHeaderSize
-	}
-	maxPart := descriptorBytes
-	if maxPart > frameCapacity {
-		maxPart = frameCapacity - frameCapacity%storeformat.MutationEntrySize
-	}
-	maxFrame := h.MaxValueSize
-	if maxPart > maxFrame {
-		maxFrame = maxPart
-	}
-	if maxFrame < storeformat.DescriptorSealSize {
-		maxFrame = storeformat.DescriptorSealSize
-	}
-	if maxFrame > frameCapacity || maxPart < storeformat.MutationEntrySize {
-		return 0, base.ErrCorrupt
+		return 0, errors.Join(base.ErrCorrupt, err)
 	}
 	return maxFrame, nil
 }

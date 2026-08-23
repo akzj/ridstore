@@ -69,6 +69,38 @@ func TestManifestWithFilesStatsAndOpenBatches(t *testing.T) {
 	}
 }
 
+func TestManifestHardLimitsReserveSpaceForPutDescriptorAndSegmentSeal(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*HardLimits)
+	}{
+		{
+			name: "put",
+			mutate: func(h *HardLimits) {
+				h.SegmentSize = SegmentHeaderSize + SegmentFooterSize + FrameHeaderSize + 64 + h.MaxValueSize - 1
+				h.MaxBatchMutations = 1
+			},
+		},
+		{
+			name: "descriptor",
+			mutate: func(h *HardLimits) {
+				h.SegmentSize = 16 << 10
+				h.MaxValueSize = 1024
+				h.MaxBatchMutations = 256
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := testManifest()
+			test.mutate(&m.HardLimits)
+			if _, err := EncodeManifest(m); !errors.Is(err, base.ErrInvalidConfig) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
 func TestContainerRejectsCorruptionAndUnknownRequired(t *testing.T) {
 	t.Parallel()
 	c := Container{Magic: ManifestMagic, Generation: 1, StoreUUID: testStoreUUID, TLVs: []TLV{{Type: 99, Required: true, Value: []byte{1}}}}

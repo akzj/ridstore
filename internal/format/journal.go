@@ -87,7 +87,7 @@ func EncodeInitializingMarker(marker InitializingMarker) ([]byte, error) {
 	if marker.Phase < InitializingPrepared || marker.Phase > InitializingManifestInstalled {
 		return nil, fmt.Errorf("initializing phase: %w", base.ErrInvalidConfig)
 	}
-	if err := validateHardLimits(marker.HardLimits); err != nil {
+	if err := ValidateHardLimits(marker.HardLimits); err != nil {
 		return nil, err
 	}
 	return EncodeContainer(Container{Magic: InitializingMagic, Generation: 1, StoreUUID: marker.StoreUUID, TLVs: []TLV{
@@ -112,7 +112,7 @@ func DecodeInitializingMarker(src []byte) (InitializingMarker, error) {
 		return InitializingMarker{}, err
 	}
 	marker := InitializingMarker{StoreUUID: c.StoreUUID, HardLimits: h, Phase: InitializingPhase(p)}
-	if marker.Phase < InitializingPrepared || marker.Phase > InitializingManifestInstalled || validateHardLimits(h) != nil {
+	if marker.Phase < InitializingPrepared || marker.Phase > InitializingManifestInstalled || ValidateHardLimits(h) != nil {
 		return InitializingMarker{}, corruptf("initializing fields")
 	}
 	return marker, nil

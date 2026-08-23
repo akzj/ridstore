@@ -31,7 +31,7 @@ func TestAppendPutGroupUsesOneSegmentAppend(t *testing.T) {
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	results := log.AppendPutGroup([]PutRequest{
+	results := log.appendPutGroup([]putRequest{
 		{Context: context.Background(), BatchID: 7, RecordID: 1, Value: []byte("one")},
 		{Context: canceled, BatchID: 7, RecordID: 2, Value: []byte("skip")},
 		{Context: context.Background(), BatchID: 7, RecordID: 3, Value: []byte("three")},
@@ -79,7 +79,7 @@ func TestAppendPutGroupSplitsAtRotationAndAccountsForSealSequence(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	results := log.AppendPutGroup([]PutRequest{
+	results := log.appendPutGroup([]putRequest{
 		{Context: context.Background(), BatchID: 1, RecordID: 1},
 		{Context: context.Background(), BatchID: 1, RecordID: 2},
 	})
@@ -116,6 +116,55 @@ func TestAppendPutDoesNotLeakErrFullWhenRotationCannotMakeProgress(t *testing.T)
 	}
 	if !log.Faulted() {
 		t.Fatal("log did not fault after impossible empty-segment capacity")
+	}
+}
+
+func TestSystemAndDescriptorAppendsDoNotLeakErrFullWithRotator(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*Log) error
+	}{
+		{"abort", func(log *Log) error {
+			return log.AppendAbort(context.Background(), 1, storeformat.BatchAbortPayload{Reason: storeformat.AbortReasonCaller})
+		}},
+		{"reserve", func(log *Log) error {
+			return log.AppendReserve(context.Background(), storeformat.FrameTypeIDReserve, storeformat.ReservePayload{PreviousHighExclusive: 1, NewHighExclusive: 2, Generation: 1})
+		}},
+		{"commit", func(log *Log) error {
+			_, err := log.AppendCommitGroup([]batch.Prepared{{BatchID: 1}}, []base.CommitSeq{1})
+			return err
+		}},
+		{"relocation", func(log *Log) error {
+			addr, _ := base.NewVAddr(1, storeformat.SegmentHeaderSize)
+			_, err := log.AppendRelocation(RelocationPrepared{BatchID: 1, Entries: []RelocationEntry{{RecordID: 1, ExpectedOldAddr: addr, NewAddr: addr}}}, 1)
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			uuid := base.StoreUUID{1}
+			segmentSize := uint64(storeformat.SegmentHeaderSize + storeformat.SegmentFooterSize + segmentSealReserve)
+			active, err := segment.CreateActiveData(root, uuid, 1, 1, segmentSize, 1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer active.Close()
+			log, err := NewWithRotator(active, 1, 1024, 64, nil, &testPutRotator{root: root, uuid: uuid, segmentSize: segmentSize})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = test.run(log)
+			if !errors.Is(err, base.ErrCorrupt) || errors.Is(err, segment.ErrFull) {
+				t.Fatalf("append error=%v", err)
+			}
+			if !log.Faulted() {
+				t.Fatal("log did not fault")
+			}
+		})
 	}
 }
 
