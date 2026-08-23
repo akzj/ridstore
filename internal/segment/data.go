@@ -326,40 +326,92 @@ func (s *ActiveData) EnsureCreationDurable() error {
 }
 
 func (s *ActiveData) Append(frame storeformat.Frame) (base.VAddr, uint64, error) {
+	results, _, err := s.AppendBatch([]storeformat.Frame{frame})
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(results) != 1 {
+		return 0, 0, base.ErrCorrupt
+	}
+	return results[0].Addr, results[0].Size, nil
+}
+
+type AppendResult struct {
+	Addr base.VAddr
+	Size uint64
+}
+
+// AppendBatch encodes complete Frames into one contiguous buffer and writes
+// that buffer with one logical append. A short write poisons the Active file;
+// callers must not publish any result from the failed group.
+func (s *ActiveData) AppendBatch(frames []storeformat.Frame) ([]AppendResult, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return 0, 0, base.ErrClosed
+		return nil, 0, base.ErrClosed
 	}
 	if s.poisoned {
-		return 0, 0, ErrPoisoned
+		return nil, 0, ErrPoisoned
 	}
-	encoded, err := storeformat.EncodeFrame(frame, s.maxPayloadSize)
-	if err != nil {
-		return 0, 0, err
+	if len(frames) == 0 {
+		return nil, 0, base.ErrInvalidConfig
 	}
-	encodedSize := uint64(len(encoded))
+	encodedSizes := make([]uint64, len(frames))
+	var total uint64
+	for i, frame := range frames {
+		size, err := storeformat.EncodedFrameSize(frame, s.maxPayloadSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		if size > ^uint64(0)-total {
+			return nil, 0, base.ErrInvalidConfig
+		}
+		encodedSizes[i] = size
+		total += size
+	}
 	contentLimit := s.segmentSize - storeformat.SegmentFooterSize
-	if encodedSize > contentLimit-s.end {
-		return 0, 0, ErrFull
+	if total > contentLimit-s.end {
+		return nil, 0, ErrFull
 	}
 	offset := s.end
+	totalInt, err := base.Uint64ToInt(total)
+	if err != nil {
+		return nil, 0, err
+	}
+	buffer := make([]byte, totalInt)
+	nextBuffer := 0
+	for i, frame := range frames {
+		size, err := base.Uint64ToInt(encodedSizes[i])
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, err := storeformat.EncodeFrameTo(buffer[nextBuffer:nextBuffer+size], frame, s.maxPayloadSize); err != nil {
+			return nil, 0, err
+		}
+		nextBuffer += size
+	}
 	if err := failpoint.Hit(s.hook, PointBeforeAppendWrite); err != nil {
 		s.poisoned = true
-		return 0, 0, err
+		return nil, 0, err
 	}
-	written, err := writeFullAt(s.file, encoded, int64(offset))
+	written, err := writeFullAt(s.file, buffer, int64(offset))
 	s.end += uint64(written)
 	if err != nil {
 		s.poisoned = true
-		return 0, uint64(written), fmt.Errorf("append frame at %d: %w", offset, err)
+		return nil, uint64(written), fmt.Errorf("append frame batch at %d: %w", offset, err)
 	}
-	addr, err := base.NewVAddr(s.segmentID, uint32(offset))
-	if err != nil {
-		s.poisoned = true
-		return 0, encodedSize, err
+	results := make([]AppendResult, len(encodedSizes))
+	next := offset
+	for i, size := range encodedSizes {
+		addr, err := base.NewVAddr(s.segmentID, uint32(next))
+		if err != nil {
+			s.poisoned = true
+			return nil, total, err
+		}
+		results[i] = AppendResult{Addr: addr, Size: size}
+		next += size
 	}
-	return addr, encodedSize, nil
+	return results, total, nil
 }
 
 func (s *ActiveData) ReadFrame(addr base.VAddr) (storeformat.Frame, error) {

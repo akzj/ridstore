@@ -72,6 +72,29 @@ func TestEmptyPutRecord(t *testing.T) {
 	}
 }
 
+func TestEncodeFrameToOverwritesReusedBuffer(t *testing.T) {
+	t.Parallel()
+	frame := Frame{Type: FrameTypePutRecord, FrameSeq: 1, BatchID: 2, RecordID: 3, Payload: []byte{1}}
+	size, err := EncodedFrameSize(frame, testMaxPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, size)
+	for i := range dst {
+		dst[i] = 0xff
+	}
+	written, err := EncodeFrameTo(dst, frame, testMaxPayload)
+	if err != nil || written != len(dst) {
+		t.Fatalf("written=%d error=%v", written, err)
+	}
+	if !allZero(dst[FrameHeaderSize+len(frame.Payload):]) {
+		t.Fatalf("padding was not cleared: %x", dst[FrameHeaderSize+len(frame.Payload):])
+	}
+	if _, err := EncodeFrameTo(dst[:len(dst)-1], frame, testMaxPayload); !errors.Is(err, base.ErrInvalidConfig) {
+		t.Fatalf("short destination error=%v", err)
+	}
+}
+
 func TestFrameRejectsInvalidIdentityAndShape(t *testing.T) {
 	t.Parallel()
 

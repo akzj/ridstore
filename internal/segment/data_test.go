@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -11,6 +12,89 @@ import (
 	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 )
+
+func TestActiveDataAppendBatchWritesContiguousFrames(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	createActiveDataFile(t, root, uuid, 1)
+	active, err := OpenActiveData(root, uuid, 1, 1<<20, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	var writes atomic.Int32
+	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		if point == PointBeforeAppendWrite {
+			writes.Add(1)
+		}
+		return nil
+	}))
+	frames := []storeformat.Frame{
+		{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1, Payload: []byte("one")},
+		{Type: storeformat.FrameTypePutRecord, FrameSeq: 2, BatchID: 1, RecordID: 2, Payload: []byte("longer-value")},
+		{Type: storeformat.FrameTypePutRecord, FrameSeq: 3, BatchID: 1, RecordID: 3},
+	}
+	results, written, err := active.AppendBatch(frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != len(frames) || writes.Load() != 1 {
+		t.Fatalf("results=%d append writes=%d", len(results), writes.Load())
+	}
+	var sum uint64
+	for i, result := range results {
+		if i > 0 && result.Addr.Offset() != results[i-1].Addr.Offset()+uint32(results[i-1].Size) {
+			t.Fatalf("non-contiguous result %d: %+v after %+v", i, result, results[i-1])
+		}
+		got, err := active.ReadFrame(result.Addr)
+		if err != nil || got.FrameSeq != frames[i].FrameSeq || got.RecordID != frames[i].RecordID || string(got.Payload) != string(frames[i].Payload) {
+			t.Fatalf("frame %d=%+v error=%v", i, got, err)
+		}
+		sum += result.Size
+	}
+	if written != sum || active.End() != storeformat.SegmentHeaderSize+sum {
+		t.Fatalf("written=%d sum=%d end=%d", written, sum, active.End())
+	}
+}
+
+func TestActiveDataAppendBatchPreflightAndPoison(t *testing.T) {
+	root := t.TempDir()
+	uuid := base.StoreUUID{1}
+	createActiveDataFile(t, root, uuid, 1)
+	segmentSize := uint64(storeformat.SegmentHeaderSize + storeformat.SegmentFooterSize + storeformat.FrameHeaderSize)
+	active, err := OpenActiveData(root, uuid, 1, segmentSize, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	before := active.End()
+	if _, _, err := active.AppendBatch(nil); !errors.Is(err, base.ErrInvalidConfig) {
+		t.Fatalf("empty group error=%v", err)
+	}
+	frames := []storeformat.Frame{
+		{Type: storeformat.FrameTypePutRecord, FrameSeq: 1, BatchID: 1, RecordID: 1},
+		{Type: storeformat.FrameTypePutRecord, FrameSeq: 2, BatchID: 1, RecordID: 2},
+	}
+	if _, _, err := active.AppendBatch(frames); !errors.Is(err, ErrFull) {
+		t.Fatalf("oversize group error=%v", err)
+	}
+	if active.End() != before {
+		t.Fatalf("preflight changed end from %d to %d", before, active.End())
+	}
+	injected := errors.New("injected append failure")
+	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		if point == PointBeforeAppendWrite {
+			return injected
+		}
+		return nil
+	}))
+	if _, _, err := active.AppendBatch(frames[:1]); !errors.Is(err, injected) {
+		t.Fatalf("append error=%v", err)
+	}
+	if _, _, err := active.AppendBatch(frames[:1]); !errors.Is(err, ErrPoisoned) {
+		t.Fatalf("append after failure=%v", err)
+	}
+}
 
 func createActiveDataFile(t *testing.T, root string, uuid base.StoreUUID, id base.DataSegmentID) {
 	t.Helper()

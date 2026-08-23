@@ -5,13 +5,94 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/batch"
+	"github.com/akzj/ridstore/internal/failpoint"
 	storeformat "github.com/akzj/ridstore/internal/format"
 	"github.com/akzj/ridstore/internal/segment"
 )
+
+func TestAppendPutGroupUsesOneSegmentAppend(t *testing.T) {
+	active, _ := newActive(t, 1<<20)
+	defer active.Close()
+	var appendWrites atomic.Int32
+	active.SetHook(failpoint.Func(func(point failpoint.Point) error {
+		if point == segment.PointBeforeAppendWrite {
+			appendWrites.Add(1)
+		}
+		return nil
+	}))
+	log, err := New(active, 1, 1024, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	results := log.AppendPutGroup([]PutRequest{
+		{Context: context.Background(), BatchID: 7, RecordID: 1, Value: []byte("one")},
+		{Context: canceled, BatchID: 7, RecordID: 2, Value: []byte("skip")},
+		{Context: context.Background(), BatchID: 7, RecordID: 3, Value: []byte("three")},
+	})
+	if len(results) != 3 || results[0].Err != nil || !errors.Is(results[1].Err, context.Canceled) || results[2].Err != nil {
+		t.Fatalf("results=%+v", results)
+	}
+	if results[0].Seq != 1 || results[2].Seq != 2 || log.NextFrameSeq() != 3 {
+		t.Fatalf("seqs=%d,%d next=%d", results[0].Seq, results[2].Seq, log.NextFrameSeq())
+	}
+	if results[2].Addr.Offset() != results[0].Addr.Offset()+uint32(results[0].Written) {
+		t.Fatalf("addresses are not contiguous: %+v", results)
+	}
+	if appendWrites.Load() != 1 {
+		t.Fatalf("physical append writes=%d", appendWrites.Load())
+	}
+}
+
+type testPutRotator struct {
+	root        string
+	uuid        base.StoreUUID
+	segmentSize uint64
+}
+
+func (r *testPutRotator) Rotate(active *segment.ActiveData, next base.FrameSeq) (*segment.ActiveData, error) {
+	if _, err := active.Seal(next); err != nil {
+		return nil, err
+	}
+	return segment.CreateActiveData(r.root, r.uuid, active.SegmentID()+1, next+1, r.segmentSize, 1024)
+}
+
+func TestAppendPutGroupSplitsAtRotationAndAccountsForSealSequence(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	uuid := base.StoreUUID{1}
+	segmentSize := uint64(storeformat.SegmentHeaderSize + storeformat.SegmentFooterSize + segmentSealReserve + storeformat.FrameHeaderSize)
+	active, err := segment.CreateActiveData(root, uuid, 1, 1, segmentSize, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotator := &testPutRotator{root: root, uuid: uuid, segmentSize: segmentSize}
+	log, err := NewWithRotator(active, 1, 1024, 64, nil, rotator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := log.AppendPutGroup([]PutRequest{
+		{Context: context.Background(), BatchID: 1, RecordID: 1},
+		{Context: context.Background(), BatchID: 1, RecordID: 2},
+	})
+	if results[0].Err != nil || results[1].Err != nil {
+		t.Fatalf("results=%+v", results)
+	}
+	if results[0].Seq != 1 || results[0].Addr.SegmentID() != 1 || results[1].Seq != 3 || results[1].Addr.SegmentID() != 2 || log.NextFrameSeq() != 4 {
+		t.Fatalf("results=%+v next=%d", results, log.NextFrameSeq())
+	}
+	if err := log.active.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func newActive(t *testing.T, segmentSize uint64) (*segment.ActiveData, base.StoreUUID) {
 	t.Helper()

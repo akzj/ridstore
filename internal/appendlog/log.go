@@ -53,6 +53,20 @@ type Barrier struct {
 	NextFrameSeq base.FrameSeq
 }
 
+type PutRequest struct {
+	Context  context.Context
+	BatchID  base.BatchID
+	RecordID base.ID
+	Value    []byte
+}
+
+type PutAppendResult struct {
+	Addr    base.VAddr
+	Seq     base.FrameSeq
+	Written uint64
+	Err     error
+}
+
 type commitPlan struct {
 	frames []storeformat.Frame
 	bytes  uint64
@@ -76,38 +90,149 @@ func NewWithRotator(active *segment.ActiveData, nextFrameSeq base.FrameSeq, maxF
 }
 
 func (l *Log) AppendPut(ctx context.Context, batchID base.BatchID, id base.ID, value []byte) (base.VAddr, base.FrameSeq, uint64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, 0, 0, err
+	results := l.AppendPutGroup([]PutRequest{{Context: ctx, BatchID: batchID, RecordID: id, Value: value}})
+	if len(results) != 1 {
+		return 0, 0, 0, base.ErrCorrupt
+	}
+	result := results[0]
+	return result.Addr, result.Seq, result.Written, result.Err
+}
+
+// AppendPutGroup appends adjacent Put requests using one write per maximal
+// segment-local group. Canceled or invalid requests consume no FrameSeq. A
+// rotation may split the input into more than one physical write.
+func (l *Log) AppendPutGroup(requests []PutRequest) []PutAppendResult {
+	results := make([]PutAppendResult, len(requests))
+	if len(requests) == 0 {
+		return results
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err := l.ready(); err != nil {
-		return 0, 0, 0, err
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, 0, 0, err
-	}
-	probe, err := storeformat.EncodeFrame(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: l.nextFrameSeq, BatchID: batchID, RecordID: id, Payload: value}, l.maxFramePayload)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	if err := l.ensureCapacityLocked(uint64(len(probe))); err != nil {
-		return 0, 0, 0, err
-	}
-	seq := l.nextFrameSeq
-	addr, written, err := l.active.Append(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: seq, BatchID: batchID, RecordID: id, Payload: value})
-	if err != nil {
-		if !errors.Is(err, segment.ErrFull) {
-			l.faulted = true
+	for start := 0; start < len(requests); {
+		for start < len(requests) {
+			ctx := requests[start].Context
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			if err := ctx.Err(); err != nil {
+				results[start].Err = err
+				start++
+				continue
+			}
+			break
 		}
-		return 0, 0, written, err
+		if start == len(requests) {
+			break
+		}
+		if err := l.ready(); err != nil {
+			for i := start; i < len(results); i++ {
+				results[i].Err = err
+			}
+			break
+		}
+
+		// Preflight the first request so rotation happens before assigning its
+		// sequence. Rotation itself consumes the SegmentSeal FrameSeq.
+		first := requests[start]
+		probeSize, err := storeformat.EncodedFrameSize(storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: l.nextFrameSeq, BatchID: first.BatchID, RecordID: first.RecordID, Payload: first.Value}, l.maxFramePayload)
+		if err != nil {
+			results[start].Err = err
+			start++
+			continue
+		}
+		if err := l.ensureCapacityLocked(probeSize); err != nil {
+			results[start].Err = err
+			start++
+			if l.faulted {
+				for i := start; i < len(results); i++ {
+					results[i].Err = segment.ErrPoisoned
+				}
+				break
+			}
+			continue
+		}
+
+		remaining := l.active.Remaining() - segmentSealReserve
+		frames := make([]storeformat.Frame, 0, len(requests)-start)
+		frameSizes := make([]uint64, 0, len(requests)-start)
+		indexes := make([]int, 0, len(requests)-start)
+		var bytes uint64
+		for i := start; i < len(requests); i++ {
+			ctx := requests[i].Context
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			if err := ctx.Err(); err != nil {
+				results[i].Err = err
+				continue
+			}
+			if l.nextFrameSeq+base.FrameSeq(len(frames)) < l.nextFrameSeq || l.nextFrameSeq+base.FrameSeq(len(frames)) == base.FrameSeq(math.MaxUint64) {
+				results[i].Err = base.ErrGenerationExhausted
+				continue
+			}
+			frame := storeformat.Frame{Type: storeformat.FrameTypePutRecord, FrameSeq: l.nextFrameSeq + base.FrameSeq(len(frames)), BatchID: requests[i].BatchID, RecordID: requests[i].RecordID, Payload: requests[i].Value}
+			size, err := storeformat.EncodedFrameSize(frame, l.maxFramePayload)
+			if err != nil {
+				results[i].Err = err
+				continue
+			}
+			if size > remaining-bytes {
+				break
+			}
+			frames = append(frames, frame)
+			frameSizes = append(frameSizes, size)
+			indexes = append(indexes, i)
+			bytes += size
+		}
+		if len(frames) == 0 {
+			// Only canceled/invalid requests were encountered after start.
+			start++
+			continue
+		}
+		appended, written, err := l.active.AppendBatch(frames)
+		if err != nil {
+			if !errors.Is(err, segment.ErrFull) {
+				l.faulted = true
+			}
+			remainingWritten := written
+			for i, index := range indexes {
+				frameWritten := frameSizes[i]
+				if frameWritten > remainingWritten {
+					frameWritten = remainingWritten
+				}
+				results[index].Written = frameWritten
+				results[index].Err = err
+				remainingWritten -= frameWritten
+			}
+			restErr := err
+			if l.faulted {
+				restErr = segment.ErrPoisoned
+			}
+			for i := indexes[len(indexes)-1] + 1; i < len(results); i++ {
+				results[i].Err = restErr
+			}
+			break
+		}
+		l.nextFrameSeq += base.FrameSeq(len(frames))
+		for i, index := range indexes {
+			results[index] = PutAppendResult{Addr: appended[i].Addr, Seq: frames[i].FrameSeq, Written: appended[i].Size}
+		}
+		for i, index := range indexes {
+			if err := failpoint.Hit(l.hook, PointPutWritten); err != nil {
+				l.faulted = true
+				results[index] = PutAppendResult{Written: appended[i].Size, Err: err}
+				for restIndex, rest := range indexes[i+1:] {
+					results[rest] = PutAppendResult{Written: appended[i+1+restIndex].Size, Err: segment.ErrPoisoned}
+				}
+				for rest := indexes[len(indexes)-1] + 1; rest < len(results); rest++ {
+					results[rest].Err = segment.ErrPoisoned
+				}
+				return results
+			}
+		}
+		start = indexes[len(indexes)-1] + 1
 	}
-	l.nextFrameSeq++
-	if err := failpoint.Hit(l.hook, PointPutWritten); err != nil {
-		l.faulted = true
-		return 0, 0, written, err
-	}
-	return addr, seq, written, nil
+	return results
 }
 
 func (l *Log) AppendAbort(ctx context.Context, batchID base.BatchID, payload storeformat.BatchAbortPayload) error {

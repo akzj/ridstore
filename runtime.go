@@ -87,7 +87,14 @@ func buildStore(cfg Config, manifest storeformat.Manifest, lock *filelock.Lock, 
 	if err != nil {
 		return fail(err)
 	}
-	log, err := appendlog.NewSequencer(physicalLog, cfg.MaxOpenBatches+cfg.MaxGroupBatches)
+	log, err := appendlog.NewBatchedSequencer(physicalLog, appendlog.SequencerConfig{
+		QueueDepth: cfg.MaxOpenBatches + cfg.MaxGroupBatches,
+		MaxFrames:  cfg.MaxGroupBatches,
+		MaxBytes:   uint64(cfg.MaxGroupBytes),
+		// Phase 1 only drains Put requests that are already queued. Reusing the
+		// commit delay here would add a second latency window before Commit.
+		MaxDelay: 0,
+	})
 	if err != nil {
 		return fail(err)
 	}

@@ -55,12 +55,8 @@ type Frame struct {
 }
 
 func EncodeFrame(frame Frame, maxPayloadSize uint64) ([]byte, error) {
-	payloadSize := uint64(len(frame.Payload))
-	totalSize, err := validateFrameFields(frame.Type, frame.FrameSeq, frame.BatchID, frame.RecordID, payloadSize, maxPayloadSize)
+	totalSize, err := EncodedFrameSize(frame, maxPayloadSize)
 	if err != nil {
-		return nil, err
-	}
-	if err := validateFramePayloadForEncode(frame); err != nil {
 		return nil, err
 	}
 	totalInt, err := base.Uint64ToInt(totalSize)
@@ -68,6 +64,41 @@ func EncodeFrame(frame Frame, maxPayloadSize uint64) ([]byte, error) {
 		return nil, fmt.Errorf("frame size: %w", err)
 	}
 	dst := make([]byte, totalInt)
+	if _, err := EncodeFrameTo(dst, frame, maxPayloadSize); err != nil {
+		return nil, err
+	}
+	return dst, nil
+}
+
+func EncodedFrameSize(frame Frame, maxPayloadSize uint64) (uint64, error) {
+	payloadSize := uint64(len(frame.Payload))
+	totalSize, err := validateFrameFields(frame.Type, frame.FrameSeq, frame.BatchID, frame.RecordID, payloadSize, maxPayloadSize)
+	if err != nil {
+		return 0, err
+	}
+	if err := validateFramePayloadForEncode(frame); err != nil {
+		return 0, err
+	}
+	return totalSize, nil
+}
+
+// EncodeFrameTo encodes one complete Frame into caller-owned storage. dst may
+// be reused; the complete encoded range, including padding, is overwritten.
+func EncodeFrameTo(dst []byte, frame Frame, maxPayloadSize uint64) (int, error) {
+	totalSize, err := EncodedFrameSize(frame, maxPayloadSize)
+	if err != nil {
+		return 0, err
+	}
+	totalInt, err := base.Uint64ToInt(totalSize)
+	if err != nil {
+		return 0, fmt.Errorf("frame size: %w", err)
+	}
+	if len(dst) < totalInt {
+		return 0, fmt.Errorf("frame destination size: %w", base.ErrInvalidConfig)
+	}
+	dst = dst[:totalInt]
+	clear(dst)
+	payloadSize := uint64(len(frame.Payload))
 	copy(dst[0:4], frameMagic[:])
 	binary.LittleEndian.PutUint16(dst[4:6], FormatMajorVersion)
 	dst[6] = byte(frame.Type)
@@ -82,7 +113,7 @@ func EncodeFrame(frame Frame, maxPayloadSize uint64) ([]byte, error) {
 	}
 	binary.LittleEndian.PutUint32(dst[52:56], crc32.Checksum(dst[:FrameHeaderSize], castagnoliTable))
 	copy(dst[FrameHeaderSize:FrameHeaderSize+len(frame.Payload)], frame.Payload)
-	return dst, nil
+	return totalInt, nil
 }
 
 func DecodeFrameHeader(src []byte, limits FrameLimits) (FrameHeader, error) {

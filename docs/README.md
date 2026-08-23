@@ -18,12 +18,13 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 12. [Offline Verify/Scrub](verify-scrub.md)：只读完整性验证、报告与资源边界；
 13. [Consistent Backup/Restore](backup-restore.md)：离线快照、artifact 与 UUID 策略；
 14. [Metrics Export](metrics-export.md)：稳定 samples 与 Prometheus adapter；
-15. [Format Upgrade/Migration](format-migration.md)：兼容规则、只读 plan 与 step 门禁；
-16. [Format v1 Freeze Review](format-freeze-review.md)：格式冻结结论、代码映射和验证边界；
-17. [Phase 5 全局审计](phase-5-audit.md)：requirement-to-evidence、当前 P0/P1 缺口和 production checklist。
-18. [72h Soak](soak.md)：长时工作负载、JSONL 资源样本和自然结束判定。
-19. [Durable Writer Syscall Fault Matrix](syscall-fault-matrix.md)：逐 writer 的 write/fsync/rename/dir-sync 覆盖与剩余缺口。
-20. [Long Fuzz 与 Nightly Evidence](long-fuzz.md)：长时 decoder fuzz runner、CI artifact 与证据判定。
+15. [Append Engine](append-engine.md)：Put 合并写、顺序边界与 staging 演进；
+16. [Format Upgrade/Migration](format-migration.md)：兼容规则、只读 plan 与 step 门禁；
+17. [Format v1 Freeze Review](format-freeze-review.md)：格式冻结结论、代码映射和验证边界；
+18. [Phase 5 全局审计](phase-5-audit.md)：requirement-to-evidence、当前 P0/P1 缺口和 production checklist。
+19. [72h Soak](soak.md)：长时工作负载、JSONL 资源样本和自然结束判定。
+20. [Durable Writer Syscall Fault Matrix](syscall-fault-matrix.md)：逐 writer 的 write/fsync/rename/dir-sync 覆盖与剩余缺口。
+21. [Long Fuzz 与 Nightly Evidence](long-fuzz.md)：长时 decoder fuzz runner、CI artifact 与证据判定。
 
 ## 文档状态
 
@@ -48,6 +49,7 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 | `verify-scrub.md` | Phase 5 implemented | 离线只读验证与 scrub report |
 | `backup-restore.md` | Phase 5 protocol v1 | 离线一致备份、恢复发布与 UUID 策略 |
 | `metrics-export.md` | Phase 5 implemented | bounded samples 与 Prometheus HTTP adapter |
+| `append-engine.md` | Phase 1 batching implemented | Put 合并写与 staging 演进边界 |
 | `format-migration.md` | Phase 5 skeleton | 只读 plan、registry 与 copy-on-write 门禁 |
 | `phase-5-audit.md` | Phase 5 in progress | 全局证据矩阵与生产声明门禁 |
 | `syscall-fault-matrix.md` | Phase 5 in progress | durable writer syscall 错误覆盖与缺口 |
