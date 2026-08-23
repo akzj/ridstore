@@ -207,7 +207,8 @@ func TestAppendPutReserveAbortAndCommit(t *testing.T) {
 		{RecordID: 1, Operation: batch.Put, Addr: putAddr, ValueBytes: 5},
 		{RecordID: 2, Operation: batch.Delete},
 	}}
-	result, err := log.AppendCommit(prepared, 1)
+	results, err := log.AppendCommitGroup([]batch.Prepared{prepared}, []base.CommitSeq{1})
+	result := results[0]
 	if err != nil || !result.SealStarted || result.SealFrameSeq != 4 {
 		t.Fatalf("commit result=%+v error=%v", result, err)
 	}
@@ -245,7 +246,8 @@ func TestCommitPreflightNoSpaceWritesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := active.End()
-	result, err := log.AppendCommit(batch.Prepared{BatchID: 1}, 1)
+	results, err := log.AppendCommitGroup([]batch.Prepared{{BatchID: 1}}, []base.CommitSeq{1})
+	result := results[0]
 	if !errors.Is(err, segment.ErrFull) || result.SealStarted {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}

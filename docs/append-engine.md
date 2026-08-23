@@ -57,8 +57,7 @@ Relocation Descriptor 的 Part/Seal 也采用相同路径。因此“一条 Reco
 - `PointPutWritten` 仍对每个完整写入的 Put 触发；Segment 的 append-write hook 对
   每个物理 group 只触发一次。
 - Commit Coordinator 仍是唯一分配 CommitSeq 并发布 Mapping 的组件；append Log
-  按其请求构造 CommitSeal 并执行 durable sync。Coordinator 只依赖强制的
-  `AppendCommitGroup` 接口，不存在逐 Batch append fallback；Put batching 不赋予
+  通过 `AppendCommitGroup` 构造 CommitSeal 并执行 durable sync。Put batching 不赋予
   Value 可见性。
 - 队列、Frame 数和聚合字节数均有界。单个允许的大 Value 即使超过 group 字节预算，
   也必须能够独立执行。

@@ -344,14 +344,6 @@ func (l *Log) AppendReserve(ctx context.Context, typ storeformat.FrameType, payl
 	return nil
 }
 
-func (l *Log) AppendCommit(prepared batch.Prepared, commitSeq base.CommitSeq) (CommitAppendResult, error) {
-	results, err := l.AppendCommitGroup([]batch.Prepared{prepared}, []base.CommitSeq{commitSeq})
-	if len(results) == 0 {
-		return CommitAppendResult{}, err
-	}
-	return results[0], err
-}
-
 // AppendCommitGroup appends every descriptor in CommitSeq order and performs
 // exactly one sync. Capacity and descriptor encoding are preflighted for the
 // entire group, so ErrFull never leaves a partial group on disk.

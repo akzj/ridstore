@@ -72,7 +72,7 @@ func TestRecoverCommitReserveAbortAndOrphanPut(t *testing.T) {
 	if err := log.AppendReserve(context.Background(), storeformat.FrameTypeIDReserve, storeformat.ReservePayload{PreviousHighExclusive: 1, NewHighExclusive: 5, Generation: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := log.AppendCommit(batch.Prepared{BatchID: 7, LogicalPayloadBytes: 5, Mutations: []batch.Mutation{{RecordID: 1, Operation: batch.Put, Addr: addr, ValueBytes: 5, PhysicalSize: physical}}}, 1); err != nil {
+	if _, err := log.AppendCommitGroup([]batch.Prepared{{BatchID: 7, LogicalPayloadBytes: 5, Mutations: []batch.Mutation{{RecordID: 1, Operation: batch.Put, Addr: addr, ValueBytes: 5, PhysicalSize: physical}}}}, []base.CommitSeq{1}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := log.AppendPut(context.Background(), 8, 2, []byte("orphan")); err != nil {
@@ -112,7 +112,7 @@ func TestRecoverRejectsDescriptorLogicalMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepared := batch.Prepared{BatchID: 7, LogicalPayloadBytes: 999, Mutations: []batch.Mutation{{RecordID: 1, Operation: batch.Put, Addr: addr, ValueBytes: 5, PhysicalSize: physical}}}
-	if _, err := log.AppendCommit(prepared, 1); err != nil {
+	if _, err := log.AppendCommitGroup([]batch.Prepared{prepared}, []base.CommitSeq{1}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := RecoverPhase1(manifest, active, 1<<16); !errors.Is(err, base.ErrCorrupt) {
@@ -191,9 +191,9 @@ func TestRecoverRelocationApplyAndCASSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := log.AppendCommit(batch.Prepared{BatchID: 7, LogicalPayloadBytes: 3, Mutations: []batch.Mutation{{
+	if _, err := log.AppendCommitGroup([]batch.Prepared{{BatchID: 7, LogicalPayloadBytes: 3, Mutations: []batch.Mutation{{
 		RecordID: 1, Operation: batch.Put, Addr: oldAddr, ValueBytes: 3, PhysicalSize: oldPhysical,
-	}}}, 1); err != nil {
+	}}}}, []base.CommitSeq{1}); err != nil {
 		t.Fatal(err)
 	}
 	copy1, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("old"))
@@ -209,9 +209,9 @@ func TestRecoverRelocationApplyAndCASSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := log.AppendCommit(batch.Prepared{BatchID: 9, LogicalPayloadBytes: 5, Mutations: []batch.Mutation{{
+	if _, err := log.AppendCommitGroup([]batch.Prepared{{BatchID: 9, LogicalPayloadBytes: 5, Mutations: []batch.Mutation{{
 		RecordID: 1, Operation: batch.Put, Addr: newerAddr, ValueBytes: 5, PhysicalSize: newerPhysical,
-	}}}, 3); err != nil {
+	}}}}, []base.CommitSeq{3}); err != nil {
 		t.Fatal(err)
 	}
 	copy2, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("old"))
@@ -242,9 +242,9 @@ func TestRecoverRejectsRelocationValueMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := log.AppendCommit(batch.Prepared{BatchID: 7, LogicalPayloadBytes: 11, Mutations: []batch.Mutation{{
+	if _, err := log.AppendCommitGroup([]batch.Prepared{{BatchID: 7, LogicalPayloadBytes: 11, Mutations: []batch.Mutation{{
 		RecordID: 1, Operation: batch.Put, Addr: oldAddr, ValueBytes: 11, PhysicalSize: physical,
-	}}}, 1); err != nil {
+	}}}}, []base.CommitSeq{1}); err != nil {
 		t.Fatal(err)
 	}
 	badCopy, _, _, err := log.AppendPut(context.Background(), 7, 1, []byte("same-size-b"))
@@ -304,9 +304,9 @@ func TestRecoverySkipsPreReplaySegmentsAndRandomReadsReferencedPut(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := log.AppendCommit(batch.Prepared{BatchID: 7, LogicalPayloadBytes: 10, Mutations: []batch.Mutation{{
+	if _, err := log.AppendCommitGroup([]batch.Prepared{{BatchID: 7, LogicalPayloadBytes: 10, Mutations: []batch.Mutation{{
 		RecordID: 1, Operation: batch.Put, Addr: oldAddr, ValueBytes: 10, PhysicalSize: physical,
-	}}}, 1); err != nil {
+	}}}}, []base.CommitSeq{1}); err != nil {
 		t.Fatal(err)
 	}
 	secondSummary, err := second.Seal(log.NextFrameSeq())
