@@ -101,14 +101,29 @@ func decodeSegmentHeader(src []byte) (segmentHeader, error) {
 }
 
 func encodeRecord(addr VAddr, payload []byte) ([]byte, error) {
-	if !addr.Valid() {
-		return nil, ErrInvalidVAddr
-	}
 	total, err := encodedRecordSize(uint64(len(payload)))
 	if err != nil {
 		return nil, err
 	}
 	dst := make([]byte, total)
+	if err := encodeRecordInto(dst, addr, payload); err != nil {
+		return nil, err
+	}
+	return dst, nil
+}
+
+func encodeRecordInto(dst []byte, addr VAddr, payload []byte) error {
+	if !addr.Valid() {
+		return ErrInvalidVAddr
+	}
+	total, err := encodedRecordSize(uint64(len(payload)))
+	if err != nil {
+		return err
+	}
+	if uint64(len(dst)) != total {
+		return ErrInvalidConfig
+	}
+	clear(dst[recordHeaderSize+uint64(len(payload)):])
 	copy(dst[0:4], recordMagic[:])
 	binary.LittleEndian.PutUint16(dst[4:6], formatVersion)
 	binary.LittleEndian.PutUint16(dst[6:8], uint16(recordHeaderSize))
@@ -118,7 +133,7 @@ func encodeRecord(addr VAddr, payload []byte) ([]byte, error) {
 	binary.LittleEndian.PutUint32(dst[24:28], crc32.Checksum(payload, crcTable))
 	binary.LittleEndian.PutUint32(dst[28:32], crc32.Checksum(dst[:28], crcTable))
 	copy(dst[recordHeaderSize:], payload)
-	return dst, nil
+	return nil
 }
 
 func decodeRecordHeader(src []byte) (recordHeader, error) {

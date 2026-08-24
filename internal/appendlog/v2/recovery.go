@@ -27,7 +27,7 @@ type recoveredSegment struct {
 
 func scanSegment(path string, expectSealed bool, repairTail bool) (recoveredSegment, []recoveredRecord, error) {
 	var records []recoveredRecord
-	recovered, err := visitSegment(path, expectSealed, repairTail, func(record recoveredRecord) error {
+	recovered, err := visitSegment(path, expectSealed, repairTail, nil, osFileBackend{}, func(record recoveredRecord) error {
 		records = append(records, record)
 		return nil
 	})
@@ -35,15 +35,19 @@ func scanSegment(path string, expectSealed bool, repairTail bool) (recoveredSegm
 }
 
 func scanSegmentMetadata(path string, expectSealed bool, repairTail bool) (recoveredSegment, error) {
-	return visitSegment(path, expectSealed, repairTail, nil)
+	return visitSegment(path, expectSealed, repairTail, nil, osFileBackend{}, nil)
 }
 
-func visitSegment(path string, expectSealed bool, repairTail bool, visit func(recoveredRecord) error) (recoveredSegment, error) {
+func scanSegmentMetadataWithHook(path string, expectSealed bool, repairTail bool, hook func(FaultPoint) error, files fileBackend) (recoveredSegment, error) {
+	return visitSegment(path, expectSealed, repairTail, hook, files, nil)
+}
+
+func visitSegment(path string, expectSealed bool, repairTail bool, hook func(FaultPoint) error, files fileBackend, visit func(recoveredRecord) error) (recoveredSegment, error) {
 	flag := os.O_RDONLY
 	if repairTail {
 		flag = os.O_RDWR
 	}
-	f, err := os.OpenFile(path, flag, 0)
+	f, err := files.openFile(path, flag, 0)
 	if err != nil {
 		return recoveredSegment{}, err
 	}
@@ -78,7 +82,7 @@ func visitSegment(path string, expectSealed bool, repairTail bool, visit func(re
 			}
 			prefix := make([]byte, prefixSize)
 			if _, err := f.ReadAt(prefix, int64(result.end)); err == nil && string(prefix) == string(segmentFooterMagic[:prefixSize]) {
-				if err := truncateActiveTail(f, result.end); err != nil {
+				if err := truncateActiveTail(f, result.end, hook); err != nil {
 					return recoveredSegment{}, err
 				}
 				physicalEnd = result.end
@@ -102,7 +106,7 @@ func visitSegment(path string, expectSealed bool, repairTail bool, visit func(re
 		}
 		if remaining < recordHeaderSize {
 			if repairTail && !expectSealed {
-				if err := truncateActiveTail(f, result.end); err != nil {
+				if err := truncateActiveTail(f, result.end, hook); err != nil {
 					return recoveredSegment{}, err
 				}
 				physicalEnd = result.end
@@ -120,7 +124,7 @@ func visitSegment(path string, expectSealed bool, repairTail bool, visit func(re
 		}
 		if uint64(recordHead.PhysicalSize) > remaining {
 			if repairTail && !expectSealed {
-				if err := truncateActiveTail(f, result.end); err != nil {
+				if err := truncateActiveTail(f, result.end, hook); err != nil {
 					return recoveredSegment{}, err
 				}
 				physicalEnd = result.end
@@ -158,15 +162,21 @@ func visitSegment(path string, expectSealed bool, repairTail bool, visit func(re
 	return result, nil
 }
 
-func truncateActiveTail(file *os.File, end uint64) error {
+func truncateActiveTail(file fileHandle, end uint64, hook func(FaultPoint) error) error {
+	if err := hitFault(hook, FaultBeforeTailTruncate); err != nil {
+		return err
+	}
 	if err := file.Truncate(int64(end)); err != nil {
+		return err
+	}
+	if err := hitFault(hook, FaultBeforeTailSync); err != nil {
 		return err
 	}
 	return file.Sync()
 }
 
-func readRecordFile(path string, addr VAddr, maxPayload uint64) ([]byte, error) {
-	f, err := os.Open(path)
+func readRecordFile(path string, addr VAddr, maxPayload uint64, files fileBackend) ([]byte, error) {
+	f, err := files.open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -218,9 +228,9 @@ func (l *Log) scanSnapshot(ctx context.Context, from VAddr, snapshot scanSnapsho
 			if !sealed {
 				return fmt.Errorf("non-terminal active segment: %w", ErrCorrupt)
 			}
-			_, err = visitSegment(path, true, false, visit)
+			_, err = visitSegment(path, true, false, nil, l.cfg.files, visit)
 		} else {
-			err = visitRecordPrefix(path, id, snapshot.written.Offset, l.cfg.MaxPayloadSize, visit)
+			err = visitRecordPrefix(path, id, snapshot.written.Offset, l.cfg.MaxPayloadSize, l.cfg.files, visit)
 		}
 		if err != nil {
 			return err
@@ -246,13 +256,13 @@ func (l *Log) scanSnapshot(ctx context.Context, from VAddr, snapshot scanSnapsho
 
 func (l *Log) resolveSegmentPath(id uint32) (string, bool, error) {
 	sealed := filepath.Join(l.cfg.Dir, sealedSegmentName(id))
-	if _, err := os.Stat(sealed); err == nil {
+	if _, err := l.cfg.files.stat(sealed); err == nil {
 		return sealed, true, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", false, err
 	}
 	active := filepath.Join(l.cfg.Dir, activeSegmentName(id))
-	if _, err := os.Stat(active); err == nil {
+	if _, err := l.cfg.files.stat(active); err == nil {
 		return active, false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", false, err
@@ -260,11 +270,11 @@ func (l *Log) resolveSegmentPath(id uint32) (string, bool, error) {
 	return "", false, fmt.Errorf("segment %d missing: %w", id, ErrCorrupt)
 }
 
-func visitRecordPrefix(path string, segmentID uint32, limit, maxPayload uint64, visit func(recoveredRecord) error) error {
+func visitRecordPrefix(path string, segmentID uint32, limit, maxPayload uint64, files fileBackend, visit func(recoveredRecord) error) error {
 	if limit < segmentHeaderSize {
 		return fmt.Errorf("scan limit: %w", ErrCorrupt)
 	}
-	f, err := os.Open(path)
+	f, err := files.open(path)
 	if err != nil {
 		return err
 	}

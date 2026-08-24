@@ -20,12 +20,14 @@ type appendResult struct {
 }
 
 type appendRequest struct {
-	data     []byte
-	sync     bool
-	bytes    uint64
-	result   chan appendResult
-	snapshot chan snapshotResult
-	stop     bool
+	data      []byte
+	sync      bool
+	bytes     uint64
+	result    chan appendResult
+	snapshot  chan snapshotResult
+	stop      bool
+	staged    bool
+	completed bool
 }
 
 type scanSnapshot struct {
@@ -63,6 +65,9 @@ type Log struct {
 }
 
 func Open(cfg Config) (*Log, error) {
+	if cfg.files == nil {
+		cfg.files = osFileBackend{}
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -76,7 +81,7 @@ func Open(cfg Config) (*Log, error) {
 	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, errors.Join(err, lockFile.Close())
 	}
-	active, idValue, err := openSegments(cfg)
+	active, idValue, lastAddr, err := openSegments(cfg)
 	if err != nil {
 		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 		return nil, errors.Join(err, lockFile.Close())
@@ -87,7 +92,7 @@ func Open(cfg Config) (*Log, error) {
 	}
 	initial := Position{SegmentID: active.header.SegmentID, Offset: active.end}
 	l.status.Watermarks = Watermarks{Reserved: initial, Written: initial, Durable: initial}
-	go l.runWriter(newWriter(l, active, idValue))
+	go l.runWriter(newWriter(l, active, idValue, lastAddr))
 	return l, nil
 }
 
@@ -125,10 +130,16 @@ func (l *Log) Append(ctx context.Context, data []byte, syncWrite bool) (VAddr, e
 
 	budgetBytes := physicalSize
 	if err := l.budget.acquire(ctx, budgetBytes); err != nil {
+		l.submitMu.Lock()
+		terminal := l.terminal
+		l.submitMu.Unlock()
+		if terminal != nil {
+			return 0, terminal
+		}
 		return 0, err
 	}
 	request := &appendRequest{
-		data: append([]byte(nil), data...), sync: syncWrite, bytes: budgetBytes, result: make(chan appendResult, 1),
+		data: data, sync: syncWrite, bytes: budgetBytes, result: make(chan appendResult, 1),
 	}
 	select {
 	case l.requests <- request:
@@ -158,14 +169,14 @@ func (l *Log) Read(ctx context.Context, addr VAddr) ([]byte, error) {
 	}
 	l.pendingMu.RUnlock()
 	active := filepath.Join(l.cfg.Dir, activeSegmentName(addr.SegmentID()))
-	payload, err := readRecordFile(active, addr, l.cfg.MaxPayloadSize)
+	payload, err := readRecordFile(active, addr, l.cfg.MaxPayloadSize, l.cfg.files)
 	if err == nil {
 		return payload, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	return readRecordFile(filepath.Join(l.cfg.Dir, sealedSegmentName(addr.SegmentID())), addr, l.cfg.MaxPayloadSize)
+	return readRecordFile(filepath.Join(l.cfg.Dir, sealedSegmentName(addr.SegmentID())), addr, l.cfg.MaxPayloadSize, l.cfg.files)
 }
 
 func (l *Log) Scan(ctx context.Context, from VAddr, fn func(VAddr, []byte) error) error {
@@ -256,6 +267,11 @@ func (l *Log) setTerminal(err error) {
 
 func (l *Log) runWriter(w *writer) {
 	defer close(l.done)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.recoverPanic(recovered)
+		}
+	}()
 	w.run()
 }
 
@@ -265,17 +281,30 @@ type segmentFile struct {
 	path   string
 }
 
-func openSegments(cfg Config) (*segment, logID, error) {
-	entries, err := os.ReadDir(cfg.Dir)
+func openSegments(cfg Config) (*segment, logID, VAddr, error) {
+	entries, err := cfg.files.readDir(cfg.Dir)
 	if err != nil {
-		return nil, logID{}, err
+		return nil, logID{}, 0, err
 	}
 	var files []segmentFile
+	removedCreating := false
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
+		if strings.HasPrefix(name, "segment-") && strings.HasSuffix(name, ".creating") {
+			idText := strings.TrimSuffix(strings.TrimPrefix(name, "segment-"), ".creating")
+			id64, parseErr := strconv.ParseUint(idText, 10, 32)
+			if parseErr != nil || id64 == 0 || name != creatingSegmentName(uint32(id64)) {
+				return nil, logID{}, 0, fmt.Errorf("creating segment filename %q: %w", name, ErrCorrupt)
+			}
+			if err := cfg.files.remove(filepath.Join(cfg.Dir, name)); err != nil {
+				return nil, logID{}, 0, err
+			}
+			removedCreating = true
+			continue
+		}
 		sealed := strings.HasSuffix(name, ".sealed")
 		active := strings.HasSuffix(name, ".active")
 		if !strings.HasPrefix(name, "segment-") || (!sealed && !active) {
@@ -284,50 +313,59 @@ func openSegments(cfg Config) (*segment, logID, error) {
 		idText := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(name, "segment-"), ".sealed"), ".active")
 		id64, err := strconv.ParseUint(idText, 10, 32)
 		if err != nil || id64 == 0 {
-			return nil, logID{}, fmt.Errorf("segment filename %q: %w", name, ErrCorrupt)
+			return nil, logID{}, 0, fmt.Errorf("segment filename %q: %w", name, ErrCorrupt)
 		}
 		files = append(files, segmentFile{id: uint32(id64), sealed: sealed, path: filepath.Join(cfg.Dir, name)})
+	}
+	if removedCreating {
+		if err := cfg.files.syncDir(cfg.Dir); err != nil {
+			return nil, logID{}, 0, err
+		}
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].id < files[j].id })
 	if len(files) == 0 {
 		var idValue logID
 		if _, err := rand.Read(idValue[:]); err != nil {
-			return nil, logID{}, err
+			return nil, logID{}, 0, err
 		}
-		active, err := createSegment(cfg.Dir, 1, 0, cfg.SegmentSize, idValue, cfg.FaultHook)
-		return active, idValue, err
+		active, err := createSegment(cfg.Dir, 1, 0, cfg.SegmentSize, idValue, cfg.FaultHook, cfg.files)
+		return active, idValue, 0, err
 	}
 	var idValue logID
 	var previous uint32
 	var activeFile segmentFile
+	var lastAddr VAddr
 	for i, file := range files {
 		if file.id != uint32(i+1) || file.id != previous+1 {
-			return nil, logID{}, fmt.Errorf("segment id sequence: %w", ErrCorrupt)
+			return nil, logID{}, 0, fmt.Errorf("segment id sequence: %w", ErrCorrupt)
 		}
 		if !file.sealed && i != len(files)-1 {
-			return nil, logID{}, fmt.Errorf("active segment is not last: %w", ErrCorrupt)
+			return nil, logID{}, 0, fmt.Errorf("active segment is not last: %w", ErrCorrupt)
 		}
-		recovered, err := scanSegmentMetadata(file.path, file.sealed, !file.sealed)
+		recovered, err := scanSegmentMetadataWithHook(file.path, file.sealed, !file.sealed, cfg.FaultHook, cfg.files)
 		if err != nil {
-			return nil, logID{}, err
+			return nil, logID{}, 0, err
 		}
 		if i == 0 {
 			idValue = recovered.header.LogID
 		} else if recovered.header.LogID != idValue || recovered.header.PreviousSegment != previous {
-			return nil, logID{}, fmt.Errorf("segment chain: %w", ErrCorrupt)
+			return nil, logID{}, 0, fmt.Errorf("segment chain: %w", ErrCorrupt)
 		}
 		if recovered.header.SegmentSize != cfg.SegmentSize {
-			return nil, logID{}, fmt.Errorf("segment size configuration: %w", ErrInvalidConfig)
+			return nil, logID{}, 0, fmt.Errorf("segment size configuration: %w", ErrInvalidConfig)
+		}
+		if recovered.last != 0 {
+			lastAddr = recovered.last
 		}
 		previous = file.id
 		if !file.sealed {
 			if recovered.sealed {
 				destination := filepath.Join(cfg.Dir, sealedSegmentName(file.id))
-				if err := os.Rename(file.path, destination); err != nil {
-					return nil, logID{}, err
+				if err := cfg.files.rename(file.path, destination); err != nil {
+					return nil, logID{}, 0, err
 				}
-				if err := syncDir(cfg.Dir); err != nil {
-					return nil, logID{}, err
+				if err := cfg.files.syncDir(cfg.Dir); err != nil {
+					return nil, logID{}, 0, err
 				}
 			} else {
 				activeFile = file
@@ -336,18 +374,18 @@ func openSegments(cfg Config) (*segment, logID, error) {
 	}
 	if activeFile.id == 0 {
 		if previous == uint32(maxSegmentID) {
-			return nil, logID{}, ErrInvalidConfig
+			return nil, logID{}, 0, ErrInvalidConfig
 		}
-		active, err := createSegment(cfg.Dir, previous+1, previous, cfg.SegmentSize, idValue, cfg.FaultHook)
-		return active, idValue, err
+		active, err := createSegment(cfg.Dir, previous+1, previous, cfg.SegmentSize, idValue, cfg.FaultHook, cfg.files)
+		return active, idValue, lastAddr, err
 	}
-	recovered, err := scanSegmentMetadata(activeFile.path, false, true)
+	recovered, err := scanSegmentMetadataWithHook(activeFile.path, false, true, cfg.FaultHook, cfg.files)
 	if err != nil {
-		return nil, logID{}, err
+		return nil, logID{}, 0, err
 	}
-	f, err := os.OpenFile(activeFile.path, os.O_RDWR, 0)
+	f, err := cfg.files.openFile(activeFile.path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, logID{}, err
+		return nil, logID{}, 0, err
 	}
-	return &segment{file: f, path: activeFile.path, header: recovered.header, end: recovered.end, first: recovered.first, last: recovered.last, records: recovered.records, hook: cfg.FaultHook}, idValue, nil
+	return &segment{file: f, path: activeFile.path, header: recovered.header, end: recovered.end, first: recovered.first, last: recovered.last, records: recovered.records, hook: cfg.FaultHook, files: cfg.files}, idValue, lastAddr, nil
 }

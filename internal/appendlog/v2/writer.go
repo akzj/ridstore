@@ -8,7 +8,7 @@ import (
 type pendingRecord struct {
 	addr    VAddr
 	payload []byte
-	encoded []byte
+	size    uint64
 	budget  uint64
 }
 
@@ -22,6 +22,7 @@ type writer struct {
 	active   *segment
 	logID    logID
 	pending  []pendingRecord
+	encoded  []byte
 	bytes    uint64
 	waiters  []durableWaiter
 	needSync bool
@@ -29,30 +30,35 @@ type writer struct {
 	writes   uint64
 	syncs    uint64
 	lastAddr VAddr
+	current  *appendRequest
 }
 
-func newWriter(log *Log, active *segment, idValue logID) *writer {
-	return &writer{log: log, active: active, logID: idValue, lastAddr: active.last}
+func newWriter(log *Log, active *segment, idValue logID, lastAddr VAddr) *writer {
+	return &writer{log: log, active: active, logID: idValue, lastAddr: lastAddr}
 }
 
 func (w *writer) run() {
 	for {
 		request := <-w.log.requests
+		w.current = request
 		if request.stop {
 			w.stop(request)
 			return
 		}
 		if request.snapshot != nil {
 			w.snapshot(request)
+			w.current = nil
 			continue
 		}
 		if w.fault != nil {
 			w.reject(request, w.fault)
+			w.current = nil
 			continue
 		}
 		boundary, err := w.stage(request)
 		if err != nil {
 			w.poison(err, request)
+			w.current = nil
 			continue
 		}
 		if boundary {
@@ -66,12 +72,14 @@ func (w *writer) run() {
 		for {
 			select {
 			case request = <-w.log.requests:
+				w.current = request
 				if request.stop {
 					w.stop(request)
 					return
 				}
 				if request.snapshot != nil {
 					w.snapshot(request)
+					w.current = nil
 					continue
 				}
 				boundary, err = w.stage(request)
@@ -91,6 +99,7 @@ func (w *writer) run() {
 				w.poison(err, nil)
 			}
 		}
+		w.current = nil
 	}
 }
 
@@ -120,25 +129,46 @@ func (w *writer) stage(request *appendRequest) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	encoded, err := encodeRecord(addr, request.data)
-	if err != nil {
+	start := len(w.encoded)
+	w.growEncoded(size)
+	if err := encodeRecordInto(w.encoded[start:], addr, request.data); err != nil {
+		w.encoded = w.encoded[:start]
 		return false, err
 	}
-	record := pendingRecord{addr: addr, payload: request.data, encoded: encoded, budget: request.bytes}
+	payloadStart := start + int(recordHeaderSize)
+	payload := w.encoded[payloadStart : payloadStart+len(request.data)]
+	record := pendingRecord{addr: addr, payload: payload, size: size, budget: request.bytes}
+	request.data = nil
 	w.log.pendingMu.Lock()
-	w.log.pending[addr] = request.data
+	w.log.pending[addr] = payload
 	w.log.pendingMu.Unlock()
 	w.pending = append(w.pending, record)
-	w.bytes += uint64(len(encoded))
+	request.staged = true
+	w.bytes += size
 	w.lastAddr = addr
 	w.needSync = w.needSync || request.sync
 	if request.sync {
 		w.waiters = append(w.waiters, durableWaiter{request: request, addr: addr})
 	} else {
-		request.result <- appendResult{addr: addr}
+		w.completeAppend(request, appendResult{addr: addr})
 	}
 	w.publishStatus()
 	return len(w.pending) >= w.log.cfg.MaxBufferRecords || w.bytes >= w.log.cfg.MaxBufferBytes, nil
+}
+
+func (w *writer) growEncoded(size uint64) {
+	required := uint64(len(w.encoded)) + size
+	if required <= uint64(cap(w.encoded)) {
+		w.encoded = w.encoded[:int(required)]
+		return
+	}
+	capacity := w.log.cfg.MaxBufferBytes
+	if required > capacity {
+		capacity = required
+	}
+	next := make([]byte, int(required), int(capacity))
+	copy(next, w.encoded)
+	w.encoded = next
 }
 
 func (w *writer) finishBatch() error {
@@ -152,7 +182,7 @@ func (w *writer) finishBatch() error {
 		}
 		return nil
 	}
-	written, err := w.active.appendEncoded(w.pending)
+	written, err := w.active.appendEncoded(w.encoded, w.pending)
 	if err != nil || written != w.bytes {
 		return errors.Join(err, fmt.Errorf("append wrote %d of %d: %w", written, w.bytes, ErrCorrupt))
 	}
@@ -164,6 +194,11 @@ func (w *writer) finishBatch() error {
 	}
 	w.log.pendingMu.Unlock()
 	w.pending = w.pending[:0]
+	if uint64(cap(w.encoded)) > w.log.cfg.MaxBufferBytes {
+		w.encoded = nil
+	} else {
+		w.encoded = w.encoded[:0]
+	}
 	w.bytes = 0
 	w.updateWritten()
 	if w.needSync {
@@ -183,7 +218,7 @@ func (w *writer) completeDurable() {
 	w.log.status.Watermarks.Durable = position
 	w.log.statusMu.Unlock()
 	for _, waiter := range w.waiters {
-		waiter.request.result <- appendResult{addr: waiter.addr}
+		w.completeAppend(waiter.request, appendResult{addr: waiter.addr})
 	}
 	w.waiters = w.waiters[:0]
 	w.needSync = false
@@ -198,7 +233,7 @@ func (w *writer) rotate() error {
 		return err
 	}
 	w.syncs++
-	next, err := createSegment(w.log.cfg.Dir, oldID+1, oldID, w.log.cfg.SegmentSize, w.logID, w.log.cfg.FaultHook)
+	next, err := createSegment(w.log.cfg.Dir, oldID+1, oldID, w.log.cfg.SegmentSize, w.logID, w.log.cfg.FaultHook, w.log.cfg.files)
 	if err != nil {
 		return err
 	}
@@ -234,7 +269,7 @@ func (w *writer) poison(err error, current *appendRequest) {
 		w.reject(current, w.fault)
 	}
 	for _, waiter := range w.waiters {
-		waiter.request.result <- appendResult{err: w.fault}
+		w.completeAppend(waiter.request, appendResult{err: w.fault})
 	}
 	w.waiters = w.waiters[:0]
 	w.needSync = false
@@ -242,16 +277,18 @@ func (w *writer) poison(err error, current *appendRequest) {
 
 func (w *writer) reject(request *appendRequest, err error) {
 	if request.snapshot != nil {
-		request.snapshot <- snapshotResult{err: err}
+		w.completeSnapshot(request, snapshotResult{err: err})
 		return
 	}
-	w.log.budget.release(request.bytes)
-	request.result <- appendResult{err: err}
+	if !request.staged {
+		w.log.budget.release(request.bytes)
+	}
+	w.completeAppend(request, appendResult{err: err})
 }
 
 func (w *writer) snapshot(request *appendRequest) {
 	if w.fault != nil {
-		request.snapshot <- snapshotResult{err: w.fault}
+		w.completeSnapshot(request, snapshotResult{err: w.fault})
 		return
 	}
 	snapshot := scanSnapshot{
@@ -262,7 +299,7 @@ func (w *writer) snapshot(request *appendRequest) {
 	for i := range w.pending {
 		snapshot.pending[w.pending[i].addr] = append([]byte(nil), w.pending[i].payload...)
 	}
-	request.snapshot <- snapshotResult{snapshot: snapshot}
+	w.completeSnapshot(request, snapshotResult{snapshot: snapshot})
 }
 
 func (w *writer) stop(request *appendRequest) {
@@ -288,5 +325,56 @@ func (w *writer) stop(request *appendRequest) {
 		w.log.pendingMu.Unlock()
 		w.pending = nil
 	}
-	request.result <- appendResult{err: err}
+	w.completeAppend(request, appendResult{err: err})
+}
+
+func (w *writer) completeAppend(request *appendRequest, result appendResult) {
+	if request == nil || request.completed {
+		return
+	}
+	request.completed = true
+	request.result <- result
+}
+
+func (w *writer) completeSnapshot(request *appendRequest, result snapshotResult) {
+	if request == nil || request.completed {
+		return
+	}
+	request.completed = true
+	request.snapshot <- result
+}
+
+func (w *writer) recoverPanic(value any) {
+	err := fmt.Errorf("writer panic: %v", value)
+	w.fault = errors.Join(ErrPoisoned, err)
+	w.log.setTerminal(err)
+	for _, waiter := range w.waiters {
+		w.completeAppend(waiter.request, appendResult{err: w.fault})
+	}
+	w.waiters = nil
+	if w.current != nil && !w.current.stop && !w.current.completed {
+		w.reject(w.current, w.fault)
+	}
+	w.log.pendingMu.Lock()
+	for i := range w.pending {
+		delete(w.log.pending, w.pending[i].addr)
+		w.log.budget.release(w.pending[i].budget)
+	}
+	w.log.pendingMu.Unlock()
+	w.pending = nil
+	w.encoded = nil
+	w.bytes = 0
+	closeErr := w.active.close()
+	if w.current != nil && w.current.stop {
+		w.completeAppend(w.current, appendResult{err: errors.Join(w.fault, closeErr)})
+		return
+	}
+	for {
+		request := <-w.log.requests
+		if request.stop {
+			w.completeAppend(request, appendResult{err: errors.Join(w.fault, closeErr)})
+			return
+		}
+		w.reject(request, w.fault)
+	}
 }

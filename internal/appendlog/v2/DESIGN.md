@@ -54,6 +54,11 @@ addr, err := log.Append(ctx, data, false)
 - Record 可能仍在内存 buffer 中；
 - 不承诺掉电后仍然存在。
 
+这里的“不复用”限于当前成功 Open 的 Log 实例。崩溃恢复会截掉未持久化的 active tail，随后
+可以重新使用该物理 offset；因此上层不能在 durable Commit 之前把 `sync=false` 返回的地址发布
+到日志之外。若跨崩溃仍需区分被丢弃的临时地址，必须把上层事务代际纳入引用，不能假设 VAddr
+本身提供该保证。
+
 ```go
 addr, err := log.Append(ctx, data, true)
 ```
@@ -366,7 +371,12 @@ payload 耗尽内存。
 
 ### 8.3 payload 所有权
 
-- v2 在 admission 阶段复制 payload；
+- 调用期间 v2 临时借用调用者 payload；writer 在返回前把它复制进自身批次 buffer，因此调用者
+  不得在 Append 返回前并发修改该 slice；
+- writer 把 Record envelope 和 payload 直接编码进可复用的连续批次 buffer，不再先生成每条
+  encoded Record、随后复制成整批；
+- 普通批次 buffer 的容量严格受 `MaxBufferBytes` 约束，超过该上限的合法单 Record 使用临时
+  大 buffer，并在 write 后释放，避免一次大请求永久抬高常驻内存；
 - Append 返回后调用者可以立即修改或复用原 slice；
 - pending Read 返回新副本；
 - writer 和 reader 不能把可变内部 buffer 暴露给上层。
@@ -399,7 +409,8 @@ written position、最后一个 VAddr 和 pending 副本；磁盘部分流式扫
 
 v2 使用独立格式，不复用 ridstore Format v1。所有多字节整数使用 Little Endian；第一版校验
 算法固定为 CRC32C。当前原型采用 64-byte Header、32-byte Record Envelope、64-byte Footer
-和 8-byte Record 对齐；这些布局在 format freeze 和 golden vectors 完成前不视为稳定格式。
+和 8-byte Record 对齐。编码器已有固定 golden vectors，三个 decoder 也有独立 fuzz 入口；最终
+format freeze 前仍允许通过显式版本变更调整布局。
 
 ```text
 Segment
@@ -467,9 +478,12 @@ Footer 不属于用户 Record，也不获得 VAddr。active Segment 没有 Foote
 2. 按需要 fsync 尚未 durable 的前缀；
 3. 写并持久化 Footer；
 4. 关闭旧 Segment；
-5. 创建新 Segment并写入 Header；
-6. 按 durability 需要持久化文件和目录项；
+5. 以 `.creating` 名称创建新 Segment并写入、fsync Header；
+6. rename 为 `.active`，随后 fsync 目录发布；
 7. 为当前 Record 分配新 Segment 中的 VAddr。
+
+`.creating` 从不接收用户 Record，也不返回 VAddr。Open 持有目录独占锁后可以安全删除遗留的
+合法 `.creating` 文件并重新创建；`.active` 则表示 Header 发布完成，不能按临时文件处理。
 
 rotation 可能把此前 `sync=false` 数据一并持久化，这是允许的：`sync=false` 表示调用者不要求
 持久化确认，不表示禁止底层持久化。
@@ -512,6 +526,7 @@ Open -> Running -> Closing -> Closed
 - 当前进程不得覆盖、移动或复用不确定尾部；
 - 必须 Close 后重新 Open，通过严格扫描决定恢复前缀；
 - writer panic 必须转换为 poisoned，不能让调用者永久等待；
+- panic 后 writer 继续拒绝已排队请求，直到收到 Close，保证所有调用者得到确定结果；
 - Close 幂等，停止接纳新请求并等待 writer 和文件句柄退出。
 
 ## 14. 并发模型
@@ -575,8 +590,11 @@ internal/mapping
 internal/recovery
 ```
 
-测试使用独立临时目录和可注入的 File 接口，不调用当前 ridstore Runtime。v2 的正确性必须来自
-自身契约，而不是现有系统替它补足语义。
+测试使用独立临时目录、物理边界 fault hook 和内部 File backend，不调用当前 ridstore Runtime。
+生产 backend 直接代理 `os.File`；测试 backend 可以从真实文件调用返回 short-write、partial-write、
+sync、rename 和目录同步错误，因此既保留真实文件状态，也能覆盖 syscall 失败后的恢复路径。该
+注入接口保持在包内，不扩张公开 Append API。v2 的正确性必须来自自身契约，而不是现有系统替
+它补足语义。
 
 ## 17. 验证计划
 
@@ -606,6 +624,12 @@ internal/recovery
 
 必须证明：成功返回的同步前缀不丢失；最多恢复额外未确认的完整 Record；VAddr 不会错误复用；
 中间损坏不能被当作合法尾部跳过。
+
+测试分为两层：in-process fault hook 验证错误传播、poison 和等待者完成；subprocess harness 在
+Header 发布、append/sync、rotation 和 tail repair 边界直接 `os.Exit`，再由新进程 Open 并继续
+追加。后者证明进程崩溃留下的可见文件状态可以恢复，但不模拟断电后设备缓存或内核 page cache
+丢失，因此不能单独证明 power-loss durability。真实断电语义仍需在可控虚拟机、块设备故障注入
+或硬件测试环境验证，并与目标文件系统的 fsync/rename/目录 fsync 契约对应。
 
 ### 17.3 性能测试
 
@@ -639,7 +663,7 @@ DataLog.Decode([]byte)
 ## 19. Review 前仍需冻结的决定
 
 1. 是否冻结原型的 32-bit SegmentID + 32-bit Offset VAddr 布局及耗尽行为；
-2. 是否冻结原型的 64/32/64-byte Header/Record/Footer 字段 offset；
+2. 是否把已有 golden vectors 对应的 64/32/64-byte Header/Record/Footer 固定为 Format v1；
 3. `fsync` 或 `fdatasync`，以及目录 fsync 的平台契约；
 4. channel、buffer byte/record 上限的默认值；
 5. active tail 是自动截断，还是先返回 repair plan；

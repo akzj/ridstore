@@ -73,16 +73,24 @@ type Config struct {
 	ChannelCapacity  int
 	MaxQueuedBytes   uint64
 	FaultHook        func(FaultPoint) error
+	files            fileBackend
 }
 
 type FaultPoint string
 
 const (
-	FaultBeforeAppendWrite FaultPoint = "before-append-write"
-	FaultBeforeSync        FaultPoint = "before-sync"
-	FaultBeforeFooterWrite FaultPoint = "before-footer-write"
-	FaultBeforeFooterSync  FaultPoint = "before-footer-sync"
-	FaultBeforeRename      FaultPoint = "before-rename"
+	FaultBeforeAppendWrite   FaultPoint = "before-append-write"
+	FaultBeforeSync          FaultPoint = "before-sync"
+	FaultBeforeFooterWrite   FaultPoint = "before-footer-write"
+	FaultBeforeFooterSync    FaultPoint = "before-footer-sync"
+	FaultBeforeRename        FaultPoint = "before-rename"
+	FaultBeforeSealDirSync   FaultPoint = "before-seal-dir-sync"
+	FaultBeforeHeaderWrite   FaultPoint = "before-header-write"
+	FaultBeforeHeaderSync    FaultPoint = "before-header-sync"
+	FaultBeforeActiveRename  FaultPoint = "before-active-rename"
+	FaultBeforeCreateDirSync FaultPoint = "before-create-dir-sync"
+	FaultBeforeTailTruncate  FaultPoint = "before-tail-truncate"
+	FaultBeforeTailSync      FaultPoint = "before-tail-sync"
 )
 
 func hitFault(hook func(FaultPoint) error, point FaultPoint) error {

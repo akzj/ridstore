@@ -9,7 +9,7 @@ import (
 )
 
 type segment struct {
-	file    *os.File
+	file    fileHandle
 	path    string
 	header  segmentHeader
 	end     uint64
@@ -17,12 +17,14 @@ type segment struct {
 	last    VAddr
 	records uint64
 	hook    func(FaultPoint) error
+	files   fileBackend
 }
 
-func activeSegmentName(id uint32) string { return fmt.Sprintf("segment-%08d.active", id) }
-func sealedSegmentName(id uint32) string { return fmt.Sprintf("segment-%08d.sealed", id) }
+func activeSegmentName(id uint32) string   { return fmt.Sprintf("segment-%08d.active", id) }
+func sealedSegmentName(id uint32) string   { return fmt.Sprintf("segment-%08d.sealed", id) }
+func creatingSegmentName(id uint32) string { return fmt.Sprintf("segment-%08d.creating", id) }
 
-func createSegment(dir string, id, previous uint32, size uint64, idValue logID, hook func(FaultPoint) error) (*segment, error) {
+func createSegment(dir string, id, previous uint32, size uint64, idValue logID, hook func(FaultPoint) error, files fileBackend) (*segment, error) {
 	if id == 0 {
 		return nil, ErrInvalidConfig
 	}
@@ -31,24 +33,40 @@ func createSegment(dir string, id, previous uint32, size uint64, idValue logID, 
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, activeSegmentName(id))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	creatingPath := filepath.Join(dir, creatingSegmentName(id))
+	activePath := filepath.Join(dir, activeSegmentName(id))
+	f, err := files.openFile(creatingPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	fail := func(cause error) (*segment, error) {
 		return nil, errors.Join(cause, f.Close())
 	}
+	if err := hitFault(hook, FaultBeforeHeaderWrite); err != nil {
+		return fail(err)
+	}
 	if _, err := writeFullAt(f, encoded[:], 0); err != nil {
+		return fail(err)
+	}
+	if err := hitFault(hook, FaultBeforeHeaderSync); err != nil {
 		return fail(err)
 	}
 	if err := f.Sync(); err != nil {
 		return fail(err)
 	}
-	if err := syncDir(dir); err != nil {
+	if err := hitFault(hook, FaultBeforeActiveRename); err != nil {
 		return fail(err)
 	}
-	return &segment{file: f, path: path, header: h, end: segmentHeaderSize, hook: hook}, nil
+	if err := files.rename(creatingPath, activePath); err != nil {
+		return fail(err)
+	}
+	if err := hitFault(hook, FaultBeforeCreateDirSync); err != nil {
+		return fail(err)
+	}
+	if err := files.syncDir(dir); err != nil {
+		return fail(err)
+	}
+	return &segment{file: f, path: activePath, header: h, end: segmentHeaderSize, hook: hook, files: files}, nil
 }
 
 func (s *segment) remaining() uint64 {
@@ -59,25 +77,24 @@ func (s *segment) remaining() uint64 {
 	return limit - s.end
 }
 
-func (s *segment) appendEncoded(records []pendingRecord) (uint64, error) {
+func (s *segment) appendEncoded(encoded []byte, records []pendingRecord) (uint64, error) {
 	if len(records) == 0 {
 		return 0, nil
 	}
 	var total uint64
 	for i := range records {
-		if total > s.remaining() || records[i].addr.SegmentID() != s.header.SegmentID || uint64(records[i].addr.Offset()) != s.end+total || uint64(len(records[i].encoded)) > s.remaining()-total {
+		if total > s.remaining() || records[i].addr.SegmentID() != s.header.SegmentID || uint64(records[i].addr.Offset()) != s.end+total || records[i].size > s.remaining()-total {
 			return 0, fmt.Errorf("append plan: %w", ErrCorrupt)
 		}
-		total += uint64(len(records[i].encoded))
+		total += records[i].size
 	}
-	buf := make([]byte, 0, total)
-	for i := range records {
-		buf = append(buf, records[i].encoded...)
+	if uint64(len(encoded)) != total {
+		return 0, fmt.Errorf("encoded batch size: %w", ErrCorrupt)
 	}
 	if err := hitFault(s.hook, FaultBeforeAppendWrite); err != nil {
 		return 0, err
 	}
-	written, err := writeFullAt(s.file, buf, int64(s.end))
+	written, err := writeFullAt(s.file, encoded, int64(s.end))
 	if err != nil {
 		return uint64(written), err
 	}
@@ -137,10 +154,13 @@ func (s *segment) seal(dir string) error {
 	if err := hitFault(s.hook, FaultBeforeRename); err != nil {
 		return err
 	}
-	if err := os.Rename(s.path, dst); err != nil {
+	if err := s.files.rename(s.path, dst); err != nil {
 		return err
 	}
-	return syncDir(dir)
+	if err := hitFault(s.hook, FaultBeforeSealDirSync); err != nil {
+		return err
+	}
+	return s.files.syncDir(dir)
 }
 
 func writeFullAt(w io.WriterAt, data []byte, offset int64) (int, error) {
@@ -156,12 +176,4 @@ func writeFullAt(w io.WriterAt, data []byte, offset int64) (int, error) {
 		}
 	}
 	return written, nil
-}
-
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(f.Sync(), f.Close())
 }

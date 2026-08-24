@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func testConfig(t *testing.T) Config {
@@ -61,6 +63,26 @@ func TestAppendPendingReadAndCommitSync(t *testing.T) {
 	}
 	if after.Watermarks.Durable != after.Watermarks.Written || after.Watermarks.Written != after.Watermarks.Reserved {
 		t.Fatalf("watermarks = %+v", after.Watermarks)
+	}
+}
+
+func TestAppendOwnsPayloadBeforeReturning(t *testing.T) {
+	cfg := testConfig(t)
+	log, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	payload := []byte("caller-owned")
+	addr, err := log.Append(context.Background(), payload, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(payload)
+	got, err := log.Read(context.Background(), addr)
+	if err != nil || string(got) != "caller-owned" {
+		t.Fatalf("read after caller reuse = %q, %v", got, err)
 	}
 }
 
@@ -293,6 +315,16 @@ func TestOpenCompletesFooterWrittenRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	var scanned []string
+	if err := reopened.Scan(context.Background(), 0, func(_ VAddr, payload []byte) error {
+		scanned = append(scanned, string(payload))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(scanned) != 1 || scanned[0] != "valid" {
+		t.Fatalf("scan after empty active recovery = %q", scanned)
+	}
 	next, err := reopened.Append(context.Background(), []byte("next"), true)
 	if err != nil {
 		t.Fatal(err)
@@ -498,8 +530,62 @@ func TestSyncFailurePoisonsAllConcurrentWaiters(t *testing.T) {
 	_ = log.Close()
 }
 
+func TestBlockedSyncNaturallyGroupsQueuedRequests(t *testing.T) {
+	cfg := testConfig(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var blocked atomic.Bool
+	cfg.FaultHook = func(point FaultPoint) error {
+		if point == FaultBeforeSync && blocked.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	log, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	const queued = 16
+	results := make(chan error, queued+1)
+	go func() {
+		_, err := log.Append(context.Background(), []byte("first"), true)
+		results <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first sync did not reach fault hook")
+	}
+	for i := 0; i < queued; i++ {
+		go func() {
+			_, err := log.Append(context.Background(), []byte("queued"), true)
+			results <- err
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for log.Status().QueueRequests != queued {
+		if time.Now().After(deadline) {
+			t.Fatalf("queued requests = %d, want %d", log.Status().QueueRequests, queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	for i := 0; i < queued+1; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	status := log.Status()
+	if status.WriteCalls != 2 || status.SyncCalls != 2 {
+		t.Fatalf("writes = %d, syncs = %d, want 2 and 2", status.WriteCalls, status.SyncCalls)
+	}
+}
+
 func TestRotationFailuresRecoverWithoutLosingPrefix(t *testing.T) {
-	points := []FaultPoint{FaultBeforeFooterWrite, FaultBeforeFooterSync, FaultBeforeRename}
+	points := []FaultPoint{FaultBeforeFooterWrite, FaultBeforeFooterSync, FaultBeforeRename, FaultBeforeSealDirSync}
 	for _, point := range points {
 		t.Run(string(point), func(t *testing.T) {
 			cfg := testConfig(t)
@@ -548,6 +634,142 @@ func TestRotationFailuresRecoverWithoutLosingPrefix(t *testing.T) {
 			}
 			if _, err := reopened.Append(context.Background(), []byte("continues"), true); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestWriterPanicPoisonsAndDoesNotStrandWaiter(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.FaultHook = func(point FaultPoint) error {
+		if point == FaultBeforeAppendWrite {
+			panic("injected panic")
+		}
+		return nil
+	}
+	log, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), []byte("value"), true); !errors.Is(err, ErrPoisoned) {
+		t.Fatalf("append error = %v", err)
+	}
+	if _, err := log.Append(context.Background(), []byte("later"), false); !errors.Is(err, ErrPoisoned) {
+		t.Fatalf("later error = %v", err)
+	}
+	if err := log.Close(); !errors.Is(err, ErrPoisoned) {
+		t.Fatalf("close error = %v", err)
+	}
+}
+
+func TestWriterPanicDuringCloseDoesNotDeadlock(t *testing.T) {
+	cfg := testConfig(t)
+	var armed atomic.Bool
+	cfg.FaultHook = func(point FaultPoint) error {
+		if point == FaultBeforeSync && armed.Load() {
+			panic("injected close panic")
+		}
+		return nil
+	}
+	log, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), []byte("pending"), false); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	closed := make(chan error, 1)
+	go func() { closed <- log.Close() }()
+	select {
+	case err := <-closed:
+		if !errors.Is(err, ErrPoisoned) {
+			t.Fatalf("close error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked after writer panic")
+	}
+}
+
+func TestInterruptedSegmentCreationCanRetryOpen(t *testing.T) {
+	points := []FaultPoint{FaultBeforeHeaderWrite, FaultBeforeHeaderSync, FaultBeforeActiveRename, FaultBeforeCreateDirSync}
+	for _, point := range points {
+		t.Run(string(point), func(t *testing.T) {
+			cfg := testConfig(t)
+			injected := errors.New("create failure")
+			cfg.FaultHook = func(got FaultPoint) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			}
+			if log, err := Open(cfg); !errors.Is(err, injected) {
+				if log != nil {
+					_ = log.Close()
+				}
+				t.Fatalf("open error = %v", err)
+			}
+			cfg.FaultHook = nil
+			log, err := Open(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer log.Close()
+			if _, err := log.Append(context.Background(), []byte("works"), true); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTailRepairFailureCanRetryOpen(t *testing.T) {
+	points := []FaultPoint{FaultBeforeTailTruncate, FaultBeforeTailSync}
+	for _, point := range points {
+		t.Run(string(point), func(t *testing.T) {
+			cfg := testConfig(t)
+			log, err := Open(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr, err := log.Append(context.Background(), []byte("valid"), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := log.Close(); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(cfg.Dir, activeSegmentName(addr.SegmentID()))
+			file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.Write([]byte{1, 2, 3}); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("tail repair failure")
+			cfg.FaultHook = func(got FaultPoint) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			}
+			if reopened, err := Open(cfg); !errors.Is(err, injected) {
+				if reopened != nil {
+					_ = reopened.Close()
+				}
+				t.Fatalf("repair error = %v", err)
+			}
+			cfg.FaultHook = nil
+			reopened, err := Open(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if got, err := reopened.Read(context.Background(), addr); err != nil || string(got) != "valid" {
+				t.Fatalf("recovered value = %q, %v", got, err)
 			}
 		})
 	}
