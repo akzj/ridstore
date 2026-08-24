@@ -379,6 +379,32 @@ func TestScanCallbackCanCloseLog(t *testing.T) {
 	}
 }
 
+func TestScanDoesNotIncludeAppendAfterSnapshot(t *testing.T) {
+	cfg := testConfig(t)
+	log, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	if _, err := log.Append(context.Background(), []byte("before"), true); err != nil {
+		t.Fatal(err)
+	}
+	var values []string
+	if err := log.Scan(context.Background(), 0, func(_ VAddr, value []byte) error {
+		values = append(values, string(value))
+		if len(values) == 1 {
+			_, err := log.Append(context.Background(), []byte("after"), true)
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 1 || values[0] != "before" {
+		t.Fatalf("snapshot scan = %v", values)
+	}
+}
+
 func TestAppendRejectsCanceledContextBeforeAdmission(t *testing.T) {
 	cfg := testConfig(t)
 	log, err := Open(cfg)
@@ -470,4 +496,59 @@ func TestSyncFailurePoisonsAllConcurrentWaiters(t *testing.T) {
 		}
 	}
 	_ = log.Close()
+}
+
+func TestRotationFailuresRecoverWithoutLosingPrefix(t *testing.T) {
+	points := []FaultPoint{FaultBeforeFooterWrite, FaultBeforeFooterSync, FaultBeforeRename}
+	for _, point := range points {
+		t.Run(string(point), func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.SegmentSize = 512
+			cfg.MaxPayloadSize = 128
+			cfg.MaxBufferBytes = 256
+			injected := errors.New("rotation failure")
+			armed := false
+			cfg.FaultHook = func(got FaultPoint) error {
+				if armed && got == point {
+					return injected
+				}
+				return nil
+			}
+			log, err := Open(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := log.Append(context.Background(), make([]byte, 128), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondValue := make([]byte, 128)
+			secondValue[0] = 2
+			second, err := log.Append(context.Background(), secondValue, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			armed = true
+			if _, err := log.Append(context.Background(), make([]byte, 128), true); !errors.Is(err, injected) {
+				t.Fatalf("rotation error = %v", err)
+			}
+			_ = log.Close()
+
+			cfg.FaultHook = nil
+			reopened, err := Open(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if got, err := reopened.Read(context.Background(), first); err != nil || len(got) != 128 {
+				t.Fatalf("first prefix record = %d bytes, %v", len(got), err)
+			}
+			if got, err := reopened.Read(context.Background(), second); err != nil || len(got) != 128 || got[0] != 2 {
+				t.Fatalf("second prefix record = %d bytes, %v", len(got), err)
+			}
+			if _, err := reopened.Append(context.Background(), []byte("continues"), true); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }

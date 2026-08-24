@@ -390,8 +390,10 @@ Read 不解释 payload：
 
 Scan 按日志顺序返回 `(VAddr, payload)`，不返回业务类型或 Sequence。它用于恢复和离线检查。
 
-Scan 的一致性边界必须显式定义：第一版建议 Open 后的 recovery scan 使用冻结文件集合；运行
-期间 Scan 在开始时捕获一个 end position，只扫描到该位置，不无限追赶新追加数据。
+Open 只保留每个 Segment 的恢复摘要，不保存扫描 payload。运行期 Scan 通过 writer 捕获
+written position、最后一个 VAddr 和 pending 副本；磁盘部分流式扫描到 written position，随后
+按地址输出 pending 副本。它不构造全日志 map，不追赶快照后的新追加，额外内存上限为单条
+最大 Record 加 pending buffer。
 
 ## 10. 通用磁盘格式
 

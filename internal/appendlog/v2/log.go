@@ -307,7 +307,7 @@ func openSegments(cfg Config) (*segment, logID, error) {
 		if !file.sealed && i != len(files)-1 {
 			return nil, logID{}, fmt.Errorf("active segment is not last: %w", ErrCorrupt)
 		}
-		recovered, _, err := scanSegment(file.path, file.sealed, !file.sealed)
+		recovered, err := scanSegmentMetadata(file.path, file.sealed, !file.sealed)
 		if err != nil {
 			return nil, logID{}, err
 		}
@@ -341,7 +341,7 @@ func openSegments(cfg Config) (*segment, logID, error) {
 		active, err := createSegment(cfg.Dir, previous+1, previous, cfg.SegmentSize, idValue, cfg.FaultHook)
 		return active, idValue, err
 	}
-	recovered, _, err := scanSegment(activeFile.path, false, true)
+	recovered, err := scanSegmentMetadata(activeFile.path, false, true)
 	if err != nil {
 		return nil, logID{}, err
 	}
