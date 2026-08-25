@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -201,7 +202,8 @@ func validateHardLimits(h HardLimits) error {
 		}
 	}
 	minimumSegment := uint64(recordlog.SegmentHeaderSize + recordlog.RecordHeaderSize + recordlog.SegmentFooterSize)
-	if h.SegmentSize <= minimumSegment || h.SegmentSize > math.MaxUint32 || h.SegmentSize&uint64(recordlog.RecordAlignment-1) != 0 ||
+	minimumMapSegment := uint64(mapstore.SegmentHeaderSize + mapstore.DenseNodeSize + mapstore.SegmentFooterSize)
+	if h.SegmentSize <= minimumSegment || h.SegmentSize < minimumMapSegment || h.SegmentSize > math.MaxUint32 || h.SegmentSize&uint64(recordlog.RecordAlignment-1) != 0 ||
 		h.MaxBatchMutations > math.MaxUint32 || h.MaxBatchConditions > math.MaxUint32 || h.MaxOpenBatches > math.MaxUint32 || h.MaxRecordLogPayload > math.MaxUint32 {
 		return ErrInvalid
 	}
@@ -263,7 +265,7 @@ func validateDataSet(m Manifest) error {
 func validateMapSet(m Manifest) error {
 	var previous model.MapSegmentID
 	for _, summary := range m.SealedMapSegments {
-		if summary.SegmentID == 0 || summary.SegmentID >= m.ActiveMapSegmentID || summary.SegmentID >= m.NextMapSegmentID || summary.SegmentID <= previous || summary.ValidEnd < 64 || uint64(summary.ValidEnd) > m.HardLimits.SegmentSize || summary.ValidEnd&7 != 0 {
+		if summary.SegmentID == 0 || summary.SegmentID >= m.ActiveMapSegmentID || summary.SegmentID >= m.NextMapSegmentID || summary.SegmentID <= previous || summary.ValidEnd < mapstore.SegmentHeaderSize || uint64(summary.ValidEnd) > m.HardLimits.SegmentSize-uint64(mapstore.SegmentFooterSize) || summary.ValidEnd&uint32(mapstore.Alignment-1) != 0 {
 			return ErrInvalid
 		}
 		previous = summary.SegmentID
@@ -278,7 +280,7 @@ func validateMapSet(m Manifest) error {
 	}
 	rootFound := false
 	if m.MappingRoot.SegmentID() == m.ActiveMapSegmentID {
-		rootFound = uint64(m.MappingRoot.Offset()) < m.HardLimits.SegmentSize-uint64(recordlog.SegmentFooterSize)
+		rootFound = uint64(m.MappingRoot.Offset()) < m.HardLimits.SegmentSize-uint64(mapstore.SegmentFooterSize)
 	} else {
 		for _, summary := range m.SealedMapSegments {
 			if summary.SegmentID == m.MappingRoot.SegmentID() {

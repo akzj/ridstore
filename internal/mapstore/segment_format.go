@@ -132,7 +132,7 @@ func (s SegmentSummary) valid(segmentSize uint32) bool {
 }
 
 func validSegmentHeader(header SegmentHeader) bool {
-	if header.StoreID == (StoreID{}) || header.SegmentID == 0 || header.SegmentID == model.MapSegmentID(math.MaxUint32) || header.SegmentSize <= SegmentHeaderSize+DenseNodeSize+SegmentFooterSize || header.SegmentSize&uint32(Alignment-1) != 0 {
+	if header.StoreID == (StoreID{}) || header.SegmentID == 0 || header.SegmentID == model.MapSegmentID(math.MaxUint32) || header.SegmentSize < SegmentHeaderSize+DenseNodeSize+SegmentFooterSize || header.SegmentSize&uint32(Alignment-1) != 0 {
 		return false
 	}
 	if header.SegmentID == 1 {

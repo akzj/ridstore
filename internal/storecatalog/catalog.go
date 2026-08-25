@@ -5,11 +5,13 @@ import (
 	"math"
 	"sync"
 
+	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
 )
 
 var _ recordlog.CatalogPort = (*Manager)(nil)
+var _ mapstore.CatalogPort = (*Manager)(nil)
 
 type Manager struct {
 	mu      sync.Mutex
@@ -45,6 +47,19 @@ func (m *Manager) Snapshot() Manifest {
 func (m *Manager) SnapshotRecordLog() recordlog.CatalogSnapshot {
 	current := m.Snapshot()
 	return recordLogSnapshot(current)
+}
+
+func (m *Manager) SnapshotMapStore() mapstore.CatalogSnapshot {
+	current := m.Snapshot()
+	sealed := make([]mapstore.SegmentRef, len(current.SealedMapSegments))
+	for index, summary := range current.SealedMapSegments {
+		sealed[index] = mapstore.SegmentRef{SegmentID: summary.SegmentID, ValidEnd: summary.ValidEnd}
+	}
+	return mapstore.CatalogSnapshot{
+		Generation: current.Generation, StoreID: mapstore.StoreID(current.StoreUUID), SegmentSize: uint32(current.HardLimits.SegmentSize),
+		ActiveSegment: current.ActiveMapSegmentID, NextSegment: current.NextMapSegmentID, SealedSegments: sealed,
+		Root: current.MappingRoot, Covered: current.CoveredCommitSeq,
+	}
 }
 
 func recordLogSnapshot(current Manifest) recordlog.CatalogSnapshot {
