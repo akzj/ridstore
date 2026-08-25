@@ -88,6 +88,20 @@ func (l *memoryLog) Read(_ context.Context, addr recordlog.VAddr) ([]byte, error
 	return append([]byte(nil), payload...), nil
 }
 
+func (l *memoryLog) Inspect(_ context.Context, addr recordlog.VAddr, prefixBytes uint32) (recordlog.RecordHeader, []byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	payload, ok := l.records[addr]
+	if !ok || prefixBytes > uint32(len(payload)) {
+		return recordlog.RecordHeader{}, nil, recordlog.ErrInvalidVAddr
+	}
+	physical, err := recordlog.PhysicalRecordSize(uint64(len(payload)))
+	if err != nil {
+		return recordlog.RecordHeader{}, nil, err
+	}
+	return recordlog.RecordHeader{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr}, append([]byte(nil), payload[:prefixBytes]...), nil
+}
+
 func (l *memoryLog) Status() recordlog.Status {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -268,11 +282,11 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 	root := t.TempDir()
 	logID := recordlog.LogID{9, 8, 7, 6}
-	if err := recordlog.CreateInitialSegment(root, logID, 1<<20); err != nil {
+	if err := recordlog.CreateInitialSegment(root, logID, 8192); err != nil {
 		t.Fatal(err)
 	}
 	storeID := storecatalog.StoreUUID{4, 3, 2, 1}
-	if err := mapstore.CreateInitialSegment(root, mapstore.StoreID(storeID), 1<<20); err != nil {
+	if err := mapstore.CreateInitialSegment(root, mapstore.StoreID(storeID), 8192); err != nil {
 		t.Fatal(err)
 	}
 	replayStart, err := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
@@ -282,9 +296,9 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 	manifest := storecatalog.Manifest{
 		Generation: 1, StoreUUID: storeID, RecordLogID: logID,
 		HardLimits: storecatalog.HardLimits{
-			SegmentSize: 1 << 20, MaxValueSize: 1024, MaxBatchBytes: 4096,
+			SegmentSize: 8192, MaxValueSize: 1024, MaxBatchBytes: 4096,
 			MaxBatchMutations: 16, MaxBatchConditions: 16, MaxOpenBatches: 4,
-			MaxRecordLogPayload: 64 << 10, IDReserveSize: 16, BatchIDReserveSize: 16,
+			MaxRecordLogPayload: 4096, IDReserveSize: 16, BatchIDReserveSize: 16,
 		},
 		ActiveDataSegmentID: 1, NextDataSegmentID: 2,
 		ActiveMapSegmentID: 1, NextMapSegmentID: 2,
@@ -295,7 +309,7 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 	}
 	config := OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: 1 << 20, QueueCapacity: 32, BufferBytes: 64 << 10, BufferRecords: 32},
-		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
+		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 4096},
 		MappingCacheBytes: 1 << 20, MaxCheckpointEntries: 1024,
 	}
 	store, err := Open(context.Background(), root, config)
@@ -313,6 +327,25 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 	committed, err := batch.Commit(context.Background())
 	if err != nil || committed.CommitSeq != 1 {
 		t.Fatalf("commit=%+v err=%v", committed, err)
+	}
+	for index := 0; index < 12; index++ {
+		item, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := item.Create(context.Background(), make([]byte, 900)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := item.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := storecatalog.Load(root)
+	if err != nil || checkpoint.MappingRoot == 0 || checkpoint.CoveredCommitSeq != 13 || checkpoint.StatsCoveredCommitSeq != 13 || checkpoint.ReplayStart == replayStart || len(checkpoint.SealedDataSegments) == 0 || len(checkpoint.SegmentStats) == 0 {
+		t.Fatalf("checkpoint=%+v err=%v", checkpoint, err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

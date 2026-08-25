@@ -68,6 +68,15 @@ func (a *Allocator) DurableHigh() uint64 {
 	return a.high
 }
 
+// IssuedHigh is the exclusive upper bound of IDs handed to callers in this
+// process. It is captured for BatchID checkpoint recovery while allocation is
+// quiesced by the Engine barrier.
+func (a *Allocator) IssuedHigh() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.next
+}
+
 func (a *Allocator) reserveRange(ctx context.Context) error {
 	if a.high > math.MaxUint64-a.reserve {
 		return base.ErrIDExhausted

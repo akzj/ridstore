@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 
 	"github.com/akzj/ridstore/internal/base"
@@ -13,12 +14,15 @@ import (
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/segmentstats"
+	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
 )
 
 type Log interface {
 	coordinator.Appender
 	Read(context.Context, recordlog.VAddr) ([]byte, error)
+	Inspect(context.Context, recordlog.VAddr, uint32) (recordlog.RecordHeader, []byte, error)
 	Close() error
 }
 
@@ -34,12 +38,14 @@ type Record struct {
 }
 
 type Store struct {
-	ops sync.RWMutex
-	mu  sync.Mutex
+	ops          sync.RWMutex
+	mu           sync.Mutex
+	checkpointMu sync.Mutex
 
 	log       Log
 	mapping   *mapping.Persistent
 	mapStore  *mapstore.Store
+	catalog   *storecatalog.Manager
 	ids       *idalloc.Allocator
 	batches   *idalloc.Allocator
 	commits   *coordinator.Coordinator
@@ -49,6 +55,8 @@ type Store struct {
 	openCount int
 	notify    chan struct{}
 	closed    bool
+	fault     error
+	maxStats  uint64
 }
 
 func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
@@ -79,6 +87,12 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 			s.mu.Unlock()
 			s.ops.RUnlock()
 			return nil, base.ErrClosed
+		}
+		if s.fault != nil {
+			err := s.fault
+			s.mu.Unlock()
+			s.ops.RUnlock()
+			return nil, errors.Join(base.ErrReadOnly, err)
 		}
 		if fault := s.commits.Fault(); fault != nil {
 			s.mu.Unlock()
@@ -133,10 +147,13 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 			return Record{}, err
 		}
 		s.mu.Lock()
-		closed := s.closed
+		closed, fault := s.closed, s.fault
 		s.mu.Unlock()
 		if closed {
 			return Record{}, base.ErrClosed
+		}
+		if fault != nil {
+			return Record{}, errors.Join(base.ErrReadOnly, fault)
 		}
 		entry, exists, err := s.mapping.Lookup(id)
 		if err != nil {
@@ -165,6 +182,8 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 }
 
 func (s *Store) Close() error {
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
 	s.ops.Lock()
 	defer s.ops.Unlock()
 	s.mu.Lock()
@@ -193,6 +212,100 @@ func (s *Store) Close() error {
 		result = errors.Join(result, s.mapStore.Close())
 	}
 	return result
+}
+
+// Checkpoint installs one atomic Mapping, replay-cut, allocator, open-batch,
+// and exact sealed-segment statistics generation.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+
+	s.ops.Lock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.ops.Unlock()
+		return base.ErrClosed
+	}
+	if s.fault != nil {
+		err := s.fault
+		s.mu.Unlock()
+		s.ops.Unlock()
+		return errors.Join(base.ErrReadOnly, err)
+	}
+	if s.catalog == nil || s.mapStore == nil || s.maxStats == 0 {
+		s.mu.Unlock()
+		s.ops.Unlock()
+		return base.ErrInvalidConfig
+	}
+	s.mu.Unlock()
+	cut, err := s.commits.CheckpointCut(ctx)
+	if err != nil {
+		s.ops.Unlock()
+		return err
+	}
+	s.mu.Lock()
+	open := make([]model.BatchID, 0, len(s.open))
+	for id := range s.open {
+		open = append(open, id)
+	}
+	s.mu.Unlock()
+	sort.Slice(open, func(i, j int) bool { return open[i] < open[j] })
+	reservedIDHigh := s.ids.DurableHigh()
+	reservedBatchIDHigh := s.batches.DurableHigh()
+	issuedBatchIDHigh := s.batches.IssuedHigh()
+	frozen, err := s.mapping.Freeze(cut.CoveredCommitSeq)
+	s.ops.Unlock()
+	if err != nil {
+		return err
+	}
+	abort := func(cause error) error {
+		return errors.Join(cause, s.mapping.AbortCheckpoint(frozen))
+	}
+	candidate, err := s.mapping.BuildCheckpoint(frozen)
+	if err != nil {
+		if errors.Is(err, mapstore.ErrPoisoned) || errors.Is(err, mapping.ErrCorrupt) {
+			s.setFault(err)
+		}
+		return abort(err)
+	}
+	manifest := s.catalog.Snapshot()
+	stats, err := segmentstats.Build(ctx, candidate, s.log, segmentstats.FileSet{
+		Active: manifest.ActiveDataSegmentID, Sealed: manifest.SealedDataSegments,
+	}, manifest.HardLimits.MaxValueSize, s.maxStats)
+	if err != nil {
+		if errors.Is(err, base.ErrCorrupt) {
+			s.setFault(err)
+		}
+		return abort(err)
+	}
+	_, err = s.catalog.InstallCheckpoint(manifest.Generation, storecatalog.Checkpoint{
+		MappingRoot: candidate.Root(), CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: cut.ReplayStart,
+		ReservedIDHigh: reservedIDHigh, ReservedBatchIDHigh: reservedBatchIDHigh, IssuedBatchIDHighAtCut: issuedBatchIDHigh,
+		OpenBatchIDsAtCut: open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,
+	})
+	if err != nil {
+		if !errors.Is(err, storecatalog.ErrConflict) {
+			s.setFault(err)
+		}
+		return abort(err)
+	}
+	if err := s.mapping.InstallCheckpoint(candidate); err != nil {
+		s.setFault(err)
+		return errors.Join(base.ErrReadOnly, err)
+	}
+	return nil
+}
+
+func (s *Store) setFault(err error) {
+	s.mu.Lock()
+	if s.fault == nil {
+		s.fault = err
+	}
+	s.mu.Unlock()
 }
 
 func (s *Store) signalLocked() {
@@ -279,10 +392,13 @@ func withBatch[T any](b *Batch, run func() (T, error)) (T, error) {
 	b.store.ops.RLock()
 	defer b.store.ops.RUnlock()
 	b.store.mu.Lock()
-	closed := b.store.closed
+	closed, fault := b.store.closed, b.store.fault
 	b.store.mu.Unlock()
 	if closed {
 		return zero, base.ErrClosed
+	}
+	if fault != nil {
+		return zero, errors.Join(base.ErrReadOnly, fault)
 	}
 	return run()
 }

@@ -104,5 +104,7 @@ func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 		return fail(err)
 	}
 	store.mapStore = physicalMapping
+	store.catalog = catalog
+	store.maxStats = config.MaxCheckpointEntries
 	return store, nil
 }

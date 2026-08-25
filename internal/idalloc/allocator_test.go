@@ -51,8 +51,8 @@ func TestRecordAndBatchReserveAreDurableBeforeIssue(t *testing.T) {
 				t.Fatalf("kind=%d got=%d want=%d err=%v", tc.kind, got, want, err)
 			}
 		}
-		if allocator.DurableHigh() != 9 || len(log.calls) != 2 {
-			t.Fatalf("kind=%d high=%d calls=%d", tc.kind, allocator.DurableHigh(), len(log.calls))
+		if allocator.DurableHigh() != 9 || allocator.IssuedHigh() != 6 || len(log.calls) != 2 {
+			t.Fatalf("kind=%d durable=%d issued=%d calls=%d", tc.kind, allocator.DurableHigh(), allocator.IssuedHigh(), len(log.calls))
 		}
 		for index, call := range log.calls {
 			if !call.sync {
