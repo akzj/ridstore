@@ -30,12 +30,30 @@ func TestPutRoundTrip(t *testing.T) {
 	if err != nil || got.OriginBatchID != want.OriginBatchID || got.RecordID != want.RecordID || string(got.Value) != string(want.Value) {
 		t.Fatalf("got=%+v err=%v", got, err)
 	}
+	if typ, err := TypeOf(encoded); err != nil || typ != RecordTypePut {
+		t.Fatalf("type=%d err=%v", typ, err)
+	}
 	got.Value[0] = 'V'
 	if encoded[PutHeaderSize] != 'V' {
 		t.Fatal("decoded value must alias source")
 	}
 	if _, err := EncodePut(PutRecord{OriginBatchID: 1, RecordID: 2, Value: make([]byte, 9)}, 8); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("value limit err=%v", err)
+	}
+}
+
+func TestTypeOfRejectsUnknownOrMalformedHeader(t *testing.T) {
+	t.Parallel()
+	encoded, _ := EncodeAbort(AbortRecord{BatchID: 1})
+	unknown := append([]byte(nil), encoded...)
+	unknown[6] = 99
+	if _, err := TypeOf(unknown); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("unknown err=%v", err)
+	}
+	malformed := append([]byte(nil), encoded...)
+	malformed[7] = 1
+	if _, err := TypeOf(malformed); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("malformed err=%v", err)
 	}
 }
 

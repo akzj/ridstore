@@ -11,6 +11,30 @@ import (
 
 var protocolMagic = [4]byte{'R', 'S', 'P', '2'}
 
+// TypeOf validates the common protocol header and returns the concrete record
+// type. Callers must still run the matching Decode function before using fields.
+func TypeOf(src []byte) (RecordType, error) {
+	if len(src) < int(CommonHeaderSize) {
+		return 0, fmt.Errorf("protocol header truncated: %w", ErrCorrupt)
+	}
+	typ := RecordType(src[6])
+	var headerSize uint32
+	switch typ {
+	case RecordTypePut:
+		headerSize = PutHeaderSize
+	case RecordTypeCommitGroup:
+		headerSize = CommitGroupHeadSize
+	case RecordTypeAbort, RecordTypeIDReserve, RecordTypeBatchIDReserve, RecordTypeCheckpoint:
+		headerSize = FixedRecordSize
+	default:
+		return 0, fmt.Errorf("protocol record type: %w", ErrCorrupt)
+	}
+	if _, err := decodeHeader(src, typ, headerSize); err != nil {
+		return 0, err
+	}
+	return typ, nil
+}
+
 type header struct {
 	Type       RecordType
 	HeaderSize uint16
