@@ -1,6 +1,6 @@
 # ridstore v2 Mapping Format
 
-状态：Implemented foundation, checkpoint pending
+状态：Checkpoint runtime implemented, Delta admission pending
 
 ## 1. 边界
 
@@ -81,6 +81,6 @@ Coordinator checkpoint barrier、RecordLog durable cut、Catalog checkpoint tupl
 v2 Open/Replay 已接线。Engine 只接受 `mapping.Persistent`；旧的全量内存 Mapping 不再是 Engine
 后端，仅待迁移为 Mapping 模型测试 oracle 后删除生产定义。
 
-当前尚未实现 Delta admission/backpressure、有界 chunk builder、Mapping GC、v2 Create/目录锁以及
-checkpoint syscall crash matrix。第一版精确 SegmentStats 通过顺序遍历 candidate Root，并利用
+当前尚未实现 Delta admission/backpressure、有界 chunk builder、Mapping GC、完整 checkpoint syscall
+crash matrix。v2 Create 与目录锁已经接入。第一版精确 SegmentStats 通过顺序遍历 candidate Root，并利用
 `RecordLog.Inspect` 只读取物理 Header 与 Put protocol header，不读取 Value body。
