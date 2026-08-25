@@ -109,6 +109,47 @@ func EncodeNode(build NodeBuild) ([]byte, error) {
 // number of bytes from this node's MapAddr to the containing segment's valid
 // end, preventing a valid-looking size from crossing a file boundary.
 func DecodeNode(src []byte, segmentRemaining uint32) (Node, uint32, error) {
+	node, size, err := decodeNodeHeader(src, segmentRemaining)
+	if err != nil {
+		return Node{}, 0, err
+	}
+	header := src[:NodeHeaderSize]
+	if uint64(size) > uint64(len(src)) {
+		return Node{}, 0, ErrCorrupt
+	}
+	payload := src[NodeHeaderSize:size]
+	if crc32.Checksum(payload, crcTable) != binary.LittleEndian.Uint32(header[44:48]) {
+		return Node{}, 0, ErrCorrupt
+	}
+	switch node.Encoding {
+	case EncodingSparse:
+		for index := range node.Bitmap {
+			node.Bitmap[index] = binary.LittleEndian.Uint64(payload[index*8 : index*8+8])
+		}
+		if bitmapCount(node.Bitmap) != int(node.EntryCount) || (node.Level == MaxLevel && !topBitmapEmpty(node.Bitmap)) {
+			return Node{}, 0, ErrCorrupt
+		}
+		node.Values = make([]uint64, node.EntryCount)
+		for index := range node.Values {
+			offset := SparseBitmapBytes + uint32(index)*8
+			node.Values[index] = binary.LittleEndian.Uint64(payload[offset : offset+8])
+		}
+	case EncodingDense:
+		node.Values = make([]uint64, NodeSlots)
+		for index := range node.Values {
+			node.Values[index] = binary.LittleEndian.Uint64(payload[index*8 : index*8+8])
+		}
+		if countValues(node.Values) != int(node.EntryCount) || (node.Level == MaxLevel && !topSlotsEmpty(node.Values)) {
+			return Node{}, 0, ErrCorrupt
+		}
+	}
+	if err := validateValues(node.Level, node.Values); err != nil {
+		return Node{}, 0, errors.Join(ErrCorrupt, err)
+	}
+	return node, size, nil
+}
+
+func decodeNodeHeader(src []byte, segmentRemaining uint32) (Node, uint32, error) {
 	if len(src) < int(NodeHeaderSize) {
 		return Node{}, 0, ErrCorrupt
 	}
@@ -123,7 +164,7 @@ func DecodeNode(src []byte, segmentRemaining uint32) (Node, uint32, error) {
 		return Node{}, 0, ErrCorrupt
 	}
 	size := binary.LittleEndian.Uint32(header[12:16])
-	if size < NodeHeaderSize || size&7 != 0 || size > segmentRemaining || uint64(size) > uint64(len(src)) {
+	if size < NodeHeaderSize || size&7 != 0 || size > segmentRemaining {
 		return Node{}, 0, ErrCorrupt
 	}
 	node := Node{
@@ -137,43 +178,18 @@ func DecodeNode(src []byte, segmentRemaining uint32) (Node, uint32, error) {
 	if node.NodeSeq == 0 || node.CoveredCommitSeq == 0 || node.EntryCount == 0 || node.EntryCount > NodeSlots || !validPrefix(node.Level, node.Prefix) {
 		return Node{}, 0, ErrCorrupt
 	}
-	payload := src[NodeHeaderSize:size]
-	if crc32.Checksum(payload, crcTable) != binary.LittleEndian.Uint32(header[44:48]) {
-		return Node{}, 0, ErrCorrupt
-	}
 	switch node.Encoding {
 	case EncodingSparse:
 		want := NodeHeaderSize + SparseBitmapBytes + uint32(node.EntryCount)*8
 		if size != want {
 			return Node{}, 0, ErrCorrupt
 		}
-		for index := range node.Bitmap {
-			node.Bitmap[index] = binary.LittleEndian.Uint64(payload[index*8 : index*8+8])
-		}
-		if bitmapCount(node.Bitmap) != int(node.EntryCount) || (node.Level == MaxLevel && !topBitmapEmpty(node.Bitmap)) {
-			return Node{}, 0, ErrCorrupt
-		}
-		node.Values = make([]uint64, node.EntryCount)
-		for index := range node.Values {
-			offset := SparseBitmapBytes + uint32(index)*8
-			node.Values[index] = binary.LittleEndian.Uint64(payload[offset : offset+8])
-		}
 	case EncodingDense:
 		if size != DenseNodeSize {
 			return Node{}, 0, ErrCorrupt
 		}
-		node.Values = make([]uint64, NodeSlots)
-		for index := range node.Values {
-			node.Values[index] = binary.LittleEndian.Uint64(payload[index*8 : index*8+8])
-		}
-		if countValues(node.Values) != int(node.EntryCount) || (node.Level == MaxLevel && !topSlotsEmpty(node.Values)) {
-			return Node{}, 0, ErrCorrupt
-		}
 	default:
 		return Node{}, 0, ErrUnsupported
-	}
-	if err := validateValues(node.Level, node.Values); err != nil {
-		return Node{}, 0, errors.Join(ErrCorrupt, err)
 	}
 	return node, size, nil
 }
