@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-`internal/mapstore` 只保存 immutable radix node。它不知道 RecordID 的事务语义、Revision、Delta、
+`internal/mapstore` 只保存 immutable radix node。它不知道 RecordID 的事务语义、条件、Delta、
 Checkpoint tuple 或 SegmentStats。上层 Mapping 负责 COW；全局 Catalog 负责 live file set。
 
 旧 `internal/format`、`internal/mapping/radix` 的 Format v1 文件不被读取，也不通过 adapter 接入。
@@ -65,7 +65,7 @@ Builder 只产生新 Root，不执行 fsync 或发布 Catalog；durability 仍�
 `internal/mapping.Persistent` 已实现 v2 运行时基础的 `active Delta + frozen Delta + persistent Root`：
 
 - Lookup 先检查 active/frozen，miss 才进入 radix；
-- Root leaf 仍只保存 VAddr，Revision 由该地址的 PutRecord resolver 验证并恢复；
+- Root leaf 只保存 VAddr；Lookup 和条件解析均不读取 PutRecord，VAddr 本身就是内部一致性 token；
 - ResolveGroup 对 cold read 使用 epoch 重试，不在 Mapping 锁内执行磁盘 I/O；
 - PublishGroup 只修改 active Delta，并保持整个 group 的原子可见性；
 - Freeze 原子切换 active Delta，失败/Abort 不丢弃 frozen layer；

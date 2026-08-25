@@ -2,6 +2,9 @@
 
 状态：最小运行闭环已实现，等待架构 Review
 
+> 历史说明：本 Review 记录 M3 完成时的实现。提交 `241fa79` 已删除这里描述的
+> LogicalRevision 模型；当前契约是 `ID -> VAddr`，以 ExpectedVAddr 做条件比较。
+
 提交：
 
 - `493344f feat: add atomic group mapping`
@@ -32,12 +35,12 @@ Engine.Begin
 
 ## 2. 已建立的不变量
 
-- Mapping 保存 `ID -> {VAddr, LogicalRevision}`，一个 durable CommitGroup 只执行一次原子发布；
+- M3 当时的 Mapping 保存 `ID -> {VAddr, LogicalRevision}`；该结构已被后续 `ID -> VAddr` 取代；
 - group 内后续 Batch 可观察前序 accepted Batch 的 virtual Mapping；冲突 Batch 不污染后续状态；
 - 冲突 Batch 不写 Descriptor、不消耗 CommitSeq；空 Batch 仍可提交；
 - Transaction 只保留每个 ID 的最终 mutation，PutRecord orphan 由后续 GC 回收；
 - `Create` 依赖 ID 永不复用，不增加 `ExpectAbsent`，因此不产生无意义的 Mapping 条件读取；
-- 用户 Put 的 Revision 等于 BatchID；Relocation CAS 保留原 Revision；
+- M3 当时把用户 Put 的 BatchID 解释为 Revision；该解释已删除，OriginBatchID 现在只用于持久化身份验证；
 - ReserveRecord 必须 `sync=true` 成功后才发放新区间，重启从 durable high 之后继续；
 - Commit 请求进入 Coordinator 队列后由 Coordinator 持有完成责任，调用者等待确定结果；
 - Coordinator 不使用 MaxDelay。前一轮 I/O 期间自然排队的请求在下一轮合并；
@@ -81,9 +84,10 @@ go vet ./...
 git diff --check
 ```
 
-覆盖单 Batch durable publish、自然形成双 Batch group、组内 Revision 依赖、冲突不消耗 CommitSeq、
+覆盖单 Batch durable publish、自然形成双 Batch group、当时的组内条件依赖、冲突不消耗 CommitSeq、
 sync failure 的 CommitUnknown、Reserve fsync-before-issue、并发 ID 唯一性、真实 RecordLog round trip、
-Get revision、Delete 和 open-batch backpressure。
+当时的 Get token、Delete 和 open-batch backpressure。当前 VAddr 条件模型由后续 Mapping、Transaction、
+Coordinator、Engine 与 Replay 测试覆盖。
 
 ## 6. 明确未完成
 

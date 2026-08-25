@@ -21,7 +21,7 @@
 
 | 当前模块 | 处置 | v2 中的职责或理由 |
 |---|---|---|
-| Public `Store`/`Batch` API 契约 | Keep | Stable-ID、Batch、LogicalRevision 的产品语义不变 |
+| Public `Store`/`Batch` API 契约 | Rewrite | 保留 Stable-ID 与原子 Batch；删除 LogicalRevision，条件提交只比较 Mapping 当前 VAddr，公共层至多暴露 opaque observation token |
 | `internal/base` | Rewrite | 保留 ID 和错误语义；重新生成 VAddr、LogPos 和边界检查，避免共享旧地址编码器 |
 | `internal/allocator` | Delete；由 `internal/idalloc` Rewrite | 保留 durable high watermark 不变量；直接依赖新 ReserveRecord 契约 |
 | `internal/batch` | Delete；由 `internal/transaction` Rewrite | 保留状态机和最终 mutation 折叠语义；删除旧 Frame/AppendLog 依赖 |

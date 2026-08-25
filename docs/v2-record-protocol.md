@@ -59,7 +59,8 @@ Header 固定 32 bytes：
 - OriginBatchID 和 RecordID 非零；
 - value 可以为空；
 - `N <= MaxValueSize`；
-- LogicalRevision 等于 OriginBatchID，GC relocation 必须保持它不变；
+- OriginBatchID 只证明 PutRecord 属于哪个用户 Batch；它不是逻辑版本，也不进入 Mapping；
+- GC relocation 复制 Value 时保留 OriginBatchID，使恢复、校验和 orphan 分析仍能追溯原始用户 Put；
 - PutRecord 出现在日志中不代表可见，CommitGroupRecord 才发布它。
 
 ## 4. CommitGroupRecord

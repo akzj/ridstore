@@ -2,6 +2,10 @@
 
 状态：Development contract v1
 
+> 本文描述 Format v1 的 Frame/CommitSeal 协议。v2 使用单 CommitGroupRecord，条件只比较 Mapping
+> VAddr，不读取 PutRecord Header 恢复 Revision；见 [v2 总体架构](v2-architecture.md)、
+> [v2 Record Protocol](v2-record-protocol.md) 与 [v2 API 契约](v2-api-contract.md)。
+
 ## 1. 设计选择
 
 第一版采用：

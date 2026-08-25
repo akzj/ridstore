@@ -2,6 +2,9 @@
 
 状态：Acceptance contract v1
 
+> 本文是 Format v1 验收矩阵。v2 模型测试必须改为 `map[ID]{value, VAddr}`，条件只比较地址；
+> LogicalRevision 相关 Case 不进入 v2 测试迁移。当前边界见 [v2 API 与一致性契约](v2-api-contract.md)。
+
 ## 1. 原则
 
 测试通过不是生产就绪的充分条件。ridstore 的证据分为：

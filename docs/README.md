@@ -11,8 +11,9 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 5. [ridstore v2 Record Protocol](v2-record-protocol.md)：业务 Record 与单 Record Commit group；
 6. [ridstore v2 Manifest](v2-manifest-format.md)：唯一 Catalog schema、字段所有权和安装协议。
 7. [ridstore v2 Mapping Format](v2-mapping-format.md)：immutable radix node 与物理 Mapping Segment；
-8. [v2 M1 Review](v2-m1-review.md)：基础格式实现、验证证据和进入 M2 前的 Review 项。
-9. [v2 M2 Review](v2-m2-review.md)：RecordLog 运行实现、崩溃边界和进入 M3 前的 Review 项。
+8. [ridstore v2 API 契约](v2-api-contract.md)：VAddr 内部一致性、opaque observation token 与上层职责；
+9. [v2 M1 Review](v2-m1-review.md)：基础格式实现、验证证据和进入 M2 前的 Review 项。
+10. [v2 M2 Review](v2-m2-review.md)：RecordLog 运行实现、崩溃边界和进入 M3 前的 Review 项。
 
 v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构。以下 Format v1 文档仍用于理解
 已实现系统和提取不变量，不自动成为 v2 的实现约束。
@@ -21,7 +22,7 @@ v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构�
 
 1. [总体设计](design.md)：项目目标、核心不变量和模块关系；
 2. [与 LSM/RocksDB 的定位边界](positioning-vs-lsm.md)：明确不研发通用有序 KV；
-3. [嵌入式 Library 与 API 契约](api-contract.md)：进程模型、公开接口、LogicalRevision、乐观冲突和数据所有权；
+3. [嵌入式 Library 与 API 契约](api-contract.md)：Format v1 已实现公开接口的历史契约；
 4. [磁盘与二进制格式](on-disk-format.md)：目录、Segment、Frame、Manifest、版本和校验；
 5. [Commit 与 Recovery 协议](commit-recovery-protocol.md)：Batch、group commit、Abort、CommitUnknown 和恢复；
 6. [Mapping 设计](mapping-design.md)：Delta Overlay、持久化 Radix、Checkpoint 和缓存；
@@ -52,6 +53,7 @@ v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构�
 | `v2-record-protocol.md` | Draft for Review | v2 业务 Record 和尺寸约束 |
 | `v2-manifest-format.md` | Draft for Review | v2 Catalog schema 和原子安装协议 |
 | `v2-mapping-format.md` | Implemented foundation | v2 immutable radix node 和 Mapping Segment 格式 |
+| `v2-api-contract.md` | Development contract v2 | v2 地址条件、公共 token 和上层并发职责 |
 | `v2-m1-review.md` | Implemented, pending review | v2 基础类型、codec 与 Catalog 审计 |
 | `v2-m2-review.md` | Implemented, pending review | v2 RecordLog、rotation recovery 与 Reader Pin 审计 |
 | `v2-m3-review.md` | Implemented | v2 transaction、Coordinator 与最小 Engine 闭环 |

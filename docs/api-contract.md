@@ -2,6 +2,9 @@
 
 状态：Development contract v1
 
+> 本文是仍在仓库中的 Format v1 公开 runtime 契约。v2 不保留 LogicalRevision，也不通过 adapter
+> 兼容本接口；目标 API 与一致性边界见 [v2 API 与一致性契约](v2-api-contract.md)。
+
 ## 1. 交付形态
 
 ridstore 第一阶段是嵌入式 Go Library，不是独立进程，也不是分布式系统。

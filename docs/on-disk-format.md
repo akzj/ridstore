@@ -1,5 +1,8 @@
 # 磁盘与二进制格式
 
+> Format v1 冻结文档：其中 LogicalRevision 是旧公开 runtime 的解释，不属于 v2。v2 的 OriginBatchID
+> 只用于持久化身份验证；当前格式见 [v2 Record Protocol](v2-record-protocol.md)。
+
 状态：Format v1 frozen（2026-08-21）
 
 ## 1. 格式原则

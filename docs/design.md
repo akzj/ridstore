@@ -1,5 +1,9 @@
 # ridstore 总体设计
 
+> Format v1 历史契约：本文描述已实现的旧公开 runtime。v2 已用 `ID -> VAddr` 和地址条件取代
+> LogicalRevision；当前目标边界见 [v2 总体架构](v2-architecture.md) 与
+> [v2 API 与一致性契约](v2-api-contract.md)。历史格式与故障证明仍保留，不自动约束 v2。
+
 状态：Accepted architecture v0.2
 
 范围：单机存储内核

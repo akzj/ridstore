@@ -2,6 +2,10 @@
 
 ridstore 是一个嵌入式、单机的 Stable-ID Log-Structured Record Store Library。
 
+当前 `v2` 分支正在进行不兼容重写。v2 的内部一致性模型只有 `ID -> VAddr`：条件提交比较
+ExpectedVAddr，不再把 PutRecord 的 BatchID 解释为 LogicalRevision。当前顶层公开 runtime 仍是待删除的
+Format v1 实现；v2 目标契约见 [v2 API 与一致性契约](docs/v2-api-contract.md)。
+
 它提供一个很小的存储抽象：
 
 ```text
@@ -10,7 +14,8 @@ uint64 ID -> variable-length bytes
 
 逻辑 ID 稳定且永不复用，物理记录只追加写入。更新产生新的物理记录，删除只改变可见映射，旧记录由后台 GC 回收。多个 Put/Delete 可以组成一个原子 Batch，并通过一次或合并后的 fsync 持久化。
 
-`Create` 明确创建新 ID，`Update`/`DeleteIfRevision` 使用 LogicalRevision 做显式乐观冲突检查；`Upsert`（兼容拼写 `Put`）才采用 CommitSeq Last-Writer-Wins。
+Format v1 的 `Update`/`DeleteIfRevision` 仍存在于旧公开 runtime；它们不再是 v2 的目标接口。v2 内部
+以地址条件提供乐观冲突检查，Blind Put 采用 CommitSeq Last-Writer-Wins。
 
 ridstore 只负责 Record，不内置 KV、Page、Blob、Stream、SQL 或业务保留策略。这些能力应当构建在稳定 ID 和原子 Batch 之上。
 

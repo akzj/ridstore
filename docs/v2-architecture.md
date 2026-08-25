@@ -112,6 +112,16 @@ Manifest v2 至少包含：
 Mapping 是 `ID -> VAddr` 可见状态的唯一所有者。RecordLog 中存在 Record 不表示它可见；只有
 durable Commit 被 Coordinator 发布或 Recovery 重放后，Mapping 才能改变。
 
+Mapping 不保存、推导或查询业务 Revision。条件提交比较调用者先前观察到的 VAddr 与提交顺序中
+当前的 VAddr；不存在条件以零地址表达。解析条件只访问 Mapping，不能为了恢复另一种版本语义读取
+PutRecord Header。这样冷 Root 条件检查至多发生一次 Mapping path read，而不是 Mapping read 后再做
+一次随机 Data Record read。
+
+VAddr 是 ridstore 内部物理观察 token，不是业务版本：GC relocation 会在 Value 不变时更新 VAddr，
+因此并发条件可能产生安全的伪冲突。上层可以重读并重试；若 B-link tree、page engine 或其他业务
+结构需要跨 relocation 稳定的 page epoch、MVCC version 或锁版本，它必须把该字段编码在自己的 Value
+中，并由自己的锁或验证协议解释。Ridstore 不把 OriginBatchID 暴露为 LogicalRevision。
+
 ## 6. RecordLog 契约
 
 ### 6.1 请求与完成
@@ -209,7 +219,7 @@ CheckpointMarker
 ```text
 1. Batch Put 向 RecordLog 提交 PutRecord，等待 reserved VAddr
 2. Batch 只保存最终 ID -> VAddr/Delete mutation
-3. Coordinator 串行验证条件并形成 virtual Mapping
+3. Coordinator 用 ExpectedVAddr 串行验证条件并形成 virtual Mapping
 4. Coordinator 按顺序分配 CommitSeq，编码一个 CommitGroupRecord
 5. Append(CommitGroupRecord, sync=true)
 6. RecordLog 合并 write 并执行 fsync

@@ -1,5 +1,9 @@
 # GC 与空间回收协议
 
+> Format v1 历史契约：v2 仍以 `Mapping[ID] == scanned VAddr` 证明 live，但不再承诺 relocation 前后
+> LogicalRevision 不变。v2 relocation 会改变地址 observation token，Value 与 OriginBatchID 仅作为内容和
+> 来源验证字段保留；见 [v2 API 与一致性契约](v2-api-contract.md)。
+
 状态：Development contract v1
 
 ## 1. 目标与边界

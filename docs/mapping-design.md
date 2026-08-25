@@ -1,5 +1,9 @@
 # Mapping 设计
 
+> Format v1 历史契约：v2 Mapping 只保存 `ID -> VAddr`，条件解析不读取 Data Record，也不存在
+> LogicalRevision resolver。当前实现契约见 [v2 Mapping Format](v2-mapping-format.md) 与
+> [v2 API 与一致性契约](v2-api-contract.md)。
+
 状态：Development contract v1
 
 ## 1. 目标
