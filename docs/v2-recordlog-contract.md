@@ -289,6 +289,16 @@ RecordLog 不独立持久化一份配置；这些硬限制来自唯一 Manifest�
 
 - `internal/recordlog/types.go`：VAddr、LogPos、AppendResult；
 - `internal/recordlog/format.go`：Segment/Record 二进制 codec；
-- `internal/recordlog/*_test.go`：golden、边界、corruption 和 fuzz。
+- `internal/recordlog/segment.go`：Active/Sealed Segment、tail recovery、size-hint read 和 scan；
+- `internal/recordlog/registry.go`：active/sealed lookup、Reader Pin、Retiring 和 detach；
+- `internal/recordlog/budget.go`：有界 queued-byte admission；
+- `internal/recordlog/writer.go`：唯一 writer、自然 batching、write/fsync 和 poison；
+- `internal/recordlog/log.go`：Append/Read/Scan/Status/Close；
+- `internal/recordlog/catalog.go`：RecordLog 所需的窄 Catalog port；
+- `internal/recordlog/rotation_journal.go`、`open.go`：rotation journal、Open 和崩溃恢复；
+- `internal/recordlog/retire.go`：Reader drain、Catalog remove、trash/unlink；
+- `internal/storecatalog/catalog.go`：直接实现 RecordLog Catalog port，不存在兼容 adapter；
+- `internal/recordlog/*_test.go`：golden、边界、corruption、Reader Pin、group commit、process crash 和 fuzz。
 
-单 writer、Segment 文件、Registry 和 rotation 属于下一阶段，当前尚未由新包实现。
+M2 已实现本契约的物理主路径，但尚未接入 v2 Store/Coordinator。旧 Format v1 runtime 仍然编译，
+不调用上述 v2 实现。
