@@ -9,6 +9,7 @@ import (
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/idalloc"
 	"github.com/akzj/ridstore/internal/mapping"
+	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -37,7 +38,8 @@ type Store struct {
 	mu  sync.Mutex
 
 	log       Log
-	mapping   mapping.Index
+	mapping   *mapping.Persistent
+	mapStore  *mapstore.Store
 	ids       *idalloc.Allocator
 	batches   *idalloc.Allocator
 	commits   *coordinator.Coordinator
@@ -49,7 +51,7 @@ type Store struct {
 	closed    bool
 }
 
-func New(log Log, current mapping.Index, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
+func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
 	if log == nil || current == nil || ids == nil || batches == nil || config.MaxOpenBatches <= 0 || transaction.ValidateLimits(config.Batch) != nil {
 		return nil, base.ErrInvalidConfig
 	}
@@ -187,6 +189,9 @@ func (s *Store) Close() error {
 	}
 	result = errors.Join(result, s.commits.Close())
 	result = errors.Join(result, s.log.Close())
+	if s.mapStore != nil {
+		result = errors.Join(result, s.mapStore.Close())
+	}
 	return result
 }
 

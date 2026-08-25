@@ -11,7 +11,9 @@ import (
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/idalloc"
 	"github.com/akzj/ridstore/internal/mapping"
+	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
+	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
@@ -22,6 +24,36 @@ type memoryLog struct {
 	offset  uint32
 	records map[recordlog.VAddr][]byte
 	closed  bool
+}
+
+type emptyNodeStore struct{}
+
+func (emptyNodeStore) Read(model.MapAddr) (mapstore.Node, error) {
+	return mapstore.Node{}, errors.New("unexpected persistent node read")
+}
+
+func (emptyNodeStore) Append(uint8, uint64, model.CommitSeq, [mapstore.NodeSlots]uint64) (model.MapAddr, error) {
+	return 0, errors.New("unexpected persistent node append")
+}
+
+func (emptyNodeStore) Sync() error { return nil }
+
+func newPersistent(t *testing.T, log mapping.RecordReader) *mapping.Persistent {
+	t.Helper()
+	nodes := emptyNodeStore{}
+	tree, err := radix.Open(nodes, 0, 0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := mapping.NewPutRevisionResolver(log, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := mapping.OpenPersistent(tree, resolver, nodes, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return current
 }
 
 func (l *memoryLog) Append(_ context.Context, payload []byte, _ bool) (recordlog.AppendResult, error) {
@@ -83,7 +115,7 @@ func newStore(t *testing.T, maxOpen int) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := New(log, mapping.NewEmpty(), ids, batches, Config{
+	store, err := New(log, newPersistent(t, log), ids, batches, Config{
 		Batch:          transaction.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16},
 		Commit:         coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 1 << 20},
 		MaxOpenBatches: maxOpen,
@@ -178,10 +210,6 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 	if err := recordlog.CreateInitialSegment(root, logID, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	mapRoot, err := model.NewMapAddr(1, 64)
-	if err != nil {
-		t.Fatal(err)
-	}
 	replayStart, err := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +222,7 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 			MaxRecordLogPayload: 64 << 10, IDReserveSize: 16, BatchIDReserveSize: 16,
 		},
 		ActiveDataSegmentID: 1, NextDataSegmentID: 2,
-		ActiveMapSegmentID: 1, NextMapSegmentID: 2, MappingRoot: mapRoot,
+		ActiveMapSegmentID: 1, NextMapSegmentID: 2,
 		ReplayStart: replayStart, ReservedIDHigh: 1, ReservedBatchIDHigh: 1, IssuedBatchIDHighAtCut: 1,
 	}
 	if err := storecatalog.Install(root, manifest, nil); err != nil {
@@ -210,7 +238,7 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 	}
 	ids, _ := idalloc.New(idalloc.RecordID, 16, 1, log)
 	batches, _ := idalloc.New(idalloc.BatchID, 16, 1, log)
-	store, err := New(log, mapping.NewEmpty(), ids, batches, Config{
+	store, err := New(log, newPersistent(t, log), ids, batches, Config{
 		Batch:  transaction.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16},
 		Commit: coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10}, MaxOpenBatches: 4,
 	})
@@ -233,6 +261,72 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
 	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
+	root := t.TempDir()
+	logID := recordlog.LogID{9, 8, 7, 6}
+	if err := recordlog.CreateInitialSegment(root, logID, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	storeID := storecatalog.StoreUUID{4, 3, 2, 1}
+	if err := mapstore.CreateInitialSegment(root, mapstore.StoreID(storeID), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	replayStart, err := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := storecatalog.Manifest{
+		Generation: 1, StoreUUID: storeID, RecordLogID: logID,
+		HardLimits: storecatalog.HardLimits{
+			SegmentSize: 1 << 20, MaxValueSize: 1024, MaxBatchBytes: 4096,
+			MaxBatchMutations: 16, MaxBatchConditions: 16, MaxOpenBatches: 4,
+			MaxRecordLogPayload: 64 << 10, IDReserveSize: 16, BatchIDReserveSize: 16,
+		},
+		ActiveDataSegmentID: 1, NextDataSegmentID: 2,
+		ActiveMapSegmentID: 1, NextMapSegmentID: 2,
+		ReplayStart: replayStart, ReservedIDHigh: 1, ReservedBatchIDHigh: 1, IssuedBatchIDHighAtCut: 1,
+	}
+	if err := storecatalog.Install(root, manifest, nil); err != nil {
+		t.Fatal(err)
+	}
+	config := OpenConfig{
+		RecordLog:         recordlog.Config{MaxQueuedBytes: 1 << 20, QueueCapacity: 32, BufferBytes: 64 << 10, BufferRecords: 32},
+		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
+		MappingCacheBytes: 1 << 20, MaxCheckpointEntries: 1024,
+	}
+	store, err := Open(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("survives restart"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := batch.Commit(context.Background())
+	if err != nil || committed.CommitSeq != 1 {
+		t.Fatalf("commit=%+v err=%v", committed, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := reopened.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "survives restart" || record.Revision != model.Revision(committed.BatchID) {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
