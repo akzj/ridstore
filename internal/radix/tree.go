@@ -1,6 +1,7 @@
 package radix
 
 import (
+	"context"
 	"errors"
 
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -11,6 +12,60 @@ import (
 type NodeStore interface {
 	Read(model.MapAddr) (mapstore.Node, error)
 	Append(level uint8, prefix uint64, covered model.CommitSeq, slots [mapstore.NodeSlots]uint64) (model.MapAddr, error)
+}
+
+// Walk visits every leaf in ID order. The tree is immutable, so callers see
+// one complete checkpoint root without holding Mapping publication locks.
+func (t *Tree) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if visit == nil {
+		return ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if t.root == 0 {
+		return nil
+	}
+	return t.walkNode(ctx, t.root, mapstore.MaxLevel, 0, visit)
+}
+
+func (t *Tree) walkNode(ctx context.Context, addr model.MapAddr, level uint8, prefix uint64, visit func(model.ID, recordlog.VAddr) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel)
+	if err != nil {
+		return err
+	}
+	for slot := uint16(0); slot < mapstore.NodeSlots; slot++ {
+		value, exists := node.Lookup(slot)
+		if !exists {
+			continue
+		}
+		if level == 0 {
+			id := model.ID(prefix<<9 | uint64(slot))
+			data, err := recordlog.ParseVAddr(value)
+			if err != nil || id == 0 {
+				return errors.Join(ErrCorrupt, err)
+			}
+			if err := visit(id, data); err != nil {
+				return err
+			}
+			continue
+		}
+		child, err := model.ParseMapAddr(value)
+		if err != nil {
+			return errors.Join(ErrCorrupt, err)
+		}
+		childPrefix := prefix<<9 | uint64(slot)
+		if err := t.walkNode(ctx, child, level-1, childPrefix, visit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type Tree struct {

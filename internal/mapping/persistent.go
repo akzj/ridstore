@@ -1,6 +1,7 @@
 package mapping
 
 import (
+	"context"
 	"errors"
 	"math"
 	"sort"
@@ -202,6 +203,13 @@ type CheckpointCandidate struct {
 
 func (c CheckpointCandidate) Root() model.MapAddr               { return c.root }
 func (c CheckpointCandidate) CoveredCommitSeq() model.CommitSeq { return c.covered }
+
+func (c CheckpointCandidate) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
+	if c.tree == nil {
+		return ErrInvalid
+	}
+	return c.tree.Walk(ctx, visit)
+}
 
 func (m *Persistent) Freeze(expected model.CommitSeq) (*FrozenCheckpoint, error) {
 	m.mu.Lock()

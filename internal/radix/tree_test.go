@@ -1,6 +1,8 @@
 package radix
 
 import (
+	"context"
+	"math"
 	"math/rand"
 	"sync"
 	"testing"
@@ -142,6 +144,42 @@ func TestBuildLookupUpdateAndPrune(t *testing.T) {
 	}
 	if tree.Root() != 0 {
 		t.Fatalf("root=%v", tree.Root())
+	}
+}
+
+func TestWalkVisitsLeavesInIDOrder(t *testing.T) {
+	store := newMemoryNodeStore()
+	tree, _ := Open(store, 0, 0, 1<<20)
+	want := []model.ID{1, 511, 512, model.ID(uint64(1) << 63), model.ID(math.MaxUint64)}
+	mutations := make([]Mutation, len(want))
+	addresses := make(map[model.ID]recordlog.VAddr, len(want))
+	for index, id := range want {
+		addr := testDataAddr(t, recordlog.SegmentID(index+1), 64)
+		mutations[index] = Mutation{ID: id, Addr: addr}
+		addresses[id] = addr
+	}
+	var err error
+	tree, err = tree.Build(1, mutations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []model.ID
+	if err := tree.Walk(context.Background(), func(id model.ID, addr recordlog.VAddr) error {
+		if addr != addresses[id] {
+			t.Fatalf("id=%d addr=%v want=%v", id, addr, addresses[id])
+		}
+		got = append(got, id)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got=%v want=%v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("got=%v want=%v", got, want)
+		}
 	}
 }
 
