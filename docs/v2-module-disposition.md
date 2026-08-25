@@ -23,6 +23,7 @@
 |---|---|---|
 | Public `Store`/`Batch` API 契约 | Rewrite | 保留 Stable-ID 与原子 Batch；删除 LogicalRevision，条件提交只比较 Mapping 当前 VAddr，公共层至多暴露 opaque observation token |
 | `internal/base` | Rewrite | 保留 ID 和错误语义；重新生成 VAddr、LogPos 和边界检查，避免共享旧地址编码器 |
+| `internal/filelock` | Keep | 单目录进程级独占锁与 v2 生命周期职责完全一致；v2 Open 在任何可变恢复前取得锁，Close 最后释放 |
 | `internal/allocator` | Delete；由 `internal/idalloc` Rewrite | 保留 durable high watermark 不变量；直接依赖新 ReserveRecord 契约 |
 | `internal/batch` | Delete；由 `internal/transaction` Rewrite | 保留状态机和最终 mutation 折叠语义；删除旧 Frame/AppendLog 依赖 |
 | `internal/commit` | Delete；由 `internal/coordinator` Rewrite | 保留冲突验证和 Mapping 发布不变量，但删除旧 AppendLog/FramePart 接口 |

@@ -313,6 +313,9 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := Open(context.Background(), root, config); !errors.Is(err, base.ErrLocked) {
+		t.Fatalf("second open err=%v", err)
+	}
 	batch, err := store.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)

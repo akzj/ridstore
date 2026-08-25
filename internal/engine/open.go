@@ -7,6 +7,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/coordinator"
+	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -38,23 +39,30 @@ func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 	if root == "" || config.MappingCacheBytes == 0 || config.MaxCheckpointEntries == 0 {
 		return nil, base.ErrInvalidConfig
 	}
-	catalog, err := storecatalog.OpenManager(root, nil)
+	dirLock, err := filelock.Acquire(root)
 	if err != nil {
 		return nil, err
+	}
+	failLock := func(cause error) (*Store, error) {
+		return nil, errors.Join(cause, dirLock.Close())
+	}
+	catalog, err := storecatalog.OpenManager(root, nil)
+	if err != nil {
+		return failLock(err)
 	}
 	log, err := recordlog.Open(root, config.RecordLog, catalog)
 	if err != nil {
-		return nil, err
+		return failLock(err)
 	}
 	failLog := func(cause error) (*Store, error) {
-		return nil, errors.Join(cause, log.Close())
+		return nil, errors.Join(cause, log.Close(), dirLock.Close())
 	}
 	physicalMapping, err := mapstore.Open(root, catalog)
 	if err != nil {
 		return failLog(err)
 	}
 	fail := func(cause error) (*Store, error) {
-		return nil, errors.Join(cause, physicalMapping.Close(), log.Close())
+		return nil, errors.Join(cause, physicalMapping.Close(), log.Close(), dirLock.Close())
 	}
 	manifest := catalog.Snapshot()
 	tree, err := radix.Open(physicalMapping, manifest.MappingRoot, manifest.CoveredCommitSeq, config.MappingCacheBytes)
@@ -102,5 +110,6 @@ func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 	store.mapStore = physicalMapping
 	store.catalog = catalog
 	store.maxStats = config.MaxCheckpointEntries
+	store.dirLock = dirLock
 	return store, nil
 }

@@ -37,6 +37,8 @@ Engine fail closed，重启以 durable Manifest 为准。
 - MapStore 独占 Mapping Node append 与 fsync；
 - Catalog 独占 Manifest generation；并发 Data/Map rotation 通过 generation CAS 使过期 checkpoint 失败；
 - SegmentStats 是 checkpoint 派生数据，不进入 Put/Commit 热路径，也不单独授权 GC 删除。
+- Engine Open 在任何 RecordLog/MapStore 恢复前取得目录独占锁，Open 失败释放，Close 在所有文件关闭后
+  最后释放；同一目录不能同时存在两个 v2 writer。
 
 ## 3. 精确统计路径
 
@@ -59,12 +61,13 @@ Engine fail closed，重启以 durable Manifest 为准。
 - SegmentStats 覆盖多 Segment、active 排除、身份错误、未知 Segment和预算上限；
 - 小 Segment 触发 RecordLog rotation 后，Checkpoint 同代安装非空精确统计；
 - Close/Reopen 从新 Root 和 ReplayStart 恢复并读取原值；
+- 第二次 Open 返回 `ErrLocked`，第一个 Store Close 后可重新 Open；
 - 相关包 race、全仓 test、vet 与 diff check 通过。
 
 ## 5. 尚未完成
 
 - checkpoint 的 Catalog/MapStore/RecordLog syscall fault injection 与进程崩溃矩阵；
-- v2 Create、目录独占锁和初始化恢复；
+- v2 Create 和初始化恢复；
 - Delta hard-limit admission 与有界 chunk builder；
 - Relocation、Data GC、Mapping GC；
 - 顶层公开 API 切换和旧 v1 模块删除。

@@ -8,6 +8,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/coordinator"
+	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -57,6 +58,7 @@ type Store struct {
 	closed    bool
 	fault     error
 	maxStats  uint64
+	dirLock   *filelock.Lock
 }
 
 func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
@@ -210,6 +212,9 @@ func (s *Store) Close() error {
 	result = errors.Join(result, s.log.Close())
 	if s.mapStore != nil {
 		result = errors.Join(result, s.mapStore.Close())
+	}
+	if s.dirLock != nil {
+		result = errors.Join(result, s.dirLock.Close())
 	}
 	return result
 }
