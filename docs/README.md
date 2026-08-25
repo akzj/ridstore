@@ -54,6 +54,8 @@ v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构�
 | `v2-mapping-format.md` | Implemented foundation | v2 immutable radix node 和 Mapping Segment 格式 |
 | `v2-m1-review.md` | Implemented, pending review | v2 基础类型、codec 与 Catalog 审计 |
 | `v2-m2-review.md` | Implemented, pending review | v2 RecordLog、rotation recovery 与 Reader Pin 审计 |
+| `v2-m3-review.md` | Implemented | v2 transaction、Coordinator 与最小 Engine 闭环 |
+| `v2-m4-review.md` | Core implemented, crash review pending | v2 Persistent Mapping、Replay 与原子 Checkpoint 闭环 |
 | `design.md` | Accepted architecture | 总体边界与不变量 |
 | `positioning-vs-lsm.md` | Accepted boundary | 防止漂移成 RocksDB 替代品 |
 | `api-contract.md` | Development contract v1 | 第一版 Library API |

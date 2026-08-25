@@ -77,6 +77,10 @@ Checkpoint merge 在分配临时表前检查显式 entry budget，超限保留 f
 无界内存换取进度。后续仍需实现 Delta admission/backpressure 和有界 chunk builder，才能让超大
 checkpoint 在固定内存内继续推进。
 
-尚未实现：Coordinator checkpoint barrier、RecordLog durable cut、Catalog checkpoint tuple 接线、
-Delta admission、SegmentStats 和 Mapping GC。旧的全量内存 Mapping 仍只支撑尚未切换的 M3/replay
-测试，不能成为 v2 Open 的生产后端。
+Coordinator checkpoint barrier、RecordLog durable cut、Catalog checkpoint tuple、精确 SegmentStats 与
+v2 Open/Replay 已接线。Engine 只接受 `mapping.Persistent`；旧的全量内存 Mapping 不再是 Engine
+后端，仅待迁移为 Mapping 模型测试 oracle 后删除生产定义。
+
+当前尚未实现 Delta admission/backpressure、有界 chunk builder、Mapping GC、v2 Create/目录锁以及
+checkpoint syscall crash matrix。第一版精确 SegmentStats 通过顺序遍历 candidate Root，并利用
+`RecordLog.Inspect` 只读取物理 Header 与 Put protocol header，不读取 Value body。
