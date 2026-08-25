@@ -50,7 +50,21 @@ func (m *Manager) SnapshotRecordLog() recordlog.CatalogSnapshot {
 }
 
 func (m *Manager) SnapshotMapStore() mapstore.CatalogSnapshot {
-	current := m.Snapshot()
+	return mapStoreSnapshot(m.Snapshot())
+}
+
+func (m *Manager) InstallMapStoreRotation(expect uint64, sealed mapstore.SegmentRef, newActive, next model.MapSegmentID) (mapstore.CatalogSnapshot, error) {
+	installed, err := m.InstallMapRotation(expect, MapRotation{
+		SealedOld: MapSegmentSummary{SegmentID: sealed.SegmentID, ValidEnd: sealed.ValidEnd},
+		NewActive: newActive, NextID: next,
+	})
+	if err != nil {
+		return mapstore.CatalogSnapshot{}, err
+	}
+	return mapStoreSnapshot(installed), nil
+}
+
+func mapStoreSnapshot(current Manifest) mapstore.CatalogSnapshot {
 	sealed := make([]mapstore.SegmentRef, len(current.SealedMapSegments))
 	for index, summary := range current.SealedMapSegments {
 		sealed[index] = mapstore.SegmentRef{SegmentID: summary.SegmentID, ValidEnd: summary.ValidEnd}

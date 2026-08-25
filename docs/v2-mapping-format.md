@@ -53,6 +53,8 @@ CoveredCommitSeq、EntryCount、payload CRC 和 header CRC。
 当前已实现：codec、golden digest、decoder fuzz seed、Segment codec、初始化 active file、顺序 append、
 sync、按 Catalog live set Open/Read、sealed 全量验证、active partial-tail repair。
 
-尚未实现：带 journal 的 Mapping rotation、bounded Node Cache、COW builder、双 Overlay checkpoint 和
-Catalog checkpoint tuple 安装。当前 `Append` 空间不足返回 `ErrFull`，不会在没有 rotation journal
-的情况下偷偷切换文件。
+Mapping rotation 使用 durable journal，顺序为 `journal -> seal old -> create new -> Catalog CAS ->
+remove journal`；Open 会从 footer 未写、部分写、已完整写、文件已 rename 或 Catalog 已安装的状态继续。
+Catalog 并发 generation 改变不会让它改写其他字段，只有 Mapping file-set 前提不变时才重试。
+
+尚未实现：bounded Node Cache、COW builder、双 Overlay checkpoint 和 Catalog checkpoint tuple 安装。

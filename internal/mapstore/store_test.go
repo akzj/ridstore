@@ -13,6 +13,16 @@ import (
 type staticCatalog struct{ state CatalogSnapshot }
 
 func (c *staticCatalog) SnapshotMapStore() CatalogSnapshot { return c.state.Clone() }
+func (c *staticCatalog) InstallMapStoreRotation(expect uint64, sealed SegmentRef, newActive, next model.MapSegmentID) (CatalogSnapshot, error) {
+	if c.state.Generation != expect || c.state.ActiveSegment != sealed.SegmentID || c.state.NextSegment != newActive || next != newActive+1 {
+		return CatalogSnapshot{}, ErrInvalid
+	}
+	c.state.Generation++
+	c.state.SealedSegments = append(c.state.SealedSegments, sealed)
+	c.state.ActiveSegment = newActive
+	c.state.NextSegment = next
+	return c.state.Clone(), nil
+}
 
 func initialState() CatalogSnapshot {
 	return CatalogSnapshot{
@@ -148,13 +158,14 @@ func TestStoreRejectsRootPastIncompleteTail(t *testing.T) {
 	}
 }
 
-func TestStoreReturnsFullWithoutMovingAddress(t *testing.T) {
+func TestStoreRotatesBeforeAssigningNextAddress(t *testing.T) {
 	root := t.TempDir()
 	state := initialState()
 	if err := CreateInitialSegment(root, state.StoreID, state.SegmentSize); err != nil {
 		t.Fatal(err)
 	}
-	store, err := Open(root, &staticCatalog{state: state})
+	catalog := &staticCatalog{state: state}
+	store, err := Open(root, catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,11 +174,19 @@ func TestStoreReturnsFullWithoutMovingAddress(t *testing.T) {
 	for index := range slots {
 		slots[index], _ = mapValue(index)
 	}
-	if _, err := store.Append(1, 0, 1, slots); err != nil {
+	first, err := store.Append(1, 0, 1, slots)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(1, 0, 1, slots); !errors.Is(err, ErrFull) {
-		t.Fatalf("err=%v", err)
+	second, err := store.Append(1, 0, 1, slots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SegmentID() != 1 || second.SegmentID() != 2 || catalog.state.ActiveSegment != 2 || len(catalog.state.SealedSegments) != 1 {
+		t.Fatalf("first=%v second=%v state=%+v", first, second, catalog.state)
+	}
+	if _, err := store.Read(first); err != nil {
+		t.Fatal(err)
 	}
 }
 

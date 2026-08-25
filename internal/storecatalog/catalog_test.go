@@ -4,9 +4,60 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
 )
+
+func TestManagerDrivesMapStoreRotation(t *testing.T) {
+	root := t.TempDir()
+	manifest := testManifest()
+	manifest.ActiveMapSegmentID = 1
+	manifest.NextMapSegmentID = 2
+	manifest.SealedMapSegments = nil
+	manifest.MappingRoot = 0
+	manifest.HardLimits.SegmentSize = 8192
+	manifest.HardLimits.MaxValueSize = 64
+	manifest.HardLimits.MaxBatchBytes = 4096
+	manifest.HardLimits.MaxBatchMutations = 4
+	manifest.HardLimits.MaxBatchConditions = 4
+	manifest.HardLimits.MaxRecordLogPayload = 4096
+	if err := Install(root, manifest, nil); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(root, manifest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mapstore.CreateInitialSegment(root, mapstore.StoreID(manifest.StoreUUID), uint32(manifest.HardLimits.SegmentSize)); err != nil {
+		t.Fatal(err)
+	}
+	store, err := mapstore.Open(root, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var slots [mapstore.NodeSlots]uint64
+	for index := range slots {
+		addr, err := model.NewMapAddr(1, mapstore.SegmentHeaderSize+uint32(index)*8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slots[index] = uint64(addr)
+	}
+	first, err := store.Append(1, 0, 1, slots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Append(1, 0, 1, slots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := manager.Snapshot()
+	if first.SegmentID() != 1 || second.SegmentID() != 2 || current.ActiveMapSegmentID != 2 || current.NextMapSegmentID != 3 || len(current.SealedMapSegments) != 1 {
+		t.Fatalf("first=%v second=%v manifest=%+v", first, second, current)
+	}
+}
 
 func TestManagerInstallsTypedUpdates(t *testing.T) {
 	t.Parallel()

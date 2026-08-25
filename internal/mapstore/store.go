@@ -25,6 +25,7 @@ type Store struct {
 	mu sync.RWMutex
 
 	root     string
+	catalog  CatalogPort
 	state    CatalogSnapshot
 	active   *segmentFile
 	sealed   map[model.MapSegmentID]*segmentFile
@@ -68,25 +69,33 @@ func Open(root string, catalog CatalogPort) (*Store, error) {
 	if root == "" || catalog == nil {
 		return nil, ErrInvalid
 	}
-	state := catalog.SnapshotMapStore()
+	state, err := recoverRotation(root, catalog)
+	if err != nil {
+		return nil, err
+	}
 	if err := state.validate(); err != nil {
 		return nil, err
 	}
-	store := &Store{root: root, state: state.Clone(), sealed: make(map[model.MapSegmentID]*segmentFile), nextSeq: 1}
+	store := &Store{root: root, catalog: catalog, state: state.Clone(), sealed: make(map[model.MapSegmentID]*segmentFile), nextSeq: 1}
 	fail := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, store.closeFiles())
 	}
+	var lastSeq uint64
 	for _, summary := range state.SealedSegments {
 		segment, err := openSealed(root, state.headerFor(summary.SegmentID), summary)
 		if err != nil {
 			return fail(err)
 		}
 		store.sealed[summary.SegmentID] = segment
+		if segment.summary.NodeCount != 0 && lastSeq != 0 && segment.summary.FirstSeq <= lastSeq {
+			return fail(ErrCorrupt)
+		}
 		if segment.summary.NodeCount != 0 && segment.summary.LastSeq >= store.nextSeq {
 			if segment.summary.LastSeq == math.MaxUint64 {
 				return fail(ErrCorrupt)
 			}
 			store.nextSeq = segment.summary.LastSeq + 1
+			lastSeq = segment.summary.LastSeq
 		}
 	}
 	active, repaired, err := openActive(root, state.headerFor(state.ActiveSegment), state.Root)
@@ -94,6 +103,9 @@ func Open(root string, catalog CatalogPort) (*Store, error) {
 		return fail(err)
 	}
 	store.active = active
+	if active.summary.NodeCount != 0 && lastSeq != 0 && active.summary.FirstSeq <= lastSeq {
+		return fail(ErrCorrupt)
+	}
 	if active.summary.NodeCount != 0 && active.summary.LastSeq >= store.nextSeq {
 		if active.summary.LastSeq == math.MaxUint64 {
 			return fail(ErrCorrupt)
@@ -134,7 +146,18 @@ func (s *Store) Append(level uint8, prefix uint64, covered model.CommitSeq, slot
 		return 0, err
 	}
 	if uint64(s.active.summary.ValidEnd)+uint64(len(encoded))+uint64(SegmentFooterSize) > uint64(s.state.SegmentSize) {
-		return 0, ErrFull
+		if s.active.summary.NodeCount == 0 {
+			return 0, ErrFull
+		}
+		if err := s.rotateLocked(); err != nil {
+			s.poisoned = true
+			return 0, errors.Join(ErrPoisoned, err)
+		}
+		build.NodeSeq = s.nextSeq
+		encoded, err = EncodeNode(build)
+		if err != nil || uint64(s.active.summary.ValidEnd)+uint64(len(encoded))+uint64(SegmentFooterSize) > uint64(s.state.SegmentSize) {
+			return 0, errors.Join(ErrFull, err)
+		}
 	}
 	offset := s.active.summary.ValidEnd
 	if err := writeFullAt(s.active.file, encoded, int64(offset)); err != nil {
@@ -154,6 +177,42 @@ func (s *Store) Append(level uint8, prefix uint64, covered model.CommitSeq, slot
 	s.active.summary.ValidEnd += uint32(len(encoded))
 	s.nextSeq++
 	return addr, nil
+}
+
+func (s *Store) rotateLocked() error {
+	fresh := s.catalog.SnapshotMapStore()
+	if err := fresh.validate(); err != nil {
+		return err
+	}
+	if fresh.StoreID != s.state.StoreID || fresh.SegmentSize != s.state.SegmentSize || fresh.ActiveSegment != s.state.ActiveSegment || fresh.NextSegment != s.state.NextSegment {
+		return ErrCorrupt
+	}
+	journal := rotationJournal{
+		BaseGeneration: fresh.Generation, StoreID: fresh.StoreID, SegmentSize: fresh.SegmentSize,
+		Old: s.active.summary, NewActive: fresh.NextSegment, NextSegment: fresh.NextSegment + 1,
+	}
+	if err := installRotationJournal(s.root, journal); err != nil {
+		return err
+	}
+	sealed, err := sealActive(s.root, s.active, journal.Old)
+	if err != nil {
+		return err
+	}
+	newActive, err := createActive(s.root, fresh.headerFor(journal.NewActive))
+	if err != nil {
+		_ = sealed.file.Close()
+		return err
+	}
+	installed, err := installCatalogRotation(s.catalog, fresh, journal)
+	if err != nil {
+		_ = sealed.file.Close()
+		_ = newActive.file.Close()
+		return err
+	}
+	s.sealed[journal.Old.SegmentID] = sealed
+	s.active = newActive
+	s.state = installed
+	return removeRotationJournal(s.root)
 }
 
 func (s *Store) Sync() error {

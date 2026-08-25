@@ -70,4 +70,5 @@ func (s CatalogSnapshot) headerFor(id model.MapSegmentID) SegmentHeader {
 
 type CatalogPort interface {
 	SnapshotMapStore() CatalogSnapshot
+	InstallMapStoreRotation(expectGeneration uint64, sealed SegmentRef, newActive, next model.MapSegmentID) (CatalogSnapshot, error)
 }
