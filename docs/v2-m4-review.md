@@ -62,11 +62,14 @@ Engine fail closed，重启以 durable Manifest 为准。
 - 小 Segment 触发 RecordLog rotation 后，Checkpoint 同代安装非空精确统计；
 - Close/Reopen 从新 Root 和 ReplayStart 恢复并读取原值；
 - 第二次 Open 返回 `ErrLocked`，第一个 Store Close 后可重新 Open；
+- Checkpoint Manifest 的 write、file sync、rename、directory sync 四个失败边界均 fail closed；fresh Open
+  分别从旧 generation replay 或从已发布新 generation 恢复，已提交值不丢失；
 - 相关包 race、全仓 test、vet 与 diff check 通过。
 
 ## 5. 尚未完成
 
-- checkpoint 的 Catalog/MapStore/RecordLog syscall fault injection 与进程崩溃矩阵；
+- checkpoint 的 Catalog syscall-error matrix 已覆盖；MapStore/RecordLog syscall fault injection 与完整
+  进程崩溃矩阵仍未完成；
 - v2 Create 和初始化恢复；
 - Delta hard-limit admission 与有界 chunk builder；
 - Relocation、Data GC、Mapping GC；

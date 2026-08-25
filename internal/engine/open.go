@@ -30,6 +30,10 @@ type OpenConfig struct {
 // opens the persistent Mapping root first and replays only the RecordLog tail
 // after the Manifest cut into that same runtime Mapping.
 func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
+	return open(ctx, root, config, nil)
+}
+
+func open(ctx context.Context, root string, config OpenConfig, catalogHook storecatalog.FaultHook) (*Store, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -46,7 +50,7 @@ func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 	failLock := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, dirLock.Close())
 	}
-	catalog, err := storecatalog.OpenManager(root, nil)
+	catalog, err := storecatalog.OpenManager(root, catalogHook)
 	if err != nil {
 		return failLock(err)
 	}
