@@ -124,6 +124,14 @@ type AppendResult struct {
 	End  LogPos
 }
 
+// RecordMetadata is the structural information available for both buffered
+// and persisted Records. It intentionally excludes on-disk checksum fields.
+type RecordMetadata struct {
+	PhysicalSize uint32
+	PayloadSize  uint32
+	Addr         VAddr
+}
+
 func NewAppendResult(addr VAddr, physicalSize uint32) (AppendResult, error) {
 	end, err := addr.End(physicalSize)
 	if err != nil {

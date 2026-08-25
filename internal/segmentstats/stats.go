@@ -18,7 +18,7 @@ type Mapping interface {
 }
 
 type Inspector interface {
-	Inspect(context.Context, recordlog.VAddr, uint32) (recordlog.RecordHeader, []byte, error)
+	Inspect(context.Context, recordlog.VAddr, uint32) (recordlog.RecordMetadata, []byte, error)
 }
 
 type FileSet struct {

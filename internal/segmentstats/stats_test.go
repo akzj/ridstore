@@ -31,16 +31,16 @@ func (m fakeMapping) Walk(ctx context.Context, visit func(model.ID, recordlog.VA
 }
 
 type inspectedRecord struct {
-	header recordlog.RecordHeader
+	header recordlog.RecordMetadata
 	prefix []byte
 }
 
 type fakeInspector map[recordlog.VAddr]inspectedRecord
 
-func (f fakeInspector) Inspect(_ context.Context, addr recordlog.VAddr, prefixBytes uint32) (recordlog.RecordHeader, []byte, error) {
+func (f fakeInspector) Inspect(_ context.Context, addr recordlog.VAddr, prefixBytes uint32) (recordlog.RecordMetadata, []byte, error) {
 	record, ok := f[addr]
 	if !ok || uint32(len(record.prefix)) != prefixBytes {
-		return recordlog.RecordHeader{}, nil, errors.New("missing record")
+		return recordlog.RecordMetadata{}, nil, errors.New("missing record")
 	}
 	return record.header, append([]byte(nil), record.prefix...), nil
 }
@@ -57,7 +57,7 @@ func addPut(t *testing.T, records fakeInspector, segment recordlog.SegmentID, of
 		t.Fatal(err)
 	}
 	records[addr] = inspectedRecord{
-		header: recordlog.RecordHeader{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr},
+		header: recordlog.RecordMetadata{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr},
 		prefix: append([]byte(nil), payload[:recordcodec.PutHeaderSize]...),
 	}
 	return addr

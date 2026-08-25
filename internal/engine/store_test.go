@@ -88,18 +88,18 @@ func (l *memoryLog) Read(_ context.Context, addr recordlog.VAddr) ([]byte, error
 	return append([]byte(nil), payload...), nil
 }
 
-func (l *memoryLog) Inspect(_ context.Context, addr recordlog.VAddr, prefixBytes uint32) (recordlog.RecordHeader, []byte, error) {
+func (l *memoryLog) Inspect(_ context.Context, addr recordlog.VAddr, prefixBytes uint32) (recordlog.RecordMetadata, []byte, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	payload, ok := l.records[addr]
 	if !ok || prefixBytes > uint32(len(payload)) {
-		return recordlog.RecordHeader{}, nil, recordlog.ErrInvalidVAddr
+		return recordlog.RecordMetadata{}, nil, recordlog.ErrInvalidVAddr
 	}
 	physical, err := recordlog.PhysicalRecordSize(uint64(len(payload)))
 	if err != nil {
-		return recordlog.RecordHeader{}, nil, err
+		return recordlog.RecordMetadata{}, nil, err
 	}
-	return recordlog.RecordHeader{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr}, append([]byte(nil), payload[:prefixBytes]...), nil
+	return recordlog.RecordMetadata{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr}, append([]byte(nil), payload[:prefixBytes]...), nil
 }
 
 func (l *memoryLog) Status() recordlog.Status {

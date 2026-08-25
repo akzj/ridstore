@@ -22,7 +22,7 @@ import (
 type Log interface {
 	coordinator.Appender
 	Read(context.Context, recordlog.VAddr) ([]byte, error)
-	Inspect(context.Context, recordlog.VAddr, uint32) (recordlog.RecordHeader, []byte, error)
+	Inspect(context.Context, recordlog.VAddr, uint32) (recordlog.RecordMetadata, []byte, error)
 	Close() error
 }
 

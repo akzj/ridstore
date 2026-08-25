@@ -215,17 +215,18 @@ func (l *Log) Read(ctx context.Context, addr VAddr) ([]byte, error) {
 	return payload, errors.Join(readErr, releaseErr)
 }
 
-// Inspect validates the physical Record header and returns only the requested
-// payload prefix. It deliberately does not validate the full payload CRC.
-func (l *Log) Inspect(ctx context.Context, addr VAddr, prefixBytes uint32) (RecordHeader, []byte, error) {
+// Inspect returns structural metadata and only the requested payload prefix.
+// Persisted records have their physical header validated; the full payload CRC
+// is deliberately not read or validated.
+func (l *Log) Inspect(ctx context.Context, addr VAddr, prefixBytes uint32) (RecordMetadata, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return RecordHeader{}, nil, err
+		return RecordMetadata{}, nil, err
 	}
 	if !addr.Valid() {
-		return RecordHeader{}, nil, ErrInvalidVAddr
+		return RecordMetadata{}, nil, ErrInvalidVAddr
 	}
 	l.submitMu.RLock()
 	closed := l.closing
@@ -234,35 +235,35 @@ func (l *Log) Inspect(ctx context.Context, addr VAddr, prefixBytes uint32) (Reco
 	terminal := l.terminal
 	if terminal != nil {
 		l.stateMu.RUnlock()
-		return RecordHeader{}, nil, terminal
+		return RecordMetadata{}, nil, terminal
 	}
 	if closed {
 		l.stateMu.RUnlock()
-		return RecordHeader{}, nil, ErrClosed
+		return RecordMetadata{}, nil, ErrClosed
 	}
 	if payload, exists := l.pending[addr]; exists {
 		if prefixBytes > uint32(len(payload)) {
 			l.stateMu.RUnlock()
-			return RecordHeader{}, nil, ErrCorrupt
+			return RecordMetadata{}, nil, ErrCorrupt
 		}
 		physical, err := PhysicalRecordSize(uint64(len(payload)))
 		if err != nil || !addr.MatchesPhysicalSize(physical) {
 			l.stateMu.RUnlock()
-			return RecordHeader{}, nil, errors.Join(ErrCorrupt, err)
+			return RecordMetadata{}, nil, errors.Join(ErrCorrupt, err)
 		}
-		header := RecordHeader{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr}
+		metadata := RecordMetadata{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr}
 		prefix := append([]byte(nil), payload[:prefixBytes]...)
 		l.stateMu.RUnlock()
-		return header, prefix, nil
+		return metadata, prefix, nil
 	}
 	l.stateMu.RUnlock()
 	pin, err := l.registry.pin(addr.SegmentID())
 	if err != nil {
-		return RecordHeader{}, nil, err
+		return RecordMetadata{}, nil, err
 	}
 	header, prefix, inspectErr := pin.inspect(addr, prefixBytes)
 	releaseErr := pin.release()
-	return header, prefix, errors.Join(inspectErr, releaseErr)
+	return RecordMetadata{PhysicalSize: header.PhysicalSize, PayloadSize: header.PayloadSize, Addr: header.Addr}, prefix, errors.Join(inspectErr, releaseErr)
 }
 
 func (l *Log) Scan(ctx context.Context, from LogPos, visit func(AppendResult, []byte) error) error {
