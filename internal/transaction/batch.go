@@ -83,14 +83,21 @@ type Batch struct {
 }
 
 func New(id model.BatchID, limits Limits, log Appender, allocator IDAllocator) (*Batch, error) {
-	if id == 0 || limits.MaxValueSize == 0 || limits.MaxBatchBytes == 0 || limits.MaxBatchMutations == 0 || limits.MaxBatchConditions == 0 ||
-		limits.MaxValueSize > limits.MaxBatchBytes || limits.MaxBatchMutations > math.MaxUint32 || limits.MaxBatchConditions > math.MaxUint32 || log == nil || allocator == nil {
+	if id == 0 || ValidateLimits(limits) != nil || log == nil || allocator == nil {
 		return nil, fmt.Errorf("transaction configuration: %w", base.ErrInvalidConfig)
 	}
 	return &Batch{
 		id: id, state: StateOpen, limits: limits, log: log, allocator: allocator,
 		mutations: make(map[model.ID]Mutation), conditions: make(map[model.ID]mapping.Condition),
 	}, nil
+}
+
+func ValidateLimits(limits Limits) error {
+	if limits.MaxValueSize == 0 || limits.MaxBatchBytes == 0 || limits.MaxBatchMutations == 0 || limits.MaxBatchConditions == 0 ||
+		limits.MaxValueSize > limits.MaxBatchBytes || limits.MaxBatchMutations > math.MaxUint32 || limits.MaxBatchConditions > math.MaxUint32 {
+		return base.ErrInvalidConfig
+	}
+	return nil
 }
 
 func (b *Batch) ID() model.BatchID { return b.id }
