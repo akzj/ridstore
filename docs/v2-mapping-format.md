@@ -57,4 +57,9 @@ Mapping rotation 使用 durable journal，顺序为 `journal -> seal old -> crea
 remove journal`；Open 会从 footer 未写、部分写、已完整写、文件已 rename 或 Catalog 已安装的状态继续。
 Catalog 并发 generation 改变不会让它改写其他字段，只有 Mapping file-set 前提不变时才重试。
 
-尚未实现：bounded Node Cache、COW builder、双 Overlay checkpoint 和 Catalog checkpoint tuple 安装。
+`internal/radix` 已实现 bounded immutable Node Cache、同地址并发 miss 合并、路径 identity 校验和
+增量 COW builder。Builder 先按 ID 排序并按 prefix 聚合，因此同一 checkpoint 中每个受影响的
+leaf/internal node 最多重写一次；未变化的 subtree 继续引用旧 MapAddr，删除最后一个 slot 会向上剪枝。
+Builder 只产生新 Root，不执行 fsync 或发布 Catalog；durability 仍由上层 checkpoint 状态机负责。
+
+尚未实现：双 Overlay checkpoint、Revision resolver、Catalog checkpoint tuple 安装和 Mapping GC。
