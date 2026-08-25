@@ -1,6 +1,6 @@
 # ridstore v2 Mapping Format
 
-状态：Checkpoint runtime implemented, Delta admission pending
+状态：Checkpoint runtime and Delta hard admission implemented
 
 ## 1. 边界
 
@@ -68,19 +68,25 @@ Builder 只产生新 Root，不执行 fsync 或发布 Catalog；durability 仍�
 - Root leaf 只保存 VAddr；Lookup 和条件解析均不读取 PutRecord，VAddr 本身就是内部一致性 token；
 - ResolveGroup 对 cold read 使用 epoch 重试，不在 Mapping 锁内执行磁盘 I/O；
 - PublishGroup 只修改 active Delta，并保持整个 group 的原子可见性；
+- Commit 在 Prepare 和 durable Descriptor 之前预留 Delta，Publish 消费实际 entry charge 并退回余量；
 - Freeze 原子切换 active Delta，失败/Abort 不丢弃 frozen layer；
 - Build 折叠所有待处理 frozen layer，生成并 fsync candidate Root；
 - 只有外部 Catalog 已经持久化完整 checkpoint tuple 后，Install 才释放对应 frozen prefix；
 - Freeze 后产生的新 Commit 留在新 active Delta，不会混入较早的 candidate Root。
 
-Checkpoint merge 在分配临时表前检查显式 entry budget，超限保留 frozen layers 并返回错误，不以
-无界内存换取进度。后续仍需实现 Delta admission/backpressure 和有界 chunk builder，才能让超大
-checkpoint 在固定内存内继续推进。
+Delta 的 charged/reserved 总量受 hard limit 约束；hard pressure 在 durable 边界前触发 Engine
+Checkpoint 并重试。Freeze/Abort 不释放 charge，只有 durable Catalog 已安装且 runtime Root 成功切换后
+才释放精确 frozen prefix。当前配置强制 hard limit 所允许的 entry 数不超过 Builder entry budget，避免
+Commit 可以被接纳、Checkpoint 却永久无法推进。soft pressure 目前只形成信号语义，尚未启动后台主动
+Checkpoint。
+
+Checkpoint merge 仍使用一次性 `map + sorted slice`，只具备 entry 上限，不具备严格的临时字节上限。
+后续仍需实现有界 chunk/run merge，才能在保持 Delta hard admission 的同时提高可配置上限。
 
 Coordinator checkpoint barrier、RecordLog durable cut、Catalog checkpoint tuple、精确 SegmentStats 与
 v2 Open/Replay 已接线。Engine 只接受 `mapping.Persistent`；旧的全量内存 Mapping 不再是 Engine
 后端，仅待迁移为 Mapping 模型测试 oracle 后删除生产定义。
 
-当前尚未实现 Delta admission/backpressure、有界 chunk builder、Mapping GC、完整 checkpoint syscall
+当前尚未实现 soft-limit 后台调度、有界 chunk builder、Mapping GC、完整 MapStore/RecordLog syscall
 crash matrix。v2 Create 与目录锁已经接入。第一版精确 SegmentStats 通过顺序遍历 candidate Root，并利用
 `RecordLog.Inspect` 只读取物理 Header 与 Put protocol header，不读取 Value body。

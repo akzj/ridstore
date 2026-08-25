@@ -9,7 +9,9 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/mapping"
+	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
+	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/transaction"
@@ -126,7 +128,7 @@ func newBatch(t *testing.T, id model.BatchID, log *fakeLog) *transaction.Batch {
 	return b
 }
 
-func newCoordinator(t *testing.T, log *fakeLog, current *mapping.Mapping) *Coordinator {
+func newCoordinator(t *testing.T, log *fakeLog, current mapping.Index) *Coordinator {
 	t.Helper()
 	c, err := New(current.CoveredCommitSeq()+1, log, current, Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 1 << 20})
 	if err != nil {
@@ -138,6 +140,34 @@ func newCoordinator(t *testing.T, log *fakeLog, current *mapping.Mapping) *Coord
 		}
 	})
 	return c
+}
+
+type coordinatorNodeStore struct{}
+
+func (coordinatorNodeStore) Read(model.MapAddr) (mapstore.Node, error) {
+	return mapstore.Node{}, mapping.ErrCorrupt
+}
+
+func (coordinatorNodeStore) Append(uint8, uint64, model.CommitSeq, [mapstore.NodeSlots]uint64) (model.MapAddr, error) {
+	return 0, mapping.ErrCorrupt
+}
+
+func (coordinatorNodeStore) Sync() error { return nil }
+
+func newPersistentMapping(t *testing.T) *mapping.Persistent {
+	t.Helper()
+	nodes := coordinatorNodeStore{}
+	tree, err := radix.Open(nodes, 0, 0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
+		MaxCheckpointEntries: 16, DeltaSoftLimitBytes: 512, DeltaHardLimitBytes: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return current
 }
 
 func TestCommitWritesDurableDescriptorBeforeMappingPublish(t *testing.T) {
@@ -258,10 +288,30 @@ func TestConflictDoesNotConsumeCommitSequence(t *testing.T) {
 	}
 }
 
+func TestConflictReleasesDeltaReservation(t *testing.T) {
+	log := &fakeLog{}
+	current := newPersistentMapping(t)
+	c := newCoordinator(t, log, current)
+	b := newBatch(t, 10, log)
+	expected, _ := recordlog.NewVAddr(1, 64, 64)
+	if err := b.Put(context.Background(), 1, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ExpectAddress(1, expected); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Commit(context.Background(), b); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("commit err=%v", err)
+	}
+	if charged, reserved, _, _ := current.DeltaUsage(); charged != 0 || reserved != 0 {
+		t.Fatalf("reservation leaked charged=%d reserved=%d", charged, reserved)
+	}
+}
+
 func TestDurabilityFailureMarksCommitUnknownAndFaults(t *testing.T) {
 	wantErr := errors.New("sync failed")
 	log := &fakeLog{syncErr: wantErr, poisoned: true}
-	current := mapping.NewEmpty()
+	current := newPersistentMapping(t)
 	c := newCoordinator(t, log, current)
 	b := newBatch(t, 1, log)
 	if err := b.Put(context.Background(), 1, []byte("value")); err != nil {
@@ -276,6 +326,9 @@ func TestDurabilityFailureMarksCommitUnknownAndFaults(t *testing.T) {
 	}
 	if _, exists, _ := current.Lookup(1); exists {
 		t.Fatal("mapping published after failed durability")
+	}
+	if charged, reserved, _, _ := current.DeltaUsage(); charged != 0 || reserved != 0 {
+		t.Fatalf("reservation leaked charged=%d reserved=%d", charged, reserved)
 	}
 }
 

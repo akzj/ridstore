@@ -56,9 +56,10 @@ type ResolvedChange struct {
 }
 
 type ResolvedProposal struct {
-	Kind     ProposalKind
-	Accepted bool
-	Changes  []ResolvedChange
+	Kind         ProposalKind
+	Accepted     bool
+	DeltaEntries uint64
+	Changes      []ResolvedChange
 }
 
 type GroupPlan struct {
@@ -82,8 +83,9 @@ type Snapshot struct {
 // temporary in-memory model for tests until the v2 Open path is complete.
 type Index interface {
 	Lookup(model.ID) (recordlog.VAddr, bool, error)
+	ReserveDelta([]model.ID) (DeltaReservation, bool, error)
 	ResolveGroup([]Proposal) (GroupPlan, error)
-	PublishGroup(model.CommitSeq, GroupPlan) (PublishResult, error)
+	PublishGroup(model.CommitSeq, GroupPlan, []DeltaReservation) (PublishResult, error)
 	CoveredCommitSeq() model.CommitSeq
 }
 
@@ -122,6 +124,10 @@ func (m *Mapping) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 	return entry, exists, nil
 }
 
+func (m *Mapping) ReserveDelta([]model.ID) (DeltaReservation, bool, error) {
+	return &unlimitedReservation{}, false, nil
+}
+
 func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	if len(proposals) == 0 || uint64(len(proposals)) > math.MaxUint32 {
 		return GroupPlan{}, ErrInvalid
@@ -133,10 +139,14 @@ func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return resolveGroupAt(m.covered, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
+	plan, err := resolveGroupAt(m.covered, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
 		value, ok := m.entries[id]
 		return value, ok, nil
 	})
+	if err == nil {
+		assignDeltaEntries(&plan, nil)
+	}
+	return plan, err
 }
 
 func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(model.ID) (recordlog.VAddr, bool, error)) (GroupPlan, error) {
@@ -195,8 +205,14 @@ func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(
 	return plan, nil
 }
 
-func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan) (PublishResult, error) {
+func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan, reservations []DeltaReservation) (PublishResult, error) {
 	if firstCommitSeq == 0 || len(plan.Proposals) == 0 {
+		return PublishResult{}, ErrInvalid
+	}
+	if err := validateReservations(plan, reservations); err != nil {
+		return PublishResult{}, err
+	}
+	if !validDeltaEntries(plan, nil) {
 		return PublishResult{}, ErrInvalid
 	}
 	if err := validateResolvedPlan(plan); err != nil {
@@ -220,9 +236,13 @@ func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan) (
 		return PublishResult{}, ErrInvalid
 	}
 	result := PublishResult{Committed: uint32(accepted)}
-	for _, proposal := range plan.Proposals {
+	for index, proposal := range plan.Proposals {
 		if !proposal.Accepted {
+			reservations[index].Release()
 			continue
+		}
+		if _, err := consumeReservation(reservations[index], proposal.DeltaEntries); err != nil {
+			return PublishResult{}, err
 		}
 		for _, resolved := range proposal.Changes {
 			if !resolved.Apply {
@@ -239,6 +259,59 @@ func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan) (
 	}
 	m.covered = model.CommitSeq(uint64(firstCommitSeq) + accepted - 1)
 	return result, nil
+}
+
+func assignDeltaEntries(plan *GroupPlan, active map[model.ID]struct{}) {
+	seen := make(map[model.ID]struct{}, len(active))
+	for id := range active {
+		seen[id] = struct{}{}
+	}
+	for proposalIndex := range plan.Proposals {
+		proposal := &plan.Proposals[proposalIndex]
+		if !proposal.Accepted {
+			continue
+		}
+		for _, change := range proposal.Changes {
+			if !change.Apply {
+				continue
+			}
+			if _, exists := seen[change.Change.RecordID]; !exists {
+				proposal.DeltaEntries++
+				seen[change.Change.RecordID] = struct{}{}
+			}
+		}
+	}
+}
+
+func validDeltaEntries(plan GroupPlan, active map[model.ID]struct{}) bool {
+	want := plan
+	want.Proposals = append([]ResolvedProposal(nil), plan.Proposals...)
+	for index := range want.Proposals {
+		want.Proposals[index].DeltaEntries = 0
+	}
+	assignDeltaEntries(&want, active)
+	for index := range plan.Proposals {
+		if plan.Proposals[index].DeltaEntries != want.Proposals[index].DeltaEntries {
+			return false
+		}
+	}
+	return true
+}
+
+func validateReservations(plan GroupPlan, reservations []DeltaReservation) error {
+	if len(reservations) != len(plan.Proposals) {
+		return ErrInvalid
+	}
+	for _, reservation := range reservations {
+		if reservation == nil {
+			return ErrInvalid
+		}
+	}
+	return nil
+}
+
+func consumeReservation(reservation DeltaReservation, entries uint64) (uint64, error) {
+	return reservation.consume(entries)
 }
 
 func (m *Mapping) Snapshot() Snapshot {

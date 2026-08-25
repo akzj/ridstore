@@ -1,6 +1,6 @@
 # ridstore v2 M4 Review
 
-状态：核心运行闭环已实现，checkpoint crash matrix 待完成
+状态：核心运行闭环与 Delta hard admission 已实现，bounded builder 待完成
 
 ## 1. 本阶段结果
 
@@ -34,6 +34,8 @@ Engine fail closed，重启以 durable Manifest 为准。
 - Coordinator 独占 CommitSeq 顺序，并把 checkpoint marker 排在此前已 admission 的 Commit 后；
 - Engine 的 `ops` barrier 只保护 cut、open Batch 和 allocator 快照，不覆盖后台 Root/Stats I/O；
 - Persistent Mapping 独占 active/frozen/root 发布；
+- Persistent Mapping 同时独占 Delta charged/reserved 预算；Coordinator 只持 reservation，Engine 只负责
+  在 hard pressure 时推进 Checkpoint；
 - MapStore 独占 Mapping Node append 与 fsync；
 - Catalog 独占 Manifest generation；并发 Data/Map rotation 通过 generation CAS 使过期 checkpoint 失败；
 - SegmentStats 是 checkpoint 派生数据，不进入 Put/Commit 热路径，也不单独授权 GC 删除。
@@ -66,15 +68,23 @@ Engine fail closed，重启以 durable Manifest 为准。
   Segment；普通 Open 拒绝未完成初始化；
 - Checkpoint Manifest 的 write、file sync、rename、directory sync 四个失败边界均 fail closed；fresh Open
   分别从旧 generation replay 或从已发布新 generation 恢复，已提交值不丢失；
+- Delta reservation 位于 Prepare/durable Descriptor 之前，冲突、取消和 pre-durable 失败会归还；重复更新
+  active hot ID 不重复计费，Freeze/Abort 不释放，Install 只释放精确 frozen prefix；
+- Delta hard pressure 会在不持有 `ops.RLock` 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
+  Close 的并发路径已纳入 race 测试；
+- Open replay 超过本次 Delta hard limit 时确定返回配置错误，不部分发布、不等待运行期 Checkpoint；
+- 配置拒绝 `floor(DeltaHardLimitBytes / 64) > MaxCheckpointEntries`，保证当前 Builder 至少能处理 admission
+  允许形成的最坏 frozen entry 数；
 - 相关包 race、全仓 test、vet 与 diff check 通过。
 
 ## 5. 尚未完成
 
 - checkpoint 的 Catalog syscall-error matrix 已覆盖；MapStore/RecordLog syscall fault injection 与完整
   进程崩溃矩阵仍未完成；
-- Delta hard-limit admission 与有界 chunk builder；
+- soft-limit 后台 Checkpoint 与有界 chunk/run-merge builder；
 - Relocation、Data GC、Mapping GC；
 - 顶层公开 API 切换和旧 v1 模块删除。
 
-因此 M4 目前证明正常执行与重启恢复闭环，不构成 production-ready 声明。下一优先级是补齐
-checkpoint crash matrix；完成后再进入 Relocation/GC，不能先删除旧公开路径。
+因此 M4 目前证明正常执行、重启恢复和 Delta 有界接纳闭环，不构成 production-ready 声明。下一优先级
+是有界 chunk/run-merge Checkpoint builder；完成后继续 MapStore/RecordLog crash matrix，再进入
+Relocation/GC，不能先删除旧公开路径。

@@ -1,6 +1,7 @@
 package mapping
 
 import (
+	"errors"
 	"sync"
 	"testing"
 
@@ -51,7 +52,9 @@ func newPersistentForTest(t *testing.T) (*Persistent, *mapstore.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := OpenPersistent(tree, physical, 1024)
+	current, err := OpenPersistent(tree, physical, PersistentConfig{
+		MaxCheckpointEntries: 1024, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +72,7 @@ func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := current.PublishGroup(1, plan); err != nil {
+	if _, err := current.PublishGroup(1, plan, reservePlan(t, current, plan)); err != nil {
 		t.Fatal(err)
 	}
 	frozen, err := current.Freeze(1)
@@ -86,7 +89,7 @@ func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := current.PublishGroup(2, plan); err != nil {
+	if _, err := current.PublishGroup(2, plan, reservePlan(t, current, plan)); err != nil {
 		t.Fatal(err)
 	}
 	if err := current.InstallCheckpoint(candidate); err != nil {
@@ -109,7 +112,7 @@ func TestPersistentRelocationFromRootUsesAddressCAS(t *testing.T) {
 	oldAddr := testAddr(t, 2, 64)
 	newAddr := testAddr(t, 3, 64)
 	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 9, NewAddr: oldAddr, Operation: OperationPut}}}})
-	if _, err := current.PublishGroup(1, plan); err != nil {
+	if _, err := current.PublishGroup(1, plan, reservePlan(t, current, plan)); err != nil {
 		t.Fatal(err)
 	}
 	frozen, _ := current.Freeze(1)
@@ -124,7 +127,7 @@ func TestPersistentRelocationFromRootUsesAddressCAS(t *testing.T) {
 	if err != nil || !plan.Proposals[0].Changes[0].Apply {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
-	if _, err := current.PublishGroup(2, plan); err != nil {
+	if _, err := current.PublishGroup(2, plan, reservePlan(t, current, plan)); err != nil {
 		t.Fatal(err)
 	}
 	got, exists, err := current.Lookup(9)
@@ -138,7 +141,7 @@ func TestPersistentAbortCheckpointRetainsFrozenLayers(t *testing.T) {
 	defer physical.Close()
 	addr := testAddr(t, 1, 64)
 	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: addr, Operation: OperationPut}}}})
-	_, _ = current.PublishGroup(1, plan)
+	_, _ = current.PublishGroup(1, plan, reservePlan(t, current, plan))
 	first, _ := current.Freeze(1)
 	if err := current.AbortCheckpoint(first); err != nil {
 		t.Fatal(err)
@@ -175,7 +178,7 @@ func TestPersistentCheckpointRejectsTemporaryMemoryOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := current.PublishGroup(1, plan); err != nil {
+	if _, err := current.PublishGroup(1, plan, reservePlan(t, current, plan)); err != nil {
 		t.Fatal(err)
 	}
 	frozen, err := current.Freeze(1)
@@ -189,3 +192,84 @@ func TestPersistentCheckpointRejectsTemporaryMemoryOverflow(t *testing.T) {
 		t.Fatalf("got=%+v exists=%v err=%v", got, exists, err)
 	}
 }
+
+func TestPersistentDeltaChargeTracksLayersUntilInstall(t *testing.T) {
+	current, physical := newPersistentForTest(t)
+	defer physical.Close()
+	firstAddr := testAddr(t, 1, 64)
+	secondAddr := testAddr(t, 1, 128)
+
+	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: firstAddr, Operation: OperationPut}}}})
+	if _, err := current.PublishGroup(1, plan, reservePlan(t, current, plan)); err != nil {
+		t.Fatal(err)
+	}
+	if charged, reserved, _, _ := current.DeltaUsage(); charged != deltaEntryCharge || reserved != 0 {
+		t.Fatalf("first publish charged=%d reserved=%d", charged, reserved)
+	}
+
+	plan, _ = current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: secondAddr, Operation: OperationPut}}}})
+	if _, err := current.PublishGroup(2, plan, reservePlan(t, current, plan)); err != nil {
+		t.Fatal(err)
+	}
+	if charged, reserved, _, _ := current.DeltaUsage(); charged != deltaEntryCharge || reserved != 0 {
+		t.Fatalf("hot update charged=%d reserved=%d", charged, reserved)
+	}
+
+	first, err := current.Freeze(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := current.AbortCheckpoint(first); err != nil {
+		t.Fatal(err)
+	}
+	if charged, _, _, _ := current.DeltaUsage(); charged != deltaEntryCharge {
+		t.Fatalf("abort released charge=%d", charged)
+	}
+
+	second, err := current.Freeze(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := current.BuildCheckpoint(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ = current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewAddr: firstAddr, Operation: OperationPut}}}})
+	if _, err := current.PublishGroup(3, plan, reservePlan(t, current, plan)); err != nil {
+		t.Fatal(err)
+	}
+	if charged, _, _, _ := current.DeltaUsage(); charged != 2*deltaEntryCharge {
+		t.Fatalf("before install charged=%d", charged)
+	}
+	if err := current.InstallCheckpoint(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if charged, reserved, _, _ := current.DeltaUsage(); charged != deltaEntryCharge || reserved != 0 {
+		t.Fatalf("install released wrong prefix charged=%d reserved=%d", charged, reserved)
+	}
+}
+
+func TestPersistentRejectsDeltaLimitLargerThanCheckpointCapacity(t *testing.T) {
+	nodes := emptyNodeStoreForPersistentTest{}
+	tree, err := radix.Open(nodes, 0, 0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenPersistent(tree, nodes, PersistentConfig{
+		MaxCheckpointEntries: 1, DeltaSoftLimitBytes: 64, DeltaHardLimitBytes: 128,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("open err=%v", err)
+	}
+}
+
+type emptyNodeStoreForPersistentTest struct{}
+
+func (emptyNodeStoreForPersistentTest) Read(model.MapAddr) (mapstore.Node, error) {
+	return mapstore.Node{}, ErrCorrupt
+}
+
+func (emptyNodeStoreForPersistentTest) Append(uint8, uint64, model.CommitSeq, [mapstore.NodeSlots]uint64) (model.MapAddr, error) {
+	return 0, ErrCorrupt
+}
+
+func (emptyNodeStoreForPersistentTest) Sync() error { return nil }

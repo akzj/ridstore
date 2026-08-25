@@ -110,5 +110,6 @@ func prepareCheckpointStore(t *testing.T) (string, OpenConfig) {
 		RecordLog:         recordlog.Config{MaxQueuedBytes: 1 << 20, QueueCapacity: 32, BufferBytes: 64 << 10, BufferRecords: 32},
 		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
 		MappingCacheBytes: 1 << 20, MaxCheckpointEntries: 1024,
+		DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
 	}
 }

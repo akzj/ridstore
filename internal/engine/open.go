@@ -25,6 +25,8 @@ type OpenConfig struct {
 	Commit               coordinator.Config
 	MappingCacheBytes    uint64
 	MaxCheckpointEntries uint64
+	DeltaSoftLimitBytes  uint64
+	DeltaHardLimitBytes  uint64
 }
 
 type CreateConfig struct {
@@ -43,7 +45,7 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if root == "" || config.Runtime.MappingCacheBytes == 0 || config.Runtime.MaxCheckpointEntries == 0 {
+	if root == "" || !validOpenConfig(config.Runtime) {
 		return nil, base.ErrInvalidConfig
 	}
 	if err := bootstrap.ValidateHardLimits(config.HardLimits); err != nil {
@@ -83,7 +85,7 @@ func open(ctx context.Context, root string, config OpenConfig, catalogHook store
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if root == "" || config.MappingCacheBytes == 0 || config.MaxCheckpointEntries == 0 {
+	if root == "" || !validOpenConfig(config) {
 		return nil, base.ErrInvalidConfig
 	}
 	dirLock, err := filelock.Acquire(root)
@@ -127,7 +129,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, catalogHook
 	if err != nil {
 		return fail(err)
 	}
-	current, err := mapping.OpenPersistent(tree, physicalMapping, config.MaxCheckpointEntries)
+	current, err := mapping.OpenPersistent(tree, physicalMapping, persistentConfig(config))
 	if err != nil {
 		return fail(err)
 	}
@@ -170,4 +172,16 @@ func openLocked(ctx context.Context, root string, config OpenConfig, catalogHook
 	store.maxStats = config.MaxCheckpointEntries
 	store.dirLock = dirLock
 	return store, nil
+}
+
+func validOpenConfig(config OpenConfig) bool {
+	return config.MappingCacheBytes != 0 && mapping.ValidatePersistentConfig(persistentConfig(config)) == nil
+}
+
+func persistentConfig(config OpenConfig) mapping.PersistentConfig {
+	return mapping.PersistentConfig{
+		MaxCheckpointEntries: config.MaxCheckpointEntries,
+		DeltaSoftLimitBytes:  config.DeltaSoftLimitBytes,
+		DeltaHardLimitBytes:  config.DeltaHardLimitBytes,
+	}
 }

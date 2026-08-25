@@ -204,6 +204,19 @@ func (b *Batch) ExpectAbsent(id model.ID) error {
 	return b.addCondition(mapping.Condition{RecordID: id})
 }
 
+func (b *Batch) MutationIDs() ([]model.ID, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.requireOpen(); err != nil {
+		return nil, err
+	}
+	ids := make([]model.ID, 0, len(b.mutations))
+	for id := range b.mutations {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 func (b *Batch) Prepare() (Prepared, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

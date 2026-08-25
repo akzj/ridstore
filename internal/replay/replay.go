@@ -141,6 +141,14 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 		return corruptAt("commit sequence", err)
 	}
 	proposals := make([]mapping.Proposal, len(group.Descriptors))
+	reservations := make([]mapping.DeltaReservation, len(group.Descriptors))
+	releaseReservations := func() {
+		for _, reservation := range reservations {
+			if reservation != nil {
+				reservation.Release()
+			}
+		}
+	}
 	for i, descriptor := range group.Descriptors {
 		if uint64(descriptor.BatchID) >= result.ReservedBatchIDHigh {
 			return corrupt(errors.New("descriptor batch outside reserved range"))
@@ -153,10 +161,21 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 			return err
 		}
 		proposals[i] = proposal
+		ids := make([]model.ID, len(descriptor.Mutations))
+		for mutationIndex, mutation := range descriptor.Mutations {
+			ids[mutationIndex] = mutation.RecordID
+		}
+		reservation, _, err := current.ReserveDelta(ids)
+		if err != nil {
+			releaseReservations()
+			return errors.Join(base.ErrInvalidConfig, err)
+		}
+		reservations[i] = reservation
 		seenTerminal[descriptor.BatchID] = struct{}{}
 	}
 	plan, err := current.ResolveGroup(proposals)
 	if err != nil {
+		releaseReservations()
 		return corrupt(err)
 	}
 	for i, proposal := range plan.Proposals {
@@ -165,7 +184,8 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 		}
 		result.Statuses[group.Descriptors[i].BatchID] = BatchStatus{State: BatchCommitted, CommitSeq: group.Descriptors[i].CommitSeq}
 	}
-	if _, err := current.PublishGroup(result.NextCommitSeq, plan); err != nil {
+	if _, err := current.PublishGroup(result.NextCommitSeq, plan, reservations); err != nil {
+		releaseReservations()
 		return corrupt(err)
 	}
 	last := group.Descriptors[len(group.Descriptors)-1].CommitSeq

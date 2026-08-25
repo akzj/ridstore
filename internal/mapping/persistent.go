@@ -22,6 +22,7 @@ type persistentDelta struct {
 
 type deltaLayer struct {
 	values map[model.ID]persistentDelta
+	charge uint64
 }
 
 // Persistent is the v2 production Mapping runtime. The complete Mapping is
@@ -40,17 +41,57 @@ type Persistent struct {
 	checkpointID         uint64
 	inCheckpoint         bool
 	maxCheckpointEntries uint64
+	budget               *deltaBudget
 }
 
-func OpenPersistent(root *radix.Tree, syncer NodeSyncer, maxCheckpointEntries uint64) (*Persistent, error) {
-	if root == nil || syncer == nil || maxCheckpointEntries == 0 {
+type PersistentConfig struct {
+	MaxCheckpointEntries uint64
+	DeltaSoftLimitBytes  uint64
+	DeltaHardLimitBytes  uint64
+}
+
+func ValidatePersistentConfig(config PersistentConfig) error {
+	if config.MaxCheckpointEntries == 0 ||
+		config.DeltaHardLimitBytes/deltaEntryCharge > config.MaxCheckpointEntries {
+		return ErrInvalid
+	}
+	if _, err := newDeltaBudget(config.DeltaSoftLimitBytes, config.DeltaHardLimitBytes); err != nil {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig) (*Persistent, error) {
+	if root == nil || syncer == nil || ValidatePersistentConfig(config) != nil {
 		return nil, ErrInvalid
 	}
+	budget, _ := newDeltaBudget(config.DeltaSoftLimitBytes, config.DeltaHardLimitBytes)
 	return &Persistent{
 		root: root, syncer: syncer, covered: root.Covered(),
 		active:               &deltaLayer{values: make(map[model.ID]persistentDelta)},
-		maxCheckpointEntries: maxCheckpointEntries,
+		maxCheckpointEntries: config.MaxCheckpointEntries,
+		budget:               budget,
 	}, nil
+}
+
+func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var entries uint64
+	seen := make(map[model.ID]struct{}, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			return nil, false, ErrInvalid
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, exists := m.active.values[id]; !exists {
+			entries++
+		}
+	}
+	return m.budget.reserve(entries)
 }
 
 func (m *Persistent) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
@@ -81,6 +122,14 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	for {
 		m.mu.RLock()
 		epoch, base, root := m.epoch, m.covered, m.root
+		active := make(map[model.ID]struct{})
+		for _, proposal := range proposals {
+			for _, change := range proposal.Changes {
+				if _, exists := m.active.values[change.RecordID]; exists {
+					active[change.RecordID] = struct{}{}
+				}
+			}
+		}
 		values := make(map[model.ID]persistentDelta, len(ids))
 		misses := make([]model.ID, 0, len(ids))
 		for _, id := range ids {
@@ -108,20 +157,38 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 		if !stable {
 			continue
 		}
-		return resolveGroupAt(base, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
+		plan, err := resolveGroupAt(base, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
 			value := values[id]
 			return value.addr, value.exists, nil
 		})
+		if err == nil {
+			assignDeltaEntries(&plan, active)
+		}
+		return plan, err
 	}
 }
 
-func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan) (PublishResult, error) {
+func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan, reservations []DeltaReservation) (PublishResult, error) {
 	if first == 0 || len(plan.Proposals) == 0 || uint64(len(plan.Proposals)) > math.MaxUint32 || validateResolvedPlan(plan) != nil {
 		return PublishResult{}, ErrInvalid
+	}
+	if err := validateReservations(plan, reservations); err != nil {
+		return PublishResult{}, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if plan.BaseCommitSeq != m.covered {
+		return PublishResult{}, ErrStalePlan
+	}
+	active := make(map[model.ID]struct{})
+	for _, proposal := range plan.Proposals {
+		for _, change := range proposal.Changes {
+			if _, exists := m.active.values[change.Change.RecordID]; exists {
+				active[change.Change.RecordID] = struct{}{}
+			}
+		}
+	}
+	if !validDeltaEntries(plan, active) {
 		return PublishResult{}, ErrStalePlan
 	}
 	accepted := uint64(0)
@@ -134,10 +201,17 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan) (Publis
 		return PublishResult{}, ErrInvalid
 	}
 	result := PublishResult{Committed: uint32(accepted)}
-	for _, proposal := range plan.Proposals {
+	var charged uint64
+	for index, proposal := range plan.Proposals {
 		if !proposal.Accepted {
+			reservations[index].Release()
 			continue
 		}
+		consumed, err := consumeReservation(reservations[index], proposal.DeltaEntries)
+		if err != nil || charged > math.MaxUint64-consumed {
+			return PublishResult{}, ErrCorrupt
+		}
+		charged += consumed
 		for _, resolved := range proposal.Changes {
 			if !resolved.Apply {
 				result.Skipped++
@@ -151,6 +225,10 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan) (Publis
 			result.Applied++
 		}
 	}
+	if m.active.charge > math.MaxUint64-charged {
+		return PublishResult{}, ErrCorrupt
+	}
+	m.active.charge += charged
 	m.covered = model.CommitSeq(uint64(first) + accepted - 1)
 	m.epoch++
 	return result, nil
@@ -269,11 +347,29 @@ func (m *Persistent) InstallCheckpoint(candidate CheckpointCandidate) error {
 			return ErrStalePlan
 		}
 	}
+	var released uint64
+	for _, layer := range checkpoint.layers {
+		if released > math.MaxUint64-layer.charge {
+			return ErrCorrupt
+		}
+		released += layer.charge
+	}
+	m.budget.mu.Lock()
+	if released > m.budget.charged {
+		m.budget.mu.Unlock()
+		return ErrCorrupt
+	}
 	m.root = candidate.tree
 	m.frozen = append([]*deltaLayer(nil), m.frozen[len(checkpoint.layers):]...)
 	m.inCheckpoint = false
 	m.epoch++
+	m.budget.charged -= released
+	m.budget.mu.Unlock()
 	return nil
+}
+
+func (m *Persistent) DeltaUsage() (charged, reserved, soft, hard uint64) {
+	return m.budget.usage()
 }
 
 func (m *Persistent) AbortCheckpoint(checkpoint *FrozenCheckpoint) error {

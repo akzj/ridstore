@@ -36,6 +36,18 @@ type response struct {
 	err    error
 }
 
+type Receipt struct {
+	result <-chan response
+}
+
+func (r Receipt) Wait() (Result, error) {
+	if r.result == nil {
+		return Result{}, base.ErrInvalidConfig
+	}
+	answer := <-r.result
+	return answer.result, answer.err
+}
+
 type CheckpointCut struct {
 	CoveredCommitSeq model.CommitSeq
 	ReplayStart      recordlog.LogPos
@@ -49,6 +61,7 @@ type checkpointResponse struct {
 type request struct {
 	batch    *transaction.Batch
 	prepared transaction.Prepared
+	reserve  mapping.DeltaReservation
 	result   chan response
 	barrier  chan checkpointResponse
 }
@@ -82,42 +95,67 @@ func New(next model.CommitSeq, log Appender, current mapping.Index, config Confi
 }
 
 func (c *Coordinator) Commit(ctx context.Context, batch *transaction.Batch) (Result, error) {
+	receipt, err := c.Submit(ctx, batch)
+	if err != nil {
+		return Result{}, err
+	}
+	return receipt.Wait()
+}
+
+// Submit reserves Delta capacity, transitions the Batch to Committing and
+// transfers completion ownership to the Coordinator. It returns after the
+// request is queued, before durability; Wait obtains the final result.
+func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Receipt, error) {
 	if batch == nil {
-		return Result{}, base.ErrInvalidConfig
+		return Receipt{}, base.ErrInvalidConfig
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
 	if err := c.Fault(); err != nil {
-		return Result{}, errors.Join(base.ErrReadOnly, err)
+		return Receipt{}, errors.Join(base.ErrReadOnly, err)
+	}
+	mutationIDs, err := batch.MutationIDs()
+	if err != nil {
+		return Receipt{}, err
+	}
+	reservation, _, err := c.mapping.ReserveDelta(mutationIDs)
+	if err != nil {
+		return Receipt{}, err
 	}
 	prepared, err := batch.Prepare()
 	if err != nil {
-		return Result{}, err
+		reservation.Release()
+		return Receipt{}, err
 	}
 	if err := ctx.Err(); err != nil {
+		reservation.Release()
 		_ = batch.MarkAborted()
-		return Result{}, err
+		return Receipt{}, err
 	}
-	req := request{batch: batch, prepared: prepared, result: make(chan response, 1)}
+	req := request{batch: batch, prepared: prepared, reserve: reservation, result: make(chan response, 1)}
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()
+		reservation.Release()
 		_ = batch.MarkAborted()
-		return Result{}, base.ErrClosed
+		return Receipt{}, base.ErrClosed
 	}
 	select {
 	case c.requests <- req:
 		c.submitMu.Unlock()
 	case <-ctx.Done():
 		c.submitMu.Unlock()
+		reservation.Release()
 		_ = batch.MarkAborted()
-		return Result{}, ctx.Err()
+		return Receipt{}, ctx.Err()
 	}
-	// Admission transfers completion ownership to the coordinator. The caller
-	// joins the result even if ctx is cancelled while durability is in flight.
-	answer := <-req.result
-	return answer.result, answer.err
+	// Admission transfers completion ownership to the coordinator. Wait joins
+	// the result even if ctx is cancelled while durability is in flight.
+	return Receipt{result: req.result}, nil
 }
 
 // CheckpointCut appends a durable marker after every commit admitted before
@@ -258,6 +296,7 @@ func (c *Coordinator) processCheckpoint(req request) {
 func (c *Coordinator) process(group []request) {
 	if fault := c.Fault(); fault != nil {
 		for _, req := range group {
+			req.reserve.Release()
 			_ = req.batch.MarkAborted()
 			req.result <- response{err: errors.Join(base.ErrReadOnly, fault)}
 		}
@@ -298,6 +337,7 @@ func (c *Coordinator) process(group []request) {
 	}
 	if len(descriptors) == 0 {
 		for _, req := range active {
+			req.reserve.Release()
 			_ = req.batch.MarkAborted()
 			req.result <- response{err: base.ErrConflict}
 		}
@@ -313,6 +353,7 @@ func (c *Coordinator) process(group []request) {
 		c.fail(err)
 		unknown := c.log.Status().Poisoned
 		for i, req := range active {
+			req.reserve.Release()
 			if !plan.Proposals[i].Accepted {
 				_ = req.batch.MarkAborted()
 				req.result <- response{err: base.ErrConflict}
@@ -328,7 +369,11 @@ func (c *Coordinator) process(group []request) {
 		}
 		return
 	}
-	published, err := c.mapping.PublishGroup(descriptors[0].CommitSeq, plan)
+	reservations := make([]mapping.DeltaReservation, len(active))
+	for index := range active {
+		reservations[index] = active[index].reserve
+	}
+	published, err := c.mapping.PublishGroup(descriptors[0].CommitSeq, plan, reservations)
 	if err == nil {
 		var mutations uint64
 		for _, item := range descriptors {
@@ -339,6 +384,9 @@ func (c *Coordinator) process(group []request) {
 		}
 	}
 	if err != nil {
+		for _, reservation := range reservations {
+			reservation.Release()
+		}
 		c.fail(err)
 		for i, req := range active {
 			if plan.Proposals[i].Accepted {
@@ -395,12 +443,14 @@ func descriptor(prepared transaction.Prepared, seq model.CommitSeq) recordcodec.
 }
 
 func (c *Coordinator) rejectInvalid(req request, err error) {
+	req.reserve.Release()
 	_ = req.batch.MarkAborted()
 	req.result <- response{err: err}
 }
 
 func (c *Coordinator) rejectGroup(group []request, err error) {
 	for _, req := range group {
+		req.reserve.Release()
 		_ = req.batch.MarkAborted()
 		req.result <- response{err: err}
 	}

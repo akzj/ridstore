@@ -7,7 +7,9 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/mapping"
+	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
+	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
 )
@@ -178,3 +180,59 @@ func TestRecoverRelocationUsesAddressCAS(t *testing.T) {
 		t.Fatalf("addr=%+v exists=%v next=%d", addr, exists, result.NextCommitSeq)
 	}
 }
+
+func TestRecoverRejectsDurableTailLargerThanDeltaBudget(t *testing.T) {
+	log := &fakeLog{byAddr: make(map[recordlog.VAddr][]byte)}
+	addresses := make([]recordlog.VAddr, 2)
+	for index := range addresses {
+		payload, _ := recordcodec.EncodePut(recordcodec.PutRecord{
+			OriginBatchID: 1, RecordID: model.ID(index + 1), Value: []byte("value"),
+		}, 1024)
+		addresses[index] = log.add(t, payload)
+	}
+	commit, _ := recordcodec.EncodeCommitGroup(recordcodec.CommitGroup{Descriptors: []recordcodec.Descriptor{{
+		Kind: recordcodec.DescriptorUserCommit, BatchID: 1, CommitSeq: 1, LogicalPayloadBytes: 10,
+		Mutations: []recordcodec.Mutation{
+			{RecordID: 1, NewAddr: addresses[0], Operation: recordcodec.OperationPut},
+			{RecordID: 2, NewAddr: addresses[1], Operation: recordcodec.OperationPut},
+		},
+	}}}, 4096)
+	log.add(t, commit)
+
+	nodes := replayNodeStore{}
+	tree, err := radix.Open(nodes, 0, 0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
+		MaxCheckpointEntries: 1, DeltaSoftLimitBytes: 32, DeltaHardLimitBytes: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
+	_, err = Recover(context.Background(), log, Checkpoint{
+		Mapping: current, ReplayStart: start, ReservedIDHigh: 3, ReservedBatchIDHigh: 2,
+	}, replayConfig())
+	if !errors.Is(err, base.ErrInvalidConfig) || !errors.Is(err, base.ErrBatchTooLarge) {
+		t.Fatalf("recover err=%v", err)
+	}
+	if current.CoveredCommitSeq() != 0 {
+		t.Fatalf("partial publication covered=%d", current.CoveredCommitSeq())
+	}
+	if charged, reserved, _, _ := current.DeltaUsage(); charged != 0 || reserved != 0 {
+		t.Fatalf("charged=%d reserved=%d", charged, reserved)
+	}
+}
+
+type replayNodeStore struct{}
+
+func (replayNodeStore) Read(model.MapAddr) (mapstore.Node, error) {
+	return mapstore.Node{}, mapping.ErrCorrupt
+}
+
+func (replayNodeStore) Append(uint8, uint64, model.CommitSeq, [mapstore.NodeSlots]uint64) (model.MapAddr, error) {
+	return 0, mapping.ErrCorrupt
+}
+
+func (replayNodeStore) Sync() error { return nil }

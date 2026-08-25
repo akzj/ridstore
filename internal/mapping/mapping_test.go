@@ -42,7 +42,7 @@ func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 	if _, exists, err := mapping.Lookup(7); err != nil || exists {
 		t.Fatalf("mapping changed before publish: exists=%v err=%v", exists, err)
 	}
-	result, err := mapping.PublishGroup(1, plan)
+	result, err := mapping.PublishGroup(1, plan, reservePlan(t, mapping, plan))
 	if err != nil || result.Committed != 2 || result.Applied != 2 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -72,7 +72,7 @@ func TestResolveGroupRejectsConflictWithoutAffectingLaterProposal(t *testing.T) 
 	if plan.Proposals[0].Accepted || !plan.Proposals[1].Accepted {
 		t.Fatalf("plan=%+v", plan)
 	}
-	result, err := mapping.PublishGroup(5, plan)
+	result, err := mapping.PublishGroup(5, plan, reservePlan(t, mapping, plan))
 	if err != nil || result.Committed != 1 || mapping.CoveredCommitSeq() != 5 {
 		t.Fatalf("result=%+v covered=%d err=%v", result, mapping.CoveredCommitSeq(), err)
 	}
@@ -96,7 +96,7 @@ func TestRelocationUsesAddressCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := mapping.PublishGroup(3, plan)
+	result, err := mapping.PublishGroup(3, plan, reservePlan(t, mapping, plan))
 	if err != nil || result.Applied != 1 || result.Skipped != 1 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -118,10 +118,10 @@ func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mapping.PublishGroup(1, first); err != nil {
+	if _, err := mapping.PublishGroup(1, first, reservePlan(t, mapping, first)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mapping.PublishGroup(2, second); !errors.Is(err, ErrStalePlan) {
+	if _, err := mapping.PublishGroup(2, second, reservePlan(t, mapping, second)); !errors.Is(err, ErrStalePlan) {
 		t.Fatalf("stale error=%v", err)
 	}
 	third, err := mapping.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewAddr: testAddr(t, 1, 128), Operation: OperationPut}}}})
@@ -129,7 +129,7 @@ func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	third.Proposals[0].Changes[0].Apply = false
-	if _, err := mapping.PublishGroup(2, third); !errors.Is(err, ErrInvalid) {
+	if _, err := mapping.PublishGroup(2, third, reservePlan(t, mapping, third)); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("mutated plan error=%v", err)
 	}
 }

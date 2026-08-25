@@ -45,7 +45,9 @@ func newPersistent(t *testing.T) *mapping.Persistent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := mapping.OpenPersistent(tree, nodes, 1024)
+	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
+		MaxCheckpointEntries: 1024, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,6 +310,7 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 		RecordLog:         recordlog.Config{MaxQueuedBytes: 1 << 20, QueueCapacity: 32, BufferBytes: 64 << 10, BufferRecords: 32},
 		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 4096},
 		MappingCacheBytes: 1 << 20, MaxCheckpointEntries: 1024,
+		DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
 	}
 	store, err := Open(context.Background(), root, config)
 	if err != nil {

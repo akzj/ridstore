@@ -62,7 +62,7 @@ upper = mutation count * DeltaEntryCharge
 
 - 单请求 upper 大于 hard limit，确定返回 `ErrBatchTooLarge`；
 - `used + upper <= hard` 时原子增加 reserved；
-- 达到 soft limit 返回 pressure signal；
+- 达到 soft limit 返回 pressure signal；当前迭代只记录该信号语义，尚未启动后台主动 Checkpoint；
 - hard limit 暂时不足时不 Prepare Batch、不写 Descriptor、不改变 Mapping；
 - Context 取消、Prepare 失败、条件冲突、编码失败或 pre-durable append 失败必须释放 reservation；
 - durable success 后 Publish 在同一 Mapping 临界区校验 plan、消费实际 charge 并释放 reservation 余量；
@@ -83,20 +83,25 @@ Commit waits Delta -> Checkpoint waits ops.Lock -> Delta waits Checkpoint
 v2 禁止该锁环。Commit 的正确流程是：
 
 ```text
-1. 短暂检查 Store lifecycle，立即释放 ops.RLock
-2. 尝试 reservation
-3. hard pressure 时，由该调用者推进一次 Checkpoint
-4. Checkpoint 安装释放 frozen charge
-5. 重试 reservation
-6. reservation 成功后 Prepare/queue/durable Publish
+1. 获取 ops.RLock 并检查 Store lifecycle
+2. 在同一个 ops.RLock 区间内 reservation、Prepare 并进入 Coordinator queue
+3. queue 接管请求后立即释放 ops.RLock；不等待 durable result
+4. hard pressure 时先释放 ops.RLock，由该调用者推进一次 Checkpoint
+5. Checkpoint 安装释放 frozen charge
+6. 重试 admission；成功后再等待 durable Publish
 ```
+
+步骤 1–3 的 RLock 不能进一步缩短：否则 reservation 成功后、queue admission 之前可能被 Freeze 穿过，
+reservation 针对旧 active layer 计算，而 Commit 最终写入新 active layer。RLock 只覆盖无 I/O 的 admission；
+durable append 和调用者等待都不持有它。
 
 Batch 在步骤 2–4 仍是 Open，因此 Checkpoint 可以把它记入 open-batch cut；它后续的 Commit Record 位于
 该 cut 之后。Close 与 Commit 通过 Batch 状态机、Coordinator queue ownership 和 Close drain 协调，不能
 依赖 Commit 长时间持有 Store lifecycle RLock。
 
-多个 pressure caller 可以同时请求 Checkpoint；`checkpointMu` 保证实际构建串行。前一个 Checkpoint 已
-释放足够空间时，后续 caller 重新尝试 reservation，而不是无条件再构建一代。
+多个 pressure caller 可以同时请求 Checkpoint；`checkpointMu` 保证实际构建串行。当前实现允许已经进入
+等待队列的 caller 在前一轮释放空间后再构建一代空 checkpoint；这是吞吐优化缺口，不破坏容量或持久性
+不变量，后续可用 pressure generation 去重。
 
 ## 6. Checkpoint 释放
 
@@ -120,6 +125,15 @@ candidate Mapping nodes durable
 DeltaHardLimit 约束共享 active/frozen/reserved 状态；CheckpointMemoryBudget 约束 Builder 的私有临时
 工作集。两者不能互相替代：即使 Delta 有硬上界，当前一次性 `map + sorted slice` Builder 仍需在后续
 迭代改为 chunk/run merge，才能对字节级工作集作可信承诺。
+
+在 chunk/run merge 完成前，配置必须满足：
+
+```text
+floor(DeltaHardLimitBytes / DeltaEntryCharge) <= MaxCheckpointEntries
+```
+
+否则 Commit 可以合法填满 Delta，却没有任何一次 Checkpoint 能接纳它，hard admission 反而会形成永久
+压力。Open/Create 会拒绝这种配置。
 
 本迭代先完成 Delta hard admission 和可释放 charge，不把“entry 数有界”误报为“Builder bytes 已严格
 有界”。

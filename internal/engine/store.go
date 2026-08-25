@@ -374,11 +374,49 @@ func (b *Batch) ExpectAbsent(id model.ID) error {
 }
 
 func (b *Batch) Commit(ctx context.Context) (coordinator.Result, error) {
-	result, err := withBatch(b, func() (coordinator.Result, error) { return b.store.commits.Commit(ctx, b.inner) })
-	if err == nil || terminal(b.inner) {
-		b.finish()
+	if b == nil || b.store == nil || b.inner == nil {
+		return coordinator.Result{}, base.ErrBatchClosed
 	}
-	return result, err
+	for {
+		receipt, err := b.store.submitCommit(ctx, b.inner)
+		if errors.Is(err, mapping.ErrBudget) {
+			// Reservation failed before Prepare or durable append. Do not hold
+			// ops.RLock here: Checkpoint must be able to install a Root and
+			// release frozen Delta charge before this Commit retries admission.
+			if err := b.store.Checkpoint(ctx); err != nil {
+				return coordinator.Result{}, err
+			}
+			continue
+		}
+		if err != nil {
+			if terminal(b.inner) {
+				b.finish()
+			}
+			return coordinator.Result{}, err
+		}
+		result, err := receipt.Wait()
+		if err == nil || terminal(b.inner) {
+			b.finish()
+		}
+		return result, err
+	}
+}
+
+func (s *Store) submitCommit(ctx context.Context, batch *transaction.Batch) (coordinator.Receipt, error) {
+	s.ops.RLock()
+	defer s.ops.RUnlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return coordinator.Receipt{}, base.ErrClosed
+	}
+	if s.fault != nil {
+		err := s.fault
+		s.mu.Unlock()
+		return coordinator.Receipt{}, errors.Join(base.ErrReadOnly, err)
+	}
+	s.mu.Unlock()
+	return s.commits.Submit(ctx, batch)
 }
 
 func (b *Batch) Abort(ctx context.Context) error {
