@@ -11,7 +11,9 @@ import (
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/idalloc"
 	"github.com/akzj/ridstore/internal/mapping"
+	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
 )
 
@@ -166,6 +168,71 @@ func TestOpenBatchLimitBackpressuresAndReleases(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := second.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealRecordLogRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	logID := recordlog.LogID{1, 2, 3, 4}
+	if err := recordlog.CreateInitialSegment(root, logID, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	mapRoot, err := model.NewMapAddr(1, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayStart, err := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := storecatalog.Manifest{
+		Generation: 1, StoreUUID: storecatalog.StoreUUID{1}, RecordLogID: logID,
+		HardLimits: storecatalog.HardLimits{
+			SegmentSize: 1 << 20, MaxValueSize: 1024, MaxBatchBytes: 4096,
+			MaxBatchMutations: 16, MaxBatchConditions: 16, MaxOpenBatches: 4,
+			MaxRecordLogPayload: 64 << 10, IDReserveSize: 16, BatchIDReserveSize: 16,
+		},
+		ActiveDataSegmentID: 1, NextDataSegmentID: 2,
+		ActiveMapSegmentID: 1, NextMapSegmentID: 2, MappingRoot: mapRoot,
+		ReplayStart: replayStart, ReservedIDHigh: 1, ReservedBatchIDHigh: 1, IssuedBatchIDHighAtCut: 1,
+	}
+	if err := storecatalog.Install(root, manifest, nil); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := storecatalog.NewManager(root, manifest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := recordlog.Open(root, recordlog.Config{MaxQueuedBytes: 1 << 20, QueueCapacity: 32, BufferBytes: 64 << 10, BufferRecords: 32}, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, _ := idalloc.New(idalloc.RecordID, 16, 1, log)
+	batches, _ := idalloc.New(idalloc.BatchID, 16, 1, log)
+	store, err := New(log, mapping.NewEmpty(), ids, batches, Config{
+		Batch:  transaction.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16},
+		Commit: coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10}, MaxOpenBatches: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("durable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "durable" || record.Revision == 0 {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
