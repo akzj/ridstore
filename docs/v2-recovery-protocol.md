@@ -27,16 +27,17 @@ Visible Mapping = Checkpoint Mapping Root
 
 ```text
 1. 获取目录独占锁
-2. 读取并校验最新 Manifest
-3. 恢复或回滚未完成的 Catalog/rotation/maintenance journal
-4. 按 Manifest 打开 RecordLog 文件集
-5. 校验 sealed Footer、Segment chain 和 active Header
-6. 扫描 active tail，截断最后一个 torn/incomplete Record
-7. 打开 Manifest 指向的 Mapping Root
-8. 从 checkpoint cut 扫描 ridstore protocol records
-9. 验证并按 CommitSeq 重放 CommitGroup/Relocation
-10. 恢复 allocator high watermarks 和 Batch 状态
-11. 构造新的 active writer，最后对外发布 Store
+2. 拒绝仍存在 `INITIALIZING-v2` 的目录，要求由 Create 恢复初始化
+3. 读取并校验最新 Manifest
+4. 恢复或回滚未完成的 Catalog/rotation/maintenance journal
+5. 按 Manifest 打开 RecordLog 文件集
+6. 校验 sealed Footer、Segment chain 和 active Header
+7. 扫描 active tail，截断最后一个 torn/incomplete Record
+8. 打开 Manifest 指向的 Mapping Root
+9. 从 checkpoint cut 扫描 ridstore protocol records
+10. 验证并按 CommitSeq 重放 CommitGroup/Relocation
+11. 恢复 allocator high watermarks 和 Batch 状态
+12. 构造新的 active writer，最后对外发布 Store
 ```
 
 任何一步失败都不能返回半打开、可写的 Store。

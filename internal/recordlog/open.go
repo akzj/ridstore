@@ -70,6 +70,55 @@ func CreateInitialSegment(root string, logID LogID, segmentSize uint32) error {
 	return segment.close()
 }
 
+// EnsureInitialSegment idempotently completes creation of the first empty
+// segment. It is only valid before the initial Catalog generation is
+// published; callers must serialize it with the store directory lock.
+func EnsureInitialSegment(root string, logID LogID, segmentSize uint32) error {
+	header := SegmentHeader{LogID: logID, SegmentID: 1, SegmentSize: segmentSize}
+	if _, err := EncodeSegmentHeader(header); err != nil {
+		return err
+	}
+	files := osFileBackend{}
+	dir, err := ensureRecordsDirectory(root, files)
+	if err != nil {
+		return err
+	}
+	activePath := filepath.Join(dir, activeSegmentName(1))
+	if _, err := os.Lstat(activePath); err == nil {
+		segment, repaired, err := openActiveSegment(root, header, nil, nil)
+		if err != nil {
+			return err
+		}
+		invalid := repaired || segment.end != SegmentHeaderSize || segment.records != 0
+		closeErr := segment.close()
+		if invalid {
+			return errors.Join(ErrCorrupt, closeErr)
+		}
+		creatingPath := filepath.Join(dir, creatingSegmentName(1))
+		if err := os.Remove(creatingPath); err == nil {
+			return errors.Join(files.syncDir(dir), closeErr)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return errors.Join(err, closeErr)
+		}
+		return closeErr
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	creatingPath := filepath.Join(dir, creatingSegmentName(1))
+	if err := os.Remove(creatingPath); err == nil {
+		if err := files.syncDir(dir); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	segment, err := createActiveSegment(root, header, nil, nil)
+	if err != nil {
+		return err
+	}
+	return segment.close()
+}
+
 type rotationManager struct {
 	root     string
 	catalog  CatalogPort

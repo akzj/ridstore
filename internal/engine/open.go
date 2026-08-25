@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/bootstrap"
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
@@ -24,6 +25,48 @@ type OpenConfig struct {
 	Commit               coordinator.Config
 	MappingCacheBytes    uint64
 	MaxCheckpointEntries uint64
+}
+
+type CreateConfig struct {
+	HardLimits storecatalog.HardLimits
+	Runtime    OpenConfig
+}
+
+func Create(ctx context.Context, root string, config CreateConfig) (*Store, error) {
+	return create(ctx, root, config, nil, nil)
+}
+
+func create(ctx context.Context, root string, config CreateConfig, bootstrapHook bootstrap.FaultHook, catalogHook storecatalog.FaultHook) (*Store, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if root == "" || config.Runtime.MappingCacheBytes == 0 || config.Runtime.MaxCheckpointEntries == 0 {
+		return nil, base.ErrInvalidConfig
+	}
+	if err := bootstrap.ValidateHardLimits(config.HardLimits); err != nil {
+		return nil, err
+	}
+	if err := bootstrap.EnsureRoot(root); err != nil {
+		return nil, err
+	}
+	dirLock, err := filelock.Acquire(root)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(cause error) (*Store, error) {
+		return nil, errors.Join(cause, dirLock.Close())
+	}
+	if _, err := bootstrap.Initialize(root, config.HardLimits, bootstrapHook); err != nil {
+		return fail(err)
+	}
+	store, err := openLocked(ctx, root, config.Runtime, catalogHook, dirLock)
+	if err != nil {
+		return fail(err)
+	}
+	return store, nil
 }
 
 // Open assembles the v2 runtime directly from the authoritative Catalog. It
@@ -50,23 +93,34 @@ func open(ctx context.Context, root string, config OpenConfig, catalogHook store
 	failLock := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, dirLock.Close())
 	}
-	catalog, err := storecatalog.OpenManager(root, catalogHook)
+	if err := bootstrap.RequireReady(root); err != nil {
+		return failLock(err)
+	}
+	store, err := openLocked(ctx, root, config, catalogHook, dirLock)
 	if err != nil {
 		return failLock(err)
+	}
+	return store, nil
+}
+
+func openLocked(ctx context.Context, root string, config OpenConfig, catalogHook storecatalog.FaultHook, dirLock *filelock.Lock) (*Store, error) {
+	catalog, err := storecatalog.OpenManager(root, catalogHook)
+	if err != nil {
+		return nil, err
 	}
 	log, err := recordlog.Open(root, config.RecordLog, catalog)
 	if err != nil {
-		return failLock(err)
+		return nil, err
 	}
 	failLog := func(cause error) (*Store, error) {
-		return nil, errors.Join(cause, log.Close(), dirLock.Close())
+		return nil, errors.Join(cause, log.Close())
 	}
 	physicalMapping, err := mapstore.Open(root, catalog)
 	if err != nil {
 		return failLog(err)
 	}
 	fail := func(cause error) (*Store, error) {
-		return nil, errors.Join(cause, physicalMapping.Close(), log.Close(), dirLock.Close())
+		return nil, errors.Join(cause, physicalMapping.Close(), log.Close())
 	}
 	manifest := catalog.Snapshot()
 	tree, err := radix.Open(physicalMapping, manifest.MappingRoot, manifest.CoveredCommitSeq, config.MappingCacheBytes)

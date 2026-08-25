@@ -156,16 +156,26 @@ Catalog 串行化全部安装，但 mutation 权限按操作限定：
 Create 顺序：
 
 ```text
-1. 创建 store directory 和 LOCK
-2. 生成 StoreUUID、RecordLogID
-3. 创建并 fsync first data active Segment
-4. 创建并 fsync first mapping active Segment；初始 MappingRoot=0
-5. 构造 generation=1 Manifest
-6. 安装 Manifest 并 fsync directory
-7. 发布可用 Store
+1. 创建并 fsync store directory，取得 LOCK
+2. 生成 StoreUUID、RecordLogID 和 generation=1 Manifest
+3. 把该 Manifest 的规范编码写入 INITIALIZING-v2，fsync + rename + directory sync
+4. 幂等创建并 fsync first data active Segment
+5. 幂等创建并 fsync first mapping active Segment；初始 MappingRoot=0
+6. 安装完全相同的 generation=1 Manifest 并 fsync directory
+7. 删除 INITIALIZING-v2 并再次 fsync directory
+8. 在仍持有同一 LOCK 时组装并发布 Store
 ```
 
-Manifest 成功前留下的文件不构成 Store，可以由下一次 Create 清理或由离线工具报告。
+Marker 直接保存未来初始 Manifest 的编码，不再维护第二套 UUID/HardLimits schema。Create 重试必须
+复用 marker 中的身份，校验已有初始 Segment，清理未发布的 `.creating` 文件并从缺失步骤继续。
+Marker 与已安装 Manifest 不完全相同属于 corruption；重试时 HardLimits 不同返回 `ErrConfigMismatch`。
+
+普通 Open 看到 durable marker 返回 `ErrRecoveryRequired`，不能把“Manifest 已 rename、marker 尚未清理”的
+目录提前发布。Create 在最终 marker remove 后 directory sync 失败时可以返回错误；此时同进程后续 Open
+已可验证完整 Manifest 和两个初始 Segment，崩溃后 marker 若重现则再次由 Create 幂等完成。
+
+Manifest 成功前留下的文件不构成 Store，只有持有目录锁的 Create 恢复路径可以清理本初始化协议明确
+命名的临时文件；不得扫描并自动接纳未知文件。
 
 ## 9. Open 与 orphan
 
