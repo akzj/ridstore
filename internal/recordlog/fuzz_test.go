@@ -27,3 +27,16 @@ func FuzzDecodeSegmentFooter(f *testing.F) {
 		_, _ = DecodeSegmentFooter(value)
 	})
 }
+
+func FuzzDecodeRotationJournal(f *testing.F) {
+	addr, _ := NewVAddr(1, SegmentHeaderSize, 64)
+	seed, _ := encodeRotationJournal(rotationJournal{
+		BaseGeneration: 1, LogID: LogID{1}, SegmentSize: 1024,
+		Old:       SegmentSummary{SegmentID: 1, ValidEnd: SegmentHeaderSize + 64, RecordCount: 1, FirstAddr: addr, LastAddr: addr},
+		NewActive: 2, NextSegmentID: 3,
+	})
+	f.Add(seed[:])
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = decodeRotationJournal(data)
+	})
+}
