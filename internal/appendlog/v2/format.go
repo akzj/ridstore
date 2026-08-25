@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	formatVersion     = uint16(1)
+	formatVersion     = uint16(2)
 	segmentHeaderSize = uint64(64)
 	recordHeaderSize  = uint64(32)
 	segmentFooterSize = uint64(64)
@@ -123,6 +123,9 @@ func encodeRecordInto(dst []byte, addr VAddr, payload []byte) error {
 	if uint64(len(dst)) != total {
 		return ErrInvalidConfig
 	}
+	if !addr.matchesPhysicalSize(total) {
+		return ErrInvalidVAddr
+	}
 	clear(dst[recordHeaderSize+uint64(len(payload)):])
 	copy(dst[0:4], recordMagic[:])
 	binary.LittleEndian.PutUint16(dst[4:6], formatVersion)
@@ -149,7 +152,7 @@ func decodeRecordHeader(src []byte) (recordHeader, error) {
 		PayloadCRC:   binary.LittleEndian.Uint32(src[24:28]),
 	}
 	want, err := encodedRecordSize(uint64(h.PayloadSize))
-	if err != nil || uint64(h.PhysicalSize) != want || !h.Addr.Valid() {
+	if err != nil || uint64(h.PhysicalSize) != want || !h.Addr.Valid() || !h.Addr.matchesPhysicalSize(uint64(h.PhysicalSize)) {
 		return recordHeader{}, fmt.Errorf("record header fields: %w", ErrCorrupt)
 	}
 	return h, nil

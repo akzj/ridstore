@@ -206,21 +206,38 @@ v2 修正：
 
 `VAddr` 同时是稳定定位信息和日志顺序信息。公开 API 不再返回独立 Sequence。
 
-第一版原型把它编码为固定宽度的逻辑地址：
+FormatVersion 2 把它编码为固定宽度的逻辑地址，并复用 8-byte 对齐天然为空的最低 3 bit：
 
 ```text
-high 32 bits: SegmentID
-low  32 bits: offset inside Segment
+63                         32 31                    3 2       0
++----------------------------+-----------------------+---------+
+|         SegmentID          |    aligned offset     | sizeTag |
++----------------------------+-----------------------+---------+
 ```
 
-这使单 Segment 最大为 4 GiB。该布局仍须在 format freeze 时确认。对上层而言 VAddr 是
-opaque value；解码、比较和合法性检查由 v2 提供的方法完成，业务不能自行假设 bit layout。
+`sizeTag` 是物理 Record 大小的读取提示：
+
+| tag | 首次读取上限 |
+| --- | ---: |
+| 0 | 64 B |
+| 1 | 128 B |
+| 2 | 256 B |
+| 3 | 512 B |
+| 4 | 1 KiB |
+| 5 | 2 KiB |
+| 6 | 4 KiB；同时表示更大的 Record |
+| 7 | 保留，出现即非法 |
+
+真实 offset 为 `low32 &^ 0b111`。标签根据包含 envelope 和 padding 的 `PhysicalSize` 计算，
+不是根据 payload 大小计算。它不缩小约 4 GiB 的 Segment 字节寻址范围，也不改变地址顺序；
+对上层而言 VAddr 仍是 opaque value，业务不能自行解释 bit layout。
 
 ### 5.1 不变量
 
 - 每次成功 Append 得到唯一 VAddr；
 - 后追加 Record 的 VAddr 在日志顺序上严格更大；
 - VAddr 指向通用 Record envelope 起点；
+- VAddr 的 sizeTag 必须与 Record Header 的 PhysicalSize 相符，否则恢复和随机读取都拒绝；
 - Record 永不跨 Segment；
 - Segment Header/Footer 和对齐空间不产生用户 VAddr；
 - rotation 可以在相邻 Record 地址之间留下物理间隙，但不能逆序；
@@ -265,10 +282,9 @@ durablePos。Status 可以暴露三个水位用于诊断，但上层协议不需
 ```text
 caller
   -> 取得 queue byte budget
-  -> 复制 payload
-  -> 送入有界 channel
+  -> 临时借用 payload 并送入有界 channel
 writer
-  -> 校验精确 Record 大小
+  -> 校验精确 Record 大小并在返回前复制 payload
   -> 分配 VAddr
   -> stage 到 pending buffer
   -> sync=false: 返回 VAddr
@@ -391,6 +407,8 @@ Read 不解释 payload：
 - VAddr 已 written：从对应 Segment 读取；
 - 两条路径都校验地址和 Record envelope；
 - disk 路径校验 CRC；
+- disk 路径先按 VAddr sizeTag 读取 64 B 到 4 KiB；小 Record 一次 `ReadAt` 完成，大 Record
+  解析 Header 后只读取剩余部分，不重复读取前 4 KiB；
 - 返回 payload 副本；
 - 指向 Record 中间、未知 Segment 或损坏数据均返回确定错误。
 
@@ -407,7 +425,8 @@ written position、最后一个 VAddr 和 pending 副本；磁盘部分流式扫
 
 ## 10. 通用磁盘格式
 
-v2 使用独立格式，不复用 ridstore Format v1。所有多字节整数使用 Little Endian；第一版校验
+v2 使用独立格式，不复用 ridstore Format v1。当前物理格式版本为 2；版本 2 引入 VAddr
+sizeTag，旧的无标签版本会被显式拒绝。所有多字节整数使用 Little Endian；第一版校验
 算法固定为 CRC32C。当前原型采用 64-byte Header、32-byte Record Envelope、64-byte Footer
 和 8-byte Record 对齐。编码器已有固定 golden vectors，三个 decoder 也有独立 fuzz 入口；最终
 format freeze 前仍允许通过显式版本变更调整布局。
@@ -662,8 +681,8 @@ DataLog.Decode([]byte)
 
 ## 19. Review 前仍需冻结的决定
 
-1. 是否冻结原型的 32-bit SegmentID + 32-bit Offset VAddr 布局及耗尽行为；
-2. 是否把已有 golden vectors 对应的 64/32/64-byte Header/Record/Footer 固定为 Format v1；
+1. 是否冻结 32-bit SegmentID + 8-byte aligned Offset + 3-bit sizeTag 的 VAddr 布局及耗尽行为；
+2. 是否把已有 golden vectors 对应的 64/32/64-byte Header/Record/Footer 固定为 FormatVersion 2；
 3. `fsync` 或 `fdatasync`，以及目录 fsync 的平台契约；
 4. channel、buffer byte/record 上限的默认值；
 5. active tail 是自动截断，还是先返回 repair plan；

@@ -18,23 +18,53 @@ var (
 type VAddr uint64
 
 const (
-	vaddrOffsetBits = 32
-	maxSegmentID    = uint64(math.MaxUint32)
-	maxSegmentSize  = uint64(math.MaxUint32)
+	vaddrOffsetBits   = 32
+	vaddrSizeBits     = 3
+	vaddrSizeMask     = uint32(1<<vaddrSizeBits) - 1
+	vaddrReservedSize = vaddrSizeMask
+	maxSegmentID      = uint64(math.MaxUint32)
+	maxSegmentSize    = uint64(math.MaxUint32)
 )
 
-func makeVAddr(segmentID uint32, offset uint64) (VAddr, error) {
-	if segmentID == 0 || offset > math.MaxUint32 {
+func makeVAddr(segmentID uint32, offset, physicalSize uint64) (VAddr, error) {
+	sizeClass, err := vaddrSizeClass(physicalSize)
+	if err != nil || segmentID == 0 || offset > math.MaxUint32 || offset&uint64(vaddrSizeMask) != 0 {
 		return 0, ErrInvalidVAddr
 	}
-	return VAddr(uint64(segmentID)<<vaddrOffsetBits | offset), nil
+	return VAddr(uint64(segmentID)<<vaddrOffsetBits | offset | uint64(sizeClass)), nil
 }
 
 func (v VAddr) SegmentID() uint32 { return uint32(uint64(v) >> vaddrOffsetBits) }
-func (v VAddr) Offset() uint32    { return uint32(v) }
+func (v VAddr) Offset() uint32    { return uint32(v) &^ vaddrSizeMask }
 
 func (v VAddr) Valid() bool {
-	return v.SegmentID() != 0 && uint64(v.Offset()) >= segmentHeaderSize
+	return v.SegmentID() != 0 && uint64(v.Offset()) >= segmentHeaderSize && v.sizeClass() != vaddrReservedSize
+}
+
+func (v VAddr) sizeClass() uint32 { return uint32(v) & vaddrSizeMask }
+
+func (v VAddr) readHint() (uint64, error) {
+	if !v.Valid() {
+		return 0, ErrInvalidVAddr
+	}
+	return uint64(64) << v.sizeClass(), nil
+}
+
+func (v VAddr) matchesPhysicalSize(physicalSize uint64) bool {
+	sizeClass, err := vaddrSizeClass(physicalSize)
+	return err == nil && v.sizeClass() == sizeClass
+}
+
+func vaddrSizeClass(physicalSize uint64) (uint32, error) {
+	if physicalSize < recordHeaderSize || physicalSize > math.MaxUint32 || physicalSize&(recordAlignment-1) != 0 {
+		return 0, ErrInvalidVAddr
+	}
+	for sizeClass, upperBound := uint32(0), uint64(64); sizeClass < vaddrReservedSize; sizeClass, upperBound = sizeClass+1, upperBound<<1 {
+		if physicalSize <= upperBound || sizeClass == vaddrReservedSize-1 {
+			return sizeClass, nil
+		}
+	}
+	return 0, ErrInvalidVAddr
 }
 
 func (v VAddr) String() string {

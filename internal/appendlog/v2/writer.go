@@ -125,7 +125,7 @@ func (w *writer) stage(request *appendRequest) (bool, error) {
 			return false, err
 		}
 	}
-	addr, err := makeVAddr(w.active.header.SegmentID, w.active.end+w.bytes)
+	addr, err := makeVAddr(w.active.header.SegmentID, w.active.end+w.bytes, size)
 	if err != nil {
 		return false, err
 	}

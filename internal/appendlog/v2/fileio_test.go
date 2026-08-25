@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -64,6 +65,16 @@ type syncFailureFile struct {
 	fileHandle
 	armed   *atomic.Bool
 	failure error
+}
+
+type readCountingFile struct {
+	fileHandle
+	reads *atomic.Uint64
+}
+
+func (f *readCountingFile) ReadAt(p []byte, offset int64) (int, error) {
+	f.reads.Add(1)
+	return f.fileHandle.ReadAt(p, offset)
 }
 
 type metadataFailureBackend struct {
@@ -223,5 +234,54 @@ func TestBackendCreationMetadataFailuresCanRetry(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestVAddrSizeHintReducesReadCalls(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentSize = 32 << 10
+	cfg.MaxPayloadSize = 8 << 10
+	cfg.MaxBufferBytes = 16 << 10
+	cfg.MaxQueuedBytes = 64 << 10
+	var reads atomic.Uint64
+	cfg.files = &wrappingBackend{
+		fileBackend: osFileBackend{},
+		wrap: func(_ string, f fileHandle) fileHandle {
+			return &readCountingFile{fileHandle: f, reads: &reads}
+		},
+	}
+	log, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	tests := []struct {
+		payloadSize int
+		readCalls   uint64
+	}{
+		{payloadSize: 0, readCalls: 1},
+		{payloadSize: 33, readCalls: 1},
+		{payloadSize: 97, readCalls: 1},
+		{payloadSize: 225, readCalls: 1},
+		{payloadSize: 481, readCalls: 1},
+		{payloadSize: 993, readCalls: 1},
+		{payloadSize: 2025, readCalls: 1},
+		{payloadSize: 5000, readCalls: 2},
+	}
+	for _, tc := range tests {
+		payload := bytes.Repeat([]byte{byte(tc.payloadSize)}, tc.payloadSize)
+		addr, err := log.Append(context.Background(), payload, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reads.Store(0)
+		got, err := log.Read(context.Background(), addr)
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("payload %d read = %d bytes, %v", tc.payloadSize, len(got), err)
+		}
+		if got := reads.Load(); got != tc.readCalls {
+			t.Fatalf("payload %d ReadAt calls = %d, want %d", tc.payloadSize, got, tc.readCalls)
+		}
 	}
 }

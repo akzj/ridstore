@@ -140,7 +140,7 @@ func visitSegment(path string, expectSealed bool, repairTail bool, hook func(Fau
 		if err != nil {
 			return recoveredSegment{}, err
 		}
-		wantAddr, err := makeVAddr(header.SegmentID, result.end)
+		wantAddr, err := makeVAddr(header.SegmentID, result.end, uint64(decoded.PhysicalSize))
 		if err != nil || decoded.Addr != wantAddr || (result.last != 0 && decoded.Addr <= result.last) {
 			return recoveredSegment{}, errors.Join(err, ErrCorrupt)
 		}
@@ -181,26 +181,37 @@ func readRecordFile(path string, addr VAddr, maxPayload uint64, files fileBacken
 		return nil, err
 	}
 	defer f.Close()
-	headerBytes := make([]byte, recordHeaderSize)
-	if _, err := f.ReadAt(headerBytes, int64(addr.Offset())); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, ErrInvalidVAddr
-		}
+	hint, err := addr.readHint()
+	if err != nil {
 		return nil, err
 	}
-	h, err := decodeRecordHeader(headerBytes)
+	encoded := make([]byte, hint)
+	n, readErr := f.ReadAt(encoded, int64(addr.Offset()))
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return nil, readErr
+	}
+	if uint64(n) < recordHeaderSize {
+		return nil, ErrInvalidVAddr
+	}
+	h, err := decodeRecordHeader(encoded[:recordHeaderSize])
 	if err != nil || h.Addr != addr || uint64(h.PayloadSize) > maxPayload {
 		return nil, errors.Join(err, ErrInvalidVAddr)
 	}
-	encoded := make([]byte, h.PhysicalSize)
-	if _, err := f.ReadAt(encoded, int64(addr.Offset())); err != nil {
-		return nil, err
+	if uint64(h.PhysicalSize) > uint64(n) {
+		full := make([]byte, h.PhysicalSize)
+		copy(full, encoded[:n])
+		if _, err := f.ReadAt(full[n:], int64(addr.Offset())+int64(n)); err != nil {
+			return nil, err
+		}
+		encoded = full
+	} else {
+		encoded = encoded[:h.PhysicalSize]
 	}
 	_, payload, err := decodeRecord(encoded)
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte(nil), payload...), nil
+	return payload[:len(payload):len(payload)], nil
 }
 
 func (l *Log) scanSnapshot(ctx context.Context, from VAddr, snapshot scanSnapshot, fn func(VAddr, []byte) error) error {
@@ -304,7 +315,7 @@ func visitRecordPrefix(path string, segmentID uint32, limit, maxPayload uint64, 
 			return err
 		}
 		decoded, payload, err := decodeRecord(encoded)
-		want, addrErr := makeVAddr(segmentID, offset)
+		want, addrErr := makeVAddr(segmentID, offset, uint64(decoded.PhysicalSize))
 		if err != nil || addrErr != nil || decoded.Addr != want {
 			return errors.Join(err, addrErr, ErrCorrupt)
 		}

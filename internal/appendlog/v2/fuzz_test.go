@@ -3,7 +3,7 @@ package v2
 import "testing"
 
 func FuzzDecodeRecord(f *testing.F) {
-	addr, _ := makeVAddr(1, segmentHeaderSize)
+	addr, _ := makeVAddr(1, segmentHeaderSize, 40)
 	valid, _ := encodeRecord(addr, []byte("seed"))
 	f.Add(valid)
 	f.Add([]byte{})

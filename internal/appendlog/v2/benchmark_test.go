@@ -81,12 +81,48 @@ func BenchmarkEncodeRecord(b *testing.B) {
 	for _, payloadSize := range []int{128, 4096, 128 << 10} {
 		b.Run(fmt.Sprintf("payload-%d", payloadSize), func(b *testing.B) {
 			payload := make([]byte, payloadSize)
-			addr, _ := makeVAddr(1, segmentHeaderSize)
+			physicalSize, _ := encodedRecordSize(uint64(len(payload)))
+			addr, _ := makeVAddr(1, segmentHeaderSize, physicalSize)
 			b.SetBytes(int64(payloadSize))
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				if _, err := encodeRecord(addr, payload); err != nil {
 					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkRead(b *testing.B) {
+	for _, payloadSize := range []int{32, 1024, 5000, 128 << 10} {
+		b.Run(fmt.Sprintf("payload-%d", payloadSize), func(b *testing.B) {
+			cfg := DefaultConfig(b.TempDir())
+			cfg.SegmentSize = 256 << 20
+			payload := make([]byte, payloadSize)
+			addr, err := func() (VAddr, error) {
+				log, err := Open(cfg)
+				if err != nil {
+					return 0, err
+				}
+				defer log.Close()
+				return log.Append(context.Background(), payload, true)
+			}()
+			if err != nil {
+				b.Fatal(err)
+			}
+			log, err := Open(cfg)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer log.Close()
+			b.SetBytes(int64(payloadSize))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				got, err := log.Read(context.Background(), addr)
+				if err != nil || len(got) != payloadSize {
+					b.Fatalf("read = %d bytes, %v", len(got), err)
 				}
 			}
 		})
