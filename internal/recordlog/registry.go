@@ -1,0 +1,262 @@
+package recordlog
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+)
+
+type segmentState uint8
+
+const (
+	segmentActive segmentState = iota + 1
+	segmentSealed
+	segmentRetiring
+)
+
+type registryEntry struct {
+	state  segmentState
+	active *activeSegment
+	sealed *sealedSegment
+	pins   uint64
+}
+
+type segmentRegistry struct {
+	mu      sync.Mutex
+	entries map[SegmentID]*registryEntry
+	active  SegmentID
+	changed chan struct{}
+	closed  bool
+}
+
+type segmentPin struct {
+	mu       sync.Mutex
+	registry *segmentRegistry
+	id       SegmentID
+	entry    *registryEntry
+	released bool
+}
+
+func newSegmentRegistry(active *activeSegment, sealed []*sealedSegment) (*segmentRegistry, error) {
+	if active == nil || active.file == nil || active.header.SegmentID == 0 {
+		return nil, ErrInvalidConfig
+	}
+	r := &segmentRegistry{entries: make(map[SegmentID]*registryEntry, len(sealed)+1), active: active.header.SegmentID, changed: make(chan struct{})}
+	r.entries[r.active] = &registryEntry{state: segmentActive, active: active}
+	for _, item := range sealed {
+		if item == nil || item.file == nil || item.header.SegmentID == r.active {
+			return nil, ErrInvalidConfig
+		}
+		id := item.header.SegmentID
+		if _, exists := r.entries[id]; exists {
+			return nil, ErrInvalidConfig
+		}
+		r.entries[id] = &registryEntry{state: segmentSealed, sealed: item}
+	}
+	return r, nil
+}
+
+func (r *segmentRegistry) pin(id SegmentID) (*segmentPin, error) {
+	if id == 0 {
+		return nil, ErrInvalidVAddr
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, ErrClosed
+	}
+	entry := r.entries[id]
+	if entry == nil {
+		return nil, ErrSegmentMissing
+	}
+	if entry.state == segmentRetiring {
+		return nil, ErrSegmentRetiring
+	}
+	entry.pins++
+	return &segmentPin{registry: r, id: id, entry: entry}, nil
+}
+
+func (p *segmentPin) read(addr VAddr) ([]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.released || p.registry == nil {
+		return nil, ErrClosed
+	}
+	if addr.SegmentID() != p.id {
+		return nil, ErrInvalidVAddr
+	}
+	p.registry.mu.Lock()
+	active, sealed := p.entry.active, p.entry.sealed
+	p.registry.mu.Unlock()
+	if active != nil {
+		return active.read(addr)
+	}
+	if sealed != nil {
+		return sealed.read(addr)
+	}
+	return nil, ErrSegmentMissing
+}
+
+func (p *segmentPin) release() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.released || p.registry == nil {
+		return ErrClosed
+	}
+	p.registry.mu.Lock()
+	entry := p.registry.entries[p.id]
+	if entry == nil || entry != p.entry || entry.pins == 0 {
+		p.registry.mu.Unlock()
+		return fmt.Errorf("reader pin underflow: %w", ErrCorrupt)
+	}
+	entry.pins--
+	p.registry.signalLocked()
+	p.registry.mu.Unlock()
+	p.released = true
+	p.registry = nil
+	p.entry = nil
+	return nil
+}
+
+func (r *segmentRegistry) publishRotation(oldID SegmentID, sealed *sealedSegment, active *activeSegment) error {
+	if sealed == nil || active == nil || sealed.header.SegmentID != oldID || active.header.PreviousSegment != oldID || sealed.file == nil || active.file == nil {
+		return ErrInvalidConfig
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrClosed
+	}
+	old := r.entries[oldID]
+	if r.active != oldID || old == nil || old.state != segmentActive || old.active == nil {
+		return ErrInvalidConfig
+	}
+	if _, exists := r.entries[active.header.SegmentID]; exists {
+		return ErrInvalidConfig
+	}
+	old.state = segmentSealed
+	old.active = nil
+	old.sealed = sealed
+	r.entries[active.header.SegmentID] = &registryEntry{state: segmentActive, active: active}
+	r.active = active.header.SegmentID
+	r.signalLocked()
+	return nil
+}
+
+func (r *segmentRegistry) beginRetire(id SegmentID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrClosed
+	}
+	entry := r.entries[id]
+	if entry == nil {
+		return ErrSegmentMissing
+	}
+	if entry.state == segmentRetiring {
+		return nil
+	}
+	if entry.state != segmentSealed || entry.sealed == nil {
+		return ErrInvalidConfig
+	}
+	entry.state = segmentRetiring
+	r.signalLocked()
+	return nil
+}
+
+func (r *segmentRegistry) cancelRetire(id SegmentID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrClosed
+	}
+	entry := r.entries[id]
+	if entry == nil {
+		return ErrSegmentMissing
+	}
+	if entry.state != segmentRetiring {
+		return ErrInvalidConfig
+	}
+	entry.state = segmentSealed
+	r.signalLocked()
+	return nil
+}
+
+func (r *segmentRegistry) waitNoReaders(ctx context.Context, id SegmentID) error {
+	for {
+		r.mu.Lock()
+		entry := r.entries[id]
+		if entry == nil {
+			r.mu.Unlock()
+			return ErrSegmentMissing
+		}
+		if entry.state != segmentRetiring {
+			r.mu.Unlock()
+			return ErrInvalidConfig
+		}
+		if entry.pins == 0 {
+			r.mu.Unlock()
+			return nil
+		}
+		changed := r.changed
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (r *segmentRegistry) detachRetired(id SegmentID) (*sealedSegment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry := r.entries[id]
+	if entry == nil {
+		return nil, ErrSegmentMissing
+	}
+	if entry.state != segmentRetiring || entry.sealed == nil {
+		return nil, ErrInvalidConfig
+	}
+	if entry.pins != 0 {
+		return nil, ErrReadersActive
+	}
+	delete(r.entries, id)
+	r.signalLocked()
+	return entry.sealed, nil
+}
+
+func (r *segmentRegistry) close() error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return ErrClosed
+	}
+	for _, entry := range r.entries {
+		if entry.pins != 0 {
+			r.mu.Unlock()
+			return ErrReadersActive
+		}
+	}
+	r.closed = true
+	entries := r.entries
+	r.entries = nil
+	r.signalLocked()
+	r.mu.Unlock()
+	var result error
+	for _, entry := range entries {
+		if entry.active != nil {
+			result = errors.Join(result, entry.active.close())
+		}
+		if entry.sealed != nil {
+			result = errors.Join(result, entry.sealed.close())
+		}
+	}
+	return result
+}
+
+func (r *segmentRegistry) signalLocked() {
+	close(r.changed)
+	r.changed = make(chan struct{})
+}
