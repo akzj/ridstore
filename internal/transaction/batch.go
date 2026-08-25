@@ -61,7 +61,6 @@ func (p Prepared) Proposal() mapping.Proposal {
 	}
 	return mapping.Proposal{
 		Kind:       mapping.ProposalUserCommit,
-		Revision:   model.Revision(p.BatchID),
 		Conditions: append([]mapping.Condition(nil), p.Conditions...),
 		Changes:    changes,
 	}
@@ -154,13 +153,13 @@ func (b *Batch) Put(ctx context.Context, id model.ID, value []byte) error {
 	return b.putLocked(ctx, id, value)
 }
 
-func (b *Batch) Update(ctx context.Context, id model.ID, expected model.Revision, value []byte) error {
+func (b *Batch) CompareAndPut(ctx context.Context, id model.ID, expected recordlog.VAddr, value []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := b.requireOpen(); err != nil {
 		return err
 	}
-	condition := mapping.Condition{RecordID: id, Kind: mapping.ConditionRevision, Revision: expected}
+	condition := mapping.Condition{RecordID: id, ExpectedAddr: expected}
 	if err := b.validateCondition(condition); err != nil {
 		return err
 	}
@@ -180,13 +179,13 @@ func (b *Batch) Delete(id model.ID) error {
 	return b.deleteLocked(id)
 }
 
-func (b *Batch) DeleteIfRevision(id model.ID, expected model.Revision) error {
+func (b *Batch) CompareAndDelete(id model.ID, expected recordlog.VAddr) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := b.requireOpen(); err != nil {
 		return err
 	}
-	condition := mapping.Condition{RecordID: id, Kind: mapping.ConditionRevision, Revision: expected}
+	condition := mapping.Condition{RecordID: id, ExpectedAddr: expected}
 	if err := b.validateCondition(condition); err != nil {
 		return err
 	}
@@ -197,12 +196,12 @@ func (b *Batch) DeleteIfRevision(id model.ID, expected model.Revision) error {
 	return nil
 }
 
-func (b *Batch) ExpectRevision(id model.ID, revision model.Revision) error {
-	return b.addCondition(mapping.Condition{RecordID: id, Kind: mapping.ConditionRevision, Revision: revision})
+func (b *Batch) ExpectAddress(id model.ID, addr recordlog.VAddr) error {
+	return b.addCondition(mapping.Condition{RecordID: id, ExpectedAddr: addr})
 }
 
 func (b *Batch) ExpectAbsent(id model.ID) error {
-	return b.addCondition(mapping.Condition{RecordID: id, Kind: mapping.ConditionAbsent})
+	return b.addCondition(mapping.Condition{RecordID: id})
 }
 
 func (b *Batch) Prepare() (Prepared, error) {
@@ -361,10 +360,8 @@ func (b *Batch) validateCondition(condition mapping.Condition) error {
 	if condition.RecordID == 0 {
 		return base.ErrInvalidID
 	}
-	if (condition.Kind == mapping.ConditionRevision && condition.Revision == 0) ||
-		(condition.Kind == mapping.ConditionAbsent && condition.Revision != 0) ||
-		(condition.Kind != mapping.ConditionRevision && condition.Kind != mapping.ConditionAbsent) {
-		return base.ErrInvalidRevision
+	if condition.ExpectedAddr != 0 && !condition.ExpectedAddr.Valid() {
+		return base.ErrInvalidAddress
 	}
 	if old, exists := b.conditions[condition.RecordID]; exists {
 		if old == condition {

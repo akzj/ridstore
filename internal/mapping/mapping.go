@@ -17,22 +17,9 @@ var (
 	ErrStalePlan = errors.New("mapping: stale resolved plan")
 )
 
-type Entry struct {
-	Addr     recordlog.VAddr
-	Revision model.Revision
-}
-
-type ConditionKind uint8
-
-const (
-	ConditionRevision ConditionKind = iota + 1
-	ConditionAbsent
-)
-
 type Condition struct {
-	RecordID model.ID
-	Kind     ConditionKind
-	Revision model.Revision
+	RecordID     model.ID
+	ExpectedAddr recordlog.VAddr // zero means the ID must be absent
 }
 
 type Operation uint8
@@ -59,20 +46,17 @@ const (
 
 type Proposal struct {
 	Kind       ProposalKind
-	Revision   model.Revision
 	Conditions []Condition
 	Changes    []Change
 }
 
 type ResolvedChange struct {
-	Change   Change
-	Revision model.Revision
-	Apply    bool
+	Change Change
+	Apply  bool
 }
 
 type ResolvedProposal struct {
 	Kind     ProposalKind
-	Revision model.Revision
 	Accepted bool
 	Changes  []ResolvedChange
 }
@@ -90,14 +74,14 @@ type PublishResult struct {
 
 type Snapshot struct {
 	CoveredCommitSeq model.CommitSeq
-	Entries          map[model.ID]Entry
+	Entries          map[model.ID]recordlog.VAddr
 }
 
 // Index is the single runtime Mapping contract used by commit, replay and
 // reads. Persistent is the production implementation; Mapping remains a
 // temporary in-memory model for tests until the v2 Open path is complete.
 type Index interface {
-	Lookup(model.ID) (Entry, bool, error)
+	Lookup(model.ID) (recordlog.VAddr, bool, error)
 	ResolveGroup([]Proposal) (GroupPlan, error)
 	PublishGroup(model.CommitSeq, GroupPlan) (PublishResult, error)
 	CoveredCommitSeq() model.CommitSeq
@@ -109,16 +93,16 @@ var _ Index = (*Persistent)(nil)
 type Mapping struct {
 	mu      sync.RWMutex
 	covered model.CommitSeq
-	entries map[model.ID]Entry
+	entries map[model.ID]recordlog.VAddr
 }
 
 func New(snapshot Snapshot) (*Mapping, error) {
-	entries := make(map[model.ID]Entry, len(snapshot.Entries))
-	for id, entry := range snapshot.Entries {
-		if id == 0 || !validEntry(entry) {
+	entries := make(map[model.ID]recordlog.VAddr, len(snapshot.Entries))
+	for id, addr := range snapshot.Entries {
+		if id == 0 || !addr.Valid() {
 			return nil, ErrInvalid
 		}
-		entries[id] = entry
+		entries[id] = addr
 	}
 	return &Mapping{covered: snapshot.CoveredCommitSeq, entries: entries}, nil
 }
@@ -128,9 +112,9 @@ func NewEmpty() *Mapping {
 	return mapping
 }
 
-func (m *Mapping) Lookup(id model.ID) (Entry, bool, error) {
+func (m *Mapping) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 	if id == 0 {
-		return Entry{}, false, ErrInvalid
+		return 0, false, ErrInvalid
 	}
 	m.mu.RLock()
 	entry, exists := m.entries[id]
@@ -149,33 +133,33 @@ func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return resolveGroupAt(m.covered, proposals, func(id model.ID) (Entry, bool, error) {
+	return resolveGroupAt(m.covered, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
 		value, ok := m.entries[id]
 		return value, ok, nil
 	})
 }
 
-func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(model.ID) (Entry, bool, error)) (GroupPlan, error) {
+func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(model.ID) (recordlog.VAddr, bool, error)) (GroupPlan, error) {
 	plan := GroupPlan{BaseCommitSeq: base, Proposals: make([]ResolvedProposal, len(proposals))}
 	type virtualEntry struct {
-		entry  Entry
+		addr   recordlog.VAddr
 		exists bool
 	}
 	virtual := make(map[model.ID]virtualEntry)
-	lookup := func(id model.ID) (Entry, bool, error) {
+	lookup := func(id model.ID) (recordlog.VAddr, bool, error) {
 		if value, ok := virtual[id]; ok {
-			return value.entry, value.exists, nil
+			return value.addr, value.exists, nil
 		}
 		return baseLookup(id)
 	}
 	for index, proposal := range proposals {
-		resolved := ResolvedProposal{Kind: proposal.Kind, Revision: proposal.Revision, Accepted: true}
+		resolved := ResolvedProposal{Kind: proposal.Kind, Accepted: true}
 		for _, condition := range proposal.Conditions {
-			entry, exists, err := lookup(condition.RecordID)
+			addr, exists, err := lookup(condition.RecordID)
 			if err != nil {
 				return GroupPlan{}, err
 			}
-			if (condition.Kind == ConditionAbsent && exists) || (condition.Kind == ConditionRevision && (!exists || entry.Revision != condition.Revision)) {
+			if condition.ExpectedAddr == 0 && exists || condition.ExpectedAddr != 0 && (!exists || addr != condition.ExpectedAddr) {
 				resolved.Accepted = false
 				break
 			}
@@ -189,21 +173,19 @@ func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(
 			result := ResolvedChange{Change: change, Apply: true}
 			switch proposal.Kind {
 			case ProposalUserCommit:
-				result.Revision = proposal.Revision
 				if change.Operation == OperationDelete {
 					virtual[change.RecordID] = virtualEntry{}
 				} else {
-					virtual[change.RecordID] = virtualEntry{entry: Entry{Addr: change.NewAddr, Revision: proposal.Revision}, exists: true}
+					virtual[change.RecordID] = virtualEntry{addr: change.NewAddr, exists: true}
 				}
 			case ProposalRelocation:
 				current, exists, err := lookup(change.RecordID)
 				if err != nil {
 					return GroupPlan{}, err
 				}
-				result.Apply = exists && current.Addr == change.ExpectedOldAddr
+				result.Apply = exists && current == change.ExpectedOldAddr
 				if result.Apply {
-					result.Revision = current.Revision
-					virtual[change.RecordID] = virtualEntry{entry: Entry{Addr: change.NewAddr, Revision: current.Revision}, exists: true}
+					virtual[change.RecordID] = virtualEntry{addr: change.NewAddr, exists: true}
 				}
 			}
 			resolved.Changes[changeIndex] = result
@@ -250,7 +232,7 @@ func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan) (
 			if resolved.Change.Operation == OperationDelete {
 				delete(m.entries, resolved.Change.RecordID)
 			} else {
-				m.entries[resolved.Change.RecordID] = Entry{Addr: resolved.Change.NewAddr, Revision: resolved.Revision}
+				m.entries[resolved.Change.RecordID] = resolved.Change.NewAddr
 			}
 			result.Applied++
 		}
@@ -262,7 +244,7 @@ func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan) (
 func (m *Mapping) Snapshot() Snapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	entries := make(map[model.ID]Entry, len(m.entries))
+	entries := make(map[model.ID]recordlog.VAddr, len(m.entries))
 	for id, entry := range m.entries {
 		entries[id] = entry
 	}
@@ -278,11 +260,8 @@ func (m *Mapping) CoveredCommitSeq() model.CommitSeq {
 func validateProposal(proposal Proposal) error {
 	switch proposal.Kind {
 	case ProposalUserCommit:
-		if proposal.Revision == 0 {
-			return ErrInvalid
-		}
 	case ProposalRelocation:
-		if proposal.Revision != 0 || len(proposal.Conditions) != 0 || len(proposal.Changes) == 0 {
+		if len(proposal.Conditions) != 0 || len(proposal.Changes) == 0 {
 			return ErrInvalid
 		}
 	default:
@@ -293,7 +272,7 @@ func validateProposal(proposal Proposal) error {
 		if condition.RecordID == 0 || (index != 0 && condition.RecordID <= previous) {
 			return ErrInvalid
 		}
-		if (condition.Kind == ConditionRevision && condition.Revision == 0) || (condition.Kind == ConditionAbsent && condition.Revision != 0) || (condition.Kind != ConditionRevision && condition.Kind != ConditionAbsent) {
+		if condition.ExpectedAddr != 0 && !condition.ExpectedAddr.Valid() {
 			return ErrInvalid
 		}
 		previous = condition.RecordID
@@ -321,7 +300,7 @@ func validateProposal(proposal Proposal) error {
 func validateResolvedPlan(plan GroupPlan) error {
 	for _, proposal := range plan.Proposals {
 		if !proposal.Accepted {
-			if proposal.Kind != ProposalUserCommit || proposal.Revision == 0 || len(proposal.Changes) != 0 {
+			if proposal.Kind != ProposalUserCommit || len(proposal.Changes) != 0 {
 				return fmt.Errorf("rejected proposal has changes: %w", ErrInvalid)
 			}
 			continue
@@ -329,23 +308,13 @@ func validateResolvedPlan(plan GroupPlan) error {
 		changes := make([]Change, len(proposal.Changes))
 		for i, resolved := range proposal.Changes {
 			changes[i] = resolved.Change
-			if proposal.Kind == ProposalUserCommit && (!resolved.Apply || resolved.Revision != proposal.Revision) {
-				return ErrInvalid
-			}
-			if proposal.Kind == ProposalRelocation && resolved.Apply && resolved.Revision == 0 {
-				return ErrInvalid
-			}
-			if proposal.Kind == ProposalRelocation && !resolved.Apply && resolved.Revision != 0 {
+			if proposal.Kind == ProposalUserCommit && !resolved.Apply {
 				return ErrInvalid
 			}
 		}
-		if err := validateProposal(Proposal{Kind: proposal.Kind, Revision: proposal.Revision, Changes: changes}); err != nil {
+		if err := validateProposal(Proposal{Kind: proposal.Kind, Changes: changes}); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func validEntry(entry Entry) bool {
-	return entry.Addr.Valid() && entry.Revision != 0
 }

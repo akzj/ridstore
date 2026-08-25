@@ -86,12 +86,12 @@ func TestPutFoldsFinalMutationsAndUsesProtocolRecords(t *testing.T) {
 		t.Fatalf("prepared=%+v", prepared)
 	}
 	proposal := prepared.Proposal()
-	if proposal.Revision != 7 || len(proposal.Changes) != 2 || proposal.Changes[1].Operation != mapping.OperationDelete {
+	if len(proposal.Changes) != 2 || proposal.Changes[1].Operation != mapping.OperationDelete {
 		t.Fatalf("proposal=%+v", proposal)
 	}
 }
 
-func TestCreateIsBlindAndUpdateDeclaresRevision(t *testing.T) {
+func TestCreateIsBlindAndCompareAndPutDeclaresAddress(t *testing.T) {
 	log := &fakeLog{}
 	created := testBatch(t, log, Limits{})
 	id, err := created.Create(context.Background(), []byte("new"))
@@ -107,14 +107,15 @@ func TestCreateIsBlindAndUpdateDeclaresRevision(t *testing.T) {
 	}
 
 	updated := testBatch(t, log, Limits{})
-	if err := updated.Update(context.Background(), 9, 11, []byte("updated")); err != nil {
+	expected, _ := recordlog.NewVAddr(1, 64, 64)
+	if err := updated.CompareAndPut(context.Background(), 9, expected, []byte("updated")); err != nil {
 		t.Fatal(err)
 	}
 	prepared, err = updated.Prepare()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(prepared.Conditions, []mapping.Condition{{RecordID: 9, Kind: mapping.ConditionRevision, Revision: 11}}) {
+	if !reflect.DeepEqual(prepared.Conditions, []mapping.Condition{{RecordID: 9, ExpectedAddr: expected}}) {
 		t.Fatalf("conditions=%+v", prepared.Conditions)
 	}
 }
@@ -125,7 +126,8 @@ func TestConditionValidatedBeforeAppend(t *testing.T) {
 	if err := b.ExpectAbsent(1); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Update(context.Background(), 2, 7, []byte("must-not-append")); !errors.Is(err, base.ErrBatchTooLarge) {
+	expected, _ := recordlog.NewVAddr(1, 64, 64)
+	if err := b.CompareAndPut(context.Background(), 2, expected, []byte("must-not-append")); !errors.Is(err, base.ErrBatchTooLarge) {
 		t.Fatalf("update err=%v", err)
 	}
 	if len(log.records) != 0 {

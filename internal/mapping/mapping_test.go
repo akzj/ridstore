@@ -23,13 +23,13 @@ func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 	secondAddr := testAddr(t, 1, 128)
 	plan, err := mapping.ResolveGroup([]Proposal{
 		{
-			Kind: ProposalUserCommit, Revision: 10,
-			Conditions: []Condition{{RecordID: 7, Kind: ConditionAbsent}},
+			Kind:       ProposalUserCommit,
+			Conditions: []Condition{{RecordID: 7}},
 			Changes:    []Change{{RecordID: 7, NewAddr: firstAddr, Operation: OperationPut}},
 		},
 		{
-			Kind: ProposalUserCommit, Revision: 11,
-			Conditions: []Condition{{RecordID: 7, Kind: ConditionRevision, Revision: 10}},
+			Kind:       ProposalUserCommit,
+			Conditions: []Condition{{RecordID: 7, ExpectedAddr: firstAddr}},
 			Changes:    []Change{{RecordID: 7, NewAddr: secondAddr, Operation: OperationPut}},
 		},
 	})
@@ -46,9 +46,9 @@ func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 	if err != nil || result.Committed != 2 || result.Applied != 2 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	entry, exists, err := mapping.Lookup(7)
-	if err != nil || !exists || entry.Addr != secondAddr || entry.Revision != 11 {
-		t.Fatalf("entry=%+v exists=%v err=%v", entry, exists, err)
+	addr, exists, err := mapping.Lookup(7)
+	if err != nil || !exists || addr != secondAddr {
+		t.Fatalf("addr=%+v exists=%v err=%v", addr, exists, err)
 	}
 	if mapping.CoveredCommitSeq() != 2 {
 		t.Fatalf("covered=%d", mapping.CoveredCommitSeq())
@@ -57,14 +57,14 @@ func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 
 func TestResolveGroupRejectsConflictWithoutAffectingLaterProposal(t *testing.T) {
 	old := testAddr(t, 1, 64)
-	mapping, err := New(Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]Entry{1: {Addr: old, Revision: 8}}})
+	mapping, err := New(Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.VAddr{1: old}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	newAddr := testAddr(t, 1, 128)
 	plan, err := mapping.ResolveGroup([]Proposal{
-		{Kind: ProposalUserCommit, Revision: 9, Conditions: []Condition{{RecordID: 1, Kind: ConditionRevision, Revision: 7}}, Changes: []Change{{RecordID: 1, Operation: OperationDelete}}},
-		{Kind: ProposalUserCommit, Revision: 10, Conditions: []Condition{{RecordID: 1, Kind: ConditionRevision, Revision: 8}}, Changes: []Change{{RecordID: 1, NewAddr: newAddr, Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Conditions: []Condition{{RecordID: 1, ExpectedAddr: testAddr(t, 9, 64)}}, Changes: []Change{{RecordID: 1, Operation: OperationDelete}}},
+		{Kind: ProposalUserCommit, Conditions: []Condition{{RecordID: 1, ExpectedAddr: old}}, Changes: []Change{{RecordID: 1, NewAddr: newAddr, Operation: OperationPut}}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,16 +76,16 @@ func TestResolveGroupRejectsConflictWithoutAffectingLaterProposal(t *testing.T) 
 	if err != nil || result.Committed != 1 || mapping.CoveredCommitSeq() != 5 {
 		t.Fatalf("result=%+v covered=%d err=%v", result, mapping.CoveredCommitSeq(), err)
 	}
-	entry, exists, _ := mapping.Lookup(1)
-	if !exists || entry.Addr != newAddr || entry.Revision != 10 {
-		t.Fatalf("entry=%+v exists=%v", entry, exists)
+	addr, exists, _ := mapping.Lookup(1)
+	if !exists || addr != newAddr {
+		t.Fatalf("addr=%+v exists=%v", addr, exists)
 	}
 }
 
-func TestRelocationCASPreservesLogicalRevision(t *testing.T) {
+func TestRelocationUsesAddressCAS(t *testing.T) {
 	old := testAddr(t, 2, 64)
 	newAddr := testAddr(t, 3, 64)
-	mapping, _ := New(Snapshot{CoveredCommitSeq: 2, Entries: map[model.ID]Entry{5: {Addr: old, Revision: 77}}})
+	mapping, _ := New(Snapshot{CoveredCommitSeq: 2, Entries: map[model.ID]recordlog.VAddr{5: old}})
 	plan, err := mapping.ResolveGroup([]Proposal{{
 		Kind: ProposalRelocation,
 		Changes: []Change{
@@ -100,16 +100,16 @@ func TestRelocationCASPreservesLogicalRevision(t *testing.T) {
 	if err != nil || result.Applied != 1 || result.Skipped != 1 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	entry, exists, _ := mapping.Lookup(5)
-	if !exists || entry.Addr != newAddr || entry.Revision != 77 {
-		t.Fatalf("entry=%+v exists=%v", entry, exists)
+	addr, exists, _ := mapping.Lookup(5)
+	if !exists || addr != newAddr {
+		t.Fatalf("addr=%+v exists=%v", addr, exists)
 	}
 }
 
 func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 	mapping := NewEmpty()
 	addr := testAddr(t, 1, 64)
-	proposal := Proposal{Kind: ProposalUserCommit, Revision: 1, Changes: []Change{{RecordID: 1, NewAddr: addr, Operation: OperationPut}}}
+	proposal := Proposal{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: addr, Operation: OperationPut}}}
 	first, err := mapping.ResolveGroup([]Proposal{proposal})
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +124,7 @@ func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 	if _, err := mapping.PublishGroup(2, second); !errors.Is(err, ErrStalePlan) {
 		t.Fatalf("stale error=%v", err)
 	}
-	third, err := mapping.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Revision: 2, Changes: []Change{{RecordID: 2, NewAddr: testAddr(t, 1, 128), Operation: OperationPut}}}})
+	third, err := mapping.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewAddr: testAddr(t, 1, 128), Operation: OperationPut}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 
 func TestSnapshotOwnsEntries(t *testing.T) {
 	addr := testAddr(t, 1, 64)
-	mapping, err := New(Snapshot{Entries: map[model.ID]Entry{1: {Addr: addr, Revision: 1}}})
+	mapping, err := New(Snapshot{Entries: map[model.ID]recordlog.VAddr{1: addr}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -98,9 +98,9 @@ func TestRecoverRebuildsMappingAllocatorsAndStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, exists, _ := result.Mapping.Lookup(2)
-	if !exists || entry.Addr != putAddr || entry.Revision != 2 || result.NextCommitSeq != 2 || result.ReservedIDHigh != 9 || result.ReservedBatchIDHigh != 9 {
-		t.Fatalf("entry=%+v exists=%v result=%+v", entry, exists, result)
+	addr, exists, _ := result.Mapping.Lookup(2)
+	if !exists || addr != putAddr || result.NextCommitSeq != 2 || result.ReservedIDHigh != 9 || result.ReservedBatchIDHigh != 9 {
+		t.Fatalf("addr=%+v exists=%v result=%+v", addr, exists, result)
 	}
 	if _, exists, _ := result.Mapping.Lookup(1); exists {
 		t.Fatal("orphan put became visible")
@@ -138,7 +138,7 @@ func TestRecoverRejectsCommitSequenceGapAndWrongPutIdentity(t *testing.T) {
 	}
 }
 
-func TestRecoverRelocationPreservesRevisionAndUsesAddressCAS(t *testing.T) {
+func TestRecoverRelocationUsesAddressCAS(t *testing.T) {
 	log := &fakeLog{byAddr: make(map[recordlog.VAddr][]byte), nextOffset: 256}
 	oldPayload, _ := recordcodec.EncodePut(recordcodec.PutRecord{OriginBatchID: 2, RecordID: 1, Value: []byte("value")}, 1024)
 	oldPhysical, _ := recordlog.PhysicalRecordSize(uint64(len(oldPayload)))
@@ -161,7 +161,7 @@ func TestRecoverRelocationPreservesRevisionAndUsesAddressCAS(t *testing.T) {
 	start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
 	initial, err := mapping.New(mapping.Snapshot{
 		CoveredCommitSeq: 4,
-		Entries:          map[model.ID]mapping.Entry{1: {Addr: oldAddr, Revision: 2}},
+		Entries:          map[model.ID]recordlog.VAddr{1: oldAddr},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -173,8 +173,8 @@ func TestRecoverRelocationPreservesRevisionAndUsesAddressCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, exists, _ := result.Mapping.Lookup(1)
-	if !exists || entry.Addr != newAddr || entry.Revision != 2 || result.NextCommitSeq != 6 {
-		t.Fatalf("entry=%+v exists=%v next=%d", entry, exists, result.NextCommitSeq)
+	addr, exists, _ := result.Mapping.Lookup(1)
+	if !exists || addr != newAddr || result.NextCommitSeq != 6 {
+		t.Fatalf("addr=%+v exists=%v next=%d", addr, exists, result.NextCommitSeq)
 	}
 }

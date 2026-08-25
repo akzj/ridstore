@@ -61,11 +61,7 @@ func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 	if err != nil {
 		return fail(err)
 	}
-	resolver, err := mapping.NewPutRevisionResolver(log, manifest.HardLimits.MaxValueSize)
-	if err != nil {
-		return fail(err)
-	}
-	current, err := mapping.OpenPersistent(tree, resolver, physicalMapping, config.MaxCheckpointEntries)
+	current, err := mapping.OpenPersistent(tree, physicalMapping, config.MaxCheckpointEntries)
 	if err != nil {
 		return fail(err)
 	}

@@ -2,7 +2,6 @@ package mapping
 
 import (
 	"context"
-	"errors"
 	"math"
 	"sort"
 	"sync"
@@ -12,16 +11,12 @@ import (
 	"github.com/akzj/ridstore/internal/recordlog"
 )
 
-type RevisionResolver interface {
-	ResolveRevision(recordlog.VAddr, model.ID) (model.Revision, error)
-}
-
 type NodeSyncer interface {
 	Sync() error
 }
 
 type persistentDelta struct {
-	entry  Entry
+	addr   recordlog.VAddr
 	exists bool
 }
 
@@ -35,50 +30,42 @@ type deltaLayer struct {
 type Persistent struct {
 	mu sync.RWMutex
 
-	root     *radix.Tree
-	resolver RevisionResolver
-	syncer   NodeSyncer
-	covered  model.CommitSeq
-	epoch    uint64
-	active   *deltaLayer
-	frozen   []*deltaLayer // oldest to newest
+	root    *radix.Tree
+	syncer  NodeSyncer
+	covered model.CommitSeq
+	epoch   uint64
+	active  *deltaLayer
+	frozen  []*deltaLayer // oldest to newest
 
 	checkpointID         uint64
 	inCheckpoint         bool
 	maxCheckpointEntries uint64
 }
 
-func OpenPersistent(root *radix.Tree, resolver RevisionResolver, syncer NodeSyncer, maxCheckpointEntries uint64) (*Persistent, error) {
-	if root == nil || resolver == nil || syncer == nil || maxCheckpointEntries == 0 {
+func OpenPersistent(root *radix.Tree, syncer NodeSyncer, maxCheckpointEntries uint64) (*Persistent, error) {
+	if root == nil || syncer == nil || maxCheckpointEntries == 0 {
 		return nil, ErrInvalid
 	}
 	return &Persistent{
-		root: root, resolver: resolver, syncer: syncer, covered: root.Covered(),
+		root: root, syncer: syncer, covered: root.Covered(),
 		active:               &deltaLayer{values: make(map[model.ID]persistentDelta)},
 		maxCheckpointEntries: maxCheckpointEntries,
 	}, nil
 }
 
-func (m *Persistent) Lookup(id model.ID) (Entry, bool, error) {
+func (m *Persistent) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 	if id == 0 {
-		return Entry{}, false, ErrInvalid
+		return 0, false, ErrInvalid
 	}
 	m.mu.RLock()
 	if value, found := lookupLayers(m.active, m.frozen, id); found {
 		m.mu.RUnlock()
-		return value.entry, value.exists, nil
+		return value.addr, value.exists, nil
 	}
 	root := m.root
 	m.mu.RUnlock()
 	addr, exists, err := root.Lookup(id)
-	if err != nil || !exists {
-		return Entry{}, exists, err
-	}
-	revision, err := m.resolver.ResolveRevision(addr, id)
-	if err != nil || revision == 0 {
-		return Entry{}, false, errors.Join(ErrCorrupt, err)
-	}
-	return Entry{Addr: addr, Revision: revision}, true, nil
+	return addr, exists, err
 }
 
 func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
@@ -111,11 +98,7 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 			}
 			value := persistentDelta{exists: exists}
 			if exists {
-				revision, err := m.resolver.ResolveRevision(addr, id)
-				if err != nil || revision == 0 {
-					return GroupPlan{}, errors.Join(ErrCorrupt, err)
-				}
-				value.entry = Entry{Addr: addr, Revision: revision}
+				value.addr = addr
 			}
 			values[id] = value
 		}
@@ -125,9 +108,9 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 		if !stable {
 			continue
 		}
-		return resolveGroupAt(base, proposals, func(id model.ID) (Entry, bool, error) {
+		return resolveGroupAt(base, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
 			value := values[id]
-			return value.entry, value.exists, nil
+			return value.addr, value.exists, nil
 		})
 	}
 }
@@ -163,7 +146,7 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan) (Publis
 			if resolved.Change.Operation == OperationDelete {
 				m.active.values[resolved.Change.RecordID] = persistentDelta{}
 			} else {
-				m.active.values[resolved.Change.RecordID] = persistentDelta{entry: Entry{Addr: resolved.Change.NewAddr, Revision: resolved.Revision}, exists: true}
+				m.active.values[resolved.Change.RecordID] = persistentDelta{addr: resolved.Change.NewAddr, exists: true}
 			}
 			result.Applied++
 		}
@@ -259,7 +242,7 @@ func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCa
 	}
 	mutations := make([]radix.Mutation, 0, len(latest))
 	for id, value := range latest {
-		mutations = append(mutations, radix.Mutation{ID: id, Addr: value.entry.Addr})
+		mutations = append(mutations, radix.Mutation{ID: id, Addr: value.addr})
 	}
 	sort.Slice(mutations, func(i, j int) bool { return mutations[i].ID < mutations[j].ID })
 	tree, err := checkpoint.base.Build(checkpoint.covered, mutations)

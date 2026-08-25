@@ -33,8 +33,8 @@ type Config struct {
 }
 
 type Record struct {
-	Value    []byte
-	Revision model.Revision
+	Value []byte
+	Addr  recordlog.VAddr
 }
 
 type Store struct {
@@ -155,14 +155,14 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		if fault != nil {
 			return Record{}, errors.Join(base.ErrReadOnly, fault)
 		}
-		entry, exists, err := s.mapping.Lookup(id)
+		addr, exists, err := s.mapping.Lookup(id)
 		if err != nil {
 			return Record{}, err
 		}
 		if !exists {
 			return Record{}, base.ErrNotFound
 		}
-		payload, err := s.log.Read(ctx, entry.Addr)
+		payload, err := s.log.Read(ctx, addr)
 		if err != nil {
 			return Record{}, err
 		}
@@ -170,14 +170,14 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		if err != nil {
 			return Record{}, err
 		}
-		if !stillExists || current != entry {
+		if !stillExists || current != addr {
 			continue
 		}
 		put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
-		if err != nil || put.RecordID != id || model.Revision(put.OriginBatchID) != entry.Revision {
+		if err != nil || put.RecordID != id {
 			return Record{}, errors.Join(base.ErrCorrupt, err)
 		}
-		return Record{Value: put.Value, Revision: entry.Revision}, nil
+		return Record{Value: put.Value, Addr: addr}, nil
 	}
 }
 
@@ -343,8 +343,8 @@ func (b *Batch) Put(ctx context.Context, id model.ID, value []byte) error {
 	return err
 }
 
-func (b *Batch) Update(ctx context.Context, id model.ID, revision model.Revision, value []byte) error {
-	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.Update(ctx, id, revision, value) })
+func (b *Batch) CompareAndPut(ctx context.Context, id model.ID, expected recordlog.VAddr, value []byte) error {
+	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.CompareAndPut(ctx, id, expected, value) })
 	return err
 }
 
@@ -353,13 +353,13 @@ func (b *Batch) Delete(id model.ID) error {
 	return err
 }
 
-func (b *Batch) DeleteIfRevision(id model.ID, revision model.Revision) error {
-	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.DeleteIfRevision(id, revision) })
+func (b *Batch) CompareAndDelete(id model.ID, expected recordlog.VAddr) error {
+	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.CompareAndDelete(id, expected) })
 	return err
 }
 
-func (b *Batch) ExpectRevision(id model.ID, revision model.Revision) error {
-	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.ExpectRevision(id, revision) })
+func (b *Batch) ExpectAddress(id model.ID, addr recordlog.VAddr) error {
+	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.ExpectAddress(id, addr) })
 	return err
 }
 

@@ -177,9 +177,9 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 }
 
 func descriptorProposal(ctx context.Context, log Log, descriptor recordcodec.Descriptor, commitAddr recordlog.VAddr, reservedIDHigh, maxValue uint64) (mapping.Proposal, error) {
-	proposal := mapping.Proposal{Revision: model.Revision(descriptor.BatchID), Changes: make([]mapping.Change, len(descriptor.Mutations))}
+	proposal := mapping.Proposal{Changes: make([]mapping.Change, len(descriptor.Mutations))}
 	if descriptor.Kind == recordcodec.DescriptorRelocation {
-		proposal.Kind, proposal.Revision = mapping.ProposalRelocation, 0
+		proposal.Kind = mapping.ProposalRelocation
 	} else {
 		proposal.Kind = mapping.ProposalUserCommit
 	}

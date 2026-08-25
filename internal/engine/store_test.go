@@ -38,18 +38,14 @@ func (emptyNodeStore) Append(uint8, uint64, model.CommitSeq, [mapstore.NodeSlots
 
 func (emptyNodeStore) Sync() error { return nil }
 
-func newPersistent(t *testing.T, log mapping.RecordReader) *mapping.Persistent {
+func newPersistent(t *testing.T) *mapping.Persistent {
 	t.Helper()
 	nodes := emptyNodeStore{}
 	tree, err := radix.Open(nodes, 0, 0, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver, err := mapping.NewPutRevisionResolver(log, 1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	current, err := mapping.OpenPersistent(tree, resolver, nodes, 1024)
+	current, err := mapping.OpenPersistent(tree, nodes, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +125,7 @@ func newStore(t *testing.T, maxOpen int) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := New(log, newPersistent(t, log), ids, batches, Config{
+	store, err := New(log, newPersistent(t), ids, batches, Config{
 		Batch:          transaction.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16},
 		Commit:         coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 1 << 20},
 		MaxOpenBatches: maxOpen,
@@ -159,12 +155,13 @@ func TestStoreCreateUpdateConflictDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	record, err := store.Get(context.Background(), id)
-	if err != nil || string(record.Value) != "one" || record.Revision != 1 {
+	if err != nil || string(record.Value) != "one" || record.Addr == 0 {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
 
 	conflict, _ := store.Begin(context.Background())
-	if err := conflict.Update(context.Background(), id, 99, []byte("bad")); err != nil {
+	wrong, _ := recordlog.NewVAddr(99, 64, 64)
+	if err := conflict.CompareAndPut(context.Background(), id, wrong, []byte("bad")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := conflict.Commit(context.Background()); !errors.Is(err, base.ErrConflict) {
@@ -172,19 +169,19 @@ func TestStoreCreateUpdateConflictDelete(t *testing.T) {
 	}
 
 	updated, _ := store.Begin(context.Background())
-	if err := updated.Update(context.Background(), id, record.Revision, []byte("two")); err != nil {
+	if err := updated.CompareAndPut(context.Background(), id, record.Addr, []byte("two")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := updated.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	record, err = store.Get(context.Background(), id)
-	if err != nil || string(record.Value) != "two" || record.Revision != 3 {
+	if err != nil || string(record.Value) != "two" || record.Addr == 0 {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
 
 	deleted, _ := store.Begin(context.Background())
-	if err := deleted.DeleteIfRevision(id, record.Revision); err != nil {
+	if err := deleted.CompareAndDelete(id, record.Addr); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := deleted.Commit(context.Background()); err != nil {
@@ -252,7 +249,7 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 	}
 	ids, _ := idalloc.New(idalloc.RecordID, 16, 1, log)
 	batches, _ := idalloc.New(idalloc.BatchID, 16, 1, log)
-	store, err := New(log, newPersistent(t, log), ids, batches, Config{
+	store, err := New(log, newPersistent(t), ids, batches, Config{
 		Batch:  transaction.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16},
 		Commit: coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10}, MaxOpenBatches: 4,
 	})
@@ -271,7 +268,7 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	record, err := store.Get(context.Background(), id)
-	if err != nil || string(record.Value) != "durable" || record.Revision == 0 {
+	if err != nil || string(record.Value) != "durable" || record.Addr == 0 {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
 	if err := store.Close(); err != nil {
@@ -356,7 +353,7 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	record, err := reopened.Get(context.Background(), id)
-	if err != nil || string(record.Value) != "survives restart" || record.Revision != model.Revision(committed.BatchID) {
+	if err != nil || string(record.Value) != "survives restart" || record.Addr == 0 {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
 	if err := reopened.Close(); err != nil {

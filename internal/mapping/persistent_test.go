@@ -34,22 +34,7 @@ func (c *persistentCatalog) InstallMapStoreRotation(expect uint64, sealed mapsto
 	return c.state.Clone(), nil
 }
 
-type revisionRecord struct {
-	id       model.ID
-	revision model.Revision
-}
-
-type revisionMap map[recordlog.VAddr]revisionRecord
-
-func (r revisionMap) ResolveRevision(addr recordlog.VAddr, id model.ID) (model.Revision, error) {
-	record, ok := r[addr]
-	if !ok || record.id != id || record.revision == 0 {
-		return 0, ErrCorrupt
-	}
-	return record.revision, nil
-}
-
-func newPersistentForTest(t *testing.T) (*Persistent, *mapstore.Store, revisionMap) {
+func newPersistentForTest(t *testing.T) (*Persistent, *mapstore.Store) {
 	t.Helper()
 	root := t.TempDir()
 	catalog := &persistentCatalog{state: mapstore.CatalogSnapshot{
@@ -66,23 +51,20 @@ func newPersistentForTest(t *testing.T) (*Persistent, *mapstore.Store, revisionM
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := make(revisionMap)
-	current, err := OpenPersistent(tree, resolver, physical, 1024)
+	current, err := OpenPersistent(tree, physical, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return current, physical, resolver
+	return current, physical
 }
 
 func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
-	current, physical, resolver := newPersistentForTest(t)
+	current, physical := newPersistentForTest(t)
 	defer physical.Close()
 	a := testAddr(t, 1, 64)
 	b := testAddr(t, 1, 128)
-	resolver[a] = revisionRecord{id: 7, revision: 10}
-	resolver[b] = revisionRecord{id: 8, revision: 11}
 	plan, err := current.ResolveGroup([]Proposal{
-		{Kind: ProposalUserCommit, Revision: 10, Changes: []Change{{RecordID: 7, NewAddr: a, Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 7, NewAddr: a, Operation: OperationPut}}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +81,7 @@ func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan, err = current.ResolveGroup([]Proposal{
-		{Kind: ProposalUserCommit, Revision: 11, Changes: []Change{{RecordID: 8, NewAddr: b, Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 8, NewAddr: b, Operation: OperationPut}}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +92,7 @@ func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
 	if err := current.InstallCheckpoint(candidate); err != nil {
 		t.Fatal(err)
 	}
-	for id, want := range map[model.ID]Entry{7: {Addr: a, Revision: 10}, 8: {Addr: b, Revision: 11}} {
+	for id, want := range map[model.ID]recordlog.VAddr{7: a, 8: b} {
 		got, exists, err := current.Lookup(id)
 		if err != nil || !exists || got != want {
 			t.Fatalf("id=%d got=%+v exists=%v err=%v", id, got, exists, err)
@@ -121,14 +103,12 @@ func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
 	}
 }
 
-func TestPersistentRelocationFromRootPreservesRevision(t *testing.T) {
-	current, physical, resolver := newPersistentForTest(t)
+func TestPersistentRelocationFromRootUsesAddressCAS(t *testing.T) {
+	current, physical := newPersistentForTest(t)
 	defer physical.Close()
 	oldAddr := testAddr(t, 2, 64)
 	newAddr := testAddr(t, 3, 64)
-	resolver[oldAddr] = revisionRecord{id: 9, revision: 20}
-	resolver[newAddr] = revisionRecord{id: 9, revision: 20}
-	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Revision: 20, Changes: []Change{{RecordID: 9, NewAddr: oldAddr, Operation: OperationPut}}}})
+	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 9, NewAddr: oldAddr, Operation: OperationPut}}}})
 	if _, err := current.PublishGroup(1, plan); err != nil {
 		t.Fatal(err)
 	}
@@ -141,24 +121,23 @@ func TestPersistentRelocationFromRootPreservesRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan, err = current.ResolveGroup([]Proposal{{Kind: ProposalRelocation, Changes: []Change{{RecordID: 9, ExpectedOldAddr: oldAddr, NewAddr: newAddr, Operation: OperationRelocate}}}})
-	if err != nil || !plan.Proposals[0].Changes[0].Apply || plan.Proposals[0].Changes[0].Revision != 20 {
+	if err != nil || !plan.Proposals[0].Changes[0].Apply {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	if _, err := current.PublishGroup(2, plan); err != nil {
 		t.Fatal(err)
 	}
 	got, exists, err := current.Lookup(9)
-	if err != nil || !exists || got != (Entry{Addr: newAddr, Revision: 20}) {
+	if err != nil || !exists || got != newAddr {
 		t.Fatalf("got=%+v exists=%v err=%v", got, exists, err)
 	}
 }
 
 func TestPersistentAbortCheckpointRetainsFrozenLayers(t *testing.T) {
-	current, physical, resolver := newPersistentForTest(t)
+	current, physical := newPersistentForTest(t)
 	defer physical.Close()
 	addr := testAddr(t, 1, 64)
-	resolver[addr] = revisionRecord{id: 1, revision: 1}
-	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Revision: 1, Changes: []Change{{RecordID: 1, NewAddr: addr, Operation: OperationPut}}}})
+	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: addr, Operation: OperationPut}}}})
 	_, _ = current.PublishGroup(1, plan)
 	first, _ := current.Freeze(1)
 	if err := current.AbortCheckpoint(first); err != nil {
@@ -178,21 +157,19 @@ func TestPersistentAbortCheckpointRetainsFrozenLayers(t *testing.T) {
 	if err := current.InstallCheckpoint(candidate); err != nil {
 		t.Fatal(err)
 	}
-	if got, exists, err := current.Lookup(1); err != nil || !exists || got.Revision != 1 {
+	if got, exists, err := current.Lookup(1); err != nil || !exists || got != addr {
 		t.Fatalf("got=%+v exists=%v err=%v", got, exists, err)
 	}
 }
 
 func TestPersistentCheckpointRejectsTemporaryMemoryOverflow(t *testing.T) {
-	current, physical, resolver := newPersistentForTest(t)
+	current, physical := newPersistentForTest(t)
 	defer physical.Close()
 	current.maxCheckpointEntries = 1
 	a := testAddr(t, 1, 64)
 	b := testAddr(t, 1, 128)
-	resolver[a] = revisionRecord{id: 1, revision: 1}
-	resolver[b] = revisionRecord{id: 2, revision: 1}
 	plan, err := current.ResolveGroup([]Proposal{{
-		Kind: ProposalUserCommit, Revision: 1,
+		Kind:    ProposalUserCommit,
 		Changes: []Change{{RecordID: 1, NewAddr: a, Operation: OperationPut}, {RecordID: 2, NewAddr: b, Operation: OperationPut}},
 	}})
 	if err != nil {
@@ -208,7 +185,7 @@ func TestPersistentCheckpointRejectsTemporaryMemoryOverflow(t *testing.T) {
 	if _, err := current.BuildCheckpoint(frozen); err != ErrBudget {
 		t.Fatalf("err=%v", err)
 	}
-	if got, exists, err := current.Lookup(1); err != nil || !exists || got.Addr != a {
+	if got, exists, err := current.Lookup(1); err != nil || !exists || got != a {
 		t.Fatalf("got=%+v exists=%v err=%v", got, exists, err)
 	}
 }

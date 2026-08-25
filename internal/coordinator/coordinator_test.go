@@ -24,6 +24,7 @@ type fakeLog struct {
 	nextOffset  uint32
 	groups      []recordcodec.CommitGroup
 	records     []recordcodec.RecordType
+	putAddrs    []recordlog.VAddr
 	checkpoints []recordcodec.CheckpointMarker
 	syncErr     error
 	poisoned    bool
@@ -52,6 +53,9 @@ func (l *fakeLog) Append(_ context.Context, payload []byte, syncWrite bool) (rec
 	}
 	l.nextOffset += physical
 	l.records = append(l.records, typ)
+	if typ == recordcodec.RecordTypePut {
+		l.putAddrs = append(l.putAddrs, addr)
+	}
 	if syncWrite {
 		switch typ {
 		case recordcodec.RecordTypeCommitGroup:
@@ -91,6 +95,12 @@ func (l *fakeLog) snapshotRecords() ([]recordcodec.RecordType, []recordcodec.Che
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]recordcodec.RecordType(nil), l.records...), append([]recordcodec.CheckpointMarker(nil), l.checkpoints...)
+}
+
+func (l *fakeLog) latestPutAddr() recordlog.VAddr {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.putAddrs[len(l.putAddrs)-1]
 }
 
 func (l *fakeLog) Status() recordlog.Status {
@@ -142,9 +152,9 @@ func TestCommitWritesDurableDescriptorBeforeMappingPublish(t *testing.T) {
 	if err != nil || result != (Result{BatchID: 7, CommitSeq: 1}) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	entry, exists, err := current.Lookup(3)
-	if err != nil || !exists || entry.Revision != 7 {
-		t.Fatalf("entry=%+v exists=%v err=%v", entry, exists, err)
+	addr, exists, err := current.Lookup(3)
+	if err != nil || !exists || addr == 0 {
+		t.Fatalf("addr=%+v exists=%v err=%v", addr, exists, err)
 	}
 	groups := log.snapshotGroups()
 	if len(groups) != 1 || len(groups[0].Descriptors) != 1 || groups[0].Descriptors[0].BatchID != 7 || groups[0].Descriptors[0].CommitSeq != 1 {
@@ -173,11 +183,13 @@ func TestQueuedCommitsFormOneVirtualMappingGroup(t *testing.T) {
 	}
 
 	second := newBatch(t, 2, log)
-	if err := second.Update(context.Background(), 9, 1, []byte("two")); err != nil {
+	firstAddr := log.latestPutAddr()
+	if err := second.CompareAndPut(context.Background(), 9, firstAddr, []byte("two")); err != nil {
 		t.Fatal(err)
 	}
+	secondAddr := log.latestPutAddr()
 	third := newBatch(t, 3, log)
-	if err := third.Update(context.Background(), 9, 2, []byte("three")); err != nil {
+	if err := third.CompareAndPut(context.Background(), 9, secondAddr, []byte("three")); err != nil {
 		t.Fatal(err)
 	}
 	results := make(chan response, 2)
@@ -216,9 +228,9 @@ func TestQueuedCommitsFormOneVirtualMappingGroup(t *testing.T) {
 	if len(groups) != 2 || len(groups[1].Descriptors) != 2 {
 		t.Fatalf("groups=%+v", groups)
 	}
-	entry, exists, _ := current.Lookup(9)
-	if !exists || entry.Revision != 3 {
-		t.Fatalf("entry=%+v exists=%v", entry, exists)
+	addr, exists, _ := current.Lookup(9)
+	if !exists || addr != log.latestPutAddr() {
+		t.Fatalf("addr=%+v exists=%v", addr, exists)
 	}
 }
 
@@ -227,14 +239,15 @@ func TestConflictDoesNotConsumeCommitSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := mapping.New(mapping.Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]mapping.Entry{1: {Addr: addr, Revision: 8}}})
+	current, err := mapping.New(mapping.Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.VAddr{1: addr}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	log := &fakeLog{}
 	c := newCoordinator(t, log, current)
 	b := newBatch(t, 9, log)
-	if err := b.DeleteIfRevision(1, 7); err != nil {
+	wrong, _ := recordlog.NewVAddr(2, 64, 64)
+	if err := b.CompareAndDelete(1, wrong); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Commit(context.Background(), b); !errors.Is(err, base.ErrConflict) {
