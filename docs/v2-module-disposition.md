@@ -23,9 +23,9 @@
 |---|---|---|
 | Public `Store`/`Batch` API 契约 | Keep | Stable-ID、Batch、LogicalRevision 的产品语义不变 |
 | `internal/base` | Rewrite | 保留 ID 和错误语义；重新生成 VAddr、LogPos 和边界检查，避免共享旧地址编码器 |
-| `internal/allocator` | Rewrite | 保留 durable high watermark 不变量；直接依赖新 ReserveRecord 契约 |
-| `internal/batch` | Rewrite | 保留状态机和最终 mutation 折叠语义；删除旧 Frame/AppendLog 依赖 |
-| `internal/commit` | Rewrite | 保留冲突验证和 Mapping 发布不变量，但删除旧 AppendLog/FramePart 接口 |
+| `internal/allocator` | Delete；由 `internal/idalloc` Rewrite | 保留 durable high watermark 不变量；直接依赖新 ReserveRecord 契约 |
+| `internal/batch` | Delete；由 `internal/transaction` Rewrite | 保留状态机和最终 mutation 折叠语义；删除旧 Frame/AppendLog 依赖 |
+| `internal/commit` | Delete；由 `internal/coordinator` Rewrite | 保留冲突验证和 Mapping 发布不变量，但删除旧 AppendLog/FramePart 接口 |
 | `internal/appendlog` | Delete | 旧 Sequencer、业务 Frame 构造和 buffer 与 RecordLog v2 重复 |
 | `internal/appendlog/v2/budget.go` | Keep | 有界 byte budget 独立于业务和旧执行路径 |
 | `internal/appendlog/v2/fileio.go` | Keep | 完整 I/O 与抽象文件后端符合物理层职责 |
