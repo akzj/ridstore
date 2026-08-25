@@ -71,6 +71,8 @@ Engine fail closed，重启以 durable Manifest 为准。
 - MapStore Node append/checkpoint sync 失败会 poison writer 并使 Engine fail closed；旧 Manifest 不变，
   fresh Open 忽略或修复不可达 COW tail，再从 RecordLog replay 恢复已提交值；active-tail truncate/sync
   失败可再次 Open 收敛；
+- RecordLog data sync 失败使提交返回 CommitUnknown、拒绝后续写；fresh Open 对完整 Commit Record 判定
+  Committed，对不完整 Commit Record 截断并判定 Aborted；
 - Delta reservation 位于 Prepare/durable Descriptor 之前，冲突、取消和 pre-durable 失败会归还；重复更新
   active hot ID 不重复计费，Freeze/Abort 不释放，Install 只释放精确 frozen prefix；
 - Delta hard pressure 会在不持有 `ops.RLock` 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
@@ -84,8 +86,9 @@ Engine fail closed，重启以 durable Manifest 为准。
 
 ## 5. 尚未完成
 
-- checkpoint 的 Catalog 与 MapStore append/sync/tail-repair fault matrix 已覆盖；MapStore rotation、
-  RecordLog sync/rotation 的完整 syscall 与进程崩溃矩阵仍未完成；详见
+- checkpoint 的 Catalog 与 MapStore append/sync/tail-repair fault matrix 已覆盖；RecordLog sync 的
+  CommitUnknown 及完整/不完整 Record 恢复分支已覆盖；MapStore 与 RecordLog rotation 的完整 syscall
+  矩阵仍未完成；详见
   [v2-fault-matrix.md](v2-fault-matrix.md)；
 - soft-limit 后台 Checkpoint；
 - Relocation、Data GC、Mapping GC；

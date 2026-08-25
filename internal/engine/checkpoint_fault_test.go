@@ -3,6 +3,10 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/akzj/ridstore/internal/base"
@@ -127,6 +131,105 @@ func TestCheckpointMapStoreFailureKeepsOldManifestRecoverable(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
+	root, config := prepareCheckpointStore(t)
+	injected := errors.New("injected recordlog sync failure")
+	var armed atomic.Bool
+	store, err := open(context.Background(), root, config, openFaultHooks{recordLog: func(point recordlog.FaultPoint) error {
+		if armed.Load() && point == recordlog.FaultBeforeDataSync {
+			return injected
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("commit outcome recovered from log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	if _, err := batch.Commit(context.Background()); !errors.Is(err, base.ErrCommitUnknown) || !errors.Is(err, injected) {
+		t.Fatalf("commit err=%v", err)
+	}
+	if _, err := store.Begin(context.Background()); !errors.Is(err, base.ErrReadOnly) {
+		t.Fatalf("begin after commit uncertainty err=%v", err)
+	}
+	if err := store.Close(); !errors.Is(err, recordlog.ErrPoisoned) {
+		t.Fatalf("close err=%v", err)
+	}
+
+	manifest, err := storecatalog.Load(root)
+	if err != nil || manifest.Generation != 1 || manifest.MappingRoot != 0 || manifest.CoveredCommitSeq != 0 {
+		t.Fatalf("manifest=%+v err=%v", manifest, err)
+	}
+	reopened, err := Open(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := reopened.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "commit outcome recovered from log" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommitSyncFailureWithPartialRecordRecoversAsAborted(t *testing.T) {
+	root, config := prepareCheckpointStore(t)
+	injected := errors.New("injected recordlog sync failure")
+	var armed atomic.Bool
+	store, err := open(context.Background(), root, config, openFaultHooks{recordLog: func(point recordlog.FaultPoint) error {
+		if armed.Load() && point == recordlog.FaultBeforeDataSync {
+			return injected
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("orphan after torn commit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCommit := store.log.Status().Watermarks.Written
+	armed.Store(true)
+	if _, err := batch.Commit(context.Background()); !errors.Is(err, base.ErrCommitUnknown) {
+		t.Fatalf("commit err=%v", err)
+	}
+	afterCommit := store.log.Status().Watermarks.Written
+	if afterCommit.SegmentID != beforeCommit.SegmentID || afterCommit.Offset <= beforeCommit.Offset+8 {
+		t.Fatalf("before=%+v after=%+v", beforeCommit, afterCommit)
+	}
+	if err := store.Close(); !errors.Is(err, recordlog.ErrPoisoned) {
+		t.Fatalf("close err=%v", err)
+	}
+	active := filepath.Join(root, "records", fmt.Sprintf("record-%010d.active", beforeCommit.SegmentID))
+	if err := os.Truncate(active, int64(beforeCommit.Offset+8)); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Get(context.Background(), id); !errors.Is(err, base.ErrNotFound) {
+		t.Fatalf("torn commit became visible err=%v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

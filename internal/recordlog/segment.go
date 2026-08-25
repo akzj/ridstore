@@ -29,6 +29,16 @@ const (
 
 type segmentFaultHook func(segmentFaultPoint) error
 
+// FaultPoint and FaultHook expose RecordLog's physical fault boundaries to
+// higher-level package tests without changing the production Open path.
+type FaultPoint = segmentFaultPoint
+type FaultHook = segmentFaultHook
+
+const (
+	FaultBeforeAppendWrite = faultBeforeAppendWrite
+	FaultBeforeDataSync    = faultBeforeDataSync
+)
+
 type SegmentSummary struct {
 	SegmentID   SegmentID
 	ValidEnd    uint32

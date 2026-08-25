@@ -80,8 +80,9 @@ func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 }
 
 type openFaultHooks struct {
-	catalog  storecatalog.FaultHook
-	mapStore mapstore.FaultHook
+	catalog   storecatalog.FaultHook
+	mapStore  mapstore.FaultHook
+	recordLog recordlog.FaultHook
 }
 
 func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks) (*Store, error) {
@@ -116,7 +117,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return nil, err
 	}
-	log, err := recordlog.Open(root, config.RecordLog, catalog)
+	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, catalog, hooks.recordLog)
 	if err != nil {
 		return nil, err
 	}

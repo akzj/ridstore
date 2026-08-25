@@ -8,6 +8,10 @@ import (
 )
 
 func Open(root string, cfg Config, catalog CatalogPort) (*Log, error) {
+	return OpenWithFaultHook(root, cfg, catalog, nil)
+}
+
+func OpenWithFaultHook(root string, cfg Config, catalog CatalogPort, hook FaultHook) (*Log, error) {
 	if root == "" || catalog == nil {
 		return nil, ErrInvalidConfig
 	}
@@ -38,7 +42,7 @@ func Open(root string, cfg Config, catalog CatalogPort) (*Log, error) {
 		}
 		sealed = append(sealed, segment)
 	}
-	active, _, err := openActiveSegment(root, snapshot.headerFor(snapshot.ActiveSegmentID), files, nil)
+	active, _, err := openActiveSegment(root, snapshot.headerFor(snapshot.ActiveSegmentID), files, hook)
 	if err != nil {
 		return fail(err)
 	}
@@ -47,7 +51,7 @@ func Open(root string, cfg Config, catalog CatalogPort) (*Log, error) {
 		_ = active.close()
 		return fail(err)
 	}
-	manager := &rotationManager{root: root, catalog: catalog, files: files, registry: registry}
+	manager := &rotationManager{root: root, catalog: catalog, files: files, registry: registry, hook: hook}
 	log, err := newLog(cfg, snapshot.MaxPayloadBytes, active, registry, manager.rotate)
 	if err != nil {
 		_ = registry.close()
@@ -124,6 +128,7 @@ type rotationManager struct {
 	catalog  CatalogPort
 	files    fileBackend
 	registry *segmentRegistry
+	hook     FaultHook
 }
 
 func (m *rotationManager) rotate(old *activeSegment) (*activeSegment, error) {
@@ -149,7 +154,7 @@ func (m *rotationManager) rotate(old *activeSegment) (*activeSegment, error) {
 	if sealedSummary != summary {
 		return nil, fmt.Errorf("sealed summary changed: %w", ErrCorrupt)
 	}
-	newActive, err := createActiveSegment(m.root, snapshot.headerFor(journal.NewActive), m.files, nil)
+	newActive, err := createActiveSegment(m.root, snapshot.headerFor(journal.NewActive), m.files, m.hook)
 	if err != nil {
 		return nil, err
 	}
