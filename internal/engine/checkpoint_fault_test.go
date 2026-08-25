@@ -32,7 +32,7 @@ func TestCheckpointCatalogFailureRecoversFromAuthoritativeManifest(t *testing.T)
 				}
 				return nil
 			}
-			store, err := open(context.Background(), root, config, hook)
+			store, err := open(context.Background(), root, config, openFaultHooks{catalog: hook})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -67,6 +67,60 @@ func TestCheckpointCatalogFailureRecoversFromAuthoritativeManifest(t *testing.T)
 			}
 			record, err := reopened.Get(context.Background(), id)
 			if err != nil || string(record.Value) != "survives checkpoint failure" {
+				t.Fatalf("record=%+v err=%v", record, err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestCheckpointMapStoreFailureKeepsOldManifestRecoverable(t *testing.T) {
+	for _, point := range []mapstore.FaultPoint{mapstore.FaultBeforeAppendWrite, mapstore.FaultBeforeSync} {
+		t.Run(string(point), func(t *testing.T) {
+			root, config := prepareCheckpointStore(t)
+			injected := errors.New("injected mapstore failure")
+			store, err := open(context.Background(), root, config, openFaultHooks{mapStore: func(got mapstore.FaultPoint) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			batch, err := store.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := batch.Create(context.Background(), []byte("survives mapstore failure"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := batch.Commit(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Checkpoint(context.Background()); !errors.Is(err, injected) || !errors.Is(err, mapstore.ErrPoisoned) {
+				t.Fatalf("checkpoint err=%v", err)
+			}
+			if _, err := store.Get(context.Background(), id); !errors.Is(err, base.ErrReadOnly) {
+				t.Fatalf("get after mapstore failure err=%v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			manifest, err := storecatalog.Load(root)
+			if err != nil || manifest.Generation != 1 || manifest.MappingRoot != 0 || manifest.CoveredCommitSeq != 0 {
+				t.Fatalf("manifest=%+v err=%v", manifest, err)
+			}
+			reopened, err := Open(context.Background(), root, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := reopened.Get(context.Background(), id)
+			if err != nil || string(record.Value) != "survives mapstore failure" {
 				t.Fatalf("record=%+v err=%v", record, err)
 			}
 			if err := reopened.Close(); err != nil {

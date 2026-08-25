@@ -32,6 +32,7 @@ type Store struct {
 	nextSeq  uint64
 	closed   bool
 	poisoned bool
+	hook     FaultHook
 }
 
 func CreateInitialSegment(root string, storeID StoreID, segmentSize uint32) error {
@@ -79,7 +80,7 @@ func EnsureInitialSegment(root string, storeID StoreID, segmentSize uint32) erro
 	}
 	activePath := filepath.Join(dir, activeName(1))
 	if _, err := os.Lstat(activePath); err == nil {
-		segment, repaired, err := openActive(root, header, 0)
+		segment, repaired, err := openActive(root, header, 0, nil)
 		if err != nil {
 			return err
 		}
@@ -110,6 +111,10 @@ func EnsureInitialSegment(root string, storeID StoreID, segmentSize uint32) erro
 }
 
 func Open(root string, catalog CatalogPort) (*Store, error) {
+	return OpenWithFaultHook(root, catalog, nil)
+}
+
+func OpenWithFaultHook(root string, catalog CatalogPort, hook FaultHook) (*Store, error) {
 	if root == "" || catalog == nil {
 		return nil, ErrInvalid
 	}
@@ -120,7 +125,7 @@ func Open(root string, catalog CatalogPort) (*Store, error) {
 	if err := state.validate(); err != nil {
 		return nil, err
 	}
-	store := &Store{root: root, catalog: catalog, state: state.Clone(), sealed: make(map[model.MapSegmentID]*segmentFile), nextSeq: 1}
+	store := &Store{root: root, catalog: catalog, state: state.Clone(), sealed: make(map[model.MapSegmentID]*segmentFile), nextSeq: 1, hook: hook}
 	fail := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, store.closeFiles())
 	}
@@ -142,7 +147,7 @@ func Open(root string, catalog CatalogPort) (*Store, error) {
 			lastSeq = segment.summary.LastSeq
 		}
 	}
-	active, repaired, err := openActive(root, state.headerFor(state.ActiveSegment), state.Root)
+	active, repaired, err := openActive(root, state.headerFor(state.ActiveSegment), state.Root, hook)
 	if err != nil {
 		return fail(err)
 	}
@@ -204,6 +209,10 @@ func (s *Store) Append(level uint8, prefix uint64, covered model.CommitSeq, slot
 		}
 	}
 	offset := s.active.summary.ValidEnd
+	if err := hitFault(s.hook, FaultBeforeAppendWrite); err != nil {
+		s.poisoned = true
+		return 0, errors.Join(ErrPoisoned, err)
+	}
 	if err := writeFullAt(s.active.file, encoded, int64(offset)); err != nil {
 		s.poisoned = true
 		return 0, errors.Join(ErrPoisoned, err)
@@ -267,6 +276,10 @@ func (s *Store) Sync() error {
 	}
 	if s.poisoned {
 		return ErrPoisoned
+	}
+	if err := hitFault(s.hook, FaultBeforeSync); err != nil {
+		s.poisoned = true
+		return errors.Join(ErrPoisoned, err)
 	}
 	if err := s.active.file.Sync(); err != nil {
 		s.poisoned = true
@@ -387,7 +400,7 @@ func openSealed(root string, expected SegmentHeader, expectedRef SegmentRef) (*s
 	return &segmentFile{file: file, header: expected, summary: expectedSummary}, nil
 }
 
-func openActive(root string, expected SegmentHeader, rootAddr model.MapAddr) (*segmentFile, bool, error) {
+func openActive(root string, expected SegmentHeader, rootAddr model.MapAddr, hook FaultHook) (*segmentFile, bool, error) {
 	path := filepath.Join(root, mappingDirectory, activeName(expected.SegmentID))
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -406,7 +419,13 @@ func openActive(root string, expected SegmentHeader, rootAddr model.MapAddr) (*s
 		return fail(err)
 	}
 	if repaired {
+		if err := hitFault(hook, FaultBeforeTailTruncate); err != nil {
+			return fail(err)
+		}
 		if err := file.Truncate(int64(summary.ValidEnd)); err != nil {
+			return fail(err)
+		}
+		if err := hitFault(hook, FaultBeforeTailSync); err != nil {
 			return fail(err)
 		}
 		if err := file.Sync(); err != nil {

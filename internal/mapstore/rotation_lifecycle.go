@@ -87,7 +87,7 @@ func verifyCommittedRotationFiles(root string, state CatalogSnapshot, journal ro
 	if err := sealed.file.Close(); err != nil {
 		return err
 	}
-	active, _, err := openActive(root, state.headerFor(journal.NewActive), state.Root)
+	active, _, err := openActive(root, state.headerFor(journal.NewActive), state.Root, nil)
 	if err != nil {
 		return err
 	}
@@ -164,7 +164,7 @@ func ensureNewActive(root string, header SegmentHeader) (*segmentFile, error) {
 	dir := filepath.Join(root, mappingDirectory)
 	activePath := filepath.Join(dir, activeName(header.SegmentID))
 	if _, err := os.Stat(activePath); err == nil {
-		active, repaired, err := openActive(root, header, 0)
+		active, repaired, err := openActive(root, header, 0, nil)
 		if err != nil {
 			return nil, err
 		}

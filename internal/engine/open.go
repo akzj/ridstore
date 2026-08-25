@@ -65,7 +65,7 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 	if _, err := bootstrap.Initialize(root, config.HardLimits, bootstrapHook); err != nil {
 		return fail(err)
 	}
-	store, err := openLocked(ctx, root, config.Runtime, catalogHook, dirLock)
+	store, err := openLocked(ctx, root, config.Runtime, openFaultHooks{catalog: catalogHook}, dirLock)
 	if err != nil {
 		return fail(err)
 	}
@@ -76,10 +76,15 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 // opens the persistent Mapping root first and replays only the RecordLog tail
 // after the Manifest cut into that same runtime Mapping.
 func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
-	return open(ctx, root, config, nil)
+	return open(ctx, root, config, openFaultHooks{})
 }
 
-func open(ctx context.Context, root string, config OpenConfig, catalogHook storecatalog.FaultHook) (*Store, error) {
+type openFaultHooks struct {
+	catalog  storecatalog.FaultHook
+	mapStore mapstore.FaultHook
+}
+
+func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks) (*Store, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -99,15 +104,15 @@ func open(ctx context.Context, root string, config OpenConfig, catalogHook store
 	if err := bootstrap.RequireReady(root); err != nil {
 		return failLock(err)
 	}
-	store, err := openLocked(ctx, root, config, catalogHook, dirLock)
+	store, err := openLocked(ctx, root, config, hooks, dirLock)
 	if err != nil {
 		return failLock(err)
 	}
 	return store, nil
 }
 
-func openLocked(ctx context.Context, root string, config OpenConfig, catalogHook storecatalog.FaultHook, dirLock *filelock.Lock) (*Store, error) {
-	catalog, err := storecatalog.OpenManager(root, catalogHook)
+func openLocked(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks, dirLock *filelock.Lock) (*Store, error) {
+	catalog, err := storecatalog.OpenManager(root, hooks.catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +123,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, catalogHook
 	failLog := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, log.Close())
 	}
-	physicalMapping, err := mapstore.Open(root, catalog)
+	physicalMapping, err := mapstore.OpenWithFaultHook(root, catalog, hooks.mapStore)
 	if err != nil {
 		return failLog(err)
 	}
