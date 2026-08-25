@@ -12,6 +12,8 @@ import (
 
 var (
 	ErrInvalid   = errors.New("mapping: invalid input")
+	ErrCorrupt   = errors.New("mapping: corrupt state")
+	ErrBudget    = errors.New("mapping: checkpoint budget exceeded")
 	ErrStalePlan = errors.New("mapping: stale resolved plan")
 )
 
@@ -134,23 +136,32 @@ func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	plan := GroupPlan{BaseCommitSeq: m.covered, Proposals: make([]ResolvedProposal, len(proposals))}
+	return resolveGroupAt(m.covered, proposals, func(id model.ID) (Entry, bool, error) {
+		value, ok := m.entries[id]
+		return value, ok, nil
+	})
+}
+
+func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(model.ID) (Entry, bool, error)) (GroupPlan, error) {
+	plan := GroupPlan{BaseCommitSeq: base, Proposals: make([]ResolvedProposal, len(proposals))}
 	type virtualEntry struct {
 		entry  Entry
 		exists bool
 	}
 	virtual := make(map[model.ID]virtualEntry)
-	lookup := func(id model.ID) (Entry, bool) {
+	lookup := func(id model.ID) (Entry, bool, error) {
 		if value, ok := virtual[id]; ok {
-			return value.entry, value.exists
+			return value.entry, value.exists, nil
 		}
-		value, ok := m.entries[id]
-		return value, ok
+		return baseLookup(id)
 	}
 	for index, proposal := range proposals {
 		resolved := ResolvedProposal{Kind: proposal.Kind, Revision: proposal.Revision, Accepted: true}
 		for _, condition := range proposal.Conditions {
-			entry, exists := lookup(condition.RecordID)
+			entry, exists, err := lookup(condition.RecordID)
+			if err != nil {
+				return GroupPlan{}, err
+			}
 			if (condition.Kind == ConditionAbsent && exists) || (condition.Kind == ConditionRevision && (!exists || entry.Revision != condition.Revision)) {
 				resolved.Accepted = false
 				break
@@ -172,7 +183,10 @@ func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 					virtual[change.RecordID] = virtualEntry{entry: Entry{Addr: change.NewAddr, Revision: proposal.Revision}, exists: true}
 				}
 			case ProposalRelocation:
-				current, exists := lookup(change.RecordID)
+				current, exists, err := lookup(change.RecordID)
+				if err != nil {
+					return GroupPlan{}, err
+				}
 				result.Apply = exists && current.Addr == change.ExpectedOldAddr
 				if result.Apply {
 					result.Revision = current.Revision

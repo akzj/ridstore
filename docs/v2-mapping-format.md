@@ -62,4 +62,21 @@ Catalog 并发 generation 改变不会让它改写其他字段，只有 Mapping 
 leaf/internal node 最多重写一次；未变化的 subtree 继续引用旧 MapAddr，删除最后一个 slot 会向上剪枝。
 Builder 只产生新 Root，不执行 fsync 或发布 Catalog；durability 仍由上层 checkpoint 状态机负责。
 
-尚未实现：双 Overlay checkpoint、Revision resolver、Catalog checkpoint tuple 安装和 Mapping GC。
+`internal/mapping.Persistent` 已实现 v2 运行时基础的 `active Delta + frozen Delta + persistent Root`：
+
+- Lookup 先检查 active/frozen，miss 才进入 radix；
+- Root leaf 仍只保存 VAddr，Revision 由该地址的 PutRecord resolver 验证并恢复；
+- ResolveGroup 对 cold read 使用 epoch 重试，不在 Mapping 锁内执行磁盘 I/O；
+- PublishGroup 只修改 active Delta，并保持整个 group 的原子可见性；
+- Freeze 原子切换 active Delta，失败/Abort 不丢弃 frozen layer；
+- Build 折叠所有待处理 frozen layer，生成并 fsync candidate Root；
+- 只有外部 Catalog 已经持久化完整 checkpoint tuple 后，Install 才释放对应 frozen prefix；
+- Freeze 后产生的新 Commit 留在新 active Delta，不会混入较早的 candidate Root。
+
+Checkpoint merge 在分配临时表前检查显式 entry budget，超限保留 frozen layers 并返回错误，不以
+无界内存换取进度。后续仍需实现 Delta admission/backpressure 和有界 chunk builder，才能让超大
+checkpoint 在固定内存内继续推进。
+
+尚未实现：Coordinator checkpoint barrier、RecordLog durable cut、Catalog checkpoint tuple 接线、
+Delta admission、SegmentStats 和 Mapping GC。旧的全量内存 Mapping 仍只支撑尚未切换的 M3/replay
+测试，不能成为 v2 Open 的生产后端。
