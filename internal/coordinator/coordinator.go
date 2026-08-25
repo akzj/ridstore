@@ -36,10 +36,21 @@ type response struct {
 	err    error
 }
 
+type CheckpointCut struct {
+	CoveredCommitSeq model.CommitSeq
+	ReplayStart      recordlog.LogPos
+}
+
+type checkpointResponse struct {
+	cut CheckpointCut
+	err error
+}
+
 type request struct {
 	batch    *transaction.Batch
 	prepared transaction.Prepared
 	result   chan response
+	barrier  chan checkpointResponse
 }
 
 type Coordinator struct {
@@ -109,6 +120,37 @@ func (c *Coordinator) Commit(ctx context.Context, batch *transaction.Batch) (Res
 	return answer.result, answer.err
 }
 
+// CheckpointCut appends a durable marker after every commit admitted before
+// this call and returns the exact replay position after that marker. Callers
+// must separately quiesce non-commit RecordLog producers while capturing the
+// rest of the checkpoint state.
+func (c *Coordinator) CheckpointCut(ctx context.Context) (CheckpointCut, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return CheckpointCut{}, err
+	}
+	if err := c.Fault(); err != nil {
+		return CheckpointCut{}, errors.Join(base.ErrReadOnly, err)
+	}
+	req := request{barrier: make(chan checkpointResponse, 1)}
+	c.submitMu.Lock()
+	if c.closed {
+		c.submitMu.Unlock()
+		return CheckpointCut{}, base.ErrClosed
+	}
+	select {
+	case c.requests <- req:
+		c.submitMu.Unlock()
+	case <-ctx.Done():
+		c.submitMu.Unlock()
+		return CheckpointCut{}, ctx.Err()
+	}
+	answer := <-req.barrier
+	return answer.cut, answer.err
+}
+
 func (c *Coordinator) Fault() error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
@@ -137,6 +179,10 @@ func (c *Coordinator) Close() error {
 func (c *Coordinator) run() {
 	defer close(c.done)
 	for first := range c.requests {
+		if first.barrier != nil {
+			c.processCheckpoint(first)
+			continue
+		}
 		group := []request{first}
 		descriptorBytes, err := descriptorPayloadSize(first.prepared)
 		bytes := uint64(recordcodec.CommitGroupHeadSize) + descriptorBytes
@@ -150,6 +196,12 @@ func (c *Coordinator) run() {
 				if !ok {
 					c.process(group)
 					return
+				}
+				if next.barrier != nil {
+					c.process(group)
+					c.processCheckpoint(next)
+					group = nil
+					break
 				}
 				nextBytes, sizeErr := descriptorPayloadSize(next.prepared)
 				if sizeErr != nil || uint64(recordcodec.CommitGroupHeadSize)+nextBytes > c.config.MaxGroupPayload {
@@ -176,6 +228,31 @@ func (c *Coordinator) run() {
 			c.process(group)
 		}
 	}
+}
+
+func (c *Coordinator) processCheckpoint(req request) {
+	if fault := c.Fault(); fault != nil {
+		req.barrier <- checkpointResponse{err: errors.Join(base.ErrReadOnly, fault)}
+		return
+	}
+	c.stateMu.Lock()
+	next := c.next
+	c.stateMu.Unlock()
+	covered := c.mapping.CoveredCommitSeq()
+	if next == 0 || covered == model.CommitSeq(math.MaxUint64) || next != covered+1 {
+		err := fmt.Errorf("checkpoint commit sequence: %w", base.ErrCorrupt)
+		c.fail(err)
+		req.barrier <- checkpointResponse{err: err}
+		return
+	}
+	payload := recordcodec.EncodeCheckpoint(recordcodec.CheckpointMarker{CoveredCommitSeq: covered})
+	physical, err := c.log.Append(context.Background(), payload, true)
+	if err != nil {
+		c.fail(err)
+		req.barrier <- checkpointResponse{err: err}
+		return
+	}
+	req.barrier <- checkpointResponse{cut: CheckpointCut{CoveredCommitSeq: covered, ReplayStart: physical.End}}
 }
 
 func (c *Coordinator) process(group []request) {

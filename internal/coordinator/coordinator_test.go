@@ -23,6 +23,8 @@ type fakeLog struct {
 	mu          sync.Mutex
 	nextOffset  uint32
 	groups      []recordcodec.CommitGroup
+	records     []recordcodec.RecordType
+	checkpoints []recordcodec.CheckpointMarker
 	syncErr     error
 	poisoned    bool
 	firstSync   chan struct{}
@@ -32,6 +34,10 @@ type fakeLog struct {
 
 func (l *fakeLog) Append(_ context.Context, payload []byte, syncWrite bool) (recordlog.AppendResult, error) {
 	physical, err := recordlog.PhysicalRecordSize(uint64(len(payload)))
+	if err != nil {
+		return recordlog.AppendResult{}, err
+	}
+	typ, err := recordcodec.TypeOf(payload)
 	if err != nil {
 		return recordlog.AppendResult{}, err
 	}
@@ -45,13 +51,24 @@ func (l *fakeLog) Append(_ context.Context, payload []byte, syncWrite bool) (rec
 		return recordlog.AppendResult{}, err
 	}
 	l.nextOffset += physical
+	l.records = append(l.records, typ)
 	if syncWrite {
-		group, decodeErr := recordcodec.DecodeCommitGroup(payload, 1<<20, 128, 1024)
-		if decodeErr != nil {
-			l.mu.Unlock()
-			return recordlog.AppendResult{}, decodeErr
+		switch typ {
+		case recordcodec.RecordTypeCommitGroup:
+			group, decodeErr := recordcodec.DecodeCommitGroup(payload, 1<<20, 128, 1024)
+			if decodeErr != nil {
+				l.mu.Unlock()
+				return recordlog.AppendResult{}, decodeErr
+			}
+			l.groups = append(l.groups, group)
+		case recordcodec.RecordTypeCheckpoint:
+			checkpoint, decodeErr := recordcodec.DecodeCheckpoint(payload)
+			if decodeErr != nil {
+				l.mu.Unlock()
+				return recordlog.AppendResult{}, decodeErr
+			}
+			l.checkpoints = append(l.checkpoints, checkpoint)
 		}
-		l.groups = append(l.groups, group)
 	}
 	wantErr, poisoned := l.syncErr, l.poisoned
 	l.mu.Unlock()
@@ -68,6 +85,12 @@ func (l *fakeLog) Append(_ context.Context, payload []byte, syncWrite bool) (rec
 		return recordlog.AppendResult{}, wantErr
 	}
 	return recordlog.NewAppendResult(addr, physical)
+}
+
+func (l *fakeLog) snapshotRecords() ([]recordcodec.RecordType, []recordcodec.CheckpointMarker) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]recordcodec.RecordType(nil), l.records...), append([]recordcodec.CheckpointMarker(nil), l.checkpoints...)
 }
 
 func (l *fakeLog) Status() recordlog.Status {
@@ -240,5 +263,35 @@ func TestDurabilityFailureMarksCommitUnknownAndFaults(t *testing.T) {
 	}
 	if _, exists, _ := current.Lookup(1); exists {
 		t.Fatal("mapping published after failed durability")
+	}
+}
+
+func TestCheckpointCutFollowsPublishedCommits(t *testing.T) {
+	log := &fakeLog{}
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+	b := newBatch(t, 7, log)
+	if err := b.Put(context.Background(), 3, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Commit(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := c.CheckpointCut(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cut.CoveredCommitSeq != 1 || !cut.ReplayStart.Valid() {
+		t.Fatalf("cut=%+v", cut)
+	}
+	records, checkpoints := log.snapshotRecords()
+	if len(records) != 3 || records[0] != recordcodec.RecordTypePut || records[1] != recordcodec.RecordTypeCommitGroup || records[2] != recordcodec.RecordTypeCheckpoint {
+		t.Fatalf("records=%v", records)
+	}
+	if len(checkpoints) != 1 || checkpoints[0].CoveredCommitSeq != 1 {
+		t.Fatalf("checkpoints=%+v", checkpoints)
+	}
+	if status := log.Status(); status.Poisoned {
+		t.Fatalf("status=%+v", status)
 	}
 }
