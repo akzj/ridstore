@@ -100,6 +100,30 @@ func DecodePut(src []byte, maxValueSize uint64) (PutRecord, error) {
 	return record, nil
 }
 
+// DecodePutMetadata validates a fixed Put protocol header against the payload
+// size from the RecordLog envelope without reading the Value body.
+func DecodePutMetadata(src []byte, payloadSize uint32, maxValueSize uint64) (PutMetadata, error) {
+	if len(src) != int(PutHeaderSize) || payloadSize < PutHeaderSize || string(src[:4]) != string(protocolMagic[:]) {
+		return PutMetadata{}, fmt.Errorf("put metadata header: %w", ErrCorrupt)
+	}
+	if binary.LittleEndian.Uint16(src[4:6]) != FormatVersion {
+		return PutMetadata{}, ErrUnsupported
+	}
+	if RecordType(src[6]) != RecordTypePut || src[7] != 0 || binary.LittleEndian.Uint16(src[8:10]) != uint16(PutHeaderSize) ||
+		binary.LittleEndian.Uint16(src[10:12]) != 0 || binary.LittleEndian.Uint32(src[12:16]) != payloadSize {
+		return PutMetadata{}, fmt.Errorf("put metadata fields: %w", ErrCorrupt)
+	}
+	result := PutMetadata{
+		OriginBatchID: model.BatchID(binary.LittleEndian.Uint64(src[16:24])),
+		RecordID:      model.ID(binary.LittleEndian.Uint64(src[24:32])),
+		ValueBytes:    uint64(payloadSize - PutHeaderSize),
+	}
+	if result.OriginBatchID == 0 || result.RecordID == 0 || result.ValueBytes > maxValueSize {
+		return PutMetadata{}, fmt.Errorf("put metadata values: %w", ErrCorrupt)
+	}
+	return result, nil
+}
+
 func EncodeCommitGroup(group CommitGroup, maxPayloadSize uint64) ([]byte, error) {
 	total, err := CommitGroupPayloadSize(group.Descriptors)
 	if err != nil || uint64(total) > maxPayloadSize {

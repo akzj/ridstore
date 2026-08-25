@@ -47,6 +47,12 @@ type PutRecord struct {
 	Value         []byte
 }
 
+type PutMetadata struct {
+	OriginBatchID model.BatchID
+	RecordID      model.ID
+	ValueBytes    uint64
+}
+
 type Mutation struct {
 	RecordID        model.ID
 	NewAddr         recordlog.VAddr

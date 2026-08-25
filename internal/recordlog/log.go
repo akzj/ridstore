@@ -215,6 +215,56 @@ func (l *Log) Read(ctx context.Context, addr VAddr) ([]byte, error) {
 	return payload, errors.Join(readErr, releaseErr)
 }
 
+// Inspect validates the physical Record header and returns only the requested
+// payload prefix. It deliberately does not validate the full payload CRC.
+func (l *Log) Inspect(ctx context.Context, addr VAddr, prefixBytes uint32) (RecordHeader, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return RecordHeader{}, nil, err
+	}
+	if !addr.Valid() {
+		return RecordHeader{}, nil, ErrInvalidVAddr
+	}
+	l.submitMu.RLock()
+	closed := l.closing
+	l.submitMu.RUnlock()
+	l.stateMu.RLock()
+	terminal := l.terminal
+	if terminal != nil {
+		l.stateMu.RUnlock()
+		return RecordHeader{}, nil, terminal
+	}
+	if closed {
+		l.stateMu.RUnlock()
+		return RecordHeader{}, nil, ErrClosed
+	}
+	if payload, exists := l.pending[addr]; exists {
+		if prefixBytes > uint32(len(payload)) {
+			l.stateMu.RUnlock()
+			return RecordHeader{}, nil, ErrCorrupt
+		}
+		physical, err := PhysicalRecordSize(uint64(len(payload)))
+		if err != nil || !addr.MatchesPhysicalSize(physical) {
+			l.stateMu.RUnlock()
+			return RecordHeader{}, nil, errors.Join(ErrCorrupt, err)
+		}
+		header := RecordHeader{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr}
+		prefix := append([]byte(nil), payload[:prefixBytes]...)
+		l.stateMu.RUnlock()
+		return header, prefix, nil
+	}
+	l.stateMu.RUnlock()
+	pin, err := l.registry.pin(addr.SegmentID())
+	if err != nil {
+		return RecordHeader{}, nil, err
+	}
+	header, prefix, inspectErr := pin.inspect(addr, prefixBytes)
+	releaseErr := pin.release()
+	return header, prefix, errors.Join(inspectErr, releaseErr)
+}
+
 func (l *Log) Scan(ctx context.Context, from LogPos, visit func(AppendResult, []byte) error) error {
 	if ctx == nil {
 		ctx = context.Background()

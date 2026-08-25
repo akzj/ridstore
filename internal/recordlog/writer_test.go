@@ -69,6 +69,13 @@ func TestLogAppendReadScanAndReopen(t *testing.T) {
 	if err != nil || string(got) != "owned after append" {
 		t.Fatalf("read=%q err=%v", got, err)
 	}
+	recordHeader, prefix, err := log.Inspect(context.Background(), first.Addr, 5)
+	if err != nil || recordHeader.Addr != first.Addr || recordHeader.PayloadSize != uint32(len(got)) || string(prefix) != "owned" {
+		t.Fatalf("header=%+v prefix=%q err=%v", recordHeader, prefix, err)
+	}
+	if _, _, err := log.Inspect(context.Background(), first.Addr, recordHeader.PayloadSize+1); err == nil {
+		t.Fatal("oversized inspection prefix accepted")
+	}
 	second, err := log.Append(context.Background(), make([]byte, 5000), true)
 	if err != nil {
 		t.Fatal(err)

@@ -33,6 +33,10 @@ func TestPutRoundTrip(t *testing.T) {
 	if typ, err := TypeOf(encoded); err != nil || typ != RecordTypePut {
 		t.Fatalf("type=%d err=%v", typ, err)
 	}
+	metadata, err := DecodePutMetadata(encoded[:PutHeaderSize], uint32(len(encoded)), 1024)
+	if err != nil || metadata.OriginBatchID != want.OriginBatchID || metadata.RecordID != want.RecordID || metadata.ValueBytes != uint64(len(want.Value)) {
+		t.Fatalf("metadata=%+v err=%v", metadata, err)
+	}
 	got.Value[0] = 'V'
 	if encoded[PutHeaderSize] != 'V' {
 		t.Fatal("decoded value must alias source")
