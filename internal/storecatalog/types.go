@@ -24,13 +24,7 @@ type HardLimits struct {
 	BatchIDReserveSize  uint64
 }
 
-type DataSegmentSummary struct {
-	SegmentID   recordlog.SegmentID
-	ValidEnd    uint32
-	RecordCount uint64
-	FirstAddr   recordlog.VAddr
-	LastAddr    recordlog.VAddr
-}
+type DataSegmentSummary = recordlog.SegmentSummary
 
 type MapSegmentSummary struct {
 	SegmentID model.MapSegmentID

@@ -9,6 +9,8 @@ import (
 	"github.com/akzj/ridstore/internal/recordlog"
 )
 
+var _ recordlog.CatalogPort = (*Manager)(nil)
+
 type Manager struct {
 	mu      sync.Mutex
 	root    string
@@ -38,6 +40,57 @@ func (m *Manager) Snapshot() Manifest {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.current.Clone()
+}
+
+func (m *Manager) SnapshotRecordLog() recordlog.CatalogSnapshot {
+	current := m.Snapshot()
+	return recordLogSnapshot(current)
+}
+
+func recordLogSnapshot(current Manifest) recordlog.CatalogSnapshot {
+	return recordlog.CatalogSnapshot{
+		Generation: current.Generation, LogID: current.RecordLogID,
+		SegmentSize: uint32(current.HardLimits.SegmentSize), MaxPayloadBytes: uint32(current.HardLimits.MaxRecordLogPayload),
+		ActiveSegmentID: current.ActiveDataSegmentID, NextSegmentID: current.NextDataSegmentID,
+		SealedSegments: append([]recordlog.SegmentSummary(nil), current.SealedDataSegments...),
+	}
+}
+
+func (m *Manager) InstallRecordLogRotation(expect uint64, sealed recordlog.SegmentSummary, newActive, next recordlog.SegmentID) (recordlog.CatalogSnapshot, error) {
+	installed, err := m.InstallDataRotation(expect, DataRotation{SealedOld: sealed, NewActive: newActive, NextID: next})
+	if err != nil {
+		return recordlog.CatalogSnapshot{}, err
+	}
+	return recordLogSnapshot(installed), nil
+}
+
+func (m *Manager) RemoveRecordLogSegment(expect uint64, sealed recordlog.SegmentSummary) (recordlog.CatalogSnapshot, error) {
+	current := m.Snapshot()
+	if current.Generation != expect {
+		return recordlog.CatalogSnapshot{}, fmt.Errorf("expected generation %d, current %d: %w", expect, current.Generation, ErrConflict)
+	}
+	replayStart := current.ReplayStart
+	if replayStart.SegmentID == sealed.SegmentID {
+		if replayStart.Offset != sealed.ValidEnd {
+			return recordlog.CatalogSnapshot{}, ErrInvalid
+		}
+		successor := current.ActiveDataSegmentID
+		for _, summary := range current.SealedDataSegments {
+			if summary.SegmentID > sealed.SegmentID && summary.SegmentID < successor {
+				successor = summary.SegmentID
+			}
+		}
+		var err error
+		replayStart, err = recordlog.NewLogPos(successor, recordlog.SegmentHeaderSize)
+		if err != nil {
+			return recordlog.CatalogSnapshot{}, err
+		}
+	}
+	installed, err := m.InstallDataRetire(expect, DataRetire{Source: sealed, CoveredCommitSeq: current.CoveredCommitSeq, ReplayStart: replayStart})
+	if err != nil {
+		return recordlog.CatalogSnapshot{}, err
+	}
+	return recordLogSnapshot(installed), nil
 }
 
 type DataRotation struct {

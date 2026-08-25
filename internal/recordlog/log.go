@@ -8,18 +8,17 @@ import (
 )
 
 type Config struct {
-	MaxPayloadBytes uint32
-	MaxQueuedBytes  uint64
-	QueueCapacity   int
-	BufferBytes     uint32
-	BufferRecords   int
+	MaxQueuedBytes uint64
+	QueueCapacity  int
+	BufferBytes    uint32
+	BufferRecords  int
 }
 
-func (c Config) validate(segmentSize uint32) error {
-	if segmentSize <= SegmentHeaderSize+SegmentFooterSize || c.MaxPayloadBytes == 0 || c.MaxQueuedBytes == 0 || c.QueueCapacity <= 0 || c.BufferBytes == 0 || c.BufferRecords <= 0 {
+func (c Config) validate(segmentSize, maxPayloadBytes uint32) error {
+	if segmentSize <= SegmentHeaderSize+SegmentFooterSize || maxPayloadBytes == 0 || c.MaxQueuedBytes == 0 || c.QueueCapacity <= 0 || c.BufferBytes == 0 || c.BufferRecords <= 0 {
 		return ErrInvalidConfig
 	}
-	maximum, err := PhysicalRecordSize(uint64(c.MaxPayloadBytes))
+	maximum, err := PhysicalRecordSize(uint64(maxPayloadBytes))
 	if err != nil || maximum > segmentSize-SegmentHeaderSize-SegmentFooterSize || uint64(maximum) > c.MaxQueuedBytes {
 		return ErrInvalidConfig
 	}
@@ -83,12 +82,16 @@ type pendingSnapshot struct {
 type rotateActive func(*activeSegment) (*activeSegment, error)
 
 type Log struct {
-	cfg      Config
-	requests chan *appendRequest
-	done     chan struct{}
-	budget   *byteBudget
-	registry *segmentRegistry
-	rotate   rotateActive
+	cfg             Config
+	root            string
+	catalog         CatalogPort
+	files           fileBackend
+	requests        chan *appendRequest
+	done            chan struct{}
+	budget          *byteBudget
+	registry        *segmentRegistry
+	rotate          rotateActive
+	maxPayloadBytes uint32
 
 	submitMu sync.RWMutex
 	closing  bool
@@ -103,8 +106,8 @@ type Log struct {
 	closeErr  error
 }
 
-func newLog(cfg Config, active *activeSegment, registry *segmentRegistry, rotate rotateActive) (*Log, error) {
-	if active == nil || registry == nil || rotate == nil || cfg.validate(active.header.SegmentSize) != nil {
+func newLog(cfg Config, maxPayloadBytes uint32, active *activeSegment, registry *segmentRegistry, rotate rotateActive) (*Log, error) {
+	if active == nil || registry == nil || rotate == nil || cfg.validate(active.header.SegmentSize, maxPayloadBytes) != nil {
 		return nil, ErrInvalidConfig
 	}
 	registry.mu.Lock()
@@ -116,7 +119,7 @@ func newLog(cfg Config, active *activeSegment, registry *segmentRegistry, rotate
 	initial := LogPos{SegmentID: active.header.SegmentID, Offset: active.summary().ValidEnd}
 	log := &Log{
 		cfg: cfg, requests: make(chan *appendRequest, cfg.QueueCapacity), done: make(chan struct{}),
-		budget: newByteBudget(cfg.MaxQueuedBytes), registry: registry, rotate: rotate,
+		budget: newByteBudget(cfg.MaxQueuedBytes), registry: registry, rotate: rotate, maxPayloadBytes: maxPayloadBytes,
 		pending: make(map[VAddr][]byte), closeDone: make(chan struct{}),
 	}
 	log.status.Watermarks = Watermarks{Reserved: initial, Written: initial, Durable: initial}
@@ -131,7 +134,7 @@ func (l *Log) Append(ctx context.Context, payload []byte, syncWrite bool) (Appen
 	if err := ctx.Err(); err != nil {
 		return AppendResult{}, err
 	}
-	if uint64(len(payload)) > uint64(l.cfg.MaxPayloadBytes) {
+	if uint64(len(payload)) > uint64(l.maxPayloadBytes) {
 		return AppendResult{}, ErrPayloadTooBig
 	}
 	physical, err := PhysicalRecordSize(uint64(len(payload)))

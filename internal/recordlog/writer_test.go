@@ -8,13 +8,12 @@ import (
 	"time"
 )
 
-func testLogConfig(maxPayload uint32) Config {
+func testLogConfig() Config {
 	return Config{
-		MaxPayloadBytes: maxPayload,
-		MaxQueuedBytes:  1 << 20,
-		QueueCapacity:   128,
-		BufferBytes:     64 << 10,
-		BufferRecords:   128,
+		MaxQueuedBytes: 1 << 20,
+		QueueCapacity:  128,
+		BufferBytes:    64 << 10,
+		BufferRecords:  128,
 	}
 }
 
@@ -49,7 +48,7 @@ func openTestLog(t *testing.T, header SegmentHeader, hook segmentFaultHook) (*Lo
 	if err != nil {
 		t.Fatal(err)
 	}
-	log, err := newLog(testLogConfig(8<<10), active, registry, testRotate(root, registry))
+	log, err := newLog(testLogConfig(), 8<<10, active, registry, testRotate(root, registry))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,8 +116,8 @@ func TestLogRotatesBeforeAssigningAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := testLogConfig(256)
-	log, err := newLog(cfg, active, registry, testRotate(root, registry))
+	cfg := testLogConfig()
+	log, err := newLog(cfg, 256, active, registry, testRotate(root, registry))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,11 +193,11 @@ func (f *countingFile) counts() (int, int) {
 	return f.writes, f.syncs
 }
 
-func newUnstartedTestLog(cfg Config, active *activeSegment, registry *segmentRegistry, rotate rotateActive) *Log {
+func newUnstartedTestLog(cfg Config, maxPayload uint32, active *activeSegment, registry *segmentRegistry, rotate rotateActive) *Log {
 	initial := LogPos{SegmentID: active.header.SegmentID, Offset: active.summary().ValidEnd}
 	log := &Log{
 		cfg: cfg, requests: make(chan *appendRequest, cfg.QueueCapacity), done: make(chan struct{}),
-		budget: newByteBudget(cfg.MaxQueuedBytes), registry: registry, rotate: rotate,
+		budget: newByteBudget(cfg.MaxQueuedBytes), registry: registry, rotate: rotate, maxPayloadBytes: maxPayload,
 		pending: make(map[VAddr][]byte), closeDone: make(chan struct{}),
 	}
 	log.status.Watermarks = Watermarks{Reserved: initial, Written: initial, Durable: initial}
@@ -217,8 +216,8 @@ func TestWriterNaturallyGroupsQueuedSyncRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := testLogConfig(1024)
-	log := newUnstartedTestLog(cfg, active, registry, testRotate(root, registry))
+	cfg := testLogConfig()
+	log := newUnstartedTestLog(cfg, 1024, active, registry, testRotate(root, registry))
 
 	const requests = 32
 	errorsCh := make(chan error, requests)
@@ -260,8 +259,8 @@ func TestWriterRejectsCanceledAcceptedRequestBeforeReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := testLogConfig(1024)
-	log := newUnstartedTestLog(cfg, active, registry, testRotate(root, registry))
+	cfg := testLogConfig()
+	log := newUnstartedTestLog(cfg, 1024, active, registry, testRotate(root, registry))
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
