@@ -7,6 +7,9 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 1. [v2 总体架构](v2-architecture.md)：目标分层、唯一所有者和 RecordLog 边界；
 2. [v2 Recovery Protocol](v2-recovery-protocol.md)：权威状态与崩溃时间线；
 3. [v2 模块处置矩阵](v2-module-disposition.md)：Keep、Rewrite、Delete 判定和实施次序。
+4. [RecordLog v2 Contract](v2-recordlog-contract.md)：统一 Append、物理格式和 Segment 生命周期；
+5. [ridstore v2 Record Protocol](v2-record-protocol.md)：业务 Record 与单 Record Commit group；
+6. [ridstore v2 Manifest](v2-manifest-format.md)：唯一 Catalog schema、字段所有权和安装协议。
 
 v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构。以下 Format v1 文档仍用于理解
 已实现系统和提取不变量，不自动成为 v2 的实现约束。
@@ -42,6 +45,9 @@ v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构�
 | `v2-architecture.md` | Draft for Review | v2 分层、唯一所有者和 RecordLog 边界 |
 | `v2-recovery-protocol.md` | Draft for Review | v2 权威状态、恢复顺序和崩溃时间线 |
 | `v2-module-disposition.md` | Draft for Review | Keep、Rewrite、Delete 决策和实施次序 |
+| `v2-recordlog-contract.md` | Draft for Review | RecordLog API、物理格式和错误语义 |
+| `v2-record-protocol.md` | Draft for Review | v2 业务 Record 和尺寸约束 |
+| `v2-manifest-format.md` | Draft for Review | v2 Catalog schema 和原子安装协议 |
 | `design.md` | Accepted architecture | 总体边界与不变量 |
 | `positioning-vs-lsm.md` | Accepted boundary | 防止漂移成 RocksDB 替代品 |
 | `api-contract.md` | Development contract v1 | 第一版 Library API |

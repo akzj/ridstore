@@ -116,20 +116,11 @@ durable Commit 被 Coordinator 发布或 Recovery 重放后，Mapping 才能改�
 
 ### 6.1 请求与完成
 
-同步 `Append` 无法让单个 Coordinator 连续提交多个 durable Record 后再共同等待 fsync，因此
-v2 使用提交句柄分离“进入唯一顺序”和“等待完成”：
+RecordLog 保持单一同步动作。是否需要持久化只是请求属性，不产生不同的控制路径：
 
 ```go
-type AppendOptions struct {
-    Durable bool
-}
-
-type Receipt interface {
-    Wait(context.Context) (VAddr, error)
-}
-
 type RecordLog interface {
-    Submit(context.Context, []byte, AppendOptions) (Receipt, error)
+    Append(context.Context, []byte, bool) (AppendResult, error) // bool means sync
     Read(context.Context, VAddr) ([]byte, error)
     Scan(context.Context, LogPos, func(VAddr, []byte) error) error
     Status() LogStatus
@@ -139,16 +130,17 @@ type RecordLog interface {
 
 语义：
 
-- `Submit` 在返回前复制 payload；成功表示请求、数据副本和 byte budget 已被 RecordLog 接管，
-  但不表示地址已经分配；调用者返回后即可复用原始 buffer；
-- `Receipt.Wait` 对 `Durable=false` 在地址已预留后完成；
-- `Receipt.Wait` 对 `Durable=true` 在覆盖该 Record 的 fsync 成功后完成；
-- writer 可以把多个 `Durable=true` 请求放入同一次 write/fsync；
-- Context 在接管前取消不产生记录，接管后不能撤销已经分配的日志位置；
+- `sync=false` 在地址已预留且 payload 已复制后返回；
+- `sync=true` 在地址已预留、数据已 write 且覆盖它的 fsync 成功后返回；
+- `AppendResult` 同时返回 Record 的 VAddr 和紧随其后的 LogPos；后者是精确 checkpoint cut；
+- 两种请求在返回后都允许调用者立即复用原始 buffer；
+- writer 可以把多个 `sync=true` 请求放入同一次 write/fsync；
+- Context 在地址预留前取消不产生记录；地址预留后不能撤销已经占用的日志位置；
 - 任何不确定 write/fsync 状态都使 RecordLog fail-closed。
 
-Coordinator 形成 group 后，先按 CommitSeq 顺序提交全部 Commit Record，再逐个等待 Receipt，因此
-不会因同步 API 在第一个 Commit 上阻塞而丢失 group fsync。
+Coordinator 把一个 group 的多个 Batch Descriptor 编码成一个 `CommitGroupRecord`，只执行一次
+`Append(sync=true)`。RecordLog 仍可把它与队列中其他请求自然合并，但不需要为业务 group 增加
+`AppendGroup` 或异步 Receipt API。
 
 ### 6.2 物理 Record
 
@@ -160,9 +152,10 @@ magic / format version / physical size / payload size / VAddr / CRC / padding
 
 Ridstore 的 RecordType、BatchID、CommitSeq、ID 和 mutations 全部位于 opaque payload 内。
 
-一个 ridstore Commit Descriptor 在 v2 中编码为一个 RecordLog Record。HardLimits 必须保证最大
-Commit Descriptor 能放入空 Segment；v2 不继续保留 CommitPart/CommitSeal 邻接协议。若未来确实
-需要超过单 Record 的 Commit，必须重新设计显式 indirection，不能悄悄恢复业务分片到 RecordLog。
+一个 ridstore `CommitGroupRecord` 包含一个或多个完整 Batch Descriptor，并编码为一个 RecordLog
+Record。HardLimits 必须保证任一合法单 Batch Descriptor 能放入空 Segment；Coordinator 的 group
+byte limit 保证整个 CommitGroupRecord 也能放入。v2 不继续保留 CommitPart/CommitSeal 邻接协议。
+若未来确实需要超过单 Record 的 Commit，必须重新设计显式 indirection，不能悄悄恢复业务分片。
 
 ### 6.3 Segment 边界
 
@@ -192,7 +185,7 @@ Mapping，直接把任意可读 Record 当成已提交数据。
 
 ```text
 PutRecord
-CommitRecord
+CommitGroupRecord
 AbortRecord
 IDReserveRecord
 BatchIDReserveRecord
@@ -203,8 +196,8 @@ CheckpointMarker
 协议层负责版本、类型、业务字段和业务 CRC。RecordLog envelope CRC 保护物理边界；协议 CRC
 保护 ridstore 语义。两层校验不能互相替代。
 
-`PutRecord` 使用 `Durable=false`，取得 VAddr 后写入 Batch 的最终 mutation。`CommitRecord` 使用
-`Durable=true`；其成功完成证明此前引用的 PutRecord 和 CommitRecord 本身均已持久化。
+`PutRecord` 使用 `sync=false`，取得 VAddr 后写入 Batch 的最终 mutation。`CommitGroupRecord` 使用
+`sync=true`；其成功完成证明此前引用的 PutRecord 和整个 Commit group 均已持久化。
 
 ## 8. 正常提交
 
@@ -212,10 +205,10 @@ CheckpointMarker
 1. Batch Put 向 RecordLog 提交 PutRecord，等待 reserved VAddr
 2. Batch 只保存最终 ID -> VAddr/Delete mutation
 3. Coordinator 串行验证条件并形成 virtual Mapping
-4. Coordinator 分配 CommitSeq，编码单个 CommitRecord
-5. 一个 group 的所有 CommitRecord 依次 Submit(Durable=true)
-6. RecordLog 合并 write 和 fsync
-7. Coordinator 按 CommitSeq 等待 Receipt 并发布 Mapping
+4. Coordinator 按顺序分配 CommitSeq，编码一个 CommitGroupRecord
+5. Append(CommitGroupRecord, sync=true)
+6. RecordLog 合并 write 并执行 fsync
+7. Coordinator 按 CommitSeq 发布 group 内各 Batch 的 Mapping
 8. 最后向调用者返回 Committed
 ```
 
@@ -233,8 +226,9 @@ SegmentStats 仍是可重建派生状态，不进入 Commit 热路径。GC 候�
 Mapping[RecordID] == scanned VAddr
 ```
 
-Relocation Commit durable 并进入 Mapping Checkpoint 后，Catalog 才能移除旧 Segment；随后
-RecordLog Registry 阻止新 reader、等待已有 pin、关闭文件并删除。
+Relocation Commit durable 并进入 Mapping Checkpoint 后，RecordLog Registry 先阻止新 reader 并
+等待已有 pin；Catalog 随后移除旧 Segment，最后关闭文件并删除。Catalog 安装失败时撤销内存
+retire gate，不能留下 Manifest 仍引用但当前进程不可读的 Segment。
 
 ## 10. VAddr 与 size tag
 
@@ -270,7 +264,7 @@ Format v1 不兼容不是 v2 分支的约束。v2 Open 必须明确拒绝 v1 数
 进入实现前必须回答：
 
 1. 单 Record Commit Descriptor 的最大尺寸约束是否可接受；
-2. Submit/Receipt 的取消、关闭和错误完成是否无悬挂；
+2. Append 的取消、关闭和错误完成是否无悬挂；
 3. rotation 与 Catalog 安装失败时，哪个文件集合是权威状态；
 4. Checkpoint cut 是否能和 Mapping Root 构成同一快照；
 5. GC 删除顺序是否在每个崩溃点都可恢复；

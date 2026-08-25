@@ -38,7 +38,7 @@
 | `internal/mapping/api` | Keep | `ID -> VAddr`、resolved publish、checkpoint 契约保持 |
 | `internal/mapping/memory` | Keep | 只实现 Mapping API，不拥有持久化格式或追加生命周期 |
 | `internal/mapping/radix` | Rewrite | 保留 COW Root、Delta、Cache 算法和测试性质；原实现绑定 Format v1/Catalog |
-| `internal/recovery` | Rewrite | v2 使用 RecordLog envelope + 单 CommitRecord，不保留 FramePart 状态机 |
+| `internal/recovery` | Rewrite | v2 使用 RecordLog envelope + 单 CommitGroupRecord，不保留 FramePart 状态机 |
 | `data_gc.go` | Rewrite | 保留 liveness/CAS/Reader Pin/删除顺序，不保留旧 Segment 和 Frame 接口 |
 | `internal/maintenance` | Rewrite | journal 机制可借鉴，但状态字段必须原生服从 v2 Catalog |
 | `internal/backup` | Rewrite | 文件集合与格式改变，不允许在旧清单结构上补兼容分支 |
@@ -80,7 +80,7 @@ v2 不再存在：
 
 不能因为已经实现就直接保留：
 
-- 当前公开同步 `Append` API；
+- 当前同步 `Append` API 可以保留；它的 Close、取消和数据所有权仍需按正式契约重新验证；
 - 当前目录扫描即权威的 open 方式；
 - 当前独立 Segment membership；
 - 当前 rotation publication；
@@ -93,37 +93,43 @@ v2 不再存在：
 
 - Review 总体架构、Recovery 和本矩阵；
 - 冻结 RecordLog API、Manifest v2 schema 和 Protocol Record；
-- 明确最大 CommitRecord 与 Segment 的约束。
+- 明确最大 CommitGroupRecord 与 Segment 的约束。
 
-### M1：全新 RecordLog
+### M1：v2 基础类型与格式
+
+- 生成新的 VAddr、LogPos、checked arithmetic 和错误分类；
+- 生成 RecordLog envelope、Ridstore Protocol 和 Manifest v2 codec；
+- 为所有 decoder 建立 golden、boundary、corruption 和 fuzz 测试；
+- 生成只接受 Manifest v2 的单一 Catalog；
+- 新代码使用最终职责命名，不创建长期 `v2compat` 或 adapter 包。
+
+### M2：全新 RecordLog
 
 - 在新包中生成正式实现，不修改旧 appendlog；
-- 实现 Submit/Receipt、唯一 writer、Segment、Registry、rotation 和物理恢复；
+- 实现统一 Append、唯一 writer、Segment、Registry、rotation、Catalog publication 和物理恢复；
 - 迁移 v2 原型的性质测试而不是复制旧 API；
-- M1 完成前旧路径仍可编译，但不与新路径互相调用。
+- M2 完成前旧路径仍可编译，但不与新路径互相调用。
 
-### M2：Ridstore Protocol 与最小闭环
+### M3：Ridstore 最小闭环
 
-- 生成 v2 PutRecord、CommitRecord、ReserveRecord codec；
 - 重写 Coordinator；
 - 接入 Mapping；
 - 完成 Create/Update/Delete/Get 与原子 Batch；
 - 建立全新 v2 runtime，不能通过 adapter 调旧 appendlog。
 
-### M3：Checkpoint 与 Recovery
+### M4：Checkpoint 与 Recovery
 
-- 生成 Manifest v2；
 - 接入 Mapping checkpoint；
 - 重写 replay；
 - 完成 crash matrix 后删除旧 recovery/format 主路径。
 
-### M4：GC 与维护
+### M5：GC 与维护
 
 - 重写 SegmentStats、Relocation 和 retire/delete；
 - 接入 Reader Pin；
 - 完成 GC crash matrix 和 model test。
 
-### M5：删除旧系统
+### M6：删除旧系统
 
 - 删除 `internal/appendlog` 和不再引用的 Format v1 组件；
 - 删除旧 runtime、rotation、recovery 和兼容测试；

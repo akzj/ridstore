@@ -21,7 +21,7 @@ Visible Mapping = Checkpoint Mapping Root
                 + durable Commit/Relocation records after cut
 ```
 
-没有 durable CommitRecord 的 PutRecord 永远不可见。
+没有 durable CommitGroupRecord 引用的 PutRecord 永远不可见。
 
 ## 2. Open 顺序
 
@@ -34,7 +34,7 @@ Visible Mapping = Checkpoint Mapping Root
 6. 扫描 active tail，截断最后一个 torn/incomplete Record
 7. 打开 Manifest 指向的 Mapping Root
 8. 从 checkpoint cut 扫描 ridstore protocol records
-9. 验证并按 CommitSeq 重放 Commit/Relocation
+9. 验证并按 CommitSeq 重放 CommitGroup/Relocation
 10. 恢复 allocator high watermarks 和 Batch 状态
 11. 构造新的 active writer，最后对外发布 Store
 ```
@@ -54,7 +54,7 @@ RecordLog 只接受从 Segment Header 开始连续出现的合法 Record 前缀�
 
 active 文件最后一个不完整 Record 可以被截断。sealed 文件的任何不一致都是 corruption，不能修剪
 后继续运行。位于最后 durable fsync 之后但恰好完整的 active Record可能保留；它是否产生业务状态
-仍由 ridstore CommitRecord 判断。
+仍由 ridstore CommitGroupRecord 判断。
 
 ## 4. Put 和 Commit 崩溃时间线
 
@@ -65,28 +65,28 @@ active 文件最后一个不完整 Record 可以被截断。sealed 文件的任�
 
 ### 4.2 Put 已 write 但未 Commit
 
-恢复能够扫描到 PutRecord，但没有引用它的合法 CommitRecord。它是 orphan，只占空间，不进入
+恢复能够扫描到 PutRecord，但没有引用它的合法 CommitGroupRecord。它是 orphan，只占空间，不进入
 Mapping，后续由 GC 回收。
 
 ### 4.3 Commit write 完整但 fsync 结果未知
 
 调用者收到 CommitUnknown，Store fail-closed。重新 Open 后：
 
-- 若 CommitRecord 位于合法 durable 前缀，按 CommitSeq 重放并报告 Committed；
-- 若不存在完整 CommitRecord，报告 Aborted/NotCommitted；
+- 若 CommitGroupRecord 位于合法 durable 前缀，按 CommitSeq 重放并报告 Committed；
+- 若不存在完整 CommitGroupRecord，报告 Aborted/NotCommitted；
 - 不允许仅凭调用者超时推断结果。
 
 ### 4.4 Commit durable、Mapping 尚未发布
 
-重启从 checkpoint cut 扫描到 CommitRecord并发布全部 mutations，因此结果仍为 Committed。
+重启从 checkpoint cut 扫描到 CommitGroupRecord并发布全部 mutations，因此结果仍为 Committed。
 
 ### 4.5 Mapping 已发布、调用者尚未收到结果
 
-结果同样为 Committed。响应不是 durable 证据，CommitRecord 才是。
+结果同样为 Committed。响应不是 durable 证据，CommitGroupRecord 才是。
 
-## 5. CommitRecord 重放规则
+## 5. CommitGroupRecord 重放规则
 
-每个 CommitRecord 必须自包含：
+每个 CommitGroupRecord 包含一个或多个完整 Batch Descriptor。每个 Descriptor 必须自包含：
 
 - BatchID 和 CommitSeq；
 - mutation 数量及有界长度；
@@ -94,10 +94,11 @@ Mapping，后续由 GC 回收。
 - Put 的 VAddr 或 Delete 标记；
 - descriptor semantic checksum/hash。
 
-Recovery 要求 CommitSeq 从 checkpoint covered sequence 之后严格连续。重复、倒退、空洞、非法
+group 内 Descriptor 按 CommitSeq 严格递增，相邻 group 也必须连续。Recovery 要求 CommitSeq 从
+checkpoint covered sequence 之后严格连续。重复、倒退、空洞、非法
 VAddr、指向非 PutRecord、RecordID/OriginBatch 不匹配均视为 corruption。
 
-历史条件不重放。只有运行时验证成功的 Batch 才能产生 CommitRecord，因此 Recovery 直接应用
+历史条件不重放。只有运行时验证成功的 Batch 才能进入 CommitGroupRecord，因此 Recovery 直接应用
 durable descriptor。
 
 ## 6. Checkpoint 时间线
@@ -157,18 +158,19 @@ live iff Mapping[ID] == scanned VAddr
 3. durable RelocationRecord
 4. Mapping CAS 发布
 5. Checkpoint 覆盖 relocation
-6. Catalog Manifest 移除源 Segment
-7. Registry 标记 Retired，阻止新 reader
-8. 等待 Reader Pin 和 open-batch refs 清零
-9. rename 到 trash 并 fsync directory
-10. 删除 trash 文件并 fsync directory
+6. Registry 进入 Retiring，阻止新 reader
+7. 等待 Reader Pin 和 open-batch refs 清零
+8. Catalog Manifest 移除源 Segment；失败则撤销 Retiring
+9. Registry detach 并关闭文件
+10. rename 到 trash 并 fsync directory
+11. 删除 trash 文件并 fsync directory
 ```
 
-第 6 步前不能删除文件。第 6 步后旧文件即使因崩溃仍残留，也只是 orphan，恢复不得重新接纳。
+第 8 步前不能删除文件。第 8 步后旧文件即使因崩溃仍残留，也只是 orphan，恢复不得重新接纳。
 
 ## 9. Reserve 与 ID 不复用
 
-IDReserveRecord 和 BatchIDReserveRecord 使用 `Durable=true`。只有 Receipt durable 完成后才能发放
+IDReserveRecord 和 BatchIDReserveRecord 使用 `sync=true`。只有 Append 成功后才能发放
 新区间。结果不确定时 Store fail-closed；恢复取 checkpoint 与 replay 中最大的合法 high watermark。
 
 允许跳过一段 ID，绝不允许回退或复用。
@@ -189,7 +191,7 @@ IDReserveRecord 和 BatchIDReserveRecord 使用 `Durable=true`。只有 Receipt 
 
 ## 11. 必须验证的崩溃点
 
-- Submit 接管前后；
+- Append 地址预留前后；
 - 地址预留后、write 前；
 - partial write；
 - write 完成、fsync 前后；
@@ -197,5 +199,5 @@ IDReserveRecord 和 BatchIDReserveRecord 使用 `Durable=true`。只有 Receipt 
 - Manifest rename 和 directory fsync 前后；
 - Mapping Root fsync 和 Manifest 安装之间；
 - Relocation durable、Checkpoint、Manifest remove 和文件删除之间；
-- Close 与并发 Submit/Wait；
-- Receipt 等待者取消和 writer poison。
+- Close 与并发 Append；
+- Append 等待者取消和 writer poison。
