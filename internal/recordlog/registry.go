@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -20,6 +21,29 @@ type registryEntry struct {
 	active *activeSegment
 	sealed *sealedSegment
 	pins   uint64
+}
+
+func (r *segmentRegistry) pinSnapshot() ([]*segmentPin, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, ErrClosed
+	}
+	ids := make([]SegmentID, 0, len(r.entries))
+	for id, entry := range r.entries {
+		if entry.state == segmentRetiring {
+			return nil, ErrSegmentRetiring
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	pins := make([]*segmentPin, 0, len(ids))
+	for _, id := range ids {
+		entry := r.entries[id]
+		entry.pins++
+		pins = append(pins, &segmentPin{registry: r, id: id, entry: entry})
+	}
+	return pins, nil
 }
 
 type segmentRegistry struct {
@@ -135,6 +159,9 @@ func (r *segmentRegistry) publishRotation(oldID SegmentID, sealed *sealedSegment
 	if _, exists := r.entries[active.header.SegmentID]; exists {
 		return ErrInvalidConfig
 	}
+	if err := old.active.transferSealedOwnership(sealed); err != nil {
+		return err
+	}
 	old.state = segmentSealed
 	old.active = nil
 	old.sealed = sealed
@@ -233,13 +260,23 @@ func (r *segmentRegistry) close() error {
 		r.mu.Unlock()
 		return ErrClosed
 	}
-	for _, entry := range r.entries {
-		if entry.pins != 0 {
-			r.mu.Unlock()
-			return ErrReadersActive
-		}
-	}
 	r.closed = true
+	for {
+		readers := false
+		for _, entry := range r.entries {
+			if entry.pins != 0 {
+				readers = true
+				break
+			}
+		}
+		if !readers {
+			break
+		}
+		changed := r.changed
+		r.mu.Unlock()
+		<-changed
+		r.mu.Lock()
+	}
 	entries := r.entries
 	r.entries = nil
 	r.signalLocked()

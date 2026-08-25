@@ -51,17 +51,18 @@ type recordExtent struct {
 }
 
 type activeSegment struct {
-	mu      sync.RWMutex
-	file    fileHandle
-	path    string
-	header  SegmentHeader
-	end     uint32
-	first   VAddr
-	last    VAddr
-	records uint64
-	sealed  bool
-	files   fileBackend
-	hook    segmentFaultHook
+	mu          sync.RWMutex
+	file        fileHandle
+	path        string
+	header      SegmentHeader
+	end         uint32
+	first       VAddr
+	last        VAddr
+	records     uint64
+	sealed      bool
+	transferred bool
+	files       fileBackend
+	hook        segmentFaultHook
 }
 
 type sealedSegment struct {
@@ -515,12 +516,22 @@ func (s *activeSegment) read(addr VAddr) ([]byte, error) {
 	return readRecordAt(s.file, s.summaryLocked(), addr)
 }
 func (s *activeSegment) scan(from uint32, visit func(AppendResult, []byte) error) error {
+	return s.scanTo(from, s.summary().ValidEnd, visit)
+}
+func (s *activeSegment) scanTo(from, limit uint32, visit func(AppendResult, []byte) error) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if s.file == nil {
+		s.mu.RUnlock()
 		return ErrClosed
 	}
-	return scanRecordRange(s.file, s.summaryLocked(), from, visit)
+	file := s.file
+	summary := s.summaryLocked()
+	s.mu.RUnlock()
+	if limit > summary.ValidEnd {
+		return ErrInvalidLogPos
+	}
+	summary.ValidEnd = limit
+	return scanRecordRange(file, summary, from, visit)
 }
 func (s *sealedSegment) read(addr VAddr) ([]byte, error) {
 	if s.file == nil {
@@ -540,12 +551,22 @@ func (s *activeSegment) close() error {
 	if s.file == nil {
 		return nil
 	}
-	if s.sealed {
+	if s.sealed && s.transferred {
 		return nil
 	}
 	err := s.file.Close()
 	s.file = nil
 	return err
+}
+
+func (s *activeSegment) transferSealedOwnership(sealed *sealedSegment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.sealed || s.transferred || s.file == nil || sealed == nil || sealed.file != s.file {
+		return ErrInvalidConfig
+	}
+	s.transferred = true
+	return nil
 }
 func (s *sealedSegment) close() error {
 	if s.file == nil {
