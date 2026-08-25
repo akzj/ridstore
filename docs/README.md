@@ -2,6 +2,15 @@
 
 ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-Structured Record Store Library。
 
+`v2` 分支正在进行不兼容的架构重建。v2 的 Review 入口为：
+
+1. [v2 总体架构](v2-architecture.md)：目标分层、唯一所有者和 RecordLog 边界；
+2. [v2 Recovery Protocol](v2-recovery-protocol.md)：权威状态与崩溃时间线；
+3. [v2 模块处置矩阵](v2-module-disposition.md)：Keep、Rewrite、Delete 判定和实施次序。
+
+v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构。以下 Format v1 文档仍用于理解
+已实现系统和提取不变量，不自动成为 v2 的实现约束。
+
 文档按约束优先级阅读：
 
 1. [总体设计](design.md)：项目目标、核心不变量和模块关系；
@@ -30,6 +39,9 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 
 | 文档 | 状态 | 作用 |
 |---|---|---|
+| `v2-architecture.md` | Draft for Review | v2 分层、唯一所有者和 RecordLog 边界 |
+| `v2-recovery-protocol.md` | Draft for Review | v2 权威状态、恢复顺序和崩溃时间线 |
+| `v2-module-disposition.md` | Draft for Review | Keep、Rewrite、Delete 决策和实施次序 |
 | `design.md` | Accepted architecture | 总体边界与不变量 |
 | `positioning-vs-lsm.md` | Accepted boundary | 防止漂移成 RocksDB 替代品 |
 | `api-contract.md` | Development contract v1 | 第一版 Library API |
