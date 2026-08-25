@@ -9,5 +9,4 @@ type BatchID uint64
 // CommitSeq is the logical publication order. Zero is reserved.
 type CommitSeq uint64
 
-// MapAddr identifies a node in the persistent mapping store. Zero means no node.
-type MapAddr uint64
+type MapSegmentID uint32
