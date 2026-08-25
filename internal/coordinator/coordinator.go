@@ -44,7 +44,7 @@ type request struct {
 
 type Coordinator struct {
 	log     Appender
-	mapping *mapping.Mapping
+	mapping mapping.Index
 	config  Config
 
 	stateMu  sync.Mutex
@@ -56,7 +56,7 @@ type Coordinator struct {
 	done     chan struct{}
 }
 
-func New(next model.CommitSeq, log Appender, current *mapping.Mapping, config Config) (*Coordinator, error) {
+func New(next model.CommitSeq, log Appender, current mapping.Index, config Config) (*Coordinator, error) {
 	if next == 0 || log == nil || current == nil || config.QueueCapacity <= 0 || config.MaxGroupBatches <= 0 || config.MaxGroupPayload == 0 ||
 		config.MaxGroupPayload < uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize) ||
 		current.CoveredCommitSeq() == model.CommitSeq(math.MaxUint64) || next != current.CoveredCommitSeq()+1 {

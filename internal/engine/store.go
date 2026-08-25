@@ -37,7 +37,7 @@ type Store struct {
 	mu  sync.Mutex
 
 	log       Log
-	mapping   *mapping.Mapping
+	mapping   mapping.Index
 	ids       *idalloc.Allocator
 	batches   *idalloc.Allocator
 	commits   *coordinator.Coordinator
@@ -49,7 +49,7 @@ type Store struct {
 	closed    bool
 }
 
-func New(log Log, current *mapping.Mapping, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
+func New(log Log, current mapping.Index, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
 	if log == nil || current == nil || ids == nil || batches == nil || config.MaxOpenBatches <= 0 || transaction.ValidateLimits(config.Batch) != nil {
 		return nil, base.ErrInvalidConfig
 	}

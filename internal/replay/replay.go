@@ -29,7 +29,7 @@ type Config struct {
 }
 
 type Checkpoint struct {
-	Mapping             mapping.Snapshot
+	Mapping             mapping.Index
 	ReplayStart         recordlog.LogPos
 	ReservedIDHigh      uint64
 	ReservedBatchIDHigh uint64
@@ -49,7 +49,7 @@ type BatchStatus struct {
 }
 
 type Result struct {
-	Mapping             *mapping.Mapping
+	Mapping             mapping.Index
 	NextCommitSeq       model.CommitSeq
 	ReservedIDHigh      uint64
 	ReservedBatchIDHigh uint64
@@ -59,18 +59,15 @@ type Result struct {
 func Recover(ctx context.Context, log Log, checkpoint Checkpoint, config Config) (Result, error) {
 	if log == nil || !checkpoint.ReplayStart.Valid() || checkpoint.ReservedIDHigh == 0 || checkpoint.ReservedBatchIDHigh == 0 ||
 		config.MaxValueSize == 0 || config.MaxRecordPayload == 0 || config.MaxGroupDescriptors == 0 || config.MaxGroupMutations == 0 ||
-		config.IDReserveSize == 0 || config.BatchIDReserveSize == 0 || checkpoint.Mapping.CoveredCommitSeq == model.CommitSeq(math.MaxUint64) {
+		config.IDReserveSize == 0 || config.BatchIDReserveSize == 0 || checkpoint.Mapping == nil || checkpoint.Mapping.CoveredCommitSeq() == model.CommitSeq(math.MaxUint64) {
 		return Result{}, base.ErrInvalidConfig
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	current, err := mapping.New(checkpoint.Mapping)
-	if err != nil {
-		return Result{}, err
-	}
+	current := checkpoint.Mapping
 	result := Result{
-		Mapping: current, NextCommitSeq: checkpoint.Mapping.CoveredCommitSeq + 1,
+		Mapping: current, NextCommitSeq: checkpoint.Mapping.CoveredCommitSeq() + 1,
 		ReservedIDHigh: checkpoint.ReservedIDHigh, ReservedBatchIDHigh: checkpoint.ReservedBatchIDHigh,
 		Statuses: make(map[model.BatchID]BatchStatus, len(checkpoint.OpenBatchIDs)),
 	}
@@ -84,7 +81,7 @@ func Recover(ctx context.Context, log Log, checkpoint Checkpoint, config Config)
 		}
 		result.Statuses[id] = BatchStatus{State: BatchAborted}
 	}
-	err = log.Scan(ctx, checkpoint.ReplayStart, func(physical recordlog.AppendResult, payload []byte) error {
+	err := log.Scan(ctx, checkpoint.ReplayStart, func(physical recordlog.AppendResult, payload []byte) error {
 		typ, err := recordcodec.TypeOf(payload)
 		if err != nil {
 			return corrupt(err)
@@ -138,7 +135,7 @@ func Recover(ctx context.Context, log Log, checkpoint Checkpoint, config Config)
 	return result, nil
 }
 
-func replayGroup(ctx context.Context, log Log, current *mapping.Mapping, result *Result, seenTerminal map[model.BatchID]struct{}, physical recordlog.AppendResult, payload []byte, config Config) error {
+func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Result, seenTerminal map[model.BatchID]struct{}, physical recordlog.AppendResult, payload []byte, config Config) error {
 	group, err := recordcodec.DecodeCommitGroup(payload, config.MaxRecordPayload, config.MaxGroupDescriptors, config.MaxGroupMutations)
 	if err != nil || group.Descriptors[0].CommitSeq != result.NextCommitSeq {
 		return corruptAt("commit sequence", err)

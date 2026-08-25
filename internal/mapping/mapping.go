@@ -93,6 +93,19 @@ type Snapshot struct {
 	Entries          map[model.ID]Entry
 }
 
+// Index is the single runtime Mapping contract used by commit, replay and
+// reads. Persistent is the production implementation; Mapping remains a
+// temporary in-memory model for tests until the v2 Open path is complete.
+type Index interface {
+	Lookup(model.ID) (Entry, bool, error)
+	ResolveGroup([]Proposal) (GroupPlan, error)
+	PublishGroup(model.CommitSeq, GroupPlan) (PublishResult, error)
+	CoveredCommitSeq() model.CommitSeq
+}
+
+var _ Index = (*Mapping)(nil)
+var _ Index = (*Persistent)(nil)
+
 type Mapping struct {
 	mu      sync.RWMutex
 	covered model.CommitSeq

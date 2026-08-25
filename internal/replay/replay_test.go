@@ -92,7 +92,7 @@ func TestRecoverRebuildsMappingAllocatorsAndStatuses(t *testing.T) {
 
 	start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
 	result, err := Recover(context.Background(), log, Checkpoint{
-		Mapping: mapping.Snapshot{}, ReplayStart: start, ReservedIDHigh: 5, ReservedBatchIDHigh: 5,
+		Mapping: mapping.NewEmpty(), ReplayStart: start, ReservedIDHigh: 5, ReservedBatchIDHigh: 5,
 		OpenBatchIDs: []model.BatchID{2, 3},
 	}, replayConfig())
 	if err != nil {
@@ -130,7 +130,7 @@ func TestRecoverRejectsCommitSequenceGapAndWrongPutIdentity(t *testing.T) {
 			}}}, 4096)
 			log.add(t, commit)
 			start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
-			_, err := Recover(context.Background(), log, Checkpoint{Mapping: mapping.Snapshot{}, ReplayStart: start, ReservedIDHigh: 1, ReservedBatchIDHigh: 1}, replayConfig())
+			_, err := Recover(context.Background(), log, Checkpoint{Mapping: mapping.NewEmpty(), ReplayStart: start, ReservedIDHigh: 1, ReservedBatchIDHigh: 1}, replayConfig())
 			if !errors.Is(err, base.ErrCorrupt) {
 				t.Fatalf("err=%v", err)
 			}
@@ -159,8 +159,15 @@ func TestRecoverRelocationPreservesRevisionAndUsesAddressCAS(t *testing.T) {
 	}}}, 4096)
 	log.add(t, group)
 	start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
+	initial, err := mapping.New(mapping.Snapshot{
+		CoveredCommitSeq: 4,
+		Entries:          map[model.ID]mapping.Entry{1: {Addr: oldAddr, Revision: 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := Recover(context.Background(), log, Checkpoint{
-		Mapping:     mapping.Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]mapping.Entry{1: {Addr: oldAddr, Revision: 2}}},
+		Mapping:     initial,
 		ReplayStart: start, ReservedIDHigh: 5, ReservedBatchIDHigh: 5,
 	}, replayConfig())
 	if err != nil {
