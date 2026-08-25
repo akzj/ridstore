@@ -205,7 +205,7 @@ func TestRecoverRejectsDurableTailLargerThanDeltaBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
-		MaxCheckpointEntries: 1, DeltaSoftLimitBytes: 32, DeltaHardLimitBytes: 64,
+		CheckpointSortBytes: 16, DeltaSoftLimitBytes: 32, DeltaHardLimitBytes: 64,
 	})
 	if err != nil {
 		t.Fatal(err)

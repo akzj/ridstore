@@ -122,21 +122,22 @@ candidate Mapping nodes durable
 
 ## 7. 与 Builder budget 的关系
 
-DeltaHardLimit 约束共享 active/frozen/reserved 状态；CheckpointMemoryBudget 约束 Builder 的私有临时
-工作集。两者不能互相替代：即使 Delta 有硬上界，当前一次性 `map + sorted slice` Builder 仍需在后续
-迭代改为 chunk/run merge，才能对字节级工作集作可信承诺。
+DeltaHardLimit 约束共享 active/frozen/reserved 状态；CheckpointSortBytes 约束 Builder 的 mutation 排序
+数组。两者不能互相替代。Builder 使用单一原地排序数组与固定深度的 Radix accumulator，不再分配
+`latest map`、第二份 mutation copy 或每层 O(N) child-change slice。
 
-在 chunk/run merge 完成前，配置必须满足：
+当前有界排序模型要求配置满足：
 
 ```text
-floor(DeltaHardLimitBytes / DeltaEntryCharge) <= MaxCheckpointEntries
+floor(DeltaHardLimitBytes / DeltaEntryCharge)
+    <= floor(CheckpointSortBytes / 16)
 ```
 
 否则 Commit 可以合法填满 Delta，却没有任何一次 Checkpoint 能接纳它，hard admission 反而会形成永久
-压力。Open/Create 会拒绝这种配置。
+压力。Open/Create 会在创建文件前拒绝这种配置。
 
-本迭代先完成 Delta hard admission 和可释放 charge，不把“entry 数有界”误报为“Builder bytes 已严格
-有界”。
+CheckpointSortBytes 只描述可变排序数组；Delta、Radix cache、固定 8 层 accumulator 和 SegmentStats
+分别计费，不能把它解释成整个 Checkpoint 或进程的总内存上限。
 
 ## 8. 验收不变量
 

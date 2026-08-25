@@ -1,6 +1,6 @@
 # ridstore v2 M4 Review
 
-状态：核心运行闭环与 Delta hard admission 已实现，bounded builder 待完成
+状态：核心运行闭环、Delta hard admission 与 bounded builder 已实现
 
 ## 1. 本阶段结果
 
@@ -73,18 +73,20 @@ Engine fail closed，重启以 durable Manifest 为准。
 - Delta hard pressure 会在不持有 `ops.RLock` 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
   Close 的并发路径已纳入 race 测试；
 - Open replay 超过本次 Delta hard limit 时确定返回配置错误，不部分发布、不等待运行期 Checkpoint；
-- 配置拒绝 `floor(DeltaHardLimitBytes / 64) > MaxCheckpointEntries`，保证当前 Builder 至少能处理 admission
-  允许形成的最坏 frozen entry 数；
+- 配置拒绝 `floor(DeltaHardLimitBytes / 64) > floor(CheckpointSortBytes / 16)`，保证 Builder 至少能处理
+  admission 允许形成的最坏 frozen entry 数；Mapping sort 与 SegmentStats 使用独立预算；
+- Checkpoint 以单一原地稳定排序数组折叠 frozen layers，Radix 以固定深度 accumulator 流式生成父节点，
+  不再保留 `latest map`、第二份 mutation copy 或逐层 O(N) child-change slice；
 - 相关包 race、全仓 test、vet 与 diff check 通过。
 
 ## 5. 尚未完成
 
 - checkpoint 的 Catalog syscall-error matrix 已覆盖；MapStore/RecordLog syscall fault injection 与完整
   进程崩溃矩阵仍未完成；
-- soft-limit 后台 Checkpoint 与有界 chunk/run-merge builder；
+- soft-limit 后台 Checkpoint；
 - Relocation、Data GC、Mapping GC；
 - 顶层公开 API 切换和旧 v1 模块删除。
 
-因此 M4 目前证明正常执行、重启恢复和 Delta 有界接纳闭环，不构成 production-ready 声明。下一优先级
-是有界 chunk/run-merge Checkpoint builder；完成后继续 MapStore/RecordLog crash matrix，再进入
-Relocation/GC，不能先删除旧公开路径。
+因此 M4 目前证明正常执行、重启恢复、Delta 有界接纳与 Checkpoint 有界构建闭环，不构成
+production-ready 声明。下一优先级是 MapStore/RecordLog crash matrix，再进入 Relocation/GC，不能先
+删除旧公开路径。

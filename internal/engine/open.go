@@ -21,12 +21,13 @@ import (
 )
 
 type OpenConfig struct {
-	RecordLog            recordlog.Config
-	Commit               coordinator.Config
-	MappingCacheBytes    uint64
-	MaxCheckpointEntries uint64
-	DeltaSoftLimitBytes  uint64
-	DeltaHardLimitBytes  uint64
+	RecordLog           recordlog.Config
+	Commit              coordinator.Config
+	MappingCacheBytes   uint64
+	CheckpointSortBytes uint64
+	MaxSegmentStats     uint64
+	DeltaSoftLimitBytes uint64
+	DeltaHardLimitBytes uint64
 }
 
 type CreateConfig struct {
@@ -169,19 +170,20 @@ func openLocked(ctx context.Context, root string, config OpenConfig, catalogHook
 	}
 	store.mapStore = physicalMapping
 	store.catalog = catalog
-	store.maxStats = config.MaxCheckpointEntries
+	store.maxStats = config.MaxSegmentStats
 	store.dirLock = dirLock
 	return store, nil
 }
 
 func validOpenConfig(config OpenConfig) bool {
-	return config.MappingCacheBytes != 0 && mapping.ValidatePersistentConfig(persistentConfig(config)) == nil
+	return config.MappingCacheBytes != 0 && config.MaxSegmentStats != 0 &&
+		mapping.ValidatePersistentConfig(persistentConfig(config)) == nil
 }
 
 func persistentConfig(config OpenConfig) mapping.PersistentConfig {
 	return mapping.PersistentConfig{
-		MaxCheckpointEntries: config.MaxCheckpointEntries,
-		DeltaSoftLimitBytes:  config.DeltaSoftLimitBytes,
-		DeltaHardLimitBytes:  config.DeltaHardLimitBytes,
+		CheckpointSortBytes: config.CheckpointSortBytes,
+		DeltaSoftLimitBytes: config.DeltaSoftLimitBytes,
+		DeltaHardLimitBytes: config.DeltaHardLimitBytes,
 	}
 }

@@ -1,6 +1,6 @@
 # ridstore v2 Mapping Format
 
-状态：Checkpoint runtime and Delta hard admission implemented
+状态：Checkpoint runtime, Delta hard admission and bounded builder implemented
 
 ## 1. 边界
 
@@ -80,13 +80,15 @@ Checkpoint 并重试。Freeze/Abort 不释放 charge，只有 durable Catalog �
 Commit 可以被接纳、Checkpoint 却永久无法推进。soft pressure 目前只形成信号语义，尚未启动后台主动
 Checkpoint。
 
-Checkpoint merge 仍使用一次性 `map + sorted slice`，只具备 entry 上限，不具备严格的临时字节上限。
-后续仍需实现有界 chunk/run merge，才能在保持 Delta hard admission 的同时提高可配置上限。
+Checkpoint merge 按 frozen layer 顺序写入一块受 `CheckpointSortBytes` 约束的 mutation 数组，原地稳定
+排序并压缩重复 ID；Radix `BuildSorted` 通过固定 8 层 accumulator 流式传播 child change，不再创建
+`latest map`、第二份 mutation copy 或逐层 O(N) slice。详见
+[v2-checkpoint-builder.md](v2-checkpoint-builder.md)。
 
 Coordinator checkpoint barrier、RecordLog durable cut、Catalog checkpoint tuple、精确 SegmentStats 与
 v2 Open/Replay 已接线。Engine 只接受 `mapping.Persistent`；旧的全量内存 Mapping 不再是 Engine
 后端，仅待迁移为 Mapping 模型测试 oracle 后删除生产定义。
 
-当前尚未实现 soft-limit 后台调度、有界 chunk builder、Mapping GC、完整 MapStore/RecordLog syscall
+当前尚未实现 soft-limit 后台调度、Mapping GC、完整 MapStore/RecordLog syscall
 crash matrix。v2 Create 与目录锁已经接入。第一版精确 SegmentStats 通过顺序遍历 candidate Root，并利用
 `RecordLog.Inspect` 只读取物理 Header 与 Put protocol header，不读取 Value body。

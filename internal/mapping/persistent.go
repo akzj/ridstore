@@ -38,21 +38,23 @@ type Persistent struct {
 	active  *deltaLayer
 	frozen  []*deltaLayer // oldest to newest
 
-	checkpointID         uint64
-	inCheckpoint         bool
-	maxCheckpointEntries uint64
-	budget               *deltaBudget
+	checkpointID        uint64
+	inCheckpoint        bool
+	checkpointSortBytes uint64
+	budget              *deltaBudget
 }
 
 type PersistentConfig struct {
-	MaxCheckpointEntries uint64
-	DeltaSoftLimitBytes  uint64
-	DeltaHardLimitBytes  uint64
+	CheckpointSortBytes uint64
+	DeltaSoftLimitBytes uint64
+	DeltaHardLimitBytes uint64
 }
 
+const checkpointMutationBytes = uint64(16)
+
 func ValidatePersistentConfig(config PersistentConfig) error {
-	if config.MaxCheckpointEntries == 0 ||
-		config.DeltaHardLimitBytes/deltaEntryCharge > config.MaxCheckpointEntries {
+	if config.CheckpointSortBytes < checkpointMutationBytes ||
+		config.DeltaHardLimitBytes/deltaEntryCharge > config.CheckpointSortBytes/checkpointMutationBytes {
 		return ErrInvalid
 	}
 	if _, err := newDeltaBudget(config.DeltaSoftLimitBytes, config.DeltaHardLimitBytes); err != nil {
@@ -68,9 +70,9 @@ func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig
 	budget, _ := newDeltaBudget(config.DeltaSoftLimitBytes, config.DeltaHardLimitBytes)
 	return &Persistent{
 		root: root, syncer: syncer, covered: root.Covered(),
-		active:               &deltaLayer{values: make(map[model.ID]persistentDelta)},
-		maxCheckpointEntries: config.MaxCheckpointEntries,
-		budget:               budget,
+		active:              &deltaLayer{values: make(map[model.ID]persistentDelta)},
+		checkpointSortBytes: config.CheckpointSortBytes,
+		budget:              budget,
 	}, nil
 }
 
@@ -306,24 +308,32 @@ func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCa
 		return CheckpointCandidate{}, ErrStalePlan
 	}
 	var total uint64
+	maxMutations := m.checkpointSortBytes / checkpointMutationBytes
 	for _, layer := range checkpoint.layers {
-		if uint64(len(layer.values)) > m.maxCheckpointEntries-total {
+		if uint64(len(layer.values)) > maxMutations-total {
 			return CheckpointCandidate{}, ErrBudget
 		}
 		total += uint64(len(layer.values))
 	}
-	latest := make(map[model.ID]persistentDelta, total)
+	mutations := make([]radix.Mutation, 0, total)
 	for _, layer := range checkpoint.layers {
 		for id, value := range layer.values {
-			latest[id] = value
+			mutations = append(mutations, radix.Mutation{ID: id, Addr: value.addr})
 		}
 	}
-	mutations := make([]radix.Mutation, 0, len(latest))
-	for id, value := range latest {
-		mutations = append(mutations, radix.Mutation{ID: id, Addr: value.addr})
+	sort.SliceStable(mutations, func(i, j int) bool { return mutations[i].ID < mutations[j].ID })
+	unique := 0
+	for start := 0; start < len(mutations); {
+		end := start + 1
+		for end < len(mutations) && mutations[end].ID == mutations[start].ID {
+			end++
+		}
+		mutations[unique] = mutations[end-1]
+		unique++
+		start = end
 	}
-	sort.Slice(mutations, func(i, j int) bool { return mutations[i].ID < mutations[j].ID })
-	tree, err := checkpoint.base.Build(checkpoint.covered, mutations)
+	mutations = mutations[:unique]
+	tree, err := checkpoint.base.BuildSorted(checkpoint.covered, mutations)
 	if err != nil {
 		return CheckpointCandidate{}, err
 	}

@@ -53,7 +53,7 @@ func newPersistentForTest(t *testing.T) (*Persistent, *mapstore.Store) {
 		t.Fatal(err)
 	}
 	current, err := OpenPersistent(tree, physical, PersistentConfig{
-		MaxCheckpointEntries: 1024, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+		CheckpointSortBytes: 16 << 10, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +168,7 @@ func TestPersistentAbortCheckpointRetainsFrozenLayers(t *testing.T) {
 func TestPersistentCheckpointRejectsTemporaryMemoryOverflow(t *testing.T) {
 	current, physical := newPersistentForTest(t)
 	defer physical.Close()
-	current.maxCheckpointEntries = 1
+	current.checkpointSortBytes = checkpointMutationBytes
 	a := testAddr(t, 1, 64)
 	b := testAddr(t, 1, 128)
 	plan, err := current.ResolveGroup([]Proposal{{
@@ -249,6 +249,43 @@ func TestPersistentDeltaChargeTracksLayersUntilInstall(t *testing.T) {
 	}
 }
 
+func TestPersistentCheckpointKeepsNewestMutationAcrossFrozenLayers(t *testing.T) {
+	current, physical := newPersistentForTest(t)
+	defer physical.Close()
+	oldAddr := testAddr(t, 1, 64)
+	newAddr := testAddr(t, 1, 128)
+	plan, _ := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: oldAddr, Operation: OperationPut}}}})
+	if _, err := current.PublishGroup(1, plan, reservePlan(t, current, plan)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := current.Freeze(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := current.AbortCheckpoint(first); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ = current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: newAddr, Operation: OperationPut}}}})
+	if _, err := current.PublishGroup(2, plan, reservePlan(t, current, plan)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := current.Freeze(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := current.BuildCheckpoint(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := current.InstallCheckpoint(candidate); err != nil {
+		t.Fatal(err)
+	}
+	addr, exists, err := current.Lookup(1)
+	if err != nil || !exists || addr != newAddr {
+		t.Fatalf("addr=%v exists=%v err=%v", addr, exists, err)
+	}
+}
+
 func TestPersistentRejectsDeltaLimitLargerThanCheckpointCapacity(t *testing.T) {
 	nodes := emptyNodeStoreForPersistentTest{}
 	tree, err := radix.Open(nodes, 0, 0, 1<<20)
@@ -256,7 +293,7 @@ func TestPersistentRejectsDeltaLimitLargerThanCheckpointCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := OpenPersistent(tree, nodes, PersistentConfig{
-		MaxCheckpointEntries: 1, DeltaSoftLimitBytes: 64, DeltaHardLimitBytes: 128,
+		CheckpointSortBytes: 16, DeltaSoftLimitBytes: 64, DeltaHardLimitBytes: 128,
 	}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("open err=%v", err)
 	}

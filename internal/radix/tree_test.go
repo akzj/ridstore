@@ -199,6 +199,39 @@ func TestBuildRejectsDuplicateIDAndSequenceRegression(t *testing.T) {
 	}
 }
 
+func TestBuildSortedRejectsInvalidOrderBeforeWriting(t *testing.T) {
+	store := newMemoryNodeStore()
+	tree, _ := Open(store, 0, 0, 1<<20)
+	addr := testDataAddr(t, 1, 64)
+	before := store.appends
+	if _, err := tree.BuildSorted(1, []Mutation{{ID: 2, Addr: addr}, {ID: 1, Addr: addr}}); err == nil {
+		t.Fatal("unsorted mutations accepted")
+	}
+	if store.appends != before {
+		t.Fatalf("invalid input wrote nodes before=%v after=%v", before, store.appends)
+	}
+}
+
+func TestBuildSortedStreamsAcrossDistantPrefixes(t *testing.T) {
+	store := newMemoryNodeStore()
+	tree, _ := Open(store, 0, 0, 1<<20)
+	ids := []model.ID{1, 512, 1 << 24, 1 << 48, model.ID(uint64(1) << 63), model.ID(math.MaxUint64)}
+	mutations := make([]Mutation, len(ids))
+	for index, id := range ids {
+		mutations[index] = Mutation{ID: id, Addr: testDataAddr(t, recordlog.SegmentID(index+1), 64)}
+	}
+	built, err := tree.BuildSorted(1, mutations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range mutations {
+		addr, exists, err := built.Lookup(mutation.ID)
+		if err != nil || !exists || addr != mutation.Addr {
+			t.Fatalf("id=%d addr=%v exists=%v err=%v", mutation.ID, addr, exists, err)
+		}
+	}
+}
+
 func TestOpenRequiresCacheCapacityForPinnedRoot(t *testing.T) {
 	store := newMemoryNodeStore()
 	tree, _ := Open(store, 0, 0, 1<<20)

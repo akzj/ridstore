@@ -162,7 +162,7 @@ func newPersistentMapping(t *testing.T) *mapping.Persistent {
 		t.Fatal(err)
 	}
 	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
-		MaxCheckpointEntries: 16, DeltaSoftLimitBytes: 512, DeltaHardLimitBytes: 1024,
+		CheckpointSortBytes: 256, DeltaSoftLimitBytes: 512, DeltaHardLimitBytes: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)
