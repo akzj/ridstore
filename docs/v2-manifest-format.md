@@ -207,8 +207,39 @@ Manifest v2 继续使用带 required bit 的 TLV container：
 - decoder 先验证总长和 count 上限，再分配；
 - 全局 CRC 覆盖所有 TLV。
 
-字段 TLV 编号和二进制 byte offset 在编码实现开始前生成 golden vector 一并冻结。本文先冻结逻辑
-schema 和所有权，不复用 Format v1 的 TLV 编号。
+Container Header 固定 64 bytes：
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic `RIDMV2\0\0` |
+| 8 | 2 | major = 2 |
+| 10 | 2 | minor = 0 |
+| 12 | 2 | header size = 64 |
+| 14 | 2 | reserved |
+| 16 | 8 | generation |
+| 24 | 16 | StoreUUID |
+| 40 | 8 | TLV payload bytes |
+| 48 | 4 | payload CRC32C |
+| 52 | 4 | header CRC32C |
+| 56 | 8 | reserved |
+
+每个 TLV 使用 8-byte Header：`Type uint16 / Flags uint16 / Length uint32`，value 后补零到 8-byte
+对齐。`Flags bit0=required`。
+
+| TLV | 内容 |
+|---:|---|
+| 1 | HardLimitsV2 |
+| 2 | RecordLogID |
+| 3 | active/next Data SegmentID |
+| 4 | sealed DataSegmentSummary 数组 |
+| 5 | active/next Mapping SegmentID |
+| 6 | sealed MapSegmentSummary 数组 |
+| 7 | MappingRoot |
+| 8 | checkpoint tuple 和 MaintenanceGeneration |
+| 9 | OpenBatchIDsAtCut |
+| 10 | StatsCoveredCommitSeq 和 SegmentStats |
+
+TLV 编号和布局已经由 `internal/storecatalog` 的 golden digest 固定，不复用 Format v1 编号。
 
 ## 12. 全局校验
 
@@ -224,3 +255,10 @@ Manifest decode 后至少验证：
 - open BatchID 唯一、递增并小于 issued high；
 - HardLimits 的所有派生尺寸均 checked 且能放入单 Segment；
 - 不存在同时 active/sealed/retired 的同一 SegmentID。
+
+## 13. 当前代码映射
+
+- `internal/storecatalog/codec.go`：Manifest v2 codec 和全局校验；
+- `internal/storecatalog/install.go`：双槽安装、文件和目录 fsync；
+- `internal/storecatalog/catalog.go`：typed Rotation、Checkpoint、Retire mutation；
+- `internal/storecatalog/*_test.go`：golden、corruption、fault、race 和 fuzz。

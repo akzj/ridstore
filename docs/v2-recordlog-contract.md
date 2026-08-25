@@ -155,6 +155,37 @@ Record Header：
 所有整数 Little Endian。单个 Record 不跨 Segment，PhysicalSize 不超过 uint32，SegmentSize
 不超过 `math.MaxUint32`。
 
+Segment Header：
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic `RIDAPV2H` |
+| 8 | 2 | format version = 2 |
+| 10 | 2 | header size = 64 |
+| 12 | 4 | SegmentID |
+| 16 | 4 | configured SegmentSize |
+| 20 | 4 | PreviousSegmentID，首段为 0 |
+| 24 | 16 | RecordLogID |
+| 40 | 4 | first content offset = 64 |
+| 44 | 16 | reserved |
+| 60 | 4 | header CRC32C |
+
+Segment Footer：
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic `RIDAPV2F` |
+| 8 | 2 | format version = 2 |
+| 10 | 2 | footer size = 64 |
+| 12 | 4 | SegmentID |
+| 16 | 4 | DataEnd |
+| 20 | 4 | reserved |
+| 24 | 8 | FirstAddr，空 Segment 为 0 |
+| 32 | 8 | LastAddr，空 Segment 为 0 |
+| 40 | 8 | RecordCount |
+| 48 | 12 | reserved |
+| 60 | 4 | footer CRC32C |
+
 ## 8. Segment 生命周期
 
 RecordLog 内部可以拆分 writer、segment、registry、rotation，但对外只有一个物理子系统：
@@ -253,3 +284,11 @@ EncodedRecord(MaxRecordLogPayload)
 ```
 
 RecordLog 不独立持久化一份配置；这些硬限制来自唯一 Manifest。
+
+## 14. 当前代码映射
+
+- `internal/recordlog/types.go`：VAddr、LogPos、AppendResult；
+- `internal/recordlog/format.go`：Segment/Record 二进制 codec；
+- `internal/recordlog/*_test.go`：golden、边界、corruption 和 fuzz。
+
+单 writer、Segment 文件、Registry 和 rotation 属于下一阶段，当前尚未由新包实现。
