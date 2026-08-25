@@ -60,6 +60,24 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestManifestAllowsCanonicalEmptyMappingRoot(t *testing.T) {
+	manifest := testManifest()
+	manifest.MappingRoot = 0
+	manifest.CoveredCommitSeq = 7
+	manifest.StatsCoveredCommitSeq = 7
+	encoded, err := Encode(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.MappingRoot != 0 || decoded.CoveredCommitSeq != 7 {
+		t.Fatalf("decoded=%+v", decoded)
+	}
+}
+
 func TestManifestDetectsCorruption(t *testing.T) {
 	t.Parallel()
 	seed, _ := Encode(testManifest())
@@ -94,6 +112,7 @@ func TestManifestValidationRejectsUnsafeLimitsAndReferences(t *testing.T) {
 		func(m *Manifest) { m.HardLimits.MaxRecordLogPayload = 1024 },
 		func(m *Manifest) { m.ReplayStart.SegmentID = 99 },
 		func(m *Manifest) { m.MappingRoot = model.MapAddr(uint64(99)<<32 | 64) },
+		func(m *Manifest) { m.MappingRoot = model.MapAddr(1) },
 		func(m *Manifest) { m.SegmentStats[0].LiveRecords = 2 },
 		func(m *Manifest) { m.OpenBatchIDsAtCut = []model.BatchID{7, 2} },
 	}

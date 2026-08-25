@@ -181,7 +181,7 @@ node prefix  = level == 7 ? 0 : ID >> (9 * (level + 1))
 
 Level 7 的 Slot 2..511 必须为 0。Node Header 的 Prefix 保存到达该 Node 之前已经消费的高位值；加载 child 时必须由 parent prefix、slot 和 child level 重新计算并校验，不能只相信磁盘指针。
 
-读取 SparseBitmap 时先检查目标 bit，再对之前的 bitmap word 执行 popcount 得到 packed value index。读取 Dense512 时直接下标访问。空 Node 不落盘；删除最后一个 Entry 后父 Slot 变为 0。
+读取 SparseBitmap 时先检查目标 bit，再对之前的 bitmap word 执行 popcount 得到 packed value index。读取 Dense512 时直接下标访问。空 Node 不落盘；删除最后一个 Entry 后父 Slot 变为 0。整棵树为空时 `MappingRoot=0`，它是空 Mapping 的 canonical 表示，不创建占位 Root Node。
 
 ## 7. Node Cache
 

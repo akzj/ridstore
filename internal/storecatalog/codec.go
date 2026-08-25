@@ -155,7 +155,7 @@ func Decode(src []byte) (Manifest, error) {
 
 func Validate(m Manifest) error {
 	if m.Generation == 0 || m.StoreUUID == (StoreUUID{}) || m.RecordLogID == (recordlog.LogID{}) || m.ActiveDataSegmentID == 0 || m.NextDataSegmentID <= m.ActiveDataSegmentID ||
-		m.ActiveMapSegmentID == 0 || m.NextMapSegmentID <= m.ActiveMapSegmentID || !m.MappingRoot.Valid() || !m.ReplayStart.Valid() {
+		m.ActiveMapSegmentID == 0 || m.NextMapSegmentID <= m.ActiveMapSegmentID || !m.ReplayStart.Valid() {
 		return ErrInvalid
 	}
 	if err := validateHardLimits(m.HardLimits); err != nil {
@@ -267,6 +267,14 @@ func validateMapSet(m Manifest) error {
 			return ErrInvalid
 		}
 		previous = summary.SegmentID
+	}
+	// Zero is the canonical root of an empty Mapping. Empty nodes are never
+	// encoded merely to give the Manifest a non-zero address.
+	if m.MappingRoot == 0 {
+		return nil
+	}
+	if !m.MappingRoot.Valid() {
+		return ErrInvalid
 	}
 	rootFound := false
 	if m.MappingRoot.SegmentID() == m.ActiveMapSegmentID {

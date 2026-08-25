@@ -105,8 +105,9 @@ Active Segment 的当前 end 不写 Manifest，因为它会持续增长；Open �
 
 ## 5. Mapping 字段
 
-Mapping 文件集与 Data 文件集分开编号。MappingRoot 必须落在 active 或 sealed Mapping Segment 的
-合法边界内。Root、CoveredCommitSeq 和 ReplayStart 是一个不可拆分的 checkpoint tuple：
+Mapping 文件集与 Data 文件集分开编号。`MappingRoot=0` 是空 Mapping 的唯一表示；空 Node 不为满足
+Manifest 约束而落盘。非零 MappingRoot 必须落在 active 或 sealed Mapping Segment 的合法边界内。
+Root、CoveredCommitSeq 和 ReplayStart 是一个不可拆分的 checkpoint tuple：
 
 ```text
 (MappingRoot, CoveredCommitSeq, ReplayStart,
@@ -158,7 +159,7 @@ Create 顺序：
 1. 创建 store directory 和 LOCK
 2. 生成 StoreUUID、RecordLogID
 3. 创建并 fsync first data active Segment
-4. 创建并 fsync first mapping active Segment/root
+4. 创建并 fsync first mapping active Segment；初始 MappingRoot=0
 5. 构造 generation=1 Manifest
 6. 安装 Manifest 并 fsync directory
 7. 发布可用 Store
@@ -248,7 +249,7 @@ Manifest decode 后至少验证：
 - UUID/LogID 非零，generation 和所有 next ID 非零；
 - active ID 小于 next ID，sealed ID 唯一且严格递增；
 - Segment summary 地址、size tag、ValidEnd 和 Footer 一致；
-- MappingRoot 位于 live Mapping file set；
+- MappingRoot 为 0，或位于 live Mapping file set；
 - ReplayStart 位于 live Data file set；
 - StatsCoveredCommitSeq 等于 CoveredCommitSeq，或 stats 明确为空并标记待重建；
 - allocator highs 非零且 issued 不超过 reserved；
