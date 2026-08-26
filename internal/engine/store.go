@@ -89,6 +89,7 @@ type Store struct {
 	batches                *idalloc.Allocator
 	commits                *coordinator.Coordinator
 	limits                 transaction.Limits
+	userAppender           transaction.Appender
 	maxOpen                int
 	open                   map[model.BatchID]*Batch
 	statuses               map[model.BatchID]statusEntry
@@ -132,7 +133,7 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 	}
 	return &Store{
 		log: log, mapping: current, ids: ids, batches: batches, commits: commits,
-		limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
+		limits: config.Batch, userAppender: log, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
 		statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
 		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
 	}, nil
@@ -225,7 +226,7 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		s.ops.RUnlock()
 		return nil, err
 	}
-	inner, err := transaction.New(model.BatchID(raw), s.limits, s.log, s.ids)
+	inner, err := transaction.New(model.BatchID(raw), s.limits, s.userAppender, s.ids)
 	if err != nil {
 		s.releaseSlot()
 		s.ops.RUnlock()

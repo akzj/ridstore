@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/bootstrap"
@@ -30,6 +31,8 @@ type OpenConfig struct {
 	DeltaSoftLimitBytes uint64
 	DeltaHardLimitBytes uint64
 	StatusRetention     uint64
+	WriteStopFreeBytes  uint64
+	SpaceCheckInterval  time.Duration
 }
 
 type CreateConfig struct {
@@ -190,6 +193,12 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.mapStore = physicalMapping
 	store.catalog = catalog
 	store.maintenance = log
+	if config.WriteStopFreeBytes != 0 {
+		store.userAppender = &spaceAppender{
+			next: log,
+			gate: newSpaceGate(root, config.WriteStopFreeBytes, config.SpaceCheckInterval, filesystemAvailable),
+		}
+	}
 	store.maintenanceHook = hooks.maintenance
 	for id, status := range recovered.Statuses {
 		state := BatchStateAborted
@@ -211,6 +220,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 
 func validOpenConfig(config OpenConfig) bool {
 	return config.MappingCacheBytes != 0 && config.MaxSegmentStats != 0 && config.StatusRetention != 0 &&
+		(config.WriteStopFreeBytes == 0 || config.SpaceCheckInterval > 0) &&
 		mapping.ValidatePersistentConfig(persistentConfig(config)) == nil
 }
 

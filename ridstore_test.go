@@ -3,8 +3,10 @@ package ridstore
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPublicV2LifecycleAndTokenAcrossReopen(t *testing.T) {
@@ -151,6 +153,27 @@ func TestPublicBatchCreateDeleteAndExpectAbsent(t *testing.T) {
 	}
 }
 
+func TestUserPutStopsBeforeReservedFilesystemHeadroom(t *testing.T) {
+	ctx := context.Background()
+	config := testCreateConfig(filepath.Join(t.TempDir(), "store"))
+	config.Runtime.WriteStopFreeBytes = math.MaxUint64
+	store, err := Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	batch, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(ctx, []byte("blocked")); !errors.Is(err, ErrInsufficientSpace) {
+		t.Fatalf("create record err=%v", err)
+	}
+	if err := batch.Abort(ctx); err != nil {
+		t.Fatalf("control append could not use reserved headroom: %v", err)
+	}
+}
+
 func testCreateConfig(dir string) CreateConfig {
 	return CreateConfig{
 		Dir: dir,
@@ -165,6 +188,7 @@ func testCreateConfig(dir string) CreateConfig {
 			MaxGroupPayload: 64 << 10, MappingCacheBytes: 1 << 20,
 			CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
 			DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+			WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second,
 		},
 	}
 }

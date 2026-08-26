@@ -17,6 +17,7 @@
 10. [Maintenance Marker](v2-maintenance-format.md)：Data GC 不可逆边界和恢复；
 11. [Fault Matrix](v2-fault-matrix.md)：当前故障注入覆盖；
 12. [M6 Review](v2-m6-review.md)：公开切换、v1 删除边界与验证证据。
+13. [磁盘空间 Admission](v2-space-admission.md)：用户写入水位、控制面 headroom 与 ENOSPC 边界。
 
 阶段 Review：
 
@@ -36,5 +37,5 @@ Backup/Verify/Soak 实现均已删除，后续能力必须按 v2 原生重写。
 ## 当前完整性
 
 v2 已具备 Create/Open、CRUD、原子 Batch、group commit、Checkpoint、Replay、CommitUnknown 查询、
-有界 GC 候选选择、Relocation、安全退休和崩溃恢复。它仍不是 production-ready：状态保留上界、
-ENOSPC/backpressure、v2 原生 Verify/Backup/Metrics、并发模型测试和长期 soak 是后续完整性工作。
+有界状态恢复、用户写入磁盘水位、GC 候选选择、Relocation、安全退休和崩溃恢复。它仍不是
+production-ready：v2 原生 Verify/Backup/Metrics、并发模型测试和长期 soak 是后续完整性工作。

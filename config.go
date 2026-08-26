@@ -1,6 +1,8 @@
 package ridstore
 
 import (
+	"time"
+
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/engine"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -41,6 +43,10 @@ type RuntimeConfig struct {
 	// StatusRetention bounds retained/replayed user Batch outcomes and must be
 	// at least HardLimits.MaxOpenBatches.
 	StatusRetention uint64
+	// WriteStopFreeBytes reserves filesystem headroom for commits, checkpoints,
+	// and GC after new user Put records have been stopped.
+	WriteStopFreeBytes uint64
+	SpaceCheckInterval time.Duration
 }
 
 type CreateConfig struct {
@@ -138,11 +144,18 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	if c.StatusRetention == 0 {
 		c.StatusRetention = 1 << 16
 	}
+	if c.WriteStopFreeBytes == 0 {
+		c.WriteStopFreeBytes = 512 * mib
+	}
+	if c.SpaceCheckInterval == 0 {
+		c.SpaceCheckInterval = 100 * time.Millisecond
+	}
 	return engine.OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: c.MaxQueuedBytes, QueueCapacity: c.AppendQueueCapacity, BufferBytes: c.AppendBufferBytes, BufferRecords: c.AppendBufferRecords},
 		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload},
 		MappingCacheBytes: c.MappingCacheBytes, CheckpointSortBytes: c.CheckpointSortBytes,
 		MaxSegmentStats: c.MaxSegmentStats, DeltaSoftLimitBytes: c.DeltaSoftLimitBytes,
 		DeltaHardLimitBytes: c.DeltaHardLimitBytes, StatusRetention: c.StatusRetention,
+		WriteStopFreeBytes: c.WriteStopFreeBytes, SpaceCheckInterval: c.SpaceCheckInterval,
 	}
 }

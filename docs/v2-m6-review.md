@@ -69,10 +69,12 @@ relocation CAS、Reader Pin 和退休前精确证明。
 
 后续优先级：
 
-1. 建立 v2 原生 ENOSPC/backpressure，不恢复旧 diskspace owner；
-2. 补充公共层并发/崩溃测试和完整 race 门禁；
-3. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
-4. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
+1. 补充公共层并发/崩溃测试和完整 race 门禁；
+2. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
+3. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
 
 M6 后的第一个完整性迭代已经为 terminal Batch Status 增加有界保留、admission 驱动的 Checkpoint 和
 Replay 容量门禁；CommitUnknown 的恢复查询语义保持不变。
+
+第二个完整性迭代增加了 v2 原生用户写入磁盘水位。它只阻止新的 Put Record，控制记录、已接收
+Batch 的 Commit、Checkpoint 和 GC relocation 可使用保留 headroom；真实 ENOSPC 仍由底层 fail-closed。
