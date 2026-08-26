@@ -108,6 +108,10 @@ func TestOpenVerifiedReaderScansAndReadsAcrossSegments(t *testing.T) {
 	if err != nil || len(got) != len(firstPayload) || got[0] != 1 {
 		t.Fatalf("read len=%d first=%d err=%v", len(got), got[0], err)
 	}
+	metadata, prefix, err := reader.Inspect(context.Background(), second.Addr, 1)
+	if err != nil || metadata.Addr != second.Addr || metadata.PayloadSize != uint32(len(secondPayload)) || len(prefix) != 1 || prefix[0] != 2 {
+		t.Fatalf("metadata=%+v prefix=%v err=%v", metadata, prefix, err)
+	}
 	var addresses []VAddr
 	if err := reader.Scan(context.Background(), first.End, func(result AppendResult, payload []byte) error {
 		addresses = append(addresses, result.Addr)
