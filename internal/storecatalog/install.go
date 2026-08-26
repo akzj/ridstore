@@ -75,6 +75,20 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 }
 
 func Load(root string) (Manifest, error) {
+	return load(root, false)
+}
+
+// LoadStrict loads the authoritative Manifest for offline verification. Unlike
+// normal recovery Load, every present slot must decode and no unpublished temp
+// slot may remain.
+func LoadStrict(root string) (Manifest, error) {
+	if root == "" {
+		return Manifest{}, ErrInvalid
+	}
+	return load(root, true)
+}
+
+func load(root string, strict bool) (Manifest, error) {
 	type candidate struct {
 		manifest Manifest
 		encoded  []byte
@@ -82,8 +96,25 @@ func Load(root string) (Manifest, error) {
 	values := make([]candidate, 0, 2)
 	var failures error
 	for slot := uint64(0); slot < 2; slot++ {
+		if strict {
+			if _, err := os.Lstat(manifestTempPath(root, slot)); err == nil {
+				return Manifest{}, ErrRecoveryRequired
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return Manifest{}, err
+			}
+			info, err := os.Lstat(manifestSlotPath(root, slot))
+			if err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+				return Manifest{}, ErrCorrupt
+			}
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return Manifest{}, err
+			}
+		}
 		encoded, err := os.ReadFile(manifestSlotPath(root, slot))
 		if err != nil {
+			if strict && !errors.Is(err, os.ErrNotExist) {
+				return Manifest{}, err
+			}
 			if !errors.Is(err, os.ErrNotExist) {
 				failures = errors.Join(failures, err)
 			}
@@ -91,6 +122,9 @@ func Load(root string) (Manifest, error) {
 		}
 		manifest, err := Decode(encoded)
 		if err != nil {
+			if strict {
+				return Manifest{}, err
+			}
 			failures = errors.Join(failures, err)
 			continue
 		}

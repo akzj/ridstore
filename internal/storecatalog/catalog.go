@@ -76,6 +76,8 @@ func mapStoreSnapshot(current Manifest) mapstore.CatalogSnapshot {
 	}
 }
 
+func (m Manifest) MapStoreSnapshot() mapstore.CatalogSnapshot { return mapStoreSnapshot(m) }
+
 func recordLogSnapshot(current Manifest) recordlog.CatalogSnapshot {
 	return recordlog.CatalogSnapshot{
 		Generation: current.Generation, LogID: current.RecordLogID,
@@ -84,6 +86,8 @@ func recordLogSnapshot(current Manifest) recordlog.CatalogSnapshot {
 		SealedSegments: append([]recordlog.SegmentSummary(nil), current.SealedDataSegments...),
 	}
 }
+
+func (m Manifest) RecordLogSnapshot() recordlog.CatalogSnapshot { return recordLogSnapshot(m) }
 
 func (m *Manager) InstallRecordLogRotation(expect uint64, sealed recordlog.SegmentSummary, newActive, next recordlog.SegmentID) (recordlog.CatalogSnapshot, error) {
 	installed, err := m.InstallDataRotation(expect, DataRotation{SealedOld: sealed, NewActive: newActive, NextID: next})

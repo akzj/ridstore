@@ -104,7 +104,7 @@ replayed commit 数和完成阶段。`error == nil` 才表示 clean；报告即�
 
 ## 7. 实现阶段
 
-1. **M1 physical inspector**：锁、artifact 门禁、Manifest、Data/Mapping 全文件只读扫描；
+1. **M1 physical inspector（已实现）**：锁、artifact 门禁、Manifest、Data/Mapping 全文件只读扫描；
 2. **M2 reachable Mapping**：Radix 全遍历、地址/层级/前缀与 alias 校验；
 3. **M3 semantic replay**：从 cut 重放并形成 final verifier view；
 4. **M4 exact join**：Put identity、最终地址唯一性、SegmentStats 精确比较；

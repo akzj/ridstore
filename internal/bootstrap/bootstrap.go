@@ -116,6 +116,22 @@ func RequireReady(root string) error {
 	return nil
 }
 
+// RecoveryArtifacts reports whether initialization state exists without
+// decoding, deleting, or otherwise recovering it.
+func RecoveryArtifacts(root string) (bool, error) {
+	if root == "" {
+		return false, base.ErrInvalidConfig
+	}
+	for _, name := range []string{MarkerName, markerTempName} {
+		if _, err := os.Lstat(filepath.Join(root, name)); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 func initialManifest(hard storecatalog.HardLimits) (storecatalog.Manifest, error) {
 	if err := ValidateHardLimits(hard); err != nil {
 		return storecatalog.Manifest{}, err

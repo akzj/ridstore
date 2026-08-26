@@ -255,6 +255,22 @@ func RemoveWithFaultHook(root string, hook FaultHook) error {
 
 func Path(root string) string { return filepath.Join(root, "journal", journalName) }
 
+// RecoveryArtifacts reports whether maintenance state exists without running
+// the normal Load cleanup path.
+func RecoveryArtifacts(root string) (bool, error) {
+	if root == "" {
+		return false, ErrInvalid
+	}
+	for _, name := range []string{journalName, tempName} {
+		if _, err := os.Lstat(filepath.Join(root, "journal", name)); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 func validate(state State) error {
 	if state.Operation != DataRetire || state.StoreUUID == (storecatalog.StoreUUID{}) || state.LogID == (recordlog.LogID{}) ||
 		state.BaseGeneration == 0 || !state.ReplayStart.Valid() || state.Source.SegmentID == 0 || state.Source.ValidEnd < recordlog.SegmentHeaderSize {
