@@ -56,7 +56,7 @@ func TestRecordLogRotationCrashHelper(t *testing.T) {
 		BaseGeneration: 1, LogID: state.LogID, SegmentSize: state.SegmentSize,
 		Old: active.summary(), NewActive: 2, NextSegmentID: 3,
 	}
-	if err := installRotationJournal(root, journal, osFileBackend{}); err != nil {
+	if err := installRotationJournal(root, journal, osFileBackend{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv(crashPhaseEnv) == "journal" {

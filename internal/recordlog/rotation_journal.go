@@ -102,7 +102,7 @@ func ensureJournalDirectory(root string, files fileBackend) (string, error) {
 	return dir, nil
 }
 
-func installRotationJournal(root string, journal rotationJournal, files fileBackend) error {
+func installRotationJournal(root string, journal rotationJournal, files fileBackend, hook FaultHook) error {
 	encoded, err := encodeRotationJournal(journal)
 	if err != nil {
 		return err
@@ -122,7 +122,13 @@ func installRotationJournal(root string, journal rotationJournal, files fileBack
 		return err
 	}
 	fail := func(cause error) error { return errors.Join(cause, file.Close()) }
+	if err := hitSegmentFault(hook, faultBeforeJournalWrite); err != nil {
+		return fail(err)
+	}
 	if _, err := writeFullAt(file, encoded[:], 0); err != nil {
+		return fail(err)
+	}
+	if err := hitSegmentFault(hook, faultBeforeJournalSync); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -131,16 +137,32 @@ func installRotationJournal(root string, journal rotationJournal, files fileBack
 	if err := file.Close(); err != nil {
 		return err
 	}
+	if err := hitSegmentFault(hook, faultBeforeJournalRename); err != nil {
+		return err
+	}
 	if err := files.rename(temp, rotationJournalPath(root)); err != nil {
+		return err
+	}
+	if err := hitSegmentFault(hook, faultBeforeJournalDirSync); err != nil {
 		return err
 	}
 	return files.syncDir(dir)
 }
 
-func loadRotationJournal(root string) (rotationJournal, bool, error) {
+func loadRotationJournal(root string, files fileBackend, hook FaultHook) (rotationJournal, bool, error) {
 	encoded, err := os.ReadFile(rotationJournalPath(root))
 	if errors.Is(err, os.ErrNotExist) {
-		return rotationJournal{}, false, nil
+		if err := removeRotationJournalTemp(root, files, hook); err != nil {
+			return rotationJournal{}, false, err
+		}
+		if _, err := files.stat(journalDirectory(root)); errors.Is(err, os.ErrNotExist) {
+			return rotationJournal{}, false, nil
+		} else if err != nil {
+			return rotationJournal{}, false, err
+		}
+		// A previous cleanup may have removed the journal but failed its
+		// directory sync. A successful Open closes that durable ambiguity.
+		return rotationJournal{}, false, files.syncDir(journalDirectory(root))
 	}
 	if err != nil {
 		return rotationJournal{}, false, err
@@ -149,10 +171,48 @@ func loadRotationJournal(root string) (rotationJournal, bool, error) {
 	return journal, err == nil, err
 }
 
-func removeRotationJournal(root string, files fileBackend) error {
-	err := files.remove(rotationJournalPath(root))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+func removeRotationJournalTemp(root string, files fileBackend, hook FaultHook) error {
+	if _, err := files.stat(rotationJournalTempPath(root)); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
 		return err
+	}
+	if err := hitSegmentFault(hook, faultBeforeJournalRemove); err != nil {
+		return err
+	}
+	if err := files.remove(rotationJournalTempPath(root)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := hitSegmentFault(hook, faultBeforeCleanupDirSync); err != nil {
+		return err
+	}
+	return files.syncDir(journalDirectory(root))
+}
+
+func removeRotationJournal(root string, files fileBackend, hook FaultHook) error {
+	exists := false
+	for _, path := range []string{rotationJournalPath(root), rotationJournalTempPath(root)} {
+		if _, err := files.stat(path); err == nil {
+			exists = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if exists {
+		if err := hitSegmentFault(hook, faultBeforeJournalRemove); err != nil {
+			return err
+		}
+	}
+	if err := files.remove(rotationJournalPath(root)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := files.remove(rotationJournalTempPath(root)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if exists {
+		if err := hitSegmentFault(hook, faultBeforeCleanupDirSync); err != nil {
+			return err
+		}
 	}
 	return files.syncDir(journalDirectory(root))
 }

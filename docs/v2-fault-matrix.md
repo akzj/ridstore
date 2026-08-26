@@ -24,7 +24,7 @@ v2 对每个 durable writer 分开验证：
 | MapStore active tail repair | truncate、file sync | 失败后再次 Open 可完成修复 | 已覆盖 |
 | MapStore rotation | journal write/sync/rename/dir-sync，footer write/sync，seal rename/dir-sync，new-active write/sync/rename/dir-sync，journal remove/cleanup dir-sync | 每点 fresh Open 收敛；recovery 自身失败可重试；journal/sealed/new-active 子进程退出已覆盖 | 已闭合 |
 | RecordLog append/sync | append write 与 data sync fault hook 已有 | Engine 已覆盖 CommitUnknown、fail-closed，以及 fresh Open 对完整/不完整 Commit Record 的 Committed/Aborted 判定 | 已覆盖当前 active append/sync 边界 |
-| RecordLog rotation | create syscall 边界已有 | journal/sealed/new-active 子进程退出已覆盖 | syscall matrix 待补 |
+| RecordLog rotation | journal write/sync/rename/dir-sync、partial-footer truncate/sync、footer write/sync、seal rename/dir-sync、new-active write/sync/rename/dir-sync、journal remove/cleanup dir-sync | 每点 fresh Open 收敛；recovery 失败可重试；journal/sealed/new-active 子进程退出已覆盖 | 已闭合 |
 | v2 Data GC / Mapping GC | 尚未进入 v2 主路径 | 尚未进入 v2 主路径 | 不适用 |
 
 ## 3. MapStore 已确认语义
@@ -42,11 +42,13 @@ MapStore poisoned
 完整但未被旧 Root 引用的 Node 可以保留；它不具备可见性，也不能被目录扫描提升为 Root。不完整 Node
 只能位于 active tail，且旧 Manifest Root 不得指向该 tail；Open 才允许截断。
 
-## 4. 下一门禁
+## 4. RecordLog rotation 已确认语义
 
-进入 Relocation/Data GC 前仍需完成：
+rotation 在发布 durable Journal 之前先 sync Journal 所描述的旧 Segment 前缀。否则一次掉电可能留下
+durable Journal，却丢失它声明的 `Old.ValidEnd` 数据，恢复将没有可验证的物理事实。
 
-1. RecordLog rotation 的逐 syscall 错误矩阵；
-2. RecordLog rotation recovery 自身失败后的重复恢复与目录文件集合断言。
+Journal 尚未 rename 时，fresh Open 删除 `.tmp` 并继续使用旧 Catalog；Journal 已可见时，fresh Open
+完成 seal、new-active 创建和 Catalog 安装。Catalog 已安装则只验证精确文件集合并清理 Journal。
+cleanup 删除成功但 directory sync 失败时，下次 Open 即使看不到 Journal，也会重新 sync Journal 目录。
 
-这些工作只增加故障注入与恢复证据，不改变 Catalog、RecordLog 或 Mapping 的所有权。
+进入 Relocation/Data GC 前，下一步是全局复核 M4 durable boundary，确认没有同级别缺口。

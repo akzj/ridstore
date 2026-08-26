@@ -24,7 +24,7 @@ func OpenWithFaultHook(root string, cfg Config, catalog CatalogPort, hook FaultH
 		return nil, err
 	}
 	var err error
-	snapshot, err = recoverRotation(root, catalog, snapshot, files)
+	snapshot, err = recoverRotation(root, catalog, snapshot, files, hook)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,12 @@ func (m *rotationManager) rotate(old *activeSegment) (*activeSegment, error) {
 		BaseGeneration: snapshot.Generation, LogID: snapshot.LogID, SegmentSize: snapshot.SegmentSize,
 		Old: summary, NewActive: snapshot.NextSegmentID, NextSegmentID: snapshot.NextSegmentID + 1,
 	}
-	if err := installRotationJournal(m.root, journal, m.files); err != nil {
+	// The durable journal names Old.ValidEnd as recovery truth. Make the
+	// corresponding record bytes durable before publishing that promise.
+	if err := old.sync(); err != nil {
+		return nil, err
+	}
+	if err := installRotationJournal(m.root, journal, m.files, m.hook); err != nil {
 		return nil, err
 	}
 	sealed, sealedSummary, err := old.seal()
@@ -160,18 +165,15 @@ func (m *rotationManager) rotate(old *activeSegment) (*activeSegment, error) {
 	}
 	installed, err := installCatalogRotation(m.catalog, snapshot, journal)
 	if err != nil {
-		_ = newActive.close()
-		return nil, err
+		return nil, errors.Join(err, newActive.close())
 	}
 	if err := validateRotationResult(snapshot, installed, summary, journal.NewActive, journal.NextSegmentID); err != nil {
-		_ = newActive.close()
-		return nil, err
+		return nil, errors.Join(err, newActive.close())
 	}
 	if err := m.registry.publishRotation(old.header.SegmentID, sealed, newActive); err != nil {
-		_ = newActive.close()
-		return nil, err
+		return nil, errors.Join(err, newActive.close())
 	}
-	if err := removeRotationJournal(m.root, m.files); err != nil {
+	if err := removeRotationJournal(m.root, m.files, m.hook); err != nil {
 		return nil, err
 	}
 	return newActive, nil
@@ -207,32 +209,22 @@ func committedRotation(snapshot CatalogSnapshot, journal rotationJournal) bool {
 	return ok && summary == journal.Old
 }
 
-func recoverRotation(root string, catalog CatalogPort, snapshot CatalogSnapshot, files fileBackend) (CatalogSnapshot, error) {
-	journal, found, err := loadRotationJournal(root)
+func recoverRotation(root string, catalog CatalogPort, snapshot CatalogSnapshot, files fileBackend, hook FaultHook) (CatalogSnapshot, error) {
+	journal, found, err := loadRotationJournal(root, files, hook)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
 	if !found {
-		if _, err := files.stat(rotationJournalTempPath(root)); err == nil {
-			if err := files.remove(rotationJournalTempPath(root)); err != nil {
-				return CatalogSnapshot{}, err
-			}
-			if err := files.syncDir(journalDirectory(root)); err != nil {
-				return CatalogSnapshot{}, err
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return CatalogSnapshot{}, err
-		}
 		return snapshot, nil
 	}
 	if journal.LogID != snapshot.LogID || journal.SegmentSize != snapshot.SegmentSize || snapshot.Generation < journal.BaseGeneration {
 		return CatalogSnapshot{}, fmt.Errorf("rotation journal identity: %w", ErrCorrupt)
 	}
 	if committedRotation(snapshot, journal) {
-		if err := ensureCommittedRotationFiles(root, snapshot, journal, files); err != nil {
+		if err := ensureCommittedRotationFiles(root, snapshot, journal, files, hook); err != nil {
 			return CatalogSnapshot{}, err
 		}
-		if err := removeRotationJournal(root, files); err != nil {
+		if err := removeRotationJournal(root, files, hook); err != nil {
 			return CatalogSnapshot{}, err
 		}
 		return snapshot, nil
@@ -240,16 +232,20 @@ func recoverRotation(root string, catalog CatalogPort, snapshot CatalogSnapshot,
 	if snapshot.ActiveSegmentID != journal.Old.SegmentID {
 		return CatalogSnapshot{}, fmt.Errorf("rotation journal/catalog state: %w", ErrCorrupt)
 	}
-	sealed, err := resumeJournalSeal(root, snapshot.headerFor(journal.Old.SegmentID), journal.Old, files)
+	sealed, err := resumeJournalSeal(root, snapshot.headerFor(journal.Old.SegmentID), journal.Old, files, hook)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	_ = sealed.close()
-	newActive, err := ensureJournalActive(root, snapshot.headerFor(journal.NewActive), files)
+	if err := sealed.close(); err != nil {
+		return CatalogSnapshot{}, err
+	}
+	newActive, err := ensureJournalActive(root, snapshot.headerFor(journal.NewActive), files, hook)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	_ = newActive.close()
+	if err := newActive.close(); err != nil {
+		return CatalogSnapshot{}, err
+	}
 	installed, err := installCatalogRotation(catalog, snapshot, journal)
 	if err != nil {
 		return CatalogSnapshot{}, err
@@ -257,13 +253,13 @@ func recoverRotation(root string, catalog CatalogPort, snapshot CatalogSnapshot,
 	if err := validateRotationResult(snapshot, installed, journal.Old, journal.NewActive, journal.NextSegmentID); err != nil {
 		return CatalogSnapshot{}, err
 	}
-	if err := removeRotationJournal(root, files); err != nil {
+	if err := removeRotationJournal(root, files, hook); err != nil {
 		return CatalogSnapshot{}, err
 	}
 	return installed, nil
 }
 
-func ensureCommittedRotationFiles(root string, snapshot CatalogSnapshot, journal rotationJournal, files fileBackend) error {
+func ensureCommittedRotationFiles(root string, snapshot CatalogSnapshot, journal rotationJournal, files fileBackend, hook FaultHook) error {
 	sealed, err := openSealedSegment(root, snapshot.headerFor(journal.Old.SegmentID), journal.Old, files)
 	if err != nil {
 		return err
@@ -271,14 +267,14 @@ func ensureCommittedRotationFiles(root string, snapshot CatalogSnapshot, journal
 	if err := sealed.close(); err != nil {
 		return err
 	}
-	active, _, err := openActiveSegment(root, snapshot.headerFor(journal.NewActive), files, nil)
+	active, _, err := openActiveSegment(root, snapshot.headerFor(journal.NewActive), files, hook)
 	if err != nil {
 		return err
 	}
 	return active.close()
 }
 
-func resumeJournalSeal(root string, header SegmentHeader, summary SegmentSummary, files fileBackend) (*sealedSegment, error) {
+func resumeJournalSeal(root string, header SegmentHeader, summary SegmentSummary, files fileBackend, hook FaultHook) (*sealedSegment, error) {
 	dir := recordsPath(root)
 	activePath := filepath.Join(dir, activeSegmentName(header.SegmentID))
 	sealedPath := filepath.Join(dir, sealedSegmentName(header.SegmentID))
@@ -312,7 +308,15 @@ func resumeJournalSeal(root string, header SegmentHeader, summary SegmentSummary
 		return nil, fmt.Errorf("rotation source size: %w", ErrCorrupt)
 	}
 	if info.Size() > int64(summary.ValidEnd) {
+		if err := hitSegmentFault(hook, faultBeforeTailTruncate); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
 		if err := file.Truncate(int64(summary.ValidEnd)); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		if err := hitSegmentFault(hook, faultBeforeTailSync); err != nil {
 			_ = file.Close()
 			return nil, err
 		}
@@ -324,7 +328,7 @@ func resumeJournalSeal(root string, header SegmentHeader, summary SegmentSummary
 	if err := file.Close(); err != nil {
 		return nil, err
 	}
-	active, repaired, err := openActiveSegment(root, header, files, nil)
+	active, repaired, err := openActiveSegment(root, header, files, hook)
 	if err != nil {
 		return nil, err
 	}
@@ -344,10 +348,10 @@ func resumeJournalSeal(root string, header SegmentHeader, summary SegmentSummary
 	return sealed, nil
 }
 
-func ensureJournalActive(root string, header SegmentHeader, files fileBackend) (*activeSegment, error) {
+func ensureJournalActive(root string, header SegmentHeader, files fileBackend, hook FaultHook) (*activeSegment, error) {
 	path := filepath.Join(recordsPath(root), activeSegmentName(header.SegmentID))
 	if _, err := files.stat(path); err == nil {
-		active, repaired, err := openActiveSegment(root, header, files, nil)
+		active, repaired, err := openActiveSegment(root, header, files, hook)
 		if err != nil {
 			return nil, err
 		}
@@ -363,5 +367,5 @@ func ensureJournalActive(root string, header SegmentHeader, files fileBackend) (
 	if err := files.remove(creating); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	return createActiveSegment(root, header, files, nil)
+	return createActiveSegment(root, header, files, hook)
 }

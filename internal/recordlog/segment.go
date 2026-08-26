@@ -13,18 +13,24 @@ const recordsDirectory = "records"
 type segmentFaultPoint string
 
 const (
-	faultBeforeHeaderWrite   segmentFaultPoint = "recordlog.segment.before-header-write"
-	faultBeforeHeaderSync    segmentFaultPoint = "recordlog.segment.before-header-sync"
-	faultBeforeCreateRename  segmentFaultPoint = "recordlog.segment.before-create-rename"
-	faultBeforeCreateDirSync segmentFaultPoint = "recordlog.segment.before-create-dir-sync"
-	faultBeforeAppendWrite   segmentFaultPoint = "recordlog.segment.before-append-write"
-	faultBeforeDataSync      segmentFaultPoint = "recordlog.segment.before-data-sync"
-	faultBeforeTailTruncate  segmentFaultPoint = "recordlog.segment.before-tail-truncate"
-	faultBeforeTailSync      segmentFaultPoint = "recordlog.segment.before-tail-sync"
-	faultBeforeFooterWrite   segmentFaultPoint = "recordlog.segment.before-footer-write"
-	faultBeforeFooterSync    segmentFaultPoint = "recordlog.segment.before-footer-sync"
-	faultBeforeSealRename    segmentFaultPoint = "recordlog.segment.before-seal-rename"
-	faultBeforeSealDirSync   segmentFaultPoint = "recordlog.segment.before-seal-dir-sync"
+	faultBeforeHeaderWrite    segmentFaultPoint = "recordlog.segment.before-header-write"
+	faultBeforeHeaderSync     segmentFaultPoint = "recordlog.segment.before-header-sync"
+	faultBeforeCreateRename   segmentFaultPoint = "recordlog.segment.before-create-rename"
+	faultBeforeCreateDirSync  segmentFaultPoint = "recordlog.segment.before-create-dir-sync"
+	faultBeforeAppendWrite    segmentFaultPoint = "recordlog.segment.before-append-write"
+	faultBeforeDataSync       segmentFaultPoint = "recordlog.segment.before-data-sync"
+	faultBeforeTailTruncate   segmentFaultPoint = "recordlog.segment.before-tail-truncate"
+	faultBeforeTailSync       segmentFaultPoint = "recordlog.segment.before-tail-sync"
+	faultBeforeJournalWrite   segmentFaultPoint = "recordlog.rotation.before-journal-write"
+	faultBeforeJournalSync    segmentFaultPoint = "recordlog.rotation.before-journal-sync"
+	faultBeforeJournalRename  segmentFaultPoint = "recordlog.rotation.before-journal-rename"
+	faultBeforeJournalDirSync segmentFaultPoint = "recordlog.rotation.before-journal-dir-sync"
+	faultBeforeFooterWrite    segmentFaultPoint = "recordlog.segment.before-footer-write"
+	faultBeforeFooterSync     segmentFaultPoint = "recordlog.segment.before-footer-sync"
+	faultBeforeSealRename     segmentFaultPoint = "recordlog.segment.before-seal-rename"
+	faultBeforeSealDirSync    segmentFaultPoint = "recordlog.segment.before-seal-dir-sync"
+	faultBeforeJournalRemove  segmentFaultPoint = "recordlog.rotation.before-journal-remove"
+	faultBeforeCleanupDirSync segmentFaultPoint = "recordlog.rotation.before-cleanup-dir-sync"
 )
 
 type segmentFaultHook func(segmentFaultPoint) error
@@ -35,8 +41,24 @@ type FaultPoint = segmentFaultPoint
 type FaultHook = segmentFaultHook
 
 const (
-	FaultBeforeAppendWrite = faultBeforeAppendWrite
-	FaultBeforeDataSync    = faultBeforeDataSync
+	FaultBeforeAppendWrite    = faultBeforeAppendWrite
+	FaultBeforeDataSync       = faultBeforeDataSync
+	FaultBeforeTailTruncate   = faultBeforeTailTruncate
+	FaultBeforeTailSync       = faultBeforeTailSync
+	FaultBeforeJournalWrite   = faultBeforeJournalWrite
+	FaultBeforeJournalSync    = faultBeforeJournalSync
+	FaultBeforeJournalRename  = faultBeforeJournalRename
+	FaultBeforeJournalDirSync = faultBeforeJournalDirSync
+	FaultBeforeFooterWrite    = faultBeforeFooterWrite
+	FaultBeforeFooterSync     = faultBeforeFooterSync
+	FaultBeforeSealRename     = faultBeforeSealRename
+	FaultBeforeSealDirSync    = faultBeforeSealDirSync
+	FaultBeforeHeaderWrite    = faultBeforeHeaderWrite
+	FaultBeforeHeaderSync     = faultBeforeHeaderSync
+	FaultBeforeCreateRename   = faultBeforeCreateRename
+	FaultBeforeCreateDirSync  = faultBeforeCreateDirSync
+	FaultBeforeJournalRemove  = faultBeforeJournalRemove
+	FaultBeforeCleanupDirSync = faultBeforeCleanupDirSync
 )
 
 type SegmentSummary struct {

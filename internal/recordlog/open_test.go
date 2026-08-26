@@ -10,8 +10,9 @@ import (
 )
 
 type memoryCatalog struct {
-	mu    sync.Mutex
-	state CatalogSnapshot
+	mu         sync.Mutex
+	state      CatalogSnapshot
+	installErr error
 }
 
 func (c *memoryCatalog) SnapshotRecordLog() CatalogSnapshot {
@@ -23,6 +24,11 @@ func (c *memoryCatalog) SnapshotRecordLog() CatalogSnapshot {
 func (c *memoryCatalog) InstallRecordLogRotation(expect uint64, sealed SegmentSummary, newActive, next SegmentID) (CatalogSnapshot, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.installErr != nil {
+		err := c.installErr
+		c.installErr = nil
+		return CatalogSnapshot{}, err
+	}
 	if expect != c.state.Generation {
 		return CatalogSnapshot{}, errors.New("generation conflict")
 	}
@@ -125,7 +131,7 @@ func TestRecoverPreparedRotationWithPartialFooter(t *testing.T) {
 		BaseGeneration: 1, LogID: state.LogID, SegmentSize: state.SegmentSize,
 		Old: summary, NewActive: 2, NextSegmentID: 3,
 	}
-	if err := installRotationJournal(root, journal, osFileBackend{}); err != nil {
+	if err := installRotationJournal(root, journal, osFileBackend{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	footer, err := EncodeSegmentFooter(SegmentFooter{SegmentID: 1, DataEnd: summary.ValidEnd, FirstAddr: summary.FirstAddr, LastAddr: summary.LastAddr, RecordCount: summary.RecordCount})
@@ -139,7 +145,7 @@ func TestRecoverPreparedRotationWithPartialFooter(t *testing.T) {
 		t.Fatal(err)
 	}
 	catalog := &memoryCatalog{state: state}
-	recovered, err := recoverRotation(root, catalog, state, osFileBackend{})
+	recovered, err := recoverRotation(root, catalog, state, osFileBackend{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

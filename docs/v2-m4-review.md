@@ -76,6 +76,9 @@ Engine fail closed，重启以 durable Manifest 为准。
 - MapStore rotation 的 Journal、Footer、sealed rename、new-active、Catalog publish 与 cleanup 全部故障边界
   已覆盖；每一点 fresh Open 均由旧/新 Catalog 与 Journal 收敛，recovery 自身失败可再次 Open，且
   journal/sealed/new-active 三阶段已通过子进程退出测试；
+- RecordLog rotation 在 Journal 发布前先 sync 其声明的旧 Segment 前缀；Journal、partial-footer repair、
+  Footer、sealed rename、new-active、Catalog publish 与 cleanup 的逐点失败均由 fresh Open 收敛，recovery
+  自身失败可再次 Open，且成功恢复后 Catalog 与目录文件集合精确一致；
 - Delta reservation 位于 Prepare/durable Descriptor 之前，冲突、取消和 pre-durable 失败会归还；重复更新
   active hot ID 不重复计费，Freeze/Abort 不释放，Install 只释放精确 frozen prefix；
 - Delta hard pressure 会在不持有 `ops.RLock` 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
@@ -89,13 +92,12 @@ Engine fail closed，重启以 durable Manifest 为准。
 
 ## 5. 尚未完成
 
-- checkpoint 的 Catalog、MapStore append/sync/tail-repair/rotation fault matrix 已覆盖；RecordLog sync 的
-  CommitUnknown 及完整/不完整 Record 恢复分支已覆盖；RecordLog rotation 的完整 syscall 矩阵仍未完成；详见
-  [v2-fault-matrix.md](v2-fault-matrix.md)；
+- checkpoint Catalog、MapStore append/sync/tail-repair/rotation，以及 RecordLog append/sync/rotation 的
+  syscall fault matrix 已覆盖；详见 [v2-fault-matrix.md](v2-fault-matrix.md)；
 - soft-limit 后台 Checkpoint；
 - Relocation、Data GC、Mapping GC；
 - 顶层公开 API 切换和旧 v1 模块删除。
 
 因此 M4 目前证明正常执行、重启恢复、Delta 有界接纳与 Checkpoint 有界构建闭环，不构成
-production-ready 声明。下一优先级是 MapStore/RecordLog crash matrix，再进入 Relocation/GC，不能先
-删除旧公开路径。
+production-ready 声明。下一优先级是复核完整 M4 durable boundary，再决定是否进入 Relocation/GC，
+不能先删除旧公开路径。
