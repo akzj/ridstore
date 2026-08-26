@@ -28,7 +28,7 @@ test-fuzz-smoke:
 	done
 
 test-crash:
-	go test ./internal/recordlog ./internal/mapstore ./internal/engine -run 'RecoveryAcrossProcessExit' -count=1 -timeout=10m
+	go test . ./internal/recordlog ./internal/mapstore ./internal/engine -run 'RecoveryAcrossProcessExit' -count=1 -timeout=10m
 
 vet:
 	go vet ./...

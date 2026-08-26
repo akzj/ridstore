@@ -69,9 +69,8 @@ relocation CAS、Reader Pin 和退休前精确证明。
 
 后续优先级：
 
-1. 补充公共层进程崩溃测试；
-2. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
-3. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
+1. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
+2. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
 
 M6 后的第一个完整性迭代已经为 terminal Batch Status 增加有界保留、admission 驱动的 Checkpoint 和
 Replay 容量门禁；CommitUnknown 的恢复查询语义保持不变。
@@ -81,3 +80,6 @@ Batch 的 Commit、Checkpoint 和 GC relocation 可使用保留 headroom；真�
 
 公开层并发模型测试现在覆盖同一 token 的多 Batch CAS、并发 Checkpoint、唯一 winner、连续 CommitSeq、
 终态 Status 和 Close/Open 后最终值恢复，并纳入完整 `go test -race ./...` 门禁。
+
+公开层子进程退出测试覆盖 uncommitted Put、Checkpoint 时仍开放的 Batch、committed tail 和已 Checkpoint
+的 commit；fresh Open 分别验证 Aborted、Committed、StatusExpired 与最终 Mapping 可见性。
