@@ -6,9 +6,8 @@
 
 ## 1. 为什么建立 v2 分支
 
-当前 ridstore 已经证明了 Stable-ID Record Store 的核心协议可以工作，但追加路径同时存在
-业务 Frame、Sequencer、buffer、ActiveData、Rotation 和独立 `appendlog/v2` 原型。继续在原结构上
-局部替换会形成两套顺序、两套 Segment 生命周期和长期兼容代码。
+ridstore v2 只保留一条从业务协议到通用 RecordLog 的追加路径，避免两套物理顺序、两套 Segment
+生命周期和长期兼容代码。
 
 v2 分支采用重新组装而不是渐进兼容：保留已经证明正确的产品边界与安全不变量，从一个通用
 RecordLog 向上构建 ridstore。旧代码只在契约完整吻合时原样复用，否则重写或删除。
@@ -253,7 +252,7 @@ v2 可以采用已验证的低三位 size tag：
 uint32 SegmentID | aligned byte offset 的高 29 bit | 3-bit size tag
 ```
 
-但它必须成为整个 v2 的唯一 VAddr 定义，而不是只存在于 `internal/appendlog/v2`：
+它是整个 v2 的唯一 VAddr 定义：
 
 - Mapping 保存完整 tagged VAddr；
 - Protocol Descriptor 保存完整 tagged VAddr；

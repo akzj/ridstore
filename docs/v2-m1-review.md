@@ -46,7 +46,7 @@ internal/storecatalog
 
 本阶段没有修改旧 `internal/base`、`internal/format`、`internal/manifest` 或 `internal/catalog`。
 
-从 appendlog/v2 复用了已经验证的思想和格式选择：size tag、32-byte Record Header、CRC32C、
+RecordLog 使用 size tag、32-byte Record Header、CRC32C、
 64-byte Segment Header/Footer。代码在最终职责包中重新生成，没有调用原型 API。
 
 ## 4. 安全边界
