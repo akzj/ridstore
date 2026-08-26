@@ -89,6 +89,17 @@ type Store struct {
 	maxStats               uint64
 	maxRelocationMutations uint64
 	dirLock                *filelock.Lock
+	identity               [16]byte
+}
+
+// Identity returns the persistent identity of this store. It is stable across
+// reopen and is used by the public package to bind opaque observation tokens
+// to the store that issued them.
+func (s *Store) Identity() [16]byte {
+	if s == nil {
+		return [16]byte{}
+	}
+	return s.identity
 }
 
 func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, config Config) (*Store, error) {

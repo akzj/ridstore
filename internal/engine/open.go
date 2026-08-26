@@ -195,6 +195,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.root = root
 	store.maxStats = config.MaxSegmentStats
 	store.dirLock = dirLock
+	store.identity = [16]byte(manifest.StoreUUID)
 	return store, nil
 }
 

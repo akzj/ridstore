@@ -1,211 +1,142 @@
 package ridstore
 
 import (
-	"fmt"
-	"math"
-	"path/filepath"
-	"time"
-
-	"github.com/akzj/ridstore/internal/base"
-	storeformat "github.com/akzj/ridstore/internal/format"
+	"github.com/akzj/ridstore/internal/coordinator"
+	"github.com/akzj/ridstore/internal/engine"
+	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
-const mib = int64(1 << 20)
+const mib = uint64(1 << 20)
 
-// Config combines persisted format limits with runtime-only resource budgets.
-// Zero fields use defaults during Create and use persisted hard limits during Open.
-type Config struct {
-	Dir string
-
-	SegmentSize        int64
-	MaxValueSize       int64
-	MaxBatchBytes      int64
-	MaxBatchMutations  int
-	MaxBatchConditions int
-	MaxOpenBatches     int
-	IDReserveSize      uint64
-	BatchIDReserveSize uint64
-
-	MappingCacheBytes      int64
-	DeltaSoftLimitBytes    int64
-	DeltaHardLimitBytes    int64
-	CheckpointMemoryBytes  int64
-	StatusRetention        int
-	MaxGroupBytes          int64
-	MaxGroupBatches        int
-	MaxGroupDelay          time.Duration
-	GCBatchBytes           int64
-	GCBatchMutations       int
-	GCMinFreeBytes         int64
-	GCBytesPerSecond       int64
-	WriteStopFreeBytes     int64
-	DiskSpaceCheckInterval time.Duration
+// HardLimits are persisted at creation and define the on-disk format bounds.
+// Zero fields receive defaults.
+type HardLimits struct {
+	SegmentSize         uint64
+	MaxValueSize        uint64
+	MaxBatchBytes       uint64
+	MaxBatchMutations   uint64
+	MaxBatchConditions  uint64
+	MaxOpenBatches      uint64
+	MaxRecordLogPayload uint64
+	IDReserveSize       uint64
+	BatchIDReserveSize  uint64
 }
 
-func normalizeCreateConfig(cfg Config) (Config, storeformat.HardLimits, error) {
-	applyHardDefaults(&cfg)
-	applyRuntimeDefaults(&cfg)
-	if err := normalizeDir(&cfg); err != nil {
-		return Config{}, storeformat.HardLimits{}, err
-	}
-	hard, err := hardLimits(cfg)
-	if err != nil {
-		return Config{}, storeformat.HardLimits{}, err
-	}
-	if err := validateRuntime(cfg, hard); err != nil {
-		return Config{}, storeformat.HardLimits{}, err
-	}
-	return cfg, hard, nil
+// RuntimeConfig contains replaceable memory, queue, and batching budgets.
+// Zero fields receive defaults on every Create or Open.
+type RuntimeConfig struct {
+	MaxQueuedBytes      uint64
+	AppendQueueCapacity int
+	AppendBufferBytes   uint32
+	AppendBufferRecords int
+	CommitQueueCapacity int
+	MaxGroupBatches     int
+	MaxGroupPayload     uint64
+	MappingCacheBytes   uint64
+	CheckpointSortBytes uint64
+	MaxSegmentStats     uint64
+	DeltaSoftLimitBytes uint64
+	DeltaHardLimitBytes uint64
 }
 
-func normalizeOpenConfig(cfg Config, disk storeformat.HardLimits) (Config, error) {
-	if err := matchOrAdoptHardLimits(&cfg, disk); err != nil {
-		return Config{}, err
-	}
-	applyRuntimeDefaults(&cfg)
-	if err := normalizeDir(&cfg); err != nil {
-		return Config{}, err
-	}
-	if err := validateRuntime(cfg, disk); err != nil {
-		return Config{}, err
-	}
-	return cfg, nil
+type CreateConfig struct {
+	Dir        string
+	HardLimits HardLimits
+	Runtime    RuntimeConfig
 }
 
-func applyHardDefaults(cfg *Config) {
-	if cfg.SegmentSize == 0 {
-		cfg.SegmentSize = 256 * mib
-	}
-	if cfg.MaxValueSize == 0 {
-		cfg.MaxValueSize = 64 * mib
-	}
-	if cfg.MaxBatchBytes == 0 {
-		cfg.MaxBatchBytes = 256 * mib
-	}
-	if cfg.MaxBatchMutations == 0 {
-		cfg.MaxBatchMutations = 1_000_000
-	}
-	if cfg.MaxBatchConditions == 0 {
-		cfg.MaxBatchConditions = 1_000_000
-	}
-	if cfg.MaxOpenBatches == 0 {
-		cfg.MaxOpenBatches = 1024
-	}
-	if cfg.IDReserveSize == 0 {
-		cfg.IDReserveSize = 1 << 20
-	}
-	if cfg.BatchIDReserveSize == 0 {
-		cfg.BatchIDReserveSize = 1 << 16
-	}
+type OpenConfig struct {
+	Dir     string
+	Runtime RuntimeConfig
 }
 
-func applyRuntimeDefaults(cfg *Config) {
-	if cfg.MappingCacheBytes == 0 {
-		cfg.MappingCacheBytes = 256 * mib
-	}
-	if cfg.DeltaSoftLimitBytes == 0 {
-		cfg.DeltaSoftLimitBytes = 256 * mib
-	}
-	if cfg.DeltaHardLimitBytes == 0 {
-		cfg.DeltaHardLimitBytes = 512 * mib
-	}
-	if cfg.CheckpointMemoryBytes == 0 {
-		cfg.CheckpointMemoryBytes = 256 * mib
-	}
-	if cfg.StatusRetention == 0 {
-		cfg.StatusRetention = 1 << 16
-	}
-	if cfg.MaxGroupBytes == 0 {
-		cfg.MaxGroupBytes = 8 * mib
-	}
-	if cfg.MaxGroupBatches == 0 {
-		cfg.MaxGroupBatches = 64
-	}
-	if cfg.GCBatchBytes == 0 {
-		cfg.GCBatchBytes = 16 * mib
-	}
-	if cfg.GCBatchMutations == 0 {
-		cfg.GCBatchMutations = 4096
-	}
-	if cfg.GCMinFreeBytes == 0 {
-		cfg.GCMinFreeBytes = cfg.SegmentSize
-	}
-	if cfg.GCBytesPerSecond == 0 {
-		cfg.GCBytesPerSecond = 64 * mib
-	}
-	if cfg.WriteStopFreeBytes == 0 {
-		cfg.WriteStopFreeBytes = 2 * cfg.SegmentSize
-		if cfg.WriteStopFreeBytes < cfg.GCMinFreeBytes {
-			cfg.WriteStopFreeBytes = cfg.GCMinFreeBytes
-		}
-	}
-	if cfg.DiskSpaceCheckInterval == 0 {
-		cfg.DiskSpaceCheckInterval = 100 * time.Millisecond
-	}
+func (c CreateConfig) engineConfig() engine.CreateConfig {
+	hard := c.HardLimits.withDefaults()
+	return engine.CreateConfig{HardLimits: storecatalog.HardLimits{
+		SegmentSize: hard.SegmentSize, MaxValueSize: hard.MaxValueSize,
+		MaxBatchBytes: hard.MaxBatchBytes, MaxBatchMutations: hard.MaxBatchMutations,
+		MaxBatchConditions: hard.MaxBatchConditions, MaxOpenBatches: hard.MaxOpenBatches,
+		MaxRecordLogPayload: hard.MaxRecordLogPayload, IDReserveSize: hard.IDReserveSize,
+		BatchIDReserveSize: hard.BatchIDReserveSize,
+	}, Runtime: c.Runtime.engineConfig()}
 }
 
-func normalizeDir(cfg *Config) error {
-	if cfg.Dir == "" {
-		return fmt.Errorf("empty directory: %w", base.ErrInvalidConfig)
+func (c OpenConfig) engineConfig() engine.OpenConfig { return c.Runtime.engineConfig() }
+
+func (h HardLimits) withDefaults() HardLimits {
+	if h.SegmentSize == 0 {
+		h.SegmentSize = 256 * mib
 	}
-	abs, err := filepath.Abs(cfg.Dir)
-	if err != nil {
-		return fmt.Errorf("resolve directory: %w", err)
+	if h.MaxValueSize == 0 {
+		h.MaxValueSize = 64 * mib
 	}
-	cfg.Dir = filepath.Clean(abs)
-	return nil
+	if h.MaxBatchBytes == 0 {
+		h.MaxBatchBytes = 256 * mib
+	}
+	if h.MaxBatchMutations == 0 {
+		h.MaxBatchMutations = 1_000_000
+	}
+	if h.MaxBatchConditions == 0 {
+		h.MaxBatchConditions = 1_000_000
+	}
+	if h.MaxOpenBatches == 0 {
+		h.MaxOpenBatches = 1024
+	}
+	if h.MaxRecordLogPayload == 0 {
+		h.MaxRecordLogPayload = 128 * mib
+	}
+	if h.IDReserveSize == 0 {
+		h.IDReserveSize = 1 << 20
+	}
+	if h.BatchIDReserveSize == 0 {
+		h.BatchIDReserveSize = 1 << 16
+	}
+	return h
 }
 
-func hardLimits(cfg Config) (storeformat.HardLimits, error) {
-	if cfg.SegmentSize <= 0 || cfg.MaxValueSize <= 0 || cfg.MaxBatchBytes <= 0 ||
-		cfg.MaxBatchMutations <= 0 || cfg.MaxBatchConditions <= 0 || cfg.MaxOpenBatches <= 0 ||
-		cfg.IDReserveSize == 0 || cfg.BatchIDReserveSize == 0 {
-		return storeformat.HardLimits{}, fmt.Errorf("non-positive hard limit: %w", base.ErrInvalidConfig)
+func (c RuntimeConfig) engineConfig() engine.OpenConfig {
+	if c.MaxQueuedBytes == 0 {
+		c.MaxQueuedBytes = 256 * mib
 	}
-	hard := storeformat.HardLimits{
-		SegmentSize: uint64(cfg.SegmentSize), MaxValueSize: uint64(cfg.MaxValueSize), MaxBatchBytes: uint64(cfg.MaxBatchBytes),
-		MaxBatchMutations: uint64(cfg.MaxBatchMutations), MaxBatchConditions: uint64(cfg.MaxBatchConditions), MaxOpenBatches: uint64(cfg.MaxOpenBatches),
-		IDReserveSize: cfg.IDReserveSize, BatchIDReserveSize: cfg.BatchIDReserveSize,
+	if c.AppendQueueCapacity == 0 {
+		c.AppendQueueCapacity = 1024
 	}
-	if err := storeformat.ValidateHardLimits(hard); err != nil {
-		return storeformat.HardLimits{}, err
+	if c.AppendBufferBytes == 0 {
+		c.AppendBufferBytes = 8 << 20
 	}
-	return hard, nil
-}
-
-func validateRuntime(cfg Config, hard storeformat.HardLimits) error {
-	if cfg.MappingCacheBytes <= 0 || cfg.DeltaSoftLimitBytes <= 0 || cfg.DeltaHardLimitBytes <= cfg.DeltaSoftLimitBytes ||
-		cfg.CheckpointMemoryBytes < 64<<10 || cfg.StatusRetention < cfg.MaxOpenBatches || cfg.MaxGroupBytes <= 0 || cfg.MaxGroupBatches <= 0 || cfg.MaxGroupDelay < 0 ||
-		cfg.GCBatchBytes <= 0 || uint64(cfg.GCBatchBytes) > hard.MaxBatchBytes || cfg.GCBatchMutations <= 0 || uint64(cfg.GCBatchMutations) > hard.MaxBatchMutations || cfg.GCMinFreeBytes < 0 || cfg.GCBytesPerSecond <= 0 ||
-		cfg.WriteStopFreeBytes < cfg.GCMinFreeBytes || cfg.DiskSpaceCheckInterval <= 0 || cfg.DiskSpaceCheckInterval > time.Minute {
-		return fmt.Errorf("invalid runtime budget: %w", base.ErrInvalidConfig)
+	if c.AppendBufferRecords == 0 {
+		c.AppendBufferRecords = 4096
 	}
-	return nil
-}
-
-func matchOrAdoptHardLimits(cfg *Config, disk storeformat.HardLimits) error {
-	type pair struct {
-		supplied int64
-		disk     uint64
-		set      func(int64)
+	if c.CommitQueueCapacity == 0 {
+		c.CommitQueueCapacity = 1024
 	}
-	pairs := []pair{
-		{cfg.SegmentSize, disk.SegmentSize, func(v int64) { cfg.SegmentSize = v }},
-		{cfg.MaxValueSize, disk.MaxValueSize, func(v int64) { cfg.MaxValueSize = v }},
-		{cfg.MaxBatchBytes, disk.MaxBatchBytes, func(v int64) { cfg.MaxBatchBytes = v }},
-		{int64(cfg.MaxBatchMutations), disk.MaxBatchMutations, func(v int64) { cfg.MaxBatchMutations = int(v) }},
-		{int64(cfg.MaxBatchConditions), disk.MaxBatchConditions, func(v int64) { cfg.MaxBatchConditions = int(v) }},
-		{int64(cfg.MaxOpenBatches), disk.MaxOpenBatches, func(v int64) { cfg.MaxOpenBatches = int(v) }},
+	if c.MaxGroupBatches == 0 {
+		c.MaxGroupBatches = 64
 	}
-	for _, p := range pairs {
-		if p.disk > math.MaxInt64 || (p.supplied != 0 && uint64(p.supplied) != p.disk) {
-			return base.ErrConfigMismatch
-		}
-		p.set(int64(p.disk))
+	if c.MaxGroupPayload == 0 {
+		c.MaxGroupPayload = 64 * mib
 	}
-	if cfg.IDReserveSize != 0 && cfg.IDReserveSize != disk.IDReserveSize || cfg.BatchIDReserveSize != 0 && cfg.BatchIDReserveSize != disk.BatchIDReserveSize {
-		return base.ErrConfigMismatch
+	if c.MappingCacheBytes == 0 {
+		c.MappingCacheBytes = 256 * mib
 	}
-	cfg.IDReserveSize, cfg.BatchIDReserveSize = disk.IDReserveSize, disk.BatchIDReserveSize
-	return nil
+	if c.CheckpointSortBytes == 0 {
+		c.CheckpointSortBytes = 256 * mib
+	}
+	if c.MaxSegmentStats == 0 {
+		c.MaxSegmentStats = 1 << 16
+	}
+	if c.DeltaSoftLimitBytes == 0 {
+		c.DeltaSoftLimitBytes = 256 * mib
+	}
+	if c.DeltaHardLimitBytes == 0 {
+		c.DeltaHardLimitBytes = 512 * mib
+	}
+	return engine.OpenConfig{
+		RecordLog:         recordlog.Config{MaxQueuedBytes: c.MaxQueuedBytes, QueueCapacity: c.AppendQueueCapacity, BufferBytes: c.AppendBufferBytes, BufferRecords: c.AppendBufferRecords},
+		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload},
+		MappingCacheBytes: c.MappingCacheBytes, CheckpointSortBytes: c.CheckpointSortBytes,
+		MaxSegmentStats: c.MaxSegmentStats, DeltaSoftLimitBytes: c.DeltaSoftLimitBytes,
+		DeltaHardLimitBytes: c.DeltaHardLimitBytes,
+	}
 }

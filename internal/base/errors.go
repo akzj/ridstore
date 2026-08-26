@@ -16,7 +16,7 @@ var (
 	ErrBatchFailed         = errors.New("ridstore: batch failed")
 	ErrBatchTooLarge       = errors.New("ridstore: batch too large")
 	ErrValueTooLarge       = errors.New("ridstore: value too large")
-	ErrInvalidRevision     = errors.New("ridstore: invalid revision")
+	ErrInvalidToken        = errors.New("ridstore: invalid version token")
 	ErrConflict            = errors.New("ridstore: optimistic conflict")
 	ErrIDExhausted         = errors.New("ridstore: id space exhausted")
 	ErrAddressExhausted    = errors.New("ridstore: physical address space exhausted")

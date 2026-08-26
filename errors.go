@@ -16,7 +16,7 @@ var (
 	ErrBatchFailed         = base.ErrBatchFailed
 	ErrBatchTooLarge       = base.ErrBatchTooLarge
 	ErrValueTooLarge       = base.ErrValueTooLarge
-	ErrInvalidRevision     = base.ErrInvalidRevision
+	ErrInvalidToken        = base.ErrInvalidToken
 	ErrConflict            = base.ErrConflict
 	ErrIDExhausted         = base.ErrIDExhausted
 	ErrAddressExhausted    = base.ErrAddressExhausted
