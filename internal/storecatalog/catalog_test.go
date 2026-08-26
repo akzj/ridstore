@@ -117,6 +117,26 @@ func TestDataRetireRequiresExactZeroLiveStats(t *testing.T) {
 	}
 }
 
+func TestDataRetireAcceptsMissingSparseStatsEntryAsZero(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	initial := testManifest()
+	initial.SegmentStats = nil
+	if err := Install(root, initial, nil); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(root, initial, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := manager.InstallDataRetire(1, DataRetire{
+		Source: initial.SealedDataSegments[0], CoveredCommitSeq: initial.CoveredCommitSeq, ReplayStart: initial.ReplayStart,
+	})
+	if err != nil || len(retired.SealedDataSegments) != 0 {
+		t.Fatalf("retired=%+v err=%v", retired, err)
+	}
+}
+
 func TestManagerImplementsRecordLogCatalogPort(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

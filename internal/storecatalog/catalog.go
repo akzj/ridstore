@@ -210,7 +210,11 @@ func (m *Manager) InstallDataRetire(expect uint64, update DataRetire) (Manifest,
 		if index < 0 {
 			return ErrInvalid
 		}
-		zeroStats := false
+		// SegmentStats is a sparse exact table for the same Mapping cut:
+		// absence means zero live records. A present non-zero entry forbids
+		// retirement; an explicit zero remains valid but is not emitted by the
+		// current checkpoint builder.
+		zeroStats := true
 		for _, stat := range next.SegmentStats {
 			if stat.SegmentID == update.Source.SegmentID {
 				zeroStats = stat.LiveBytes == 0 && stat.LiveRecords == 0

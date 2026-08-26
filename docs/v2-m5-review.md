@@ -60,3 +60,10 @@ Mapping[ID] != scanned VAddr
 7. 完成上述每个边界的 crash/syscall matrix。
 
 在这些条件闭合前，Engine 不调用 `RecordLog.RetireSegment`。
+
+## 5. Sparse SegmentStats 语义修正
+
+Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺失在同一
+`StatsCoveredCommitSeq == CoveredCommitSeq` 的 Manifest 中明确表示零存活。Catalog retire 门禁已按
+这一格式解释：缺失或显式零值允许继续，任何非零值拒绝。它仍只是必要条件；Engine 的二次 Mapping
+证明、open-batch gate 和可恢复 maintenance 协议尚未完成时，不调用物理 retire。
