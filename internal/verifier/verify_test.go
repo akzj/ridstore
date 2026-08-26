@@ -9,6 +9,7 @@ import (
 
 	"github.com/akzj/ridstore"
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/verifier"
 )
 
@@ -44,7 +45,7 @@ func TestVerifyPhysicalUsesReadOnlyExclusiveLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Stage != verifier.StageSemantic || report.ManifestGeneration == 0 || report.Data.Records < 2 || report.Mapping.Segments != 1 || report.CheckpointLiveIDs != 1 || report.LiveIDs != 1 || report.NextCommitSeq != 2 {
+	if report.Stage != verifier.StageExact || report.ManifestGeneration == 0 || report.Data.Records < 2 || report.Mapping.Segments != 1 || report.CheckpointLiveIDs != 1 || report.LiveIDs != 1 || report.NextCommitSeq != 2 || report.VerifiedPuts != 1 {
 		t.Fatalf("report=%+v", report)
 	}
 }
@@ -167,7 +168,7 @@ func TestVerifyReplaysDurableTailFromCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Stage != verifier.StageSemantic || report.CheckpointLiveIDs != 1 || report.LiveIDs != 3 || report.ReplayedCommits != 2 || report.BatchStatuses != 2 || report.NextCommitSeq != 4 {
+	if report.Stage != verifier.StageExact || report.CheckpointLiveIDs != 1 || report.LiveIDs != 3 || report.ReplayedCommits != 2 || report.BatchStatuses != 2 || report.NextCommitSeq != 4 || report.VerifiedPuts != 3 {
 		t.Fatalf("report=%+v", report)
 	}
 	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{
@@ -179,6 +180,57 @@ func TestVerifyReplaysDurableTailFromCheckpoint(t *testing.T) {
 		MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024, MaxReplayStatuses: 1,
 	}); !errors.Is(err, base.ErrStatusCapacity) {
 		t.Fatalf("bounded status err=%v", err)
+	}
+}
+
+func TestVerifyRejectsCheckpointSegmentStatsMismatch(t *testing.T) {
+	ctx := context.Background()
+	config := verifyCreateConfig(filepath.Join(t.TempDir(), "store"))
+	config.HardLimits.SegmentSize = 8192
+	config.HardLimits.MaxRecordLogPayload = 4096
+	store, err := ridstore.Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		batch, err := store.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Create(ctx, make([]byte, 1024)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := storecatalog.OpenManager(config.Dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := manager.Snapshot()
+	if len(manifest.SegmentStats) == 0 || manifest.SegmentStats[0].LiveBytes == 0 {
+		t.Fatalf("stats=%+v", manifest.SegmentStats)
+	}
+	manifest.SegmentStats[0].LiveBytes--
+	if _, err := manager.InstallCheckpoint(manifest.Generation, storecatalog.Checkpoint{
+		MappingRoot: manifest.MappingRoot, CoveredCommitSeq: manifest.CoveredCommitSeq, ReplayStart: manifest.ReplayStart,
+		ReservedIDHigh: manifest.ReservedIDHigh, ReservedBatchIDHigh: manifest.ReservedBatchIDHigh,
+		IssuedBatchIDHighAtCut: manifest.IssuedBatchIDHighAtCut, OpenBatchIDsAtCut: manifest.OpenBatchIDsAtCut,
+		StatsCoveredCommitSeq: manifest.StatsCoveredCommitSeq, SegmentStats: manifest.SegmentStats,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{
+		MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024, MaxReplayStatuses: 1024,
+	}); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("verify err=%v", err)
 	}
 }
 

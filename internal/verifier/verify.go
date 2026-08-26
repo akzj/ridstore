@@ -18,6 +18,7 @@ import (
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/replay"
+	"github.com/akzj/ridstore/internal/segmentstats"
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
@@ -33,6 +34,7 @@ const (
 	StagePhysical  Stage = "physical-complete"
 	StageReachable Stage = "mapping-reachable"
 	StageSemantic  Stage = "semantic-replay"
+	StageExact     Stage = "exact-join"
 )
 
 type Config struct {
@@ -51,11 +53,13 @@ type Report struct {
 	ReplayedCommits    uint64
 	BatchStatuses      uint64
 	NextCommitSeq      model.CommitSeq
+	VerifiedPuts       uint64
+	VerifiedStats      uint64
 }
 
-// Verify validates stable v2 physical files and the reachable checkpoint
-// Mapping under an exclusive read-only lease. It never invokes recovery or a
-// writer path.
+// Verify validates stable v2 physical files, the checkpoint Mapping, semantic
+// replay, and the final Mapping-to-Record join under an exclusive read-only
+// lease. It never invokes recovery or a writer path.
 func Verify(ctx context.Context, root string, config Config) (report Report, resultErr error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -166,6 +170,43 @@ func Verify(ctx context.Context, root string, config Config) (report Report, res
 	report.ReplayedCommits = uint64(recovered.NextCommitSeq) - uint64(manifest.CoveredCommitSeq) - 1
 	report.BatchStatuses = uint64(len(recovered.Statuses))
 	report.Stage = StageSemantic
+	finalAddresses := make(map[recordlog.VAddr]model.ID, len(final.Entries))
+	for id, addr := range final.Entries {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		if !containsDataAddress(manifest, report.Data, addr) {
+			return report, base.ErrCorrupt
+		}
+		if owner, exists := finalAddresses[addr]; exists {
+			return report, errors.Join(base.ErrCorrupt, fmt.Errorf("data address %v aliases IDs %d and %d", addr, owner, id))
+		}
+		payload, err := dataReader.Read(ctx, addr)
+		if err != nil {
+			return report, classify(err)
+		}
+		put, err := recordcodec.DecodePut(payload, manifest.HardLimits.MaxValueSize)
+		if err != nil || put.RecordID != id {
+			return report, errors.Join(base.ErrCorrupt, err)
+		}
+		finalAddresses[addr] = id
+		report.VerifiedPuts++
+	}
+	maxStats := uint64(len(manifest.SealedDataSegments))
+	if maxStats == 0 {
+		maxStats = 1
+	}
+	stats, err := segmentstats.Build(ctx, tree, dataReader, segmentstats.FileSet{
+		Active: manifest.ActiveDataSegmentID, Sealed: manifest.SealedDataSegments,
+	}, manifest.HardLimits.MaxValueSize, maxStats)
+	if err != nil {
+		return report, classify(err)
+	}
+	if !equalSegmentStats(stats, manifest.SegmentStats) {
+		return report, base.ErrCorrupt
+	}
+	report.VerifiedStats = uint64(len(stats))
+	report.Stage = StageExact
 	return report, nil
 }
 
@@ -232,6 +273,18 @@ func containsDataAddress(manifest storecatalog.Manifest, data recordlog.Physical
 		}
 	}
 	return false
+}
+
+func equalSegmentStats(left, right []storecatalog.SegmentStats) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func verifyJournalAndTrash(root string) error {
