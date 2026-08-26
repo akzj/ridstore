@@ -25,7 +25,7 @@ v2 对每个 durable writer 分开验证：
 | MapStore rotation | journal write/sync/rename/dir-sync，footer write/sync，seal rename/dir-sync，new-active write/sync/rename/dir-sync，journal remove/cleanup dir-sync | 每点 fresh Open 收敛；recovery 自身失败可重试；journal/sealed/new-active 子进程退出已覆盖 | 已闭合 |
 | RecordLog append/sync | append write 与 data sync fault hook 已有 | Engine 已覆盖 CommitUnknown、fail-closed，以及 fresh Open 对完整/不完整 Commit Record 的 Committed/Aborted 判定 | 已覆盖当前 active append/sync 边界 |
 | RecordLog rotation | journal write/sync/rename/dir-sync、partial-footer truncate/sync、footer write/sync、seal rename/dir-sync、new-active write/sync/rename/dir-sync、journal remove/cleanup dir-sync | 每点 fresh Open 收敛；recovery 失败可重试；journal/sealed/new-active 子进程退出已覆盖 | 已闭合 |
-| v2 Data GC relocation | sealed Segment 单段扫描、Put 复制、共享 BatchID、Coordinator CAS、Checkpoint coverage 与退休前 proof 已进入主路径 | 并发用户更新胜出并使 relocation skip；open Batch source ref 阻止 proof；复制品成为 orphan | 可恢复 maintenance journal 和 retire crash matrix 尚未接线 |
+| v2 Data GC | relocation、Checkpoint coverage、退休前 proof、durable marker、Catalog remove、trash/delete 与 Open 恢复已进入主路径 | 并发用户更新胜出；open Batch ref 阻止 proof；Catalog present 回滚 marker，Catalog absent 完成清理 | syscall/process crash matrix 尚未闭合 |
 | v2 Mapping GC | 尚未进入 v2 主路径 | 尚未进入 v2 主路径 | 不适用 |
 
 ## 3. MapStore 已确认语义

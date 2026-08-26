@@ -29,6 +29,7 @@ type Log interface {
 
 type maintenanceLog interface {
 	ScanSegment(context.Context, recordlog.SegmentID, func(recordlog.AppendResult, []byte) error) error
+	RetireSegment(context.Context, recordlog.SegmentID, uint64) error
 }
 
 type Config struct {
@@ -50,6 +51,7 @@ type Store struct {
 
 	log                    Log
 	maintenance            maintenanceLog
+	root                   string
 	mapping                *mapping.Persistent
 	mapStore               *mapstore.Store
 	catalog                *storecatalog.Manager

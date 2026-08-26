@@ -122,7 +122,7 @@ v2 不再存在：
 - SegmentStats 已由 Checkpoint 精确派生；
 - Relocation 已接入 sealed Segment pin/scan、共享 BatchID、唯一 Coordinator 和 Mapping VAddr CAS；
 - Checkpoint coverage、open-batch gate 和二次精确 liveness 证明已组合为退休前 proof；
-- 下一步建立可恢复 maintenance journal，再接入 retire/delete；
+- 最小 durable maintenance marker、retire gate、Catalog remove、trash/delete 与 Open 恢复已接入；
 - 完成 GC crash matrix 和 model test。
 
 ### M6：删除旧系统

@@ -107,6 +107,27 @@ func TestPrepareSegmentRetirementRejectsOpenBatchReference(t *testing.T) {
 	}
 }
 
+func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
+	store, source, id, oldAddr, _ := relocationFixture(t)
+	result, err := store.CompactSegment(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Proof.Source.SegmentID != source || result.Proof.CatalogGeneration == 0 {
+		t.Fatalf("result=%+v", result)
+	}
+	if containsSealedSegment(store.catalog.Snapshot(), result.Proof.Source) {
+		t.Fatal("retired source remains in Catalog")
+	}
+	if _, err := store.log.Read(context.Background(), oldAddr); !errors.Is(err, recordlog.ErrSegmentMissing) {
+		t.Fatalf("old address read err=%v", err)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "source-value" || record.Addr == oldAddr {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
 func TestConcurrentUserUpdateWinsOverSegmentRelocation(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
 	underlying := store.log
@@ -216,6 +237,20 @@ func relocationFixture(t *testing.T) (*Store, recordlog.SegmentID, model.ID, rec
 
 func newRelocationStore(t *testing.T) *Store {
 	t.Helper()
+	config := relocationConfig()
+	store, err := Create(context.Background(), t.TempDir(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil && !errors.Is(err, recordlog.ErrClosed) && !errors.Is(err, base.ErrClosed) {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return store
+}
+
+func relocationConfig() CreateConfig {
 	config := testCreateConfig()
 	config.HardLimits.SegmentSize = 8192
 	config.HardLimits.MaxValueSize = 512
@@ -224,15 +259,5 @@ func newRelocationStore(t *testing.T) *Store {
 	config.HardLimits.MaxRecordLogPayload = 1024
 	config.Runtime.RecordLog.BufferBytes = 2048
 	config.Runtime.Commit.MaxGroupPayload = 1024
-	store, err := Create(context.Background(), t.TempDir(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil && !errors.Is(err, recordlog.ErrClosed) {
-			t.Errorf("close: %v", err)
-		}
-	})
-
-	return store
+	return config
 }

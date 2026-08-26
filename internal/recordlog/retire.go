@@ -26,10 +26,6 @@ func (l *Log) RetireSegment(ctx context.Context, id SegmentID, expectGeneration 
 	if !ok {
 		return ErrSegmentMissing
 	}
-	trash, err := ensureTrashDirectory(l.root, l.files)
-	if err != nil {
-		return err
-	}
 	if err := l.registry.beginRetire(id); err != nil {
 		return err
 	}
@@ -60,21 +56,57 @@ func (l *Log) RetireSegment(ctx context.Context, id SegmentID, expectGeneration 
 	if err := segment.close(); err != nil {
 		return err
 	}
-	source := filepath.Join(recordsPath(l.root), sealedSegmentName(id))
-	destination := filepath.Join(trash, fmt.Sprintf("%s.g%d.trash", sealedSegmentName(id), installed.Generation))
-	if err := l.files.rename(source, destination); err != nil {
+	return cleanupRetiredSegment(l.root, id, installed.Generation, l.files)
+}
+
+// CleanupRetiredSegment completes the physical half of a retirement whose
+// Catalog removal is already durable. The caller must prove that id is absent
+// from the authoritative Catalog before calling it.
+func CleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64) error {
+	if root == "" || id == 0 || catalogGeneration == 0 {
+		return ErrInvalidConfig
+	}
+	return cleanupRetiredSegment(root, id, catalogGeneration, osFileBackend{})
+}
+
+func cleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64, files fileBackend) error {
+	trash, err := ensureTrashDirectory(root, files)
+	if err != nil {
 		return err
 	}
-	if err := l.files.syncDir(recordsPath(l.root)); err != nil {
-		return err
+	source := filepath.Join(recordsPath(root), sealedSegmentName(id))
+	destination := filepath.Join(trash, fmt.Sprintf("%s.g%d.trash", sealedSegmentName(id), catalogGeneration))
+	_, sourceErr := files.stat(source)
+	_, destinationErr := files.stat(destination)
+	sourceExists, destinationExists := sourceErr == nil, destinationErr == nil
+	if sourceErr != nil && !errors.Is(sourceErr, os.ErrNotExist) {
+		return sourceErr
 	}
-	if err := l.files.syncDir(trash); err != nil {
-		return err
+	if destinationErr != nil && !errors.Is(destinationErr, os.ErrNotExist) {
+		return destinationErr
 	}
-	if err := l.files.remove(destination); err != nil {
-		return err
+	if sourceExists && destinationExists {
+		return fmt.Errorf("retired source and trash both exist: %w", ErrCorrupt)
 	}
-	return l.files.syncDir(trash)
+	if sourceExists {
+		if err := files.rename(source, destination); err != nil {
+			return err
+		}
+		if err := files.syncDir(recordsPath(root)); err != nil {
+			return err
+		}
+		if err := files.syncDir(trash); err != nil {
+			return err
+		}
+		destinationExists = true
+	}
+	if destinationExists {
+		if err := files.remove(destination); err != nil {
+			return err
+		}
+		return files.syncDir(trash)
+	}
+	return nil
 }
 
 func ensureTrashDirectory(root string, files fileBackend) (string, error) {

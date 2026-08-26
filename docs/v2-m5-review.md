@@ -1,6 +1,6 @@
 # ridstore v2 M5 Review
 
-状态：Relocation 与退休前证明已闭合；物理删除尚未接入
+状态：Data GC 主路径已闭合；fault matrix 仍在扩展
 
 ## 1. 本阶段解决的问题
 
@@ -66,8 +66,16 @@ Mapping[ID] != scanned VAddr
 历史 Put 若已被同 Batch 的 Put/Delete 覆盖，不会进入 Mapping，因此不属于 open-batch 引用。proof 不是
 独立删除令牌；未来 retire 操作必须在 maintenance/operation gate 内消费并重新验证。
 
-尚未完成的是可恢复 maintenance journal、retire gate/Catalog remove/trash/delete 的组合以及对应
-crash/syscall matrix。在这些条件闭合前，Engine 不调用 `RecordLog.RetireSegment`。
+`CompactSegment` 在 proof 之后安装唯一 durable `MAINTENANCE.v2` marker，再调用 RecordLog retire gate、
+Catalog remove、Registry detach、close、trash 和 delete。marker 删除是最后一步。
+
+恢复不持久化内存阶段，而只比较 marker 与 Catalog：
+
+- source 仍在 BaseGeneration Catalog：不可逆操作尚未发生，删除 marker；
+- source 已从 BaseGeneration+1 Catalog 移除：继续幂等物理清理，再删除 marker；
+- 其他 generation、identity 或 summary 组合：corruption，拒绝猜测。
+
+尚未完成的是各 write/fsync/rename/remove 边界的系统调用 fault matrix 和 process-crash matrix。
 
 Transaction 可以从最终 mutation 集合报告 Segment 引用。被后续 Put/Delete 覆盖的历史 Put 不会进入
 Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable publication 或终止清理前持续
@@ -78,4 +86,4 @@ Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable p
 Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺失在同一
 `StatsCoveredCommitSeq == CoveredCommitSeq` 的 Manifest 中明确表示零存活。Catalog retire 门禁已按
 这一格式解释：缺失或显式零值允许继续，任何非零值拒绝。它仍只是必要条件；Engine 的二次 Mapping
-证明、open-batch gate 和可恢复 maintenance 协议尚未完成时，不调用物理 retire。
+证明与 open-batch gate 仍是物理 retire 的前置条件。

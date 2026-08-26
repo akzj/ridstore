@@ -117,6 +117,9 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return nil, err
 	}
+	if err := recoverMaintenance(root, catalog); err != nil {
+		return nil, err
+	}
 	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, catalog, hooks.recordLog)
 	if err != nil {
 		return nil, err
@@ -177,6 +180,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.mapStore = physicalMapping
 	store.catalog = catalog
 	store.maintenance = log
+	store.root = root
 	store.maxStats = config.MaxSegmentStats
 	store.dirLock = dirLock
 	return store, nil

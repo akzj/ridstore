@@ -176,38 +176,34 @@ GC 不选择 open-batch ref > 0 的 Segment。Batch 只需按 Segment 去重持�
 
 即使 Commit Descriptor 自包含最终 VAddr，也不能在 Commit 前删除 payload Segment。
 
-## 10. Maintenance Journal
+## 10. Maintenance Marker
 
-清理 Operation 状态：
+Relocation、Checkpoint 和 retirement proof 都发生在不可逆操作之前；失败只会留下由 Mapping 决定
+是否可达的 Record，不需要为每个内存步骤持久化 Phase。唯一不可逆边界是 Catalog 移除 source。
+
+v2 因此使用一个固定格式的全局 `MAINTENANCE.v2` marker：
 
 ```text
-Prepared
--> Copying
--> RelocationsDurable
--> MappingCheckpointDurable
--> Retired
--> Trashed
--> Deleted
+proof complete
+-> install marker and fsync journal directory
+-> Registry retire gate / wait readers
+-> Catalog remove source
+-> Registry detach / close
+-> rename to trash / fsync directories / delete
+-> remove marker / fsync journal directory
 ```
 
-每次 Phase 更新先写 journal temp、fsync、rename、directory fsync。
+marker 包含 StoreUUID、RecordLogID、BaseGeneration、CoveredCommitSeq、ReplayStart 和完整 source summary。
+Open 在 RecordLog 打开文件前恢复：
 
-DataGC 在 RelocationsDurable 后调用的 Mapping Checkpoint 是该 DataGC operation 的嵌套步骤，不另占第二个 `MAINTENANCE` 文件；新 Mapping 文件记录在同一 Journal 的 DestinationFiles 中，完成后直接推进到 MappingCheckpointDurable。普通 Mapping Checkpoint、Mapping GC 和 Data GC 由 maintenance coordinator 串行，Data Segment rotation 使用独立短 Journal。
-
-恢复动作：
-
-| Phase | Open 行为 |
+| durable evidence | Open 行为 |
 |---|---|
-| Prepared/Copying | 保留源 Segment；复制副本按 Mapping 判定为垃圾 |
-| RelocationsDurable | Manifest 尚无 GC checkpoint 证明时撤销本轮；若 checkpoint 已发布而 phase-4 Journal publication 失败，则由 Manifest 证明并补写 phase 4 后继续 |
-| MappingCheckpointDurable | 验证无 Mapping 指向源后继续 Retire |
-| Retired | 等待 pin（重启后进程 pin 为 0）并继续 Trash |
-| Trashed | 确认 Manifest 不引用后删除 |
-| Deleted | 清理 Journal |
+| source 仍在 BaseGeneration Catalog，字段与 marker 一致 | Catalog remove 未发生；删除 marker，保留 source |
+| source 不在 BaseGeneration+1 Catalog | Catalog remove 已 durable；幂等完成 canonical/trash 清理，再删除 marker |
+| 其他 generation、identity、summary 组合 | corruption，拒绝打开 |
 
-任一验证失败停止 Open，并提供确定错误；不能跳到更后 Phase。
-
-`MaintenanceGeneration == Journal.Generation` 不是单独充分证据：Data GC 内嵌的 Mapping rotation 也可能先发布该 generation。phase 3 恢复必须同时验证精确 SegmentStats 不再包含 source、ReplayStart 已越过 source、StatsCoveredCommitSeq 等于 CoveredCommitSeq；source 仍为 live 时证明 GC checkpoint 尚未完成，只能保留 source 并撤销 Journal。
+Catalog 是方向判定的唯一状态源；marker 只标识本次允许清理的确定文件，避免把未知 orphan 当作 GC
+产物自动删除。普通 Checkpoint 不写 marker，Data Segment rotation 继续使用自己的短物理 journal。
 
 ## 11. Manifest 与文件操作顺序
 
@@ -216,12 +212,13 @@ DataGC 在 RelocationsDurable 后调用的 Mapping Checkpoint 是该 DataGC oper
 ```text
 write new Manifest without source
 -> fsync Manifest/CURRENT/root dirs
--> rename data/source -> trash/source.operationID
+-> rename data/source -> trash/source.catalogGeneration
 -> fsync data dir
 -> fsync trash dir
--> mark Trashed
 -> unlink trash file
 -> fsync trash dir
+-> remove maintenance marker
+-> fsync journal dir
 ```
 
 如果 Manifest 已移除但 rename 前崩溃，Journal 指示继续移动；如果文件已在 trash，Open 不把它重新加入正式 Segment。

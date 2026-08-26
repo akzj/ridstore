@@ -8,10 +8,12 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/coordinator"
+	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
 // SegmentRelocationResult describes only the copy-and-CAS phase of data GC.
@@ -37,6 +39,11 @@ type SegmentRetirementProof struct {
 	CatalogGeneration uint64
 	CoveredCommitSeq  model.CommitSeq
 	ReplayStart       recordlog.LogPos
+}
+
+type SegmentCompactionResult struct {
+	Relocation SegmentRelocationResult
+	Proof      SegmentRetirementProof
 }
 
 type copiedRecord struct {
@@ -96,6 +103,75 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	defer s.ops.Unlock()
 	proof, err := s.proveSegmentRetirementLocked(ctx, source, relocated.LastCommitSeq)
 	return proof, relocated, err
+}
+
+// CompactSegment executes the complete logical and physical retirement under
+// the Engine's maintenance gate. A durable marker is installed immediately
+// before Catalog removal so Open can finish or roll back any interrupted
+// physical cleanup deterministically.
+func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) (SegmentCompactionResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return SegmentCompactionResult{}, err
+	}
+	if source == 0 {
+		return SegmentCompactionResult{}, base.ErrInvalidConfig
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+
+	relocated, err := s.relocateSegment(ctx, source)
+	result := SegmentCompactionResult{Relocation: relocated}
+	if err != nil {
+		return result, err
+	}
+	if err := s.Checkpoint(ctx); err != nil {
+		return result, err
+	}
+
+	s.ops.Lock()
+	defer s.ops.Unlock()
+	proof, err := s.proveSegmentRetirementLocked(ctx, source, relocated.LastCommitSeq)
+	result.Proof = proof
+	if err != nil {
+		return result, err
+	}
+	manifest := s.catalog.Snapshot()
+	if s.root == "" || manifest.Generation != proof.CatalogGeneration || manifest.RecordLogID == (recordlog.LogID{}) {
+		return result, base.ErrInvalidConfig
+	}
+	state := maintstate.State{
+		Operation: maintstate.DataRetire, StoreUUID: manifest.StoreUUID, LogID: manifest.RecordLogID,
+		BaseGeneration: proof.CatalogGeneration, CoveredCommitSeq: proof.CoveredCommitSeq,
+		ReplayStart: proof.ReplayStart, Source: proof.Source,
+	}
+	if err := maintstate.Install(s.root, state); err != nil {
+		return result, err
+	}
+	if err := s.maintenance.RetireSegment(ctx, source, proof.CatalogGeneration); err != nil {
+		current := s.catalog.Snapshot()
+		if current.Generation == proof.CatalogGeneration && containsSealedSegment(current, proof.Source) {
+			return result, errors.Join(err, maintstate.Remove(s.root))
+		}
+		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
+		s.setFault(recoveryErr)
+		return result, recoveryErr
+	}
+	if err := maintstate.Remove(s.root); err != nil {
+		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
+		s.setFault(recoveryErr)
+		return result, recoveryErr
+	}
+	return result, nil
+}
+
+func containsSealedSegment(manifest storecatalog.Manifest, source recordlog.SegmentSummary) bool {
+	index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool {
+		return manifest.SealedDataSegments[i].SegmentID >= source.SegmentID
+	})
+	return index < len(manifest.SealedDataSegments) && manifest.SealedDataSegments[index] == source
 }
 
 func (s *Store) proveSegmentRetirementLocked(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq) (SegmentRetirementProof, error) {
