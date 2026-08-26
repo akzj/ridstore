@@ -19,6 +19,7 @@
 12. [M6 Review](v2-m6-review.md)：公开切换、v1 删除边界与验证证据。
 13. [磁盘空间 Admission](v2-space-admission.md)：用户写入水位、控制面 headroom 与 ENOSPC 边界。
 14. [v2 Offline Verify](v2-verify-design.md)：只读审计边界、证据分层与实现阶段。
+15. [v2 Mapping GC](v2-mapping-gc-design.md)：Root 全量重建、文件集原子替换与崩溃恢复。
 
 阶段 Review：
 
