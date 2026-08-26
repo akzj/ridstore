@@ -118,7 +118,7 @@ func OpenWithFaultHook(root string, catalog CatalogPort, hook FaultHook) (*Store
 	if root == "" || catalog == nil {
 		return nil, ErrInvalid
 	}
-	state, err := recoverRotation(root, catalog)
+	state, err := recoverRotation(root, catalog, hook)
 	if err != nil {
 		return nil, err
 	}
@@ -244,14 +244,14 @@ func (s *Store) rotateLocked() error {
 		BaseGeneration: fresh.Generation, StoreID: fresh.StoreID, SegmentSize: fresh.SegmentSize,
 		Old: s.active.summary, NewActive: fresh.NextSegment, NextSegment: fresh.NextSegment + 1,
 	}
-	if err := installRotationJournal(s.root, journal); err != nil {
+	if err := installRotationJournal(s.root, journal, s.hook); err != nil {
 		return err
 	}
-	sealed, err := sealActive(s.root, s.active, journal.Old)
+	sealed, err := sealActive(s.root, s.active, journal.Old, s.hook)
 	if err != nil {
 		return err
 	}
-	newActive, err := createActive(s.root, fresh.headerFor(journal.NewActive))
+	newActive, err := createActive(s.root, fresh.headerFor(journal.NewActive), s.hook)
 	if err != nil {
 		_ = sealed.file.Close()
 		return err
@@ -265,7 +265,7 @@ func (s *Store) rotateLocked() error {
 	s.sealed[journal.Old.SegmentID] = sealed
 	s.active = newActive
 	s.state = installed
-	return removeRotationJournal(s.root)
+	return removeRotationJournal(s.root, s.hook)
 }
 
 func (s *Store) Sync() error {

@@ -73,6 +73,9 @@ Engine fail closed，重启以 durable Manifest 为准。
   失败可再次 Open 收敛；
 - RecordLog data sync 失败使提交返回 CommitUnknown、拒绝后续写；fresh Open 对完整 Commit Record 判定
   Committed，对不完整 Commit Record 截断并判定 Aborted；
+- MapStore rotation 的 Journal、Footer、sealed rename、new-active、Catalog publish 与 cleanup 全部故障边界
+  已覆盖；每一点 fresh Open 均由旧/新 Catalog 与 Journal 收敛，recovery 自身失败可再次 Open，且
+  journal/sealed/new-active 三阶段已通过子进程退出测试；
 - Delta reservation 位于 Prepare/durable Descriptor 之前，冲突、取消和 pre-durable 失败会归还；重复更新
   active hot ID 不重复计费，Freeze/Abort 不释放，Install 只释放精确 frozen prefix；
 - Delta hard pressure 会在不持有 `ops.RLock` 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
@@ -86,9 +89,8 @@ Engine fail closed，重启以 durable Manifest 为准。
 
 ## 5. 尚未完成
 
-- checkpoint 的 Catalog 与 MapStore append/sync/tail-repair fault matrix 已覆盖；RecordLog sync 的
-  CommitUnknown 及完整/不完整 Record 恢复分支已覆盖；MapStore 与 RecordLog rotation 的完整 syscall
-  矩阵仍未完成；详见
+- checkpoint 的 Catalog、MapStore append/sync/tail-repair/rotation fault matrix 已覆盖；RecordLog sync 的
+  CommitUnknown 及完整/不完整 Record 恢复分支已覆盖；RecordLog rotation 的完整 syscall 矩阵仍未完成；详见
   [v2-fault-matrix.md](v2-fault-matrix.md)；
 - soft-limit 后台 Checkpoint；
 - Relocation、Data GC、Mapping GC；

@@ -10,10 +10,18 @@ import (
 	"github.com/akzj/ridstore/internal/recordlog"
 )
 
-type staticCatalog struct{ state CatalogSnapshot }
+type staticCatalog struct {
+	state      CatalogSnapshot
+	installErr error
+}
 
 func (c *staticCatalog) SnapshotMapStore() CatalogSnapshot { return c.state.Clone() }
 func (c *staticCatalog) InstallMapStoreRotation(expect uint64, sealed SegmentRef, newActive, next model.MapSegmentID) (CatalogSnapshot, error) {
+	if c.installErr != nil {
+		err := c.installErr
+		c.installErr = nil
+		return CatalogSnapshot{}, err
+	}
 	if c.state.Generation != expect || c.state.ActiveSegment != sealed.SegmentID || c.state.NextSegment != newActive || next != newActive+1 {
 		return CatalogSnapshot{}, ErrInvalid
 	}
