@@ -69,7 +69,7 @@ relocation CAS、Reader Pin 和退休前精确证明。
 
 后续优先级：
 
-1. 补充公共层并发/崩溃测试和完整 race 门禁；
+1. 补充公共层进程崩溃测试；
 2. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
 3. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
 
@@ -78,3 +78,6 @@ Replay 容量门禁；CommitUnknown 的恢复查询语义保持不变。
 
 第二个完整性迭代增加了 v2 原生用户写入磁盘水位。它只阻止新的 Put Record，控制记录、已接收
 Batch 的 Commit、Checkpoint 和 GC relocation 可使用保留 headroom；真实 ENOSPC 仍由底层 fail-closed。
+
+公开层并发模型测试现在覆盖同一 token 的多 Batch CAS、并发 Checkpoint、唯一 winner、连续 CommitSeq、
+终态 Status 和 Close/Open 后最终值恢复，并纳入完整 `go test -race ./...` 门禁。
