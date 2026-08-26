@@ -46,6 +46,11 @@ type SegmentCompactionResult struct {
 	Proof      SegmentRetirementProof
 }
 
+type NextSegmentCompactionResult struct {
+	Candidate  SegmentCompactionCandidate
+	Compaction SegmentCompactionResult
+}
+
 type copiedRecord struct {
 	id      model.ID
 	oldAddr recordlog.VAddr
@@ -121,6 +126,48 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
+	return s.compactSegmentLocked(ctx, source)
+}
+
+// CompactNextSegment checkpoints current Mapping state, selects at most one
+// checkpoint-safe candidate, and runs the full retirement protocol. A false
+// found result means no Segment passed the policy and open-Batch gates.
+func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy) (NextSegmentCompactionResult, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return NextSegmentCompactionResult{}, false, err
+	}
+	if policy.MinReclaimableRatioBasis > compactionRatioScale {
+		return NextSegmentCompactionResult{}, false, base.ErrInvalidConfig
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if err := s.Checkpoint(ctx); err != nil {
+		return NextSegmentCompactionResult{}, false, err
+	}
+	manifest := s.catalog.Snapshot()
+	excluded, err := s.openBatchSegmentReferences(manifest.SealedDataSegments)
+	if err != nil {
+		return NextSegmentCompactionResult{}, false, err
+	}
+	candidate, found, err := selectCompactionCandidate(manifest, policy, excluded)
+	if err != nil {
+		if errors.Is(err, base.ErrCorrupt) {
+			s.setFault(err)
+		}
+		return NextSegmentCompactionResult{}, false, err
+	}
+	if !found {
+		return NextSegmentCompactionResult{}, false, nil
+	}
+	compaction, err := s.compactSegmentLocked(ctx, candidate.Source.SegmentID)
+	return NextSegmentCompactionResult{Candidate: candidate, Compaction: compaction}, true, err
+}
+
+// compactSegmentLocked requires maintenanceMu.
+func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.SegmentID) (SegmentCompactionResult, error) {
 
 	relocated, err := s.relocateSegment(ctx, source)
 	result := SegmentCompactionResult{Relocation: relocated}
@@ -175,6 +222,27 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
 		s.setFault(recoveryErr)
 		return result, recoveryErr
+	}
+	return result, nil
+}
+
+func (s *Store) openBatchSegmentReferences(sealed []recordlog.SegmentSummary) (map[recordlog.SegmentID]struct{}, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, base.ErrClosed
+	}
+	if s.fault != nil {
+		return nil, errors.Join(base.ErrReadOnly, s.fault)
+	}
+	result := make(map[recordlog.SegmentID]struct{})
+	for _, source := range sealed {
+		for _, batch := range s.open {
+			if batch.inner.ReferencesSegment(source.SegmentID) {
+				result[source.SegmentID] = struct{}{}
+				break
+			}
+		}
 	}
 	return result, nil
 }

@@ -128,6 +128,67 @@ func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
 	}
 }
 
+func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
+	store, source, id, _, _ := relocationFixture(t)
+	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{})
+	if err != nil || !found {
+		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
+	}
+	if result.Candidate.Source.SegmentID != source || result.Compaction.Proof.Source.SegmentID != source {
+		t.Fatalf("result=%+v", result)
+	}
+	if containsSealedSegment(store.catalog.Snapshot(), result.Candidate.Source) {
+		t.Fatal("selected source remains in Catalog")
+	}
+	if record, err := store.Get(context.Background(), id); err != nil || string(record.Value) != "source-value" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
+func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{MinReclaimableBytes: ^uint64(0)})
+	if err != nil || found || result != (NextSegmentCompactionResult{}) {
+		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
+	}
+	if !containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
+		t.Fatal("policy-rejected source was retired")
+	}
+}
+
+func TestCompactNextSegmentSkipsOpenBatchReferences(t *testing.T) {
+	store := newRelocationStore(t)
+	pending, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.Create(context.Background(), []byte("open-before-rotation")); err != nil {
+		t.Fatal(err)
+	}
+	source := recordlog.SegmentID(1)
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{}); err != nil || found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if err := pending.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{}); err != nil || !found || result.Candidate.Source.SegmentID != source {
+		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
+	}
+}
+
 func TestConcurrentUserUpdateWinsOverSegmentRelocation(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
 	underlying := store.log
