@@ -234,6 +234,10 @@ func openActiveSegment(root string, expected SegmentHeader, files fileBackend, h
 }
 
 func scanActiveSegment(file fileHandle, expected SegmentHeader) (SegmentSummary, bool, error) {
+	return scanActiveSegmentWithVisitor(file, expected, nil)
+}
+
+func scanActiveSegmentWithVisitor(file fileHandle, expected SegmentHeader, visit func(AppendResult, []byte) error) (SegmentSummary, bool, error) {
 	info, err := file.Stat()
 	if err != nil {
 		return SegmentSummary{}, false, err
@@ -278,12 +282,21 @@ func scanActiveSegment(file fileHandle, expected SegmentHeader) (SegmentSummary,
 		if err := readFullAt(file, record, int64(result.ValidEnd)); err != nil {
 			return SegmentSummary{}, false, err
 		}
-		decoded, _, err := DecodeRecord(record)
+		decoded, payload, err := DecodeRecord(record)
 		if err != nil || decoded != recordHeader {
 			if err == nil {
 				err = ErrCorrupt
 			}
 			return SegmentSummary{}, false, err
+		}
+		if visit != nil {
+			result, err := NewAppendResult(recordHeader.Addr, recordHeader.PhysicalSize)
+			if err != nil {
+				return SegmentSummary{}, false, err
+			}
+			if err := visit(result, payload); err != nil {
+				return SegmentSummary{}, false, err
+			}
 		}
 		if result.RecordCount == 0 {
 			result.FirstAddr = recordHeader.Addr
