@@ -25,7 +25,7 @@ v2 对每个 durable writer 分开验证：
 | MapStore rotation | journal write/sync/rename/dir-sync，footer write/sync，seal rename/dir-sync，new-active write/sync/rename/dir-sync，journal remove/cleanup dir-sync | 每点 fresh Open 收敛；recovery 自身失败可重试；journal/sealed/new-active 子进程退出已覆盖 | 已闭合 |
 | RecordLog append/sync | append write 与 data sync fault hook 已有 | Engine 已覆盖 CommitUnknown、fail-closed，以及 fresh Open 对完整/不完整 Commit Record 的 Committed/Aborted 判定 | 已覆盖当前 active append/sync 边界 |
 | RecordLog rotation | journal write/sync/rename/dir-sync、partial-footer truncate/sync、footer write/sync、seal rename/dir-sync、new-active write/sync/rename/dir-sync、journal remove/cleanup dir-sync | 每点 fresh Open 收敛；recovery 失败可重试；journal/sealed/new-active 子进程退出已覆盖 | 已闭合 |
-| v2 Data GC | relocation、Checkpoint coverage、退休前 proof、durable marker、Catalog remove、trash/delete 与 Open 恢复已进入主路径 | 并发用户更新胜出；open Batch ref 阻止 proof；Catalog present 回滚 marker，Catalog absent 完成清理 | syscall/process crash matrix 尚未闭合 |
+| v2 Data GC | marker temp/write/file-sync/close/rename/dir-sync/remove；retire rename、records/trash dir-sync、trash unlink/final dir-sync | 每个 fault point 可由 fresh Open 重试；子进程覆盖 marker-only、Catalog removed、trash、deleted 四个状态 | durable fault/crash matrix 已闭合 |
 | v2 Mapping GC | 尚未进入 v2 主路径 | 尚未进入 v2 主路径 | 不适用 |
 
 ## 3. MapStore 已确认语义
@@ -52,4 +52,15 @@ Journal 尚未 rename 时，fresh Open 删除 `.tmp` 并继续使用旧 Catalog�
 完成 seal、new-active 创建和 Catalog 安装。Catalog 已安装则只验证精确文件集合并清理 Journal。
 cleanup 删除成功但 directory sync 失败时，下次 Open 即使看不到 Journal，也会重新 sync Journal 目录。
 
-进入 Relocation/Data GC 前，下一步是全局复核 M4 durable boundary，确认没有同级别缺口。
+## 5. Data GC 已确认语义
+
+marker 发布前的失败不会授权 Catalog remove。marker rename 后 directory sync 失败属于 durable outcome
+不确定，Engine 必须 fail closed；fresh Open 读取实际目录状态，不能允许当前进程继续 checkpoint 或维护。
+
+Catalog remove 之后的任一物理清理错误都保留 marker，并使运行时只读。恢复可能看到 canonical、trash、
+或二者都不存在；它会先稳定 `records/` 与 `trash/` 目录，再删除 trash。特别是从上一次进程继承 trash
+时，不能跳过两目录 fsync，否则未持久化的跨目录 rename 仍可能在 marker 删除后回滚。
+
+真实子进程退出覆盖：marker durable/Catalog present、Catalog removed/canonical present、trash present、
+trash deleted/marker present。四种状态 fresh Open 都保持 relocated value 可读，并按 Catalog membership
+选择回滚或完成，而不是使用内存 phase。

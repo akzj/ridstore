@@ -1,6 +1,6 @@
 # ridstore v2 M5 Review
 
-状态：Data GC 主路径已闭合；fault matrix 仍在扩展
+状态：Data GC 主路径与 durable fault/crash matrix 已闭合；候选策略和长期收敛测试待实现
 
 ## 1. 本阶段解决的问题
 
@@ -75,7 +75,18 @@ Catalog remove、Registry detach、close、trash 和 delete。marker 删除是�
 - source 已从 BaseGeneration+1 Catalog 移除：继续幂等物理清理，再删除 marker；
 - 其他 generation、identity 或 summary 组合：corruption，拒绝猜测。
 
-尚未完成的是各 write/fsync/rename/remove 边界的系统调用 fault matrix 和 process-crash matrix。
+fault hook 已覆盖 marker 的 temp cleanup/create、write、file sync、close、rename、directory sync 和 remove，
+以及 source-to-trash rename、records/trash directory sync、trash unlink 和最终 directory sync。marker 已
+rename 但目录 sync 失败时，Engine 将其视为 outcome unknown，进入 `RecoveryRequired`，禁止在当前实例
+继续 checkpoint 或维护。
+
+子进程退出测试固定了四个恢复状态：marker durable/Catalog present、Catalog removed/canonical present、
+source in trash、trash deleted/marker present。fresh Open 均只依赖 marker + Catalog 收敛，并验证搬迁后
+的值仍可读取。
+
+跨目录 rename 的重试有一个不可省略的顺序：只要发现 trash 文件，在 unlink 前都重新 fsync
+`records/` 和 `trash/`。否则上次 rename 的目录同步失败后，当前进程删除 marker，再次掉电仍可能让
+canonical source 重新出现。
 
 Transaction 可以从最终 mutation 集合报告 Segment 引用。被后续 Put/Delete 覆盖的历史 Put 不会进入
 Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable publication 或终止清理前持续
@@ -87,3 +98,14 @@ Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺
 `StatsCoveredCommitSeq == CoveredCommitSeq` 的 Manifest 中明确表示零存活。Catalog retire 门禁已按
 这一格式解释：缺失或显式零值允许继续，任何非零值拒绝。它仍只是必要条件；Engine 的二次 Mapping
 证明与 open-batch gate 仍是物理 retire 的前置条件。
+
+## 6. M5 剩余范围
+
+当前缺口不再是“能否安全删除一个已指定 Segment”，而是 GC 策略和长期收敛：
+
+- 基于 checkpoint stats 的 bounded candidate selection；
+- ENOSPC 下 relocation/Checkpoint 的空间预算与退避；
+- relocation 与前台更新交错的模型测试；
+- 重复 GC、重启和空间回收的长时 convergence soak。
+
+这些工作不能削弱当前删除门禁；SegmentStats 仍只筛选候选，不能独立授权删除。

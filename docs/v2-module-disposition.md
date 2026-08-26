@@ -123,7 +123,8 @@ v2 不再存在：
 - Relocation 已接入 sealed Segment pin/scan、共享 BatchID、唯一 Coordinator 和 Mapping VAddr CAS；
 - Checkpoint coverage、open-batch gate 和二次精确 liveness 证明已组合为退休前 proof；
 - 最小 durable maintenance marker、retire gate、Catalog remove、trash/delete 与 Open 恢复已接入；
-- 完成 GC crash matrix 和 model test。
+- durable marker/retire 的 syscall fault matrix 与四阶段 process-crash recovery 已闭合；
+- 待完成 bounded candidate selection、ENOSPC/backpressure、并发 model test 和 convergence soak。
 
 ### M6：删除旧系统
 

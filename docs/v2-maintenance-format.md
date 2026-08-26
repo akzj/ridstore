@@ -1,6 +1,6 @@
 # ridstore v2 Maintenance Marker
 
-状态：Implemented format；fault matrix pending
+状态：Implemented format；durable fault/crash matrix closed
 
 ## 1. 定位
 
@@ -48,9 +48,11 @@ source summary 必须与 sealed Footer 和 BaseGeneration Catalog 完全一致�
 
 ```text
 remove stale temp
+-> fsync journal directory when a stale temp was removed
 -> create .MAINTENANCE.v2.tmp
 -> write full 128 bytes
 -> fsync file
+-> close file
 -> rename to MAINTENANCE.v2
 -> fsync journal directory
 ```
@@ -70,13 +72,31 @@ Open 已持有 Store directory lock，并在打开 RecordLog 文件前恢复：
 | generation = base+1，source 不存在 | Catalog remove 已 durable；继续 canonical→trash→delete，再删除 marker |
 | 其他情况 | corruption；不猜测、不删除 |
 
-物理清理是幂等的：source 存在则 rename 到带 Catalog generation 的确定 trash 名称；trash 存在则删除；
-两者均不存在表示已经完成；两者同时存在表示 corruption。
+物理清理是幂等的：source 存在则 rename 到带 Catalog generation 的确定 trash 名称；在删除 trash 前总是
+重新 fsync `records/` 和 `trash/` 两个目录，即使 rename 来自上一次失败的进程。随后 unlink trash 并再次
+fsync `trash/`。两者均不存在表示已经完成；两者同时存在表示 corruption。trash 目录必须是真实目录，
+symlink 或其他文件类型一律拒绝。
+
+marker rename 已发生、但 journal directory fsync 返回错误时，调用方不能继续运行：marker 是否 durable
+已经不确定，Engine 进入 `RecoveryRequired`。fresh Open 以实际可见 marker 和 Catalog 为准收敛。
 
 ## 5. 不变量
 
 - Catalog source removal 永远早于物理删除；
 - marker 永远早于 Catalog source removal；
 - marker 删除永远晚于物理清理；
+- marker、temp、trash 路径都不跟随 symlink；
 - SegmentStats 只是一项前置条件，Engine 仍执行 open-batch 与 Mapping 精确证明；
 - 未匹配 marker 的 Catalog 外文件不会被该恢复协议自动删除。
+
+## 6. 已验证崩溃点
+
+fault hook 覆盖 temp cleanup/create、marker write/file-sync/close/rename/directory-sync、marker unlink，
+以及 source-to-trash rename、两个目录的稳定化、trash unlink 和最终 directory sync。子进程退出测试覆盖：
+
+- marker durable，Catalog 仍拥有 source；
+- Catalog 已移除 source，canonical 文件仍存在；
+- source 已进入 trash；
+- trash 已删除，marker 仍存在。
+
+四种状态均由 fresh Open 收敛，且 relocated value 保持可读。
