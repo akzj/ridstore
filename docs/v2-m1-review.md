@@ -1,5 +1,8 @@
 # ridstore v2 M1 Review
 
+> 历史阶段快照：其中关于“旧 runtime 仍存在”的陈述已被 M6 取代，当前边界见
+> [v2 M6 Review](v2-m6-review.md)。
+
 状态：Implemented, pending architecture review
 
 提交：

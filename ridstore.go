@@ -132,7 +132,11 @@ func (s *Store) Status(ctx context.Context, id BatchID) (BatchStatus, error) {
 	if err != nil {
 		return BatchStatus{}, err
 	}
-	return BatchStatus{BatchID: status.BatchID, State: BatchState(status.State), CommitSeq: status.CommitSeq}, nil
+	state, ok := publicBatchState(status.State)
+	if !ok {
+		return BatchStatus{}, base.ErrCorrupt
+	}
+	return BatchStatus{BatchID: status.BatchID, State: state, CommitSeq: status.CommitSeq}, nil
 }
 
 func (s *Store) Checkpoint(ctx context.Context) error {
@@ -187,6 +191,23 @@ func (s *Store) address(token VersionToken) (recordlog.VAddr, error) {
 		return 0, errors.Join(base.ErrInvalidToken, err)
 	}
 	return addr, nil
+}
+
+func publicBatchState(state engine.BatchState) (BatchState, bool) {
+	switch state {
+	case engine.BatchStateOpen:
+		return BatchStateOpen, true
+	case engine.BatchStateCommitting:
+		return BatchStateCommitting, true
+	case engine.BatchStateCommitted:
+		return BatchStateCommitted, true
+	case engine.BatchStateAborted:
+		return BatchStateAborted, true
+	case engine.BatchStateCommitUnknown:
+		return BatchStateCommitUnknown, true
+	default:
+		return 0, false
+	}
 }
 
 type Batch struct {

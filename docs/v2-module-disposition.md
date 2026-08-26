@@ -1,6 +1,6 @@
 # ridstore v2 模块处置矩阵
 
-状态：Active migration ledger
+状态：M6 completed
 
 本文决定现有代码进入 v2 主路径时是 `Keep`、`Rewrite` 还是 `Delete`。不存在 `Adapt`。
 
@@ -17,33 +17,33 @@
 任一条件不满足即 `Rewrite`。新实现稳定后，旧实现 `Delete`。禁止长期 wrapper、bridge、dual-write
 或新旧格式分支。
 
-## 2. 当前初步矩阵
+## 2. 最终处置矩阵
 
 | 当前模块 | 处置 | v2 中的职责或理由 |
 |---|---|---|
-| Public `Store`/`Batch` API 契约 | Rewrite | 保留 Stable-ID 与原子 Batch；删除 LogicalRevision，条件提交只比较 Mapping 当前 VAddr，公共层至多暴露 opaque observation token |
-| `internal/base` | Shrink at M6 | v2 暂时共享错误；旧 ID、Revision、VAddr、LogPos 类型在 v1 删除后移除 |
+| Public `Store`/`Batch` API 契约 | Rewritten | 根包直连 v2 Engine；公开 opaque `VersionToken`，不再存在 LogicalRevision |
+| `internal/base` | Shrunk | 只保留 v2 共享错误；旧 ID、Revision、VAddr、LogPos 类型已删除 |
 | `internal/filelock` | Keep | 单目录进程级独占锁与 v2 生命周期职责完全一致；v2 Open 在任何可变恢复前取得锁，Close 最后释放 |
 | `internal/bootstrap` | Keep | v2 初始化唯一所有者；以初始 Manifest 编码作为恢复 marker |
-| `internal/allocator` | Delete at M6 | 已由 `internal/idalloc` 替代 |
-| `internal/batch` | Delete at M6 | 已由 `internal/transaction` 替代 |
-| `internal/commit` | Delete at M6 | 已由 `internal/coordinator` 替代 |
-| `internal/appendlog` | Delete | 旧 Sequencer、业务 Frame 构造和 buffer 与 RecordLog v2 重复 |
+| `internal/allocator` | Deleted | 已由 `internal/idalloc` 替代 |
+| `internal/batch` | Deleted | 已由 `internal/transaction` 替代 |
+| `internal/commit` | Deleted | 已由 `internal/coordinator` 替代 |
+| `internal/appendlog` | Deleted | 旧 Sequencer、业务 Frame 构造和 buffer 与 RecordLog v2 重复 |
 | `internal/recordlog` | Keep | v2 唯一物理日志：有界队列、batching、VAddr、Segment、rotation、Reader Pin 与恢复 |
-| `internal/segment` | Delete at M6 | 物理读、Reader Pin 和 rotation 已由 `internal/recordlog` 原生拥有 |
-| `internal/rotation` | Delete at M6 | rotation 已分别由 RecordLog 和 MapStore 原生拥有 |
-| `internal/catalog` | Delete at M6 | 已由 `internal/storecatalog` 替代 |
-| `internal/manifest` | Delete at M6 | Manifest codec/install 已由 `internal/storecatalog` 替代 |
-| `internal/format` | Delete at M6 | v2 格式已拆分到 `recordcodec`、`recordlog`、`mapstore`、`storecatalog` |
-| `internal/mapping/api` | Delete at M6 | 已由 `internal/mapping` 的单一 Index 契约替代 |
-| `internal/mapping/memory` | Delete at M6 | v2 测试模型已位于 `internal/mapping`，不保留第二套 Mapping |
-| `internal/mapping/radix` | Delete at M6 | 已由 `internal/mapping`、`internal/radix`、`internal/mapstore` 替代 |
-| `internal/recovery` | Delete at M6 | 已由 `internal/replay` 替代 |
-| `data_gc.go` | Rewrite | 保留 liveness/CAS/Reader Pin/删除顺序，不保留旧 Segment 和 Frame 接口 |
-| `internal/maintenance` | Rewrite | journal 机制可借鉴，但状态字段必须原生服从 v2 Catalog |
-| `internal/backup` | Rewrite | 文件集合与格式改变，不允许在旧清单结构上补兼容分支 |
-| `internal/verify` | Rewrite | verifier 必须原生理解 Format v2，不能双格式猜测 |
-| metrics/export | Rewrite | 指标名称可以复用；采集结构直接围绕 v2 水位和唯一 writer 生成 |
+| `internal/segment` | Deleted | 物理读、Reader Pin 和 rotation 已由 `internal/recordlog` 原生拥有 |
+| `internal/rotation` | Deleted | rotation 已分别由 RecordLog 和 MapStore 原生拥有 |
+| `internal/catalog` | Deleted | 已由 `internal/storecatalog` 替代 |
+| `internal/manifest` | Deleted | Manifest codec/install 已由 `internal/storecatalog` 替代 |
+| `internal/format` | Deleted | v2 格式已拆分到 `recordcodec`、`recordlog`、`mapstore`、`storecatalog` |
+| `internal/mapping/api` | Deleted | 已由 `internal/mapping` 的单一 Index 契约替代 |
+| `internal/mapping/memory` | Deleted | v2 测试模型位于 `internal/mapping`，不保留第二套 Mapping |
+| `internal/mapping/radix` | Deleted | 已由 `internal/mapping`、`internal/radix`、`internal/mapstore` 替代 |
+| `internal/recovery` | Deleted | 已由 `internal/replay` 替代 |
+| `data_gc.go` | Deleted/Rewritten | 旧文件已删除；v2 GC 原生位于 `internal/engine`、`recordlog`、`segmentstats` 和 `maintstate` |
+| `internal/maintenance` | Deleted/Rewritten | 旧 journal 已删除；v2 marker 位于 `internal/maintstate` |
+| `internal/backup` | Deleted, future rewrite | v2 原生 Backup 尚未实现，不保留旧格式代码 |
+| `internal/verify` | Deleted, future rewrite | v2 原生 verifier 尚未实现，不保留旧格式代码 |
+| metrics/export | Deleted, future rewrite | v2 原生 metrics 尚未实现，不保留旧 runtime 采集结构 |
 | fault/crash/model tests | Keep 测试意图 | 测试代码按新接口重写，故障矩阵和性质继续作为验收标准 |
 
 矩阵中的决定面向最终主路径。Rewrite 可以复用经过证明的不变量、算法和测试性质，但不复制旧
@@ -129,10 +129,10 @@ v2 不再存在：
 
 ### M6：删除旧系统
 
-- 删除 `internal/appendlog` 和不再引用的 Format v1 组件；
-- 删除旧 runtime、rotation、recovery 和兼容测试；
-- `rg` 验证不存在 fallback、legacy、v1 runtime 分支；
-- 全量 race/fuzz/crash/soak 后才允许把 v2 作为 main 候选。
+- 已删除 `internal/appendlog` 和不再引用的 Format v1 组件；
+- 已删除旧 runtime、rotation、recovery 和兼容测试；
+- 已用源码扫描和 `go list -deps` 验证生产依赖不存在 v1 路径；
+- 全量 unit、race、短 fuzz 和 process-crash 测试已通过；长期 soak 仍属于 production-ready 门禁。
 
 ## 6. 每个模块开工前的问题
 

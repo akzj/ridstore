@@ -11,8 +11,8 @@ uint64 ID -> variable-length bytes
 ```
 
 它提供原子 Batch、durable commit、单 Record 读取和稳定 ID，不提供业务 Revision、MVCC、自动读集、
-Serializable 隔离或跨多次 Get 的 Snapshot。旧 [api-contract.md](api-contract.md) 描述仍在 v1 公开
-runtime 中存在的 API；v2 切换时必须 Rewrite，不能通过 adapter 同时维持 Revision 与地址条件两套模型。
+Serializable 隔离或跨多次 Get 的 Snapshot。根包公开 API 已在 M6 直接切换到 v2 Engine；旧
+[api-contract.md](api-contract.md) 仅是 Format v1 历史记录，代码中不存在 Revision adapter 或双运行时。
 
 ## 2. 内部唯一事实
 
