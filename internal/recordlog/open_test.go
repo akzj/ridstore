@@ -242,6 +242,115 @@ func TestCleanupRetiredSegmentIsIdempotentAcrossRestartStates(t *testing.T) {
 	}
 }
 
+func TestRetiredSegmentCleanupFaultsConvergeOnRetry(t *testing.T) {
+	points := []FaultPoint{
+		FaultBeforeTrashRootSync,
+		FaultBeforeRetireRename,
+		FaultBeforeRecordsDirSync,
+		FaultBeforeTrashDirSync,
+		FaultBeforeTrashRemove,
+		FaultBeforeTrashFinalSync,
+	}
+	for _, point := range points {
+		t.Run(string(point), func(t *testing.T) {
+			root := prepareSealedRetirementFile(t)
+			injected := errors.New("injected retirement failure")
+			err := CleanupRetiredSegmentWithFaultHook(root, 1, 9, func(got FaultPoint) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			})
+			if !errors.Is(err, injected) {
+				t.Fatalf("cleanup err=%v", err)
+			}
+			if err := CleanupRetiredSegment(root, 1, 9); err != nil {
+				t.Fatalf("retry cleanup: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(recordsPath(root), sealedSegmentName(1))); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("sealed file remains: %v", err)
+			}
+			trash := filepath.Join(root, "trash", sealedSegmentName(1)+".g9.trash")
+			if _, err := os.Stat(trash); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("trash file remains: %v", err)
+			}
+		})
+	}
+}
+
+func TestRetireFaultAfterCatalogRemovalPoisonsLog(t *testing.T) {
+	root := t.TempDir()
+	state := initialCatalog(512, 256)
+	if err := CreateInitialSegment(root, state.LogID, state.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	catalog := &memoryCatalog{state: state}
+	injected := errors.New("injected retire failure")
+	log, err := OpenWithFaultHook(root, testLogConfig(), catalog, func(got FaultPoint) error {
+		if got == FaultBeforeRetireRename {
+			return injected
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), true); err != nil {
+		t.Fatal(err)
+	}
+	generation := catalog.SnapshotRecordLog().Generation
+	if err := log.RetireSegment(context.Background(), 1, generation); !errors.Is(err, ErrPoisoned) || !errors.Is(err, injected) {
+		t.Fatalf("retire err=%v", err)
+	}
+	if _, ok := catalog.SnapshotRecordLog().sealedSummary(1); ok {
+		t.Fatal("Catalog removal did not precede physical cleanup")
+	}
+	if _, err := log.Append(context.Background(), []byte("rejected"), true); !errors.Is(err, ErrPoisoned) {
+		t.Fatalf("append err=%v", err)
+	}
+	_ = log.Close()
+	if err := CleanupRetiredSegment(root, 1, catalog.SnapshotRecordLog().Generation); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupRetiredSegmentRejectsSymlinkTrashDirectory(t *testing.T) {
+	root := prepareSealedRetirementFile(t)
+	if err := os.Symlink("records", filepath.Join(root, "trash")); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupRetiredSegment(root, 1, 9); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("cleanup err=%v", err)
+	}
+}
+
+func prepareSealedRetirementFile(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	state := initialCatalog(512, 256)
+	if err := CreateInitialSegment(root, state.LogID, state.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	catalog := &memoryCatalog{state: state}
+	log, err := Open(root, testLogConfig(), catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 func TestRotationJournalRejectsCorruption(t *testing.T) {
 	state := initialCatalog(1024, 512)
 	addr, err := NewVAddr(1, SegmentHeaderSize, 64)

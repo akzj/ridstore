@@ -60,6 +60,7 @@ func OpenWithFaultHook(root string, cfg Config, catalog CatalogPort, hook FaultH
 	log.root = root
 	log.catalog = catalog
 	log.files = files
+	log.hook = hook
 	return log, nil
 }
 

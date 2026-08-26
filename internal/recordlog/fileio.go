@@ -24,6 +24,7 @@ type fileBackend interface {
 	openFile(string, int, fs.FileMode) (fileHandle, error)
 	mkdir(string, fs.FileMode) error
 	stat(string) (fs.FileInfo, error)
+	lstat(string) (fs.FileInfo, error)
 	remove(string) error
 	rename(string, string) error
 	syncDir(string) error
@@ -37,6 +38,7 @@ func (osFileBackend) openFile(name string, flag int, mode fs.FileMode) (fileHand
 }
 func (osFileBackend) mkdir(name string, mode fs.FileMode) error { return os.Mkdir(name, mode) }
 func (osFileBackend) stat(name string) (fs.FileInfo, error)     { return os.Stat(name) }
+func (osFileBackend) lstat(name string) (fs.FileInfo, error)    { return os.Lstat(name) }
 func (osFileBackend) remove(name string) error                  { return os.Remove(name) }
 func (osFileBackend) rename(oldPath, newPath string) error      { return os.Rename(oldPath, newPath) }
 func (b osFileBackend) syncDir(path string) error {

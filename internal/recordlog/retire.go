@@ -56,7 +56,10 @@ func (l *Log) RetireSegment(ctx context.Context, id SegmentID, expectGeneration 
 	if err := segment.close(); err != nil {
 		return err
 	}
-	return cleanupRetiredSegment(l.root, id, installed.Generation, l.files)
+	if err := cleanupRetiredSegment(l.root, id, installed.Generation, l.files, l.hook); err != nil {
+		return l.setTerminal(err)
+	}
+	return nil
 }
 
 // CleanupRetiredSegment completes the physical half of a retirement whose
@@ -66,11 +69,20 @@ func CleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64) 
 	if root == "" || id == 0 || catalogGeneration == 0 {
 		return ErrInvalidConfig
 	}
-	return cleanupRetiredSegment(root, id, catalogGeneration, osFileBackend{})
+	return CleanupRetiredSegmentWithFaultHook(root, id, catalogGeneration, nil)
 }
 
-func cleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64, files fileBackend) error {
-	trash, err := ensureTrashDirectory(root, files)
+// CleanupRetiredSegmentWithFaultHook exposes durable cleanup boundaries to
+// recovery tests without making the filesystem backend configurable.
+func CleanupRetiredSegmentWithFaultHook(root string, id SegmentID, catalogGeneration uint64, hook FaultHook) error {
+	if root == "" || id == 0 || catalogGeneration == 0 {
+		return ErrInvalidConfig
+	}
+	return cleanupRetiredSegment(root, id, catalogGeneration, osFileBackend{}, hook)
+}
+
+func cleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64, files fileBackend, hook FaultHook) error {
+	trash, err := ensureTrashDirectory(root, files, hook)
 	if err != nil {
 		return err
 	}
@@ -89,19 +101,37 @@ func cleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64, 
 		return fmt.Errorf("retired source and trash both exist: %w", ErrCorrupt)
 	}
 	if sourceExists {
+		if err := hitSegmentFault(hook, faultBeforeRetireRename); err != nil {
+			return err
+		}
 		if err := files.rename(source, destination); err != nil {
-			return err
-		}
-		if err := files.syncDir(recordsPath(root)); err != nil {
-			return err
-		}
-		if err := files.syncDir(trash); err != nil {
 			return err
 		}
 		destinationExists = true
 	}
 	if destinationExists {
+		// A previous call may have observed an error after cross-directory
+		// rename. Stabilize both directory entries before unlinking the only
+		// remaining copy.
+		if err := hitSegmentFault(hook, faultBeforeRecordsDirSync); err != nil {
+			return err
+		}
+		if err := files.syncDir(recordsPath(root)); err != nil {
+			return err
+		}
+		if err := hitSegmentFault(hook, faultBeforeTrashDirSync); err != nil {
+			return err
+		}
+		if err := files.syncDir(trash); err != nil {
+			return err
+		}
+		if err := hitSegmentFault(hook, faultBeforeTrashRemove); err != nil {
+			return err
+		}
 		if err := files.remove(destination); err != nil {
+			return err
+		}
+		if err := hitSegmentFault(hook, faultBeforeTrashFinalSync); err != nil {
 			return err
 		}
 		return files.syncDir(trash)
@@ -109,10 +139,13 @@ func cleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64, 
 	return nil
 }
 
-func ensureTrashDirectory(root string, files fileBackend) (string, error) {
+func ensureTrashDirectory(root string, files fileBackend, hook FaultHook) (string, error) {
 	dir := filepath.Join(root, "trash")
 	err := files.mkdir(dir, 0o700)
 	if err == nil {
+		if err := hitSegmentFault(hook, faultBeforeTrashRootSync); err != nil {
+			return "", err
+		}
 		if err := files.syncDir(root); err != nil {
 			return "", err
 		}
@@ -121,11 +154,11 @@ func ensureTrashDirectory(root string, files fileBackend) (string, error) {
 	if !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
-	info, statErr := files.stat(dir)
+	info, statErr := files.lstat(dir)
 	if statErr != nil {
 		return "", statErr
 	}
-	if !info.IsDir() {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("trash path is not a directory: %w", ErrCorrupt)
 	}
 	return dir, nil

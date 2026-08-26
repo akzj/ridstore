@@ -31,6 +31,12 @@ const (
 	faultBeforeSealDirSync    segmentFaultPoint = "recordlog.segment.before-seal-dir-sync"
 	faultBeforeJournalRemove  segmentFaultPoint = "recordlog.rotation.before-journal-remove"
 	faultBeforeCleanupDirSync segmentFaultPoint = "recordlog.rotation.before-cleanup-dir-sync"
+	faultBeforeRetireRename   segmentFaultPoint = "recordlog.retire.before-rename"
+	faultBeforeRecordsDirSync segmentFaultPoint = "recordlog.retire.before-records-dir-sync"
+	faultBeforeTrashDirSync   segmentFaultPoint = "recordlog.retire.before-trash-dir-sync"
+	faultBeforeTrashRemove    segmentFaultPoint = "recordlog.retire.before-trash-remove"
+	faultBeforeTrashFinalSync segmentFaultPoint = "recordlog.retire.before-trash-final-sync"
+	faultBeforeTrashRootSync  segmentFaultPoint = "recordlog.retire.before-trash-root-sync"
 )
 
 type segmentFaultHook func(segmentFaultPoint) error
@@ -59,6 +65,12 @@ const (
 	FaultBeforeCreateDirSync  = faultBeforeCreateDirSync
 	FaultBeforeJournalRemove  = faultBeforeJournalRemove
 	FaultBeforeCleanupDirSync = faultBeforeCleanupDirSync
+	FaultBeforeRetireRename   = faultBeforeRetireRename
+	FaultBeforeRecordsDirSync = faultBeforeRecordsDirSync
+	FaultBeforeTrashDirSync   = faultBeforeTrashDirSync
+	FaultBeforeTrashRemove    = faultBeforeTrashRemove
+	FaultBeforeTrashFinalSync = faultBeforeTrashFinalSync
+	FaultBeforeTrashRootSync  = faultBeforeTrashRootSync
 )
 
 type SegmentSummary struct {

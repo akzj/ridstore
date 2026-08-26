@@ -86,6 +86,7 @@ type Log struct {
 	root            string
 	catalog         CatalogPort
 	files           fileBackend
+	hook            FaultHook
 	requests        chan *appendRequest
 	done            chan struct{}
 	budget          *byteBudget
