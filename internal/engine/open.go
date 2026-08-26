@@ -10,6 +10,7 @@ import (
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
+	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/radix"
@@ -80,9 +81,10 @@ func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 }
 
 type openFaultHooks struct {
-	catalog   storecatalog.FaultHook
-	mapStore  mapstore.FaultHook
-	recordLog recordlog.FaultHook
+	catalog     storecatalog.FaultHook
+	mapStore    mapstore.FaultHook
+	recordLog   recordlog.FaultHook
+	maintenance maintstate.FaultHook
 }
 
 func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks) (*Store, error) {
@@ -117,7 +119,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return nil, err
 	}
-	if err := recoverMaintenance(root, catalog); err != nil {
+	if err := recoverMaintenance(root, catalog, hooks.maintenance, hooks.recordLog); err != nil {
 		return nil, err
 	}
 	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, catalog, hooks.recordLog)
@@ -180,6 +182,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.mapStore = physicalMapping
 	store.catalog = catalog
 	store.maintenance = log
+	store.maintenanceHook = hooks.maintenance
 	store.root = root
 	store.maxStats = config.MaxSegmentStats
 	store.dirLock = dirLock

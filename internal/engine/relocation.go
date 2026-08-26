@@ -147,13 +147,19 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		BaseGeneration: proof.CatalogGeneration, CoveredCommitSeq: proof.CoveredCommitSeq,
 		ReplayStart: proof.ReplayStart, Source: proof.Source,
 	}
-	if err := maintstate.Install(s.root, state); err != nil {
+	if err := maintstate.InstallWithFaultHook(s.root, state, s.maintenanceHook); err != nil {
+		_, markerVisible, loadErr := maintstate.Load(s.root)
+		if loadErr != nil || markerVisible {
+			recoveryErr := errors.Join(base.ErrRecoveryRequired, err, loadErr)
+			s.setFault(recoveryErr)
+			return result, recoveryErr
+		}
 		return result, err
 	}
 	if err := s.maintenance.RetireSegment(ctx, source, proof.CatalogGeneration); err != nil {
 		current := s.catalog.Snapshot()
 		if current.Generation == proof.CatalogGeneration && containsSealedSegment(current, proof.Source) {
-			cleanupErr := maintstate.Remove(s.root)
+			cleanupErr := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook)
 			if cleanupErr == nil {
 				return result, err
 			}
@@ -165,7 +171,7 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		s.setFault(recoveryErr)
 		return result, recoveryErr
 	}
-	if err := maintstate.Remove(s.root); err != nil {
+	if err := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook); err != nil {
 		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
 		s.setFault(recoveryErr)
 		return result, recoveryErr

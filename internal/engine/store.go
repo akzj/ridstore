@@ -10,6 +10,7 @@ import (
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
+	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
@@ -51,6 +52,7 @@ type Store struct {
 
 	log                    Log
 	maintenance            maintenanceLog
+	maintenanceHook        maintstate.FaultHook
 	root                   string
 	mapping                *mapping.Persistent
 	mapStore               *mapstore.Store
