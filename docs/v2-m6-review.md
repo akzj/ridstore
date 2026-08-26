@@ -69,8 +69,9 @@ relocation CAS、Reader Pin 和退休前精确证明。
 
 后续优先级：
 
-1. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
-2. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
+1. 按 `v2-verify-design.md` 实现 Offline Verify；
+2. 按需重新设计 Backup、Metrics 与长时 soak；
+3. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
 
 M6 后的第一个完整性迭代已经为 terminal Batch Status 增加有界保留、admission 驱动的 Checkpoint 和
 Replay 容量门禁；CommitUnknown 的恢复查询语义保持不变。

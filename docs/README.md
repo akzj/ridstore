@@ -18,6 +18,7 @@
 11. [Fault Matrix](v2-fault-matrix.md)：当前故障注入覆盖；
 12. [M6 Review](v2-m6-review.md)：公开切换、v1 删除边界与验证证据。
 13. [磁盘空间 Admission](v2-space-admission.md)：用户写入水位、控制面 headroom 与 ENOSPC 边界。
+14. [v2 Offline Verify](v2-verify-design.md)：只读审计边界、证据分层与实现阶段。
 
 阶段 Review：
 
