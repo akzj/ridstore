@@ -365,6 +365,44 @@ func (l *Log) Scan(ctx context.Context, from LogPos, visit func(AppendResult, []
 	return nil
 }
 
+// ScanSegment pins and scans one sealed Segment. The pin prevents retirement
+// for the whole callback sequence; RecordLog validates physical framing and
+// payload CRC but deliberately does not interpret the payload protocol.
+func (l *Log) ScanSegment(ctx context.Context, id SegmentID, visit func(AppendResult, []byte) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if id == 0 || visit == nil {
+		return ErrInvalidConfig
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.submitMu.RLock()
+	closed := l.closing
+	l.submitMu.RUnlock()
+	l.stateMu.RLock()
+	terminal := l.terminal
+	l.stateMu.RUnlock()
+	if terminal != nil {
+		return terminal
+	}
+	if closed {
+		return ErrClosed
+	}
+	pin, err := l.registry.pin(id)
+	if err != nil {
+		return err
+	}
+	scanErr := pin.scanSealed(SegmentHeaderSize, func(result AppendResult, payload []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return visit(result, payload)
+	})
+	return errors.Join(scanErr, pin.release())
+}
+
 func (l *Log) snapshotForScan() scanSnapshot {
 	l.stateMu.RLock()
 	defer l.stateMu.RUnlock()

@@ -27,6 +27,10 @@ type Log interface {
 	Close() error
 }
 
+type maintenanceLog interface {
+	ScanSegment(context.Context, recordlog.SegmentID, func(recordlog.AppendResult, []byte) error) error
+}
+
 type Config struct {
 	Batch          transaction.Limits
 	Commit         coordinator.Config
@@ -39,26 +43,29 @@ type Record struct {
 }
 
 type Store struct {
-	ops          sync.RWMutex
-	mu           sync.Mutex
-	checkpointMu sync.Mutex
+	ops           sync.RWMutex
+	mu            sync.Mutex
+	checkpointMu  sync.Mutex
+	maintenanceMu sync.Mutex
 
-	log       Log
-	mapping   *mapping.Persistent
-	mapStore  *mapstore.Store
-	catalog   *storecatalog.Manager
-	ids       *idalloc.Allocator
-	batches   *idalloc.Allocator
-	commits   *coordinator.Coordinator
-	limits    transaction.Limits
-	maxOpen   int
-	open      map[model.BatchID]*Batch
-	openCount int
-	notify    chan struct{}
-	closed    bool
-	fault     error
-	maxStats  uint64
-	dirLock   *filelock.Lock
+	log                    Log
+	maintenance            maintenanceLog
+	mapping                *mapping.Persistent
+	mapStore               *mapstore.Store
+	catalog                *storecatalog.Manager
+	ids                    *idalloc.Allocator
+	batches                *idalloc.Allocator
+	commits                *coordinator.Coordinator
+	limits                 transaction.Limits
+	maxOpen                int
+	open                   map[model.BatchID]*Batch
+	openCount              int
+	notify                 chan struct{}
+	closed                 bool
+	fault                  error
+	maxStats               uint64
+	maxRelocationMutations uint64
+	dirLock                *filelock.Lock
 }
 
 func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
@@ -72,6 +79,7 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 	return &Store{
 		log: log, mapping: current, ids: ids, batches: batches, commits: commits,
 		limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch), notify: make(chan struct{}),
+		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
 	}, nil
 }
 

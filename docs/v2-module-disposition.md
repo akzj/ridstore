@@ -119,8 +119,9 @@ v2 不再存在：
 
 ### M5：GC 与维护
 
-- 重写 SegmentStats、Relocation 和 retire/delete；
-- 接入 Reader Pin；
+- SegmentStats 已由 Checkpoint 精确派生；
+- Relocation 已接入 sealed Segment pin/scan、共享 BatchID、唯一 Coordinator 和 Mapping VAddr CAS；
+- 下一步建立 Checkpoint coverage、二次精确 liveness 证明，再接入 retire/delete；
 - 完成 GC crash matrix 和 model test。
 
 ### M6：删除旧系统

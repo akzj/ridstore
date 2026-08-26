@@ -176,6 +176,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	}
 	store.mapStore = physicalMapping
 	store.catalog = catalog
+	store.maintenance = log
 	store.maxStats = config.MaxSegmentStats
 	store.dirLock = dirLock
 	return store, nil

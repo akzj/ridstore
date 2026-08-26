@@ -96,6 +96,22 @@ func TestOpenUsesCatalogAndDurablyRotates(t *testing.T) {
 	if installed.Generation != 2 || installed.ActiveSegmentID != 2 || len(installed.SealedSegments) != 1 {
 		t.Fatalf("catalog=%+v", installed)
 	}
+	var scanned []string
+	if err := log.ScanSegment(context.Background(), 1, func(result AppendResult, payload []byte) error {
+		if result.Addr.SegmentID() != 1 {
+			t.Fatalf("scanned addr=%v", result.Addr)
+		}
+		scanned = append(scanned, string(payload))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(scanned) != 1 || len(scanned[0]) != 200 {
+		t.Fatalf("scanned=%d", len(scanned))
+	}
+	if err := log.ScanSegment(context.Background(), 2, func(AppendResult, []byte) error { return nil }); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("scan active err=%v", err)
+	}
 	if _, err := os.Stat(rotationJournalPath(root)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal remains: %v", err)
 	}

@@ -240,16 +240,17 @@ type CatalogPort interface {
 
 ```go
 type Maintenance interface {
-    PinSegment(id uint32) (SegmentPin, error)
     ScanSegment(ctx context.Context, id uint32, visit func(AppendResult, []byte) error) error
-    BeginRetire(id uint32) error
-    WaitNoReaders(ctx context.Context, id uint32) error
-    RemoveRetired(ctx context.Context, id uint32) error
+    RetireSegment(ctx context.Context, id uint32, expectGeneration uint64) error
 }
 ```
 
-这些方法只执行物理生命周期，不判断 liveness。GC 必须先完成 Mapping CAS、Checkpoint 和 Catalog
-移除，再调用删除步骤。最终 API 在 GC 协议实现前冻结，不能先为旧 Registry 写 wrapper。
+`ScanSegment` 只接受 sealed Segment，并在整个扫描期间持有内部 Reader Pin；callback 得到通过 RecordLog
+envelope CRC 校验的完整 payload。RecordLog 不解析 Put、Commit 或 GC 语义。
+
+这些方法只执行物理生命周期，不判断 liveness。GC 必须先完成 Mapping CAS、Checkpoint 和精确
+liveness 证明，才可调用 `RetireSegment`。后者内部执行 retire gate、等待 Reader Pin、Catalog 移除、
+detach、close、trash rename 和删除。Catalog 移除失败时撤销 retire gate。
 
 ## 12. Close 与错误
 

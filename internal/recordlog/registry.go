@@ -62,6 +62,21 @@ type segmentPin struct {
 	released bool
 }
 
+func (p *segmentPin) scanSealed(start uint32, visit func(AppendResult, []byte) error) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.released || p.registry == nil {
+		return ErrClosed
+	}
+	p.registry.mu.Lock()
+	state, sealed := p.entry.state, p.entry.sealed
+	p.registry.mu.Unlock()
+	if state != segmentSealed || sealed == nil {
+		return ErrInvalidConfig
+	}
+	return sealed.scan(start, visit)
+}
+
 func newSegmentRegistry(active *activeSegment, sealed []*sealedSegment) (*segmentRegistry, error) {
 	if active == nil || active.file == nil || active.header.SegmentID == 0 {
 		return nil, ErrInvalidConfig
