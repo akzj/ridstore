@@ -132,7 +132,8 @@ trash 已删除但 marker 尚在。成功后必须通过 v2 Offline Verify，且
 
 1. **G1 streaming rebuild（已实现）**：Radix 有界流式 builder 与独立 GenerationWriter；
 2. **G2 catalog transaction（已实现）**：Mapping file-set 原子替换及字段不变性测试；
-3. **G3 durable recovery**：独立 marker、promotion/retirement 和 fresh-open 收敛；
+3. **G3 durable recovery（进行中）**：独立 marker 的有界格式、CRC、原子发布/清理及 Verify 门禁已实现；
+   staging promotion、旧文件 retirement 和 fresh-open 收敛尚未实现；
 4. **G4 runtime switch**：Engine 锁序、checkpoint cut、Persistent rebase 和公开显式入口；
 5. **G5 evidence**：fault matrix、process-exit、race、Verify 与重复 GC 收敛测试。
 
