@@ -121,7 +121,8 @@ v2 不再存在：
 
 - SegmentStats 已由 Checkpoint 精确派生；
 - Relocation 已接入 sealed Segment pin/scan、共享 BatchID、唯一 Coordinator 和 Mapping VAddr CAS；
-- 下一步建立 Checkpoint coverage、二次精确 liveness 证明，再接入 retire/delete；
+- Checkpoint coverage、open-batch gate 和二次精确 liveness 证明已组合为退休前 proof；
+- 下一步建立可恢复 maintenance journal，再接入 retire/delete；
 - 完成 GC crash matrix 和 model test。
 
 ### M6：删除旧系统

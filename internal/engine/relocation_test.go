@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -48,6 +49,61 @@ func TestRelocateSegmentReportsCommitSequenceRangeAcrossBatches(t *testing.T) {
 	if result.Applied < 2 || result.FirstCommitSeq == 0 ||
 		uint64(result.LastCommitSeq-result.FirstCommitSeq)+1 != result.Applied {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestPrepareSegmentRetirementCheckpointsAndProvesNoLiveMapping(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	proof, relocated, err := store.PrepareSegmentRetirement(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.Source.SegmentID != source || proof.CatalogGeneration == 0 ||
+		proof.CoveredCommitSeq < relocated.LastCommitSeq || !proof.ReplayStart.Valid() {
+		t.Fatalf("proof=%+v relocated=%+v", proof, relocated)
+	}
+	manifest := store.catalog.Snapshot()
+	if manifest.Generation != proof.CatalogGeneration || manifest.CoveredCommitSeq != proof.CoveredCommitSeq {
+		t.Fatalf("manifest=%+v proof=%+v", manifest, proof)
+	}
+	for _, stat := range manifest.SegmentStats {
+		if stat.SegmentID == source && (stat.LiveBytes != 0 || stat.LiveRecords != 0) {
+			t.Fatalf("source remains live in checkpoint: %+v", stat)
+		}
+	}
+}
+
+func TestPrepareSegmentRetirementRejectsOpenBatchReference(t *testing.T) {
+	store := newRelocationStore(t)
+	pending, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.Create(context.Background(), []byte("open-before-rotation")); err != nil {
+		t.Fatal(err)
+	}
+	source := recordlog.SegmentID(1)
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := store.PrepareSegmentRetirement(context.Background(), source); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("prepare err=%v", err)
+	}
+	if err := pending.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	proof, _, err := store.PrepareSegmentRetirement(context.Background(), source)
+	if err != nil || proof.Source.SegmentID != source {
+		t.Fatalf("proof=%+v err=%v", proof, err)
 	}
 }
 
@@ -124,23 +180,7 @@ func (l *blockingCopyLog) Append(ctx context.Context, payload []byte, syncWrite 
 
 func relocationFixture(t *testing.T) (*Store, recordlog.SegmentID, model.ID, recordlog.VAddr, model.BatchID) {
 	t.Helper()
-	config := testCreateConfig()
-	config.HardLimits.SegmentSize = 8192
-	config.HardLimits.MaxValueSize = 512
-	config.HardLimits.MaxBatchBytes = 2048
-	config.HardLimits.MaxBatchMutations = 4
-	config.HardLimits.MaxRecordLogPayload = 1024
-	config.Runtime.RecordLog.BufferBytes = 2048
-	config.Runtime.Commit.MaxGroupPayload = 1024
-	store, err := Create(context.Background(), t.TempDir(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil && !errors.Is(err, recordlog.ErrClosed) {
-			t.Errorf("close: %v", err)
-		}
-	})
+	store := newRelocationStore(t)
 
 	batch, err := store.Begin(context.Background())
 	if err != nil {
@@ -172,4 +212,27 @@ func relocationFixture(t *testing.T) (*Store, recordlog.SegmentID, model.ID, rec
 		}
 	}
 	return store, source, id, record.Addr, origin
+}
+
+func newRelocationStore(t *testing.T) *Store {
+	t.Helper()
+	config := testCreateConfig()
+	config.HardLimits.SegmentSize = 8192
+	config.HardLimits.MaxValueSize = 512
+	config.HardLimits.MaxBatchBytes = 2048
+	config.HardLimits.MaxBatchMutations = 4
+	config.HardLimits.MaxRecordLogPayload = 1024
+	config.Runtime.RecordLog.BufferBytes = 2048
+	config.Runtime.Commit.MaxGroupPayload = 1024
+	store, err := Create(context.Background(), t.TempDir(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil && !errors.Is(err, recordlog.ErrClosed) {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	return store
 }
