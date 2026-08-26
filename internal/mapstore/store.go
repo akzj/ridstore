@@ -451,6 +451,10 @@ func verifyHeader(file *os.File, expected SegmentHeader) error {
 }
 
 func scanNodes(file *os.File, header SegmentHeader, end uint32, root model.MapAddr) (SegmentSummary, bool, error) {
+	return scanNodesWithVisitor(file, header, end, root, nil)
+}
+
+func scanNodesWithVisitor(file *os.File, header SegmentHeader, end uint32, root model.MapAddr, visit func(model.MapAddr, Node, uint32) error) (SegmentSummary, bool, error) {
 	result := SegmentSummary{SegmentID: header.SegmentID, ValidEnd: SegmentHeaderSize}
 	for result.ValidEnd < end {
 		remainingFile := end - result.ValidEnd
@@ -481,6 +485,15 @@ func scanNodes(file *os.File, header SegmentHeader, end uint32, root model.MapAd
 		decoded, _, err := DecodeNode(encoded, header.SegmentSize-SegmentFooterSize-result.ValidEnd)
 		if err != nil || decoded.NodeSeq != node.NodeSeq {
 			return SegmentSummary{}, false, errors.Join(ErrCorrupt, err)
+		}
+		if visit != nil {
+			addr, err := model.NewMapAddr(header.SegmentID, result.ValidEnd)
+			if err != nil {
+				return SegmentSummary{}, false, err
+			}
+			if err := visit(addr, decoded, size); err != nil {
+				return SegmentSummary{}, false, err
+			}
 		}
 		if result.NodeCount == 0 {
 			result.FirstSeq = decoded.NodeSeq
