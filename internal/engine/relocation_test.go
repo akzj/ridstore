@@ -19,7 +19,8 @@ func TestRelocateSegmentCopiesLivePutAndPreservesOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.LiveCandidates == 0 || result.Applied == 0 || result.Applied != result.CopiedRecords || result.Skipped != 0 {
+	if result.LiveCandidates == 0 || result.Applied == 0 || result.Applied != result.CopiedRecords || result.Skipped != 0 ||
+		result.FirstCommitSeq == 0 || result.LastCommitSeq < result.FirstCommitSeq {
 		t.Fatalf("result=%+v", result)
 	}
 	record, err := store.Get(context.Background(), id)
@@ -33,6 +34,20 @@ func TestRelocateSegmentCopiesLivePutAndPreservesOrigin(t *testing.T) {
 	put, err := recordcodec.DecodePut(payload, store.limits.MaxValueSize)
 	if err != nil || put.OriginBatchID != origin || put.RecordID != id {
 		t.Fatalf("put=%+v err=%v", put, err)
+	}
+}
+
+func TestRelocateSegmentReportsCommitSequenceRangeAcrossBatches(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	store.maxRelocationMutations = 1
+
+	result, err := store.RelocateSegment(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied < 2 || result.FirstCommitSeq == 0 ||
+		uint64(result.LastCommitSeq-result.FirstCommitSeq)+1 != result.Applied {
+		t.Fatalf("result=%+v", result)
 	}
 }
 

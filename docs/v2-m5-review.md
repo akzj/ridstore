@@ -21,6 +21,10 @@ RecordLog.ScanSegment(sealed source, held reader pin)
 复制保留 `RecordID`、Value 和 `OriginBatchID`。Relocation descriptor 使用新的内部 BatchID，并和用户
 Commit 共用 CommitSeq、group fsync、Delta reservation 和 Mapping publication。
 
+Engine 返回本轮 relocation descriptor 的 `FirstCommitSeq`/`LastCommitSeq`。后续删除协议必须要求
+durable Checkpoint 的 `CoveredCommitSeq >= LastCommitSeq`；不能用“搬迁调用已经返回”替代 checkpoint
+覆盖证明。没有 live candidate 时二者均为零。
+
 ## 2. 并发语义
 
 扫描时的 Mapping lookup 只是候选判断，不提供排他性。复制后、Coordinator resolve 前如果用户已经

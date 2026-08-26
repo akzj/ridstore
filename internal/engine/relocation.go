@@ -24,6 +24,8 @@ type SegmentRelocationResult struct {
 	CopiedValueBytes uint64
 	Applied          uint64
 	Skipped          uint64
+	FirstCommitSeq   model.CommitSeq
+	LastCommitSeq    model.CommitSeq
 }
 
 type copiedRecord struct {
@@ -102,6 +104,13 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 		if err != nil {
 			return err
 		}
+		if result.FirstCommitSeq == 0 {
+			result.FirstCommitSeq = published.CommitSeq
+		}
+		if published.CommitSeq <= result.LastCommitSeq {
+			return errors.Join(base.ErrCorrupt, errors.New("non-monotonic relocation commit sequence"))
+		}
+		result.LastCommitSeq = published.CommitSeq
 		result.Applied += uint64(published.Applied)
 		result.Skipped += uint64(published.Skipped)
 		pending = pending[:0]
