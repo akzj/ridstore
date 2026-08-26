@@ -11,6 +11,7 @@ import (
 	"github.com/akzj/ridstore/internal/bootstrap"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/maintstate"
+	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
@@ -84,6 +85,11 @@ func Verify(ctx context.Context, root string, config Config) (report Report, res
 		return report, base.ErrRecoveryRequired
 	}
 	if found, err := maintstate.RecoveryArtifacts(root); err != nil {
+		return report, err
+	} else if found {
+		return report, base.ErrRecoveryRequired
+	}
+	if found, err := mapgcstate.RecoveryArtifacts(root); err != nil {
 		return report, err
 	} else if found {
 		return report, base.ErrRecoveryRequired

@@ -9,6 +9,7 @@ import (
 
 	"github.com/akzj/ridstore"
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/verifier"
 )
@@ -84,6 +85,29 @@ func TestVerifyPhysicalReportsRecoveryWithoutChangingTail(t *testing.T) {
 	}
 	if before.Size() != after.Size() {
 		t.Fatalf("verify changed active size from %d to %d", before.Size(), after.Size())
+	}
+}
+
+func TestVerifyRejectsMappingGCMarker(t *testing.T) {
+	ctx := context.Background()
+	config := verifyCreateConfig(filepath.Join(t.TempDir(), "store"))
+	store, err := ridstore.Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(mapgcstate.Path(config.Dir)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mapgcstate.Path(config.Dir), []byte("incomplete"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{
+		MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024, MaxReplayStatuses: 1024,
+	}); !errors.Is(err, base.ErrRecoveryRequired) {
+		t.Fatalf("verify err=%v", err)
 	}
 }
 
