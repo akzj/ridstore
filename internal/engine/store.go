@@ -44,6 +44,22 @@ type Record struct {
 	Addr  recordlog.VAddr
 }
 
+type BatchState uint8
+
+const (
+	BatchStateOpen BatchState = iota + 1
+	BatchStateCommitting
+	BatchStateCommitted
+	BatchStateAborted
+	BatchStateCommitUnknown
+)
+
+type BatchStatus struct {
+	BatchID   model.BatchID
+	State     BatchState
+	CommitSeq model.CommitSeq
+}
+
 type Store struct {
 	ops           sync.RWMutex
 	mu            sync.Mutex
@@ -63,7 +79,10 @@ type Store struct {
 	limits                 transaction.Limits
 	maxOpen                int
 	open                   map[model.BatchID]*Batch
+	statuses               map[model.BatchID]BatchStatus
 	openCount              int
+	recoveryAbortedStart   uint64
+	recoveryAbortedEnd     uint64
 	notify                 chan struct{}
 	closed                 bool
 	fault                  error
@@ -82,9 +101,44 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 	}
 	return &Store{
 		log: log, mapping: current, ids: ids, batches: batches, commits: commits,
-		limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch), notify: make(chan struct{}),
+		limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
+		statuses: make(map[model.BatchID]BatchStatus), notify: make(chan struct{}),
 		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
 	}, nil
+}
+
+func (s *Store) Status(ctx context.Context, id model.BatchID) (BatchStatus, error) {
+	if id == 0 {
+		return BatchStatus{}, base.ErrInvalidID
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return BatchStatus{}, err
+	}
+	s.ops.RLock()
+	defer s.ops.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return BatchStatus{}, base.ErrClosed
+	}
+	if batch, ok := s.open[id]; ok {
+		state, seq := batch.inner.State()
+		return BatchStatus{BatchID: id, State: publicBatchState(state), CommitSeq: seq}, nil
+	}
+	if status, ok := s.statuses[id]; ok {
+		return status, nil
+	}
+	raw := uint64(id)
+	if raw >= s.recoveryAbortedStart && raw < s.recoveryAbortedEnd {
+		return BatchStatus{BatchID: id, State: BatchStateAborted}, nil
+	}
+	if raw < s.batches.IssuedHigh() {
+		return BatchStatus{}, base.ErrStatusExpired
+	}
+	return BatchStatus{}, base.ErrNotFound
 }
 
 func (s *Store) Begin(ctx context.Context) (*Batch, error) {
@@ -490,7 +544,11 @@ func terminal(batch *transaction.Batch) bool {
 
 func (b *Batch) finish() {
 	b.done.Do(func() {
+		state, seq := b.inner.State()
 		b.store.mu.Lock()
+		if terminalState := publicBatchState(state); terminalState == BatchStateCommitted || terminalState == BatchStateAborted || terminalState == BatchStateCommitUnknown {
+			b.store.statuses[b.ID()] = BatchStatus{BatchID: b.ID(), State: terminalState, CommitSeq: seq}
+		}
 		delete(b.store.open, b.ID())
 		if b.store.openCount > 0 {
 			b.store.openCount--
@@ -498,4 +556,21 @@ func (b *Batch) finish() {
 		b.store.signalLocked()
 		b.store.mu.Unlock()
 	})
+}
+
+func publicBatchState(state transaction.State) BatchState {
+	switch state {
+	case transaction.StateOpen, transaction.StateFailed:
+		return BatchStateOpen
+	case transaction.StateCommitting:
+		return BatchStateCommitting
+	case transaction.StateCommitted:
+		return BatchStateCommitted
+	case transaction.StateAborted:
+		return BatchStateAborted
+	case transaction.StateCommitUnknown:
+		return BatchStateCommitUnknown
+	default:
+		return 0
+	}
 }

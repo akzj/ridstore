@@ -217,6 +217,48 @@ func TestOpenBatchLimitBackpressuresAndReleases(t *testing.T) {
 	}
 }
 
+func TestBatchStatusTracksOpenAndTerminalOutcomes(t *testing.T) {
+	store := newStore(t, 2)
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := store.Status(context.Background(), batch.ID())
+	if err != nil || status.State != BatchStateOpen {
+		t.Fatalf("open status=%+v err=%v", status, err)
+	}
+	if _, err := batch.Create(context.Background(), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := batch.Commit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err = store.Status(context.Background(), batch.ID())
+	if err != nil || status.State != BatchStateCommitted || status.CommitSeq != result.CommitSeq {
+		t.Fatalf("committed status=%+v result=%+v err=%v", status, result, err)
+	}
+
+	aborted, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := aborted.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	status, err = store.Status(context.Background(), aborted.ID())
+	if err != nil || status.State != BatchStateAborted || status.CommitSeq != 0 {
+		t.Fatalf("aborted status=%+v err=%v", status, err)
+	}
+	if _, err := store.Status(context.Background(), model.BatchID(store.batches.IssuedHigh())); !errors.Is(err, base.ErrNotFound) {
+		t.Fatalf("future status err=%v", err)
+	}
+	delete(store.statuses, batch.ID())
+	if _, err := store.Status(context.Background(), batch.ID()); !errors.Is(err, base.ErrStatusExpired) {
+		t.Fatalf("expired status err=%v", err)
+	}
+}
+
 func TestRealRecordLogRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	logID := recordlog.LogID{1, 2, 3, 4}

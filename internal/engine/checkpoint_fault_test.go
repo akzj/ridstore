@@ -152,6 +152,7 @@ func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	batchID := batch.ID()
 	id, err := batch.Create(context.Background(), []byte("commit outcome recovered from log"))
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +160,10 @@ func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	armed.Store(true)
 	if _, err := batch.Commit(context.Background()); !errors.Is(err, base.ErrCommitUnknown) || !errors.Is(err, injected) {
 		t.Fatalf("commit err=%v", err)
+	}
+	status, err := store.Status(context.Background(), batchID)
+	if err != nil || status.State != BatchStateCommitUnknown || status.CommitSeq != 0 {
+		t.Fatalf("unknown status=%+v err=%v", status, err)
 	}
 	if _, err := store.Begin(context.Background()); !errors.Is(err, base.ErrReadOnly) {
 		t.Fatalf("begin after commit uncertainty err=%v", err)
@@ -178,6 +183,10 @@ func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	record, err := reopened.Get(context.Background(), id)
 	if err != nil || string(record.Value) != "commit outcome recovered from log" {
 		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	status, err = reopened.Status(context.Background(), batchID)
+	if err != nil || status.State != BatchStateCommitted || status.CommitSeq == 0 {
+		t.Fatalf("status=%+v err=%v", status, err)
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
@@ -201,6 +210,7 @@ func TestCommitSyncFailureWithPartialRecordRecoversAsAborted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	batchID := batch.ID()
 	id, err := batch.Create(context.Background(), []byte("orphan after torn commit"))
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +238,10 @@ func TestCommitSyncFailureWithPartialRecordRecoversAsAborted(t *testing.T) {
 	}
 	if _, err := reopened.Get(context.Background(), id); !errors.Is(err, base.ErrNotFound) {
 		t.Fatalf("torn commit became visible err=%v", err)
+	}
+	status, err := reopened.Status(context.Background(), batchID)
+	if err != nil || status.State != BatchStateAborted || status.CommitSeq != 0 {
+		t.Fatalf("status=%+v err=%v", status, err)
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)

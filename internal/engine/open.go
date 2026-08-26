@@ -183,6 +183,15 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.catalog = catalog
 	store.maintenance = log
 	store.maintenanceHook = hooks.maintenance
+	for id, status := range recovered.Statuses {
+		state := BatchStateAborted
+		if status.State == replay.BatchCommitted {
+			state = BatchStateCommitted
+		}
+		store.statuses[id] = BatchStatus{BatchID: id, State: state, CommitSeq: status.CommitSeq}
+	}
+	store.recoveryAbortedStart = manifest.IssuedBatchIDHighAtCut
+	store.recoveryAbortedEnd = recovered.ReservedBatchIDHigh
 	store.root = root
 	store.maxStats = config.MaxSegmentStats
 	store.dirLock = dirLock
