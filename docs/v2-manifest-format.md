@@ -51,7 +51,6 @@ type ManifestV2 struct {
 
     StatsCoveredCommitSeq uint64
     SegmentStats          []SegmentStats
-    MaintenanceGeneration uint64
 }
 ```
 
@@ -146,7 +145,6 @@ Catalog 串行化全部安装，但 mutation 权限按操作限定：
 | Checkpoint | MappingRoot 和完整 checkpoint tuple；允许替换对应 Mapping file set |
 | Data GC publish | 移除已证明安全的 SealedData summary、更新对应 stats |
 | Mapping GC publish | 移除新 Root 不再引用的 Mapping segments |
-| Maintenance | MaintenanceGeneration 和已定义的 maintenance state |
 
 每个 mutation 必须携带 expected generation。Catalog 在锁内复制当前 Manifest、验证调用者只能改变
 获准字段、完整执行全局 validation，随后安装。不能向调用者暴露任意 `func(*Manifest)`。
@@ -246,7 +244,7 @@ Container Header 固定 64 bytes：
 | 5 | active/next Mapping SegmentID |
 | 6 | sealed MapSegmentSummary 数组 |
 | 7 | MappingRoot |
-| 8 | checkpoint tuple 和 MaintenanceGeneration |
+| 8 | checkpoint tuple；末尾 16 bytes reserved，必须为零 |
 | 9 | OpenBatchIDsAtCut |
 | 10 | StatsCoveredCommitSeq 和 SegmentStats |
 

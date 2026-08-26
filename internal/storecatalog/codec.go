@@ -420,12 +420,11 @@ func encodeCheckpoint(m Manifest) []byte {
 	binary.LittleEndian.PutUint64(dst[16:24], m.ReservedIDHigh)
 	binary.LittleEndian.PutUint64(dst[24:32], m.ReservedBatchIDHigh)
 	binary.LittleEndian.PutUint64(dst[32:40], m.IssuedBatchIDHighAtCut)
-	binary.LittleEndian.PutUint64(dst[40:48], m.MaintenanceGeneration)
 	return dst
 }
 
 func decodeCheckpoint(src []byte, m *Manifest) error {
-	if len(src) != 56 || !zero(src[48:56]) {
+	if len(src) != 56 || !zero(src[40:56]) {
 		return fmt.Errorf("checkpoint size: %w", ErrCorrupt)
 	}
 	m.CoveredCommitSeq = model.CommitSeq(binary.LittleEndian.Uint64(src[0:8]))
@@ -437,7 +436,6 @@ func decodeCheckpoint(src []byte, m *Manifest) error {
 	m.ReservedIDHigh = binary.LittleEndian.Uint64(src[16:24])
 	m.ReservedBatchIDHigh = binary.LittleEndian.Uint64(src[24:32])
 	m.IssuedBatchIDHighAtCut = binary.LittleEndian.Uint64(src[32:40])
-	m.MaintenanceGeneration = binary.LittleEndian.Uint64(src[40:48])
 	return nil
 }
 

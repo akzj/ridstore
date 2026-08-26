@@ -234,7 +234,7 @@ write new Manifest without source
 - 用户 Commit 优先级高于 GC copy；
 - 每个 Relocation Batch 有字节/Mutation 上限；
 - 磁盘压力过高时允许 backpressure 新写，但不破坏已开始 Commit；
-- Close 阻止新的 GC，并等待当前 Phase 到可恢复边界。
+- Close 阻止新的 GC，并等待当前操作到 marker/Catalog 可恢复边界。
 
 多 Segment 并发 GC 只有在单 Segment协议和资源控制稳定后考虑。
 
@@ -277,7 +277,13 @@ Checkpoint 与 GC 保持可运行，以免水位门禁阻塞自身的收敛路�
 
 当可用空间不足以同时保存 live copy 和旧 Segment 时，不能开始无法完成的 GC。返回明确 `ENOSPC`/资源错误并保持旧数据可读。
 
-第一版采用两段保守 admission：Journal `Prepared` 前覆盖 exact live copy、Relocation Descriptor、两个 rotation Segment 和 `GCMinFreeBytes`；Relocation 完成后，Checkpoint barrier 冻结实际 Delta layers，再按实际 entry 数覆盖每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment 和 `GCMinFreeBytes`。不能只按源 Segment 的 live Record 数估计最终 Mapping，因为 copy 期间允许前台 Commit，最终 cut 还可能包含这些用户 Delta。第二段返回 `ErrInsufficientSpace` 时 Relocation 副本可作为垃圾保留，源 Segment 与旧 checkpoint 仍可恢复，Journal 在 Phase 4 前撤销。文件系统可用空间不是可锁定资源，因此 admission 通过后仍必须处理真实 `ENOSPC`；在 MappingCheckpointDurable 之前保留源文件，之后则 fault closed 并由 Open 完成既定删除协议。
+第一版采用两段保守 admission：maintenance marker 前覆盖 exact live copy、Relocation Descriptor、两个
+rotation Segment 和 `GCMinFreeBytes`；Relocation 完成后，Checkpoint barrier 冻结实际 Delta layers，再按
+实际 entry 数覆盖每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment 和 `GCMinFreeBytes`。
+不能只按源 Segment 的 live Record 数估计最终 Mapping，因为 copy 期间允许前台 Commit，最终 cut 还可能
+包含这些用户 Delta。第二段返回 `ErrInsufficientSpace` 时 Relocation 副本可作为垃圾保留，source 和旧
+checkpoint 仍可恢复。文件系统可用空间不是可锁定资源，因此 admission 通过后仍必须处理真实
+`ENOSPC`；Catalog remove 之前可以撤销 marker，之后则 fail closed 并由 Open 完成既定物理清理。
 
 ## 15. Scrub
 
@@ -307,7 +313,7 @@ GC 遇到 corruption 不能通过复制“看起来可读”的部分掩盖错�
 - unlink/dir fsync 前后崩溃；
 - Open Batch 跨 Rotation 长时间不结束；
 - ENOSPC、fsync error、permission error；
-- Close 与 GC 各 Phase 并发。
+- Close 与 GC 的 marker/Catalog/remove 各 durable boundary 并发。
 
 ## 17. 完成定义
 

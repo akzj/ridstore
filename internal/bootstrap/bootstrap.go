@@ -263,7 +263,7 @@ func isInitial(manifest storecatalog.Manifest) bool {
 		manifest.CoveredCommitSeq == 0 && manifest.ReplayStart == wantReplay && manifest.ReservedIDHigh == 1 &&
 		manifest.ReservedBatchIDHigh == 1 && manifest.IssuedBatchIDHighAtCut == 1 && len(manifest.SealedDataSegments) == 0 &&
 		len(manifest.SealedMapSegments) == 0 && len(manifest.OpenBatchIDsAtCut) == 0 && manifest.StatsCoveredCommitSeq == 0 &&
-		len(manifest.SegmentStats) == 0 && manifest.MaintenanceGeneration == 0
+		len(manifest.SegmentStats) == 0
 }
 
 func requireFresh(root string) error {

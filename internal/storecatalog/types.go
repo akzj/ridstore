@@ -61,7 +61,6 @@ type Manifest struct {
 
 	StatsCoveredCommitSeq model.CommitSeq
 	SegmentStats          []SegmentStats
-	MaintenanceGeneration uint64
 }
 
 func (m Manifest) Clone() Manifest {
