@@ -2,6 +2,7 @@ package storecatalog
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -100,6 +101,73 @@ func TestManagerInstallsTypedUpdates(t *testing.T) {
 	loaded, err := Load(root)
 	if err != nil || loaded.Generation != 4 {
 		t.Fatalf("loaded generation=%d err=%v", loaded.Generation, err)
+	}
+}
+
+func TestInstallMappingRewriteChangesOnlyMappingFileSet(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	initial := testManifest()
+	if err := Install(root, initial, nil); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(root, initial, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootAddr, err := model.NewMapAddr(initial.NextMapSegmentID, mapstore.SegmentHeaderSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := manager.InstallMappingRewrite(initial.Generation, MappingRewrite{
+		ActiveSegment: initial.NextMapSegmentID, NextSegment: initial.NextMapSegmentID + 1,
+		Root: rootAddr, Covered: initial.CoveredCommitSeq,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Generation != initial.Generation+1 || updated.ActiveMapSegmentID != initial.NextMapSegmentID || updated.NextMapSegmentID != initial.NextMapSegmentID+1 || updated.MappingRoot != rootAddr || len(updated.SealedMapSegments) != 0 {
+		t.Fatalf("updated=%+v", updated)
+	}
+	updated.Generation = initial.Generation
+	updated.ActiveMapSegmentID = initial.ActiveMapSegmentID
+	updated.NextMapSegmentID = initial.NextMapSegmentID
+	updated.MappingRoot = initial.MappingRoot
+	updated.SealedMapSegments = initial.SealedMapSegments
+	if !reflect.DeepEqual(updated, initial) {
+		t.Fatalf("non-mapping fields changed\nupdated=%+v\ninitial=%+v", updated, initial)
+	}
+}
+
+func TestInstallMappingRewriteRejectsStaleCutAndNonContiguousGeneration(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		update func(Manifest) MappingRewrite
+	}{
+		{name: "stale cut", update: func(m Manifest) MappingRewrite {
+			return MappingRewrite{ActiveSegment: m.NextMapSegmentID, NextSegment: m.NextMapSegmentID + 1, Covered: m.CoveredCommitSeq + 1}
+		}},
+		{name: "wrong first", update: func(m Manifest) MappingRewrite {
+			return MappingRewrite{ActiveSegment: m.NextMapSegmentID + 1, NextSegment: m.NextMapSegmentID + 2, Covered: m.CoveredCommitSeq}
+		}},
+		{name: "gap", update: func(m Manifest) MappingRewrite {
+			return MappingRewrite{
+				SealedSegments: []MapSegmentSummary{{SegmentID: m.NextMapSegmentID, ValidEnd: mapstore.SegmentHeaderSize}},
+				ActiveSegment:  m.NextMapSegmentID + 2, NextSegment: m.NextMapSegmentID + 3, Covered: m.CoveredCommitSeq,
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			initial := testManifest()
+			manager, err := NewManager(t.TempDir(), initial, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.InstallMappingRewrite(initial.Generation, test.update(initial)); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	}
 }
 

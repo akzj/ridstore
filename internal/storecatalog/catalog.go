@@ -151,6 +151,47 @@ type MapRotation struct {
 	NextID    model.MapSegmentID
 }
 
+// MappingRewrite atomically replaces the complete Mapping file set while
+// preserving the logical checkpoint cut and every non-Mapping Manifest field.
+type MappingRewrite struct {
+	SealedSegments []MapSegmentSummary
+	ActiveSegment  model.MapSegmentID
+	NextSegment    model.MapSegmentID
+	Root           model.MapAddr
+	Covered        model.CommitSeq
+}
+
+func (m *Manager) InstallMappingRewrite(expect uint64, update MappingRewrite) (Manifest, error) {
+	return m.install(expect, func(next *Manifest) error {
+		if update.Covered != next.CoveredCommitSeq || update.ActiveSegment == 0 || update.ActiveSegment == model.MapSegmentID(math.MaxUint32) ||
+			update.NextSegment != update.ActiveSegment+1 {
+			return ErrInvalid
+		}
+		first := update.ActiveSegment
+		if len(update.SealedSegments) != 0 {
+			first = update.SealedSegments[0].SegmentID
+		}
+		if first != next.NextMapSegmentID {
+			return ErrInvalid
+		}
+		want := first
+		for _, summary := range update.SealedSegments {
+			if summary.SegmentID != want || summary.ValidEnd < mapstore.SegmentHeaderSize || summary.ValidEnd > uint32(next.HardLimits.SegmentSize)-mapstore.SegmentFooterSize || summary.ValidEnd%mapstore.Alignment != 0 {
+				return ErrInvalid
+			}
+			want++
+		}
+		if want != update.ActiveSegment || update.Root == 0 && len(update.SealedSegments) != 0 {
+			return ErrInvalid
+		}
+		next.SealedMapSegments = append([]MapSegmentSummary(nil), update.SealedSegments...)
+		next.ActiveMapSegmentID = update.ActiveSegment
+		next.NextMapSegmentID = update.NextSegment
+		next.MappingRoot = update.Root
+		return nil
+	})
+}
+
 func (m *Manager) InstallMapRotation(expect uint64, update MapRotation) (Manifest, error) {
 	return m.install(expect, func(next *Manifest) error {
 		if update.SealedOld.SegmentID != next.ActiveMapSegmentID || update.NewActive != next.NextMapSegmentID || update.NextID != update.NewActive+1 || update.NewActive == model.MapSegmentID(math.MaxUint32) {
