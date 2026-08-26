@@ -70,6 +70,62 @@ func TestVerifyFilesScansSealedPayloads(t *testing.T) {
 	}
 }
 
+func TestOpenVerifiedReaderScansAndReadsAcrossSegments(t *testing.T) {
+	root := t.TempDir()
+	snapshot := initialCatalog(512, 256)
+	if err := CreateInitialSegment(root, snapshot.LogID, snapshot.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	catalog := &memoryCatalog{state: snapshot}
+	log, err := Open(root, testLogConfig(), catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPayload := make([]byte, 200)
+	firstPayload[0] = 1
+	first, err := log.Append(context.Background(), firstPayload, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPayload := make([]byte, 200)
+	secondPayload[0] = 2
+	second, err := log.Append(context.Background(), secondPayload, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, report, err := OpenVerifiedReader(context.Background(), root, catalog.SnapshotRecordLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Records != 2 {
+		t.Fatalf("report=%+v", report)
+	}
+	got, err := reader.Read(context.Background(), first.Addr)
+	if err != nil || len(got) != len(firstPayload) || got[0] != 1 {
+		t.Fatalf("read len=%d first=%d err=%v", len(got), got[0], err)
+	}
+	var addresses []VAddr
+	if err := reader.Scan(context.Background(), first.End, func(result AppendResult, payload []byte) error {
+		addresses = append(addresses, result.Addr)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 1 || addresses[0] != second.Addr {
+		t.Fatalf("addresses=%v want=%v", addresses, second.Addr)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(context.Background(), first.Addr); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed read err=%v", err)
+	}
+}
+
 func TestVerifyFilesRejectsPartialTailWithoutRepair(t *testing.T) {
 	root := t.TempDir()
 	snapshot := initialCatalog(1024, 512)
