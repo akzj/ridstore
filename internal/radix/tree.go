@@ -9,8 +9,12 @@ import (
 	"github.com/akzj/ridstore/internal/recordlog"
 )
 
-type NodeStore interface {
+type NodeReader interface {
 	Read(model.MapAddr) (mapstore.Node, error)
+}
+
+type NodeStore interface {
+	NodeReader
 	Append(level uint8, prefix uint64, covered model.CommitSeq, slots [mapstore.NodeSlots]uint64) (model.MapAddr, error)
 }
 
@@ -69,17 +73,31 @@ func (t *Tree) walkNode(ctx context.Context, addr model.MapAddr, level uint8, pr
 }
 
 type Tree struct {
-	store   NodeStore
+	reader  NodeReader
+	writer  NodeStore
 	root    model.MapAddr
 	covered model.CommitSeq
 	cache   *nodeCache
 }
 
 func Open(store NodeStore, root model.MapAddr, covered model.CommitSeq, cacheBytes uint64) (*Tree, error) {
-	if store == nil || cacheBytes == 0 || (root != 0 && !root.Valid()) {
+	if store == nil {
 		return nil, ErrInvalid
 	}
-	tree := &Tree{store: store, root: root, covered: covered, cache: newNodeCache(cacheBytes)}
+	return open(store, store, root, covered, cacheBytes)
+}
+
+// OpenReadOnly constructs a tree that can Lookup and Walk but cannot build a
+// new root. It keeps verification readers out of the append-capable contract.
+func OpenReadOnly(reader NodeReader, root model.MapAddr, covered model.CommitSeq, cacheBytes uint64) (*Tree, error) {
+	return open(reader, nil, root, covered, cacheBytes)
+}
+
+func open(reader NodeReader, writer NodeStore, root model.MapAddr, covered model.CommitSeq, cacheBytes uint64) (*Tree, error) {
+	if reader == nil || cacheBytes == 0 || (root != 0 && !root.Valid()) {
+		return nil, ErrInvalid
+	}
+	tree := &Tree{reader: reader, writer: writer, root: root, covered: covered, cache: newNodeCache(cacheBytes)}
 	if root != 0 {
 		if _, err := tree.load(root, mapstore.MaxLevel, 0, true); err != nil {
 			return nil, err
@@ -126,7 +144,7 @@ func (t *Tree) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 }
 
 func (t *Tree) load(addr model.MapAddr, level uint8, prefix uint64, pin bool) (mapstore.Node, error) {
-	node, err := t.cache.get(addr, pin, func() (mapstore.Node, error) { return t.store.Read(addr) })
+	node, err := t.cache.get(addr, pin, func() (mapstore.Node, error) { return t.reader.Read(addr) })
 	if err != nil {
 		return mapstore.Node{}, err
 	}

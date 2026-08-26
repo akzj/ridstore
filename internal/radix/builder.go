@@ -30,7 +30,7 @@ func (t *Tree) Build(covered model.CommitSeq, mutations []Mutation) (*Tree, erro
 // It does not retain or copy the input. Parent changes are folded through a
 // fixed-depth pipeline, so auxiliary memory does not grow with mutation count.
 func (t *Tree) BuildSorted(covered model.CommitSeq, ordered []Mutation) (*Tree, error) {
-	if covered < t.covered || (len(ordered) != 0 && covered <= t.covered) {
+	if t.writer == nil || covered < t.covered || (len(ordered) != 0 && covered <= t.covered) {
 		return nil, ErrInvalid
 	}
 	for index, mutation := range ordered {
@@ -39,7 +39,7 @@ func (t *Tree) BuildSorted(covered model.CommitSeq, ordered []Mutation) (*Tree, 
 		}
 	}
 	if len(ordered) == 0 {
-		return Open(t.store, t.root, covered, t.cache.capacity)
+		return Open(t.writer, t.root, covered, t.cache.capacity)
 	}
 
 	builder := streamingBuilder{tree: t, covered: covered, root: t.root}
@@ -77,7 +77,7 @@ func (t *Tree) BuildSorted(covered model.CommitSeq, ordered []Mutation) (*Tree, 
 			return nil, err
 		}
 	}
-	return Open(t.store, builder.root, covered, t.cache.capacity)
+	return Open(t.writer, builder.root, covered, t.cache.capacity)
 }
 
 type nodeAccumulator struct {
@@ -161,7 +161,10 @@ func (t *Tree) writeChangedNode(level uint8, prefix uint64, covered model.Commit
 	if allZero {
 		return 0, nil
 	}
-	return t.store.Append(level, prefix, covered, after)
+	if t.writer == nil {
+		return 0, ErrInvalid
+	}
+	return t.writer.Append(level, prefix, covered, after)
 }
 
 func (t *Tree) oldSlots(addr model.MapAddr, level uint8, prefix uint64) ([mapstore.NodeSlots]uint64, error) {

@@ -21,6 +21,12 @@ type memoryNodeStore struct {
 	appends [8]int
 }
 
+type readOnlyNodeStore struct{ source *memoryNodeStore }
+
+func (s readOnlyNodeStore) Read(addr model.MapAddr) (mapstore.Node, error) {
+	return s.source.Read(addr)
+}
+
 func TestIncrementalBuildMatchesMapModel(t *testing.T) {
 	store := newMemoryNodeStore()
 	tree, _ := Open(store, 0, 0, 1<<20)
@@ -180,6 +186,39 @@ func TestWalkVisitsLeavesInIDOrder(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("got=%v want=%v", got, want)
 		}
+	}
+}
+
+func TestOpenReadOnlyWalksButCannotBuild(t *testing.T) {
+	store := newMemoryNodeStore()
+	writable, err := Open(store, 0, 0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := testDataAddr(t, 1, 64)
+	writable, err = writable.Build(1, []Mutation{{ID: 7, Addr: addr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := OpenReadOnly(readOnlyNodeStore{source: store}, writable.Root(), writable.Covered(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := readOnly.Walk(context.Background(), func(id model.ID, got recordlog.VAddr) error {
+		count++
+		if id != 7 || got != addr {
+			t.Fatalf("id=%d addr=%v", id, got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("count=%d", count)
+	}
+	if _, err := readOnly.Build(2, []Mutation{{ID: 8, Addr: addr}}); err != ErrInvalid {
+		t.Fatalf("read-only build err=%v", err)
 	}
 }
 

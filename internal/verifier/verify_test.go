@@ -19,7 +19,8 @@ func TestVerifyPhysicalUsesReadOnlyExclusiveLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verifier.VerifyPhysical(ctx, config.Dir); !errors.Is(err, base.ErrLocked) {
+	verifyConfig := verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024}
+	if _, err := verifier.Verify(ctx, config.Dir, verifyConfig); !errors.Is(err, base.ErrLocked) {
 		t.Fatalf("verify open store err=%v", err)
 	}
 	batch, err := store.Begin(ctx)
@@ -32,15 +33,18 @@ func TestVerifyPhysicalUsesReadOnlyExclusiveLease(t *testing.T) {
 	if _, err := batch.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	report, err := verifier.VerifyPhysical(ctx, config.Dir)
+	report, err := verifier.Verify(ctx, config.Dir, verifyConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Stage != verifier.StagePhysical || report.ManifestGeneration == 0 || report.Data.Records < 2 || report.Mapping.Segments != 1 {
+	if report.Stage != verifier.StageReachable || report.ManifestGeneration == 0 || report.Data.Records < 2 || report.Mapping.Segments != 1 || report.LiveIDs != 1 {
 		t.Fatalf("report=%+v", report)
 	}
 }
@@ -70,7 +74,7 @@ func TestVerifyPhysicalReportsRecoveryWithoutChangingTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verifier.VerifyPhysical(ctx, config.Dir); !errors.Is(err, base.ErrRecoveryRequired) {
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024}); !errors.Is(err, base.ErrRecoveryRequired) {
 		t.Fatalf("verify err=%v", err)
 	}
 	after, err := os.Stat(active)
@@ -79,6 +83,37 @@ func TestVerifyPhysicalReportsRecoveryWithoutChangingTail(t *testing.T) {
 	}
 	if before.Size() != after.Size() {
 		t.Fatalf("verify changed active size from %d to %d", before.Size(), after.Size())
+	}
+}
+
+func TestVerifyBoundsReachableMappingState(t *testing.T) {
+	ctx := context.Background()
+	config := verifyCreateConfig(filepath.Join(t.TempDir(), "store"))
+	store, err := ridstore.Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(ctx, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(ctx, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1}); !errors.Is(err, verifier.ErrLimit) {
+		t.Fatalf("verify err=%v", err)
 	}
 }
 

@@ -308,6 +308,10 @@ func (s *Store) readLocked(addr model.MapAddr) (Node, error) {
 	if segment == nil || addr.Offset() > segment.summary.ValidEnd || segment.summary.ValidEnd-addr.Offset() < NodeHeaderSize {
 		return Node{}, ErrInvalid
 	}
+	return readNode(segment, addr)
+}
+
+func readNode(segment *segmentFile, addr model.MapAddr) (Node, error) {
 	header := make([]byte, NodeHeaderSize)
 	if _, err := segment.file.ReadAt(header, int64(addr.Offset())); err != nil {
 		return Node{}, err

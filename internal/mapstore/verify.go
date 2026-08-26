@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/akzj/ridstore/internal/model"
 )
@@ -19,48 +20,67 @@ type PhysicalReport struct {
 	ActiveEnd      uint32
 }
 
+// ReadOnly is a verified, immutable view of the Mapping files named by one
+// Catalog snapshot. It owns its file descriptors and cannot append or repair.
+type ReadOnly struct {
+	mu     sync.RWMutex
+	files  map[model.MapSegmentID]*segmentFile
+	closed bool
+}
+
 // VerifyFiles validates the authoritative Mapping file set without opening a
 // writer or repairing the active tail.
 func VerifyFiles(ctx context.Context, root string, snapshot CatalogSnapshot) (PhysicalReport, error) {
+	reader, report, err := OpenVerifiedReader(ctx, root, snapshot)
+	if reader == nil {
+		return report, err
+	}
+	return report, errors.Join(err, reader.Close())
+}
+
+// OpenVerifiedReader performs the full physical verification and retains a
+// read-only handle for reachable-tree validation.
+func OpenVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapshot) (*ReadOnly, PhysicalReport, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return PhysicalReport{}, err
+		return nil, PhysicalReport{}, err
 	}
 	if root == "" || snapshot.validate() != nil {
-		return PhysicalReport{}, ErrInvalid
+		return nil, PhysicalReport{}, ErrInvalid
 	}
 	if found, err := mappingRecoveryArtifacts(root); err != nil {
-		return PhysicalReport{}, err
+		return nil, PhysicalReport{}, err
 	} else if found {
-		return PhysicalReport{}, ErrRecoveryRequired
+		return nil, PhysicalReport{}, ErrRecoveryRequired
 	}
 	if err := verifyMappingFileSet(root, snapshot); err != nil {
-		return PhysicalReport{}, err
+		return nil, PhysicalReport{}, err
 	}
 
 	report := PhysicalReport{Segments: uint64(len(snapshot.SealedSegments)) + 1, SealedSegments: uint64(len(snapshot.SealedSegments))}
+	reader := &ReadOnly{files: make(map[model.MapSegmentID]*segmentFile, len(snapshot.SealedSegments)+1)}
+	fail := func(cause error) (*ReadOnly, PhysicalReport, error) {
+		return nil, report, errors.Join(cause, reader.Close())
+	}
 	var lastSeq uint64
 	for _, ref := range snapshot.SealedSegments {
 		if err := ctx.Err(); err != nil {
-			return report, err
+			return fail(err)
 		}
 		segment, err := openSealed(root, snapshot.headerFor(ref.SegmentID), ref)
 		if err != nil {
-			return report, err
+			return fail(err)
 		}
 		if segment.summary.NodeCount != 0 && lastSeq != 0 && segment.summary.FirstSeq <= lastSeq {
 			_ = segment.file.Close()
-			return report, ErrCorrupt
+			return fail(ErrCorrupt)
 		}
 		if segment.summary.NodeCount != 0 {
 			lastSeq = segment.summary.LastSeq
 		}
-		closeErr := segment.file.Close()
-		if closeErr != nil {
-			return report, closeErr
-		}
+		reader.files[ref.SegmentID] = segment
 		report.Nodes += segment.summary.NodeCount
 		report.PhysicalBytes += uint64(ref.ValidEnd) + uint64(SegmentFooterSize)
 	}
@@ -68,33 +88,69 @@ func VerifyFiles(ctx context.Context, root string, snapshot CatalogSnapshot) (Ph
 	activePath := filepath.Join(root, mappingDirectory, activeName(snapshot.ActiveSegment))
 	file, err := openMappingRegularReadOnly(activePath)
 	if err != nil {
-		return report, err
+		return fail(err)
 	}
 	if err := verifyHeader(file, snapshot.headerFor(snapshot.ActiveSegment)); err != nil {
 		_ = file.Close()
-		return report, err
+		return fail(err)
 	}
 	info, err := file.Stat()
 	if err != nil || info.Size() < int64(SegmentHeaderSize) || info.Size() > int64(snapshot.SegmentSize-SegmentFooterSize) {
 		_ = file.Close()
-		return report, errors.Join(ErrCorrupt, err)
+		return fail(errors.Join(ErrCorrupt, err))
 	}
 	summary, partial, scanErr := scanNodesWithVisitor(file, snapshot.headerFor(snapshot.ActiveSegment), uint32(info.Size()), snapshot.Root,
 		func(model.MapAddr, Node, uint32) error { return ctx.Err() })
-	closeErr := file.Close()
-	if err := errors.Join(scanErr, closeErr); err != nil {
-		return report, err
+	if scanErr != nil {
+		_ = file.Close()
+		return fail(scanErr)
 	}
 	if partial {
-		return report, ErrRecoveryRequired
+		_ = file.Close()
+		return fail(ErrRecoveryRequired)
 	}
 	if summary.NodeCount != 0 && lastSeq != 0 && summary.FirstSeq <= lastSeq {
-		return report, ErrCorrupt
+		_ = file.Close()
+		return fail(ErrCorrupt)
 	}
+	reader.files[snapshot.ActiveSegment] = &segmentFile{file: file, header: snapshot.headerFor(snapshot.ActiveSegment), summary: summary}
 	report.Nodes += summary.NodeCount
 	report.PhysicalBytes += uint64(summary.ValidEnd)
 	report.ActiveEnd = summary.ValidEnd
-	return report, nil
+	return reader, report, nil
+}
+
+func (r *ReadOnly) Read(addr model.MapAddr) (Node, error) {
+	if r == nil || !addr.Valid() {
+		return Node{}, ErrInvalid
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return Node{}, ErrClosed
+	}
+	segment := r.files[addr.SegmentID()]
+	if segment == nil || addr.Offset() > segment.summary.ValidEnd || segment.summary.ValidEnd-addr.Offset() < NodeHeaderSize {
+		return Node{}, ErrInvalid
+	}
+	return readNode(segment, addr)
+}
+
+func (r *ReadOnly) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	var result error
+	for _, segment := range r.files {
+		result = errors.Join(result, segment.file.Close())
+	}
+	return result
 }
 
 func mappingRecoveryArtifacts(root string) (bool, error) {
