@@ -1,6 +1,6 @@
 # ridstore v2 Offline Verify
 
-状态：Design frozen for implementation
+状态：M1-M3 implemented；M4-M5 pending
 
 ## 1. 定位
 
@@ -96,6 +96,8 @@ Verify(ctx context.Context, config VerifyConfig) (VerifyReport, error)
 ```
 
 `VerifyConfig` 只包含目录和 verifier 自己的内存/issue 上限，不接受 HardLimits；磁盘 Manifest 是格式事实。
+`MaxLiveIDs` 同时约束 checkpoint Root 物化与 replay 后 final Mapping；`MaxReplayStatuses` 独立约束
+replay 保留的 Batch terminal status，不能借用运行时 retention 配置。
 `VerifyReport` 至少包含 Manifest generation、扫描的 Data/Mapping 文件与字节、Record/Node 数、live ID 数、
 replayed commit 数和完成阶段。`error == nil` 才表示 clean；报告即使失败也只包含失败前已证明的统计。
 
@@ -107,7 +109,10 @@ replayed commit 数和完成阶段。`error == nil` 才表示 clean；报告即�
 1. **M1 physical inspector（已实现）**：锁、artifact 门禁、Manifest、Data/Mapping 全文件只读扫描；
 2. **M2 reachable Mapping（已实现）**：只读 Mapping Reader、Radix 全遍历、地址/层级/前缀、
    live Data Segment membership、VAddr alias 与 `MaxLiveIDs` 上限校验；
-3. **M3 semantic replay**：从 cut 重放并形成 final verifier view；
+3. **M3 semantic replay（已实现）**：保留验证后的只读 RecordLog handles，将 checkpoint Root 物化到
+   verifier-owned bounded Mapping，从 `ReplayStart` 复用正式 replay 协议形成 final view；验证 CommitSeq、
+   Put/Descriptor identity、relocation、allocator reserve 和 Batch terminal 状态机，并报告 checkpoint/final
+   live IDs、replayed commit、retained status 与 NextCommitSeq；
 4. **M4 exact join**：Put identity、最终地址唯一性、SegmentStats 精确比较；
 5. **M5 public/report**：公开 API、corruption/process-exit tests、CLI 可选封装。
 

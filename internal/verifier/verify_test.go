@@ -19,7 +19,7 @@ func TestVerifyPhysicalUsesReadOnlyExclusiveLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	verifyConfig := verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024}
+	verifyConfig := verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024, MaxReplayStatuses: 1024}
 	if _, err := verifier.Verify(ctx, config.Dir, verifyConfig); !errors.Is(err, base.ErrLocked) {
 		t.Fatalf("verify open store err=%v", err)
 	}
@@ -44,7 +44,7 @@ func TestVerifyPhysicalUsesReadOnlyExclusiveLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Stage != verifier.StageReachable || report.ManifestGeneration == 0 || report.Data.Records < 2 || report.Mapping.Segments != 1 || report.LiveIDs != 1 {
+	if report.Stage != verifier.StageSemantic || report.ManifestGeneration == 0 || report.Data.Records < 2 || report.Mapping.Segments != 1 || report.CheckpointLiveIDs != 1 || report.LiveIDs != 1 || report.NextCommitSeq != 2 {
 		t.Fatalf("report=%+v", report)
 	}
 }
@@ -74,7 +74,7 @@ func TestVerifyPhysicalReportsRecoveryWithoutChangingTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024}); !errors.Is(err, base.ErrRecoveryRequired) {
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024, MaxReplayStatuses: 1024}); !errors.Is(err, base.ErrRecoveryRequired) {
 		t.Fatalf("verify err=%v", err)
 	}
 	after, err := os.Stat(active)
@@ -112,8 +112,73 @@ func TestVerifyBoundsReachableMappingState(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1}); !errors.Is(err, verifier.ErrLimit) {
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{MappingCacheBytes: 1 << 20, MaxLiveIDs: 1, MaxReplayStatuses: 1024}); !errors.Is(err, verifier.ErrLimit) {
 		t.Fatalf("verify err=%v", err)
+	}
+}
+
+func TestVerifyReplaysDurableTailFromCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	config := verifyCreateConfig(filepath.Join(t.TempDir(), "store"))
+	store, err := ridstore.Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Create(ctx, []byte("checkpoint")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Create(ctx, []byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := third.Create(ctx, []byte("tail-two")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := third.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := verifier.Verify(ctx, config.Dir, verifier.Config{
+		MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024, MaxReplayStatuses: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Stage != verifier.StageSemantic || report.CheckpointLiveIDs != 1 || report.LiveIDs != 3 || report.ReplayedCommits != 2 || report.BatchStatuses != 2 || report.NextCommitSeq != 4 {
+		t.Fatalf("report=%+v", report)
+	}
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{
+		MappingCacheBytes: 1 << 20, MaxLiveIDs: 1, MaxReplayStatuses: 1024,
+	}); !errors.Is(err, verifier.ErrLimit) || errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("bounded replay err=%v", err)
+	}
+	if _, err := verifier.Verify(ctx, config.Dir, verifier.Config{
+		MappingCacheBytes: 1 << 20, MaxLiveIDs: 1024, MaxReplayStatuses: 1,
+	}); !errors.Is(err, base.ErrStatusCapacity) {
+		t.Fatalf("bounded status err=%v", err)
 	}
 }
 
