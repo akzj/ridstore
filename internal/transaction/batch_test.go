@@ -91,6 +91,41 @@ func TestPutFoldsFinalMutationsAndUsesProtocolRecords(t *testing.T) {
 	}
 }
 
+func TestReferencedSegmentTracksOnlyFinalPublishablePut(t *testing.T) {
+	log := &fakeLog{}
+	b := testBatch(t, log, Limits{})
+	if b.ReferencesSegment(1) || b.ReferencesSegment(0) {
+		t.Fatal("empty batch references a segment")
+	}
+	if err := b.Put(context.Background(), 1, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if !b.ReferencesSegment(1) {
+		t.Fatal("final Put reference was not retained")
+	}
+	if err := b.Delete(1); err != nil {
+		t.Fatal(err)
+	}
+	if b.ReferencesSegment(1) {
+		t.Fatal("superseded Put remained a publishable reference")
+	}
+	if err := b.Put(context.Background(), 1, []byte("replacement")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if !b.ReferencesSegment(1) {
+		t.Fatal("committing Put lost its reference before publication")
+	}
+	if err := b.MarkCommitted(1); err != nil {
+		t.Fatal(err)
+	}
+	if b.ReferencesSegment(1) {
+		t.Fatal("terminal batch retained a segment reference")
+	}
+}
+
 func TestCreateIsBlindAndCompareAndPutDeclaresAddress(t *testing.T) {
 	log := &fakeLog{}
 	created := testBatch(t, log, Limits{})

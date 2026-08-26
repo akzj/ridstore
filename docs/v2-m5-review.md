@@ -65,6 +65,10 @@ Mapping[ID] != scanned VAddr
 
 在这些条件闭合前，Engine 不调用 `RecordLog.RetireSegment`。
 
+Transaction 现在可以从最终 mutation 集合报告 Segment 引用。被后续 Put/Delete 覆盖的历史 Put 不会
+进入 Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable publication 或终止清理前
+持续构成引用。退休门禁必须在阻止新 Batch 操作并排空 Coordinator 后检查该引用集合。
+
 ## 5. Sparse SegmentStats 语义修正
 
 Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺失在同一

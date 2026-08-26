@@ -217,6 +217,23 @@ func (b *Batch) MutationIDs() ([]model.ID, error) {
 	return ids, nil
 }
 
+// ReferencesSegment reports whether the Batch's final mutation set can still
+// publish a Put address in the Segment. Superseded Put records are deliberately
+// excluded: they can never enter Mapping and are already garbage.
+func (b *Batch) ReferencesSegment(segment recordlog.SegmentID) bool {
+	if segment == 0 {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, mutation := range b.mutations {
+		if mutation.Operation == mapping.OperationPut && mutation.Addr.SegmentID() == segment {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Batch) Prepare() (Prepared, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
