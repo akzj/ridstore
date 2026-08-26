@@ -92,6 +92,18 @@ func TestCreateRejectsUncheckpointableDeltaBudgetBeforeBootstrap(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsStatusRetentionBelowOpenLimitBeforeBootstrap(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.StatusRetention = config.HardLimits.MaxOpenBatches - 1
+	if _, err := Create(context.Background(), root, config); !errors.Is(err, base.ErrInvalidConfig) {
+		t.Fatalf("create err=%v", err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid create changed root err=%v", err)
+	}
+}
+
 func TestCommitAdvancesCheckpointUnderDeltaHardPressure(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
@@ -187,6 +199,62 @@ func TestConcurrentCommitCheckpointAndClose(t *testing.T) {
 	}
 }
 
+func TestStatusCapacityAdvancesCheckpointBeforeNextBatch(t *testing.T) {
+	ctx := context.Background()
+	config := testCreateConfig()
+	config.HardLimits.MaxOpenBatches = 1
+	config.Runtime.StatusRetention = 1
+	root := filepath.Join(t.TempDir(), "store")
+	store, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Status(ctx, first.ID()); !errors.Is(err, base.ErrStatusExpired) {
+		t.Fatalf("first status err=%v", err)
+	}
+	if status, err := store.Status(ctx, second.ID()); err != nil || status.State != BatchStateAborted {
+		t.Fatalf("second status=%+v err=%v", status, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, root, config.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Status(ctx, first.ID()); !errors.Is(err, base.ErrStatusExpired) {
+		t.Fatalf("reopened first status err=%v", err)
+	}
+	if status, err := reopened.Status(ctx, second.ID()); err != nil || status.State != BatchStateAborted {
+		t.Fatalf("reopened second status=%+v err=%v", status, err)
+	}
+	third, err := reopened.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := third.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Status(ctx, second.ID()); !errors.Is(err, base.ErrStatusExpired) {
+		t.Fatalf("evicted recovered status err=%v", err)
+	}
+}
+
 func testCreateConfig() CreateConfig {
 	return CreateConfig{
 		HardLimits: storecatalog.HardLimits{
@@ -199,6 +267,7 @@ func testCreateConfig() CreateConfig {
 			Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
 			MappingCacheBytes: 1 << 20, CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
 			DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+			StatusRetention: 64,
 		},
 	}
 }

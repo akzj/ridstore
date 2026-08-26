@@ -151,3 +151,22 @@ OriginBatchID 不进入 Mapping、不由 Get 返回、不参与用户条件，�
 - OriginBatchID 的持久化身份验证用途；
 - Relocation 的 expected-old-VAddr CAS、Reader Pin 和删除门禁；
 - 单次 Get 的 Mapping revalidation。
+
+## 10. Batch Status 保留边界
+
+`Status(BatchID)` 只为不确定提交恢复提供有界查询窗口，不是永久业务历史。`RuntimeConfig.StatusRetention`
+同时限制：
+
+- 进程内保留的最近用户 Batch 终态数量；
+- Checkpoint cut 之后允许 Replay 构造的用户终态数量；
+- 尚未终结的公开 Batch 为未来终态预留的容量。
+
+`StatusRetention` 必须不小于创建时持久化的 `MaxOpenBatches`；Create 在写入目录前验证该关系，Open 在
+执行任何可变恢复前验证该关系。
+
+当 `tail terminal count + open batch count` 达到上限时，新的 `Begin` 先同步推进 Checkpoint，再重新
+尝试 admission。已被淘汰或被新 Checkpoint 覆盖、且无法再给出确定结果的 Batch 返回
+`ErrStatusExpired`；从未发放的未来 BatchID 返回 `ErrNotFound`。
+
+GC relocation 使用共享的 durable BatchID/CommitSeq 顺序，但不是用户提交，不进入公开 Status 保留集。
+Replay 仍验证其 CommitSeq、Descriptor 和 mutation，只是不为它生成可查询状态。

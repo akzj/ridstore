@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"sync"
 
@@ -34,9 +35,10 @@ type maintenanceLog interface {
 }
 
 type Config struct {
-	Batch          transaction.Limits
-	Commit         coordinator.Config
-	MaxOpenBatches int
+	Batch           transaction.Limits
+	Commit          coordinator.Config
+	MaxOpenBatches  int
+	StatusRetention uint64
 }
 
 type Record struct {
@@ -60,6 +62,16 @@ type BatchStatus struct {
 	CommitSeq model.CommitSeq
 }
 
+type statusEntry struct {
+	status BatchStatus
+	serial uint64
+}
+
+type statusOrderEntry struct {
+	id     model.BatchID
+	serial uint64
+}
+
 type Store struct {
 	ops           sync.RWMutex
 	mu            sync.Mutex
@@ -79,10 +91,17 @@ type Store struct {
 	limits                 transaction.Limits
 	maxOpen                int
 	open                   map[model.BatchID]*Batch
-	statuses               map[model.BatchID]BatchStatus
+	statuses               map[model.BatchID]statusEntry
+	statusOrder            []statusOrderEntry
+	statusOrderHead        int
+	statusSerial           uint64
+	statusRetention        uint64
+	terminalTotal          uint64
+	terminalBase           uint64
 	openCount              int
 	recoveryAbortedStart   uint64
 	recoveryAbortedEnd     uint64
+	recoveryAbortedValid   bool
 	notify                 chan struct{}
 	closed                 bool
 	fault                  error
@@ -103,7 +122,8 @@ func (s *Store) Identity() [16]byte {
 }
 
 func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, config Config) (*Store, error) {
-	if log == nil || current == nil || ids == nil || batches == nil || config.MaxOpenBatches <= 0 || transaction.ValidateLimits(config.Batch) != nil {
+	if log == nil || current == nil || ids == nil || batches == nil || config.MaxOpenBatches <= 0 ||
+		config.StatusRetention < uint64(config.MaxOpenBatches) || transaction.ValidateLimits(config.Batch) != nil {
 		return nil, base.ErrInvalidConfig
 	}
 	commits, err := coordinator.New(current.CoveredCommitSeq()+1, log, current, config.Commit)
@@ -113,7 +133,7 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 	return &Store{
 		log: log, mapping: current, ids: ids, batches: batches, commits: commits,
 		limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
-		statuses: make(map[model.BatchID]BatchStatus), notify: make(chan struct{}),
+		statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
 		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
 	}, nil
 }
@@ -140,10 +160,10 @@ func (s *Store) Status(ctx context.Context, id model.BatchID) (BatchStatus, erro
 		return BatchStatus{BatchID: id, State: publicBatchState(state), CommitSeq: seq}, nil
 	}
 	if status, ok := s.statuses[id]; ok {
-		return status, nil
+		return status.status, nil
 	}
 	raw := uint64(id)
-	if raw >= s.recoveryAbortedStart && raw < s.recoveryAbortedEnd {
+	if s.recoveryAbortedValid && raw >= s.recoveryAbortedStart && raw < s.recoveryAbortedEnd {
 		return BatchStatus{BatchID: id, State: BatchStateAborted}, nil
 	}
 	if raw < s.batches.IssuedHigh() {
@@ -178,7 +198,8 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 			s.ops.RUnlock()
 			return nil, errors.Join(base.ErrReadOnly, fault)
 		}
-		if s.openCount < s.maxOpen {
+		capacityBlocked := !s.statusCapacityAvailableLocked()
+		if s.openCount < s.maxOpen && !capacityBlocked {
 			s.openCount++
 			s.mu.Unlock()
 			break
@@ -186,6 +207,12 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		notify := s.notify
 		s.mu.Unlock()
 		s.ops.RUnlock()
+		if capacityBlocked {
+			if err := s.Checkpoint(ctx); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -329,7 +356,7 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		s.ops.Unlock()
 		return err
 	}
-	open, err := s.openBatchIDsAtCut()
+	open, statusCut, err := s.openBatchIDsAtCut()
 	if err != nil {
 		s.ops.Unlock()
 		s.setFault(err)
@@ -379,6 +406,13 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
+	s.mu.Lock()
+	if statusCut > s.terminalBase {
+		s.terminalBase = statusCut
+	}
+	s.recoveryAbortedValid = false
+	s.signalLocked()
+	s.mu.Unlock()
 	return nil
 }
 
@@ -387,7 +421,7 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 // when its caller has not yet consumed the response and removed the Batch from
 // Store.open. Only genuinely non-terminal, non-committing batches belong in
 // the recovery snapshot.
-func (s *Store) openBatchIDsAtCut() ([]model.BatchID, error) {
+func (s *Store) openBatchIDsAtCut() ([]model.BatchID, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	open := make([]model.BatchID, 0, len(s.open))
@@ -399,12 +433,12 @@ func (s *Store) openBatchIDsAtCut() ([]model.BatchID, error) {
 		case transaction.StateCommitted, transaction.StateAborted, transaction.StateCommitUnknown:
 			// Client-side finish may lag behind the durable terminal state.
 		case transaction.StateCommitting:
-			return nil, errors.Join(base.ErrCorrupt, errors.New("committing batch remained after checkpoint barrier"))
+			return nil, 0, errors.Join(base.ErrCorrupt, errors.New("committing batch remained after checkpoint barrier"))
 		default:
-			return nil, errors.Join(base.ErrCorrupt, errors.New("unknown batch state at checkpoint"))
+			return nil, 0, errors.Join(base.ErrCorrupt, errors.New("unknown batch state at checkpoint"))
 		}
 	}
-	return open, nil
+	return open, s.terminalTotal, nil
 }
 
 func (s *Store) setFault(err error) {
@@ -558,7 +592,12 @@ func (b *Batch) finish() {
 		state, seq := b.inner.State()
 		b.store.mu.Lock()
 		if terminalState := publicBatchState(state); terminalState == BatchStateCommitted || terminalState == BatchStateAborted || terminalState == BatchStateCommitUnknown {
-			b.store.statuses[b.ID()] = BatchStatus{BatchID: b.ID(), State: terminalState, CommitSeq: seq}
+			if b.store.terminalTotal == math.MaxUint64 {
+				b.store.fault = errors.Join(base.ErrReadOnly, base.ErrStatusCapacity)
+			} else {
+				b.store.terminalTotal++
+				b.store.addStatusLocked(BatchStatus{BatchID: b.ID(), State: terminalState, CommitSeq: seq})
+			}
 		}
 		delete(b.store.open, b.ID())
 		if b.store.openCount > 0 {

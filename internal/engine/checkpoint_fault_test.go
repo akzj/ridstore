@@ -337,5 +337,6 @@ func prepareCheckpointStore(t *testing.T) (string, OpenConfig) {
 		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
 		MappingCacheBytes: 1 << 20, CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
 		DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+		StatusRetention: 64,
 	}
 }

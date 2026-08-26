@@ -29,6 +29,7 @@ type OpenConfig struct {
 	MaxSegmentStats     uint64
 	DeltaSoftLimitBytes uint64
 	DeltaHardLimitBytes uint64
+	StatusRetention     uint64
 }
 
 type CreateConfig struct {
@@ -52,6 +53,9 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 	}
 	if err := bootstrap.ValidateHardLimits(config.HardLimits); err != nil {
 		return nil, err
+	}
+	if config.Runtime.StatusRetention < config.HardLimits.MaxOpenBatches {
+		return nil, base.ErrInvalidConfig
 	}
 	if err := bootstrap.EnsureRoot(root); err != nil {
 		return nil, err
@@ -119,6 +123,9 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return nil, err
 	}
+	if config.StatusRetention < catalog.Snapshot().HardLimits.MaxOpenBatches {
+		return nil, base.ErrInvalidConfig
+	}
 	if err := recoverMaintenance(root, catalog, hooks.maintenance, hooks.recordLog); err != nil {
 		return nil, err
 	}
@@ -154,6 +161,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 		MaxGroupDescriptors: uint64(manifest.HardLimits.MaxRecordLogPayload) / uint64(recordcodec.DescriptorHeadSize),
 		MaxGroupMutations:   uint64(manifest.HardLimits.MaxRecordLogPayload) / uint64(recordcodec.MutationSize),
 		IDReserveSize:       manifest.HardLimits.IDReserveSize, BatchIDReserveSize: manifest.HardLimits.BatchIDReserveSize,
+		StatusCapacity: config.StatusRetention,
 	})
 	if err != nil {
 		return fail(err)
@@ -174,7 +182,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 			MaxValueSize: manifest.HardLimits.MaxValueSize, MaxBatchBytes: manifest.HardLimits.MaxBatchBytes,
 			MaxBatchMutations: manifest.HardLimits.MaxBatchMutations, MaxBatchConditions: manifest.HardLimits.MaxBatchConditions,
 		},
-		Commit: config.Commit, MaxOpenBatches: int(manifest.HardLimits.MaxOpenBatches),
+		Commit: config.Commit, MaxOpenBatches: int(manifest.HardLimits.MaxOpenBatches), StatusRetention: config.StatusRetention,
 	})
 	if err != nil {
 		return fail(err)
@@ -188,10 +196,12 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 		if status.State == replay.BatchCommitted {
 			state = BatchStateCommitted
 		}
-		store.statuses[id] = BatchStatus{BatchID: id, State: state, CommitSeq: status.CommitSeq}
+		store.addStatusLocked(BatchStatus{BatchID: id, State: state, CommitSeq: status.CommitSeq})
 	}
+	store.terminalTotal = recovered.TerminalCount
 	store.recoveryAbortedStart = manifest.IssuedBatchIDHighAtCut
 	store.recoveryAbortedEnd = recovered.ReservedBatchIDHigh
+	store.recoveryAbortedValid = store.recoveryAbortedStart < store.recoveryAbortedEnd
 	store.root = root
 	store.maxStats = config.MaxSegmentStats
 	store.dirLock = dirLock
@@ -200,7 +210,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 }
 
 func validOpenConfig(config OpenConfig) bool {
-	return config.MappingCacheBytes != 0 && config.MaxSegmentStats != 0 &&
+	return config.MappingCacheBytes != 0 && config.MaxSegmentStats != 0 && config.StatusRetention != 0 &&
 		mapping.ValidatePersistentConfig(persistentConfig(config)) == nil
 }
 

@@ -130,7 +130,7 @@ func newStore(t *testing.T, maxOpen int) *Store {
 	store, err := New(log, newPersistent(t), ids, batches, Config{
 		Batch:          transaction.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16},
 		Commit:         coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 1 << 20},
-		MaxOpenBatches: maxOpen,
+		MaxOpenBatches: maxOpen, StatusRetention: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -295,7 +295,7 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 	batches, _ := idalloc.New(idalloc.BatchID, 16, 1, log)
 	store, err := New(log, newPersistent(t), ids, batches, Config{
 		Batch:  transaction.Limits{MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16},
-		Commit: coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10}, MaxOpenBatches: 4,
+		Commit: coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10}, MaxOpenBatches: 4, StatusRetention: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -353,6 +353,7 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 4096},
 		MappingCacheBytes: 1 << 20, CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
 		DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+		StatusRetention: 64,
 	}
 	store, err := Open(context.Background(), root, config)
 	if err != nil {

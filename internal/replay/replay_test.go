@@ -71,7 +71,7 @@ func (l *fakeLog) Read(_ context.Context, addr recordlog.VAddr) ([]byte, error) 
 }
 
 func replayConfig() Config {
-	return Config{MaxValueSize: 1024, MaxRecordPayload: 4096, MaxGroupDescriptors: 16, MaxGroupMutations: 64, IDReserveSize: 4, BatchIDReserveSize: 4}
+	return Config{MaxValueSize: 1024, MaxRecordPayload: 4096, MaxGroupDescriptors: 16, MaxGroupMutations: 64, IDReserveSize: 4, BatchIDReserveSize: 4, StatusCapacity: 64}
 }
 
 func TestRecoverRebuildsMappingAllocatorsAndStatuses(t *testing.T) {
@@ -168,16 +168,41 @@ func TestRecoverRelocationUsesAddressCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	config := replayConfig()
+	config.StatusCapacity = 1
 	result, err := Recover(context.Background(), log, Checkpoint{
 		Mapping:     initial,
 		ReplayStart: start, ReservedIDHigh: 5, ReservedBatchIDHigh: 5,
-	}, replayConfig())
+	}, config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr, exists, _ := result.Mapping.Lookup(1)
 	if !exists || addr != newAddr || result.NextCommitSeq != 6 {
 		t.Fatalf("addr=%+v exists=%v next=%d", addr, exists, result.NextCommitSeq)
+	}
+	if len(result.Statuses) != 0 || result.TerminalCount != 0 {
+		t.Fatalf("relocation leaked public status: %+v", result)
+	}
+}
+
+func TestRecoverRejectsUserStatusTailBeyondCapacity(t *testing.T) {
+	log := &fakeLog{byAddr: make(map[recordlog.VAddr][]byte)}
+	for id := model.BatchID(1); id <= 2; id++ {
+		abort, err := recordcodec.EncodeAbort(recordcodec.AbortRecord{BatchID: id, Reason: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		log.add(t, abort)
+	}
+	start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
+	config := replayConfig()
+	config.StatusCapacity = 1
+	_, err := Recover(context.Background(), log, Checkpoint{
+		Mapping: mapping.NewEmpty(), ReplayStart: start, ReservedIDHigh: 1, ReservedBatchIDHigh: 3,
+	}, config)
+	if !errors.Is(err, base.ErrStatusCapacity) {
+		t.Fatalf("recover err=%v", err)
 	}
 }
 

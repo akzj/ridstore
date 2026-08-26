@@ -69,8 +69,10 @@ relocation CAS、Reader Pin 和退休前精确证明。
 
 后续优先级：
 
-1. 给 terminal Batch Status 增加明确的有界保留策略，并保持 CommitUnknown 可恢复查询；
-2. 建立 v2 原生 ENOSPC/backpressure，不恢复旧 diskspace owner；
-3. 补充公共层并发/崩溃测试和完整 race 门禁；
-4. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
-5. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
+1. 建立 v2 原生 ENOSPC/backpressure，不恢复旧 diskspace owner；
+2. 补充公共层并发/崩溃测试和完整 race 门禁；
+3. 按需重新设计 Verify、Backup、Metrics 与长时 soak；
+4. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
+
+M6 后的第一个完整性迭代已经为 terminal Batch Status 增加有界保留、admission 驱动的 Checkpoint 和
+Replay 容量门禁；CommitUnknown 的恢复查询语义保持不变。

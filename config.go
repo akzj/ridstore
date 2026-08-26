@@ -38,6 +38,9 @@ type RuntimeConfig struct {
 	MaxSegmentStats     uint64
 	DeltaSoftLimitBytes uint64
 	DeltaHardLimitBytes uint64
+	// StatusRetention bounds retained/replayed user Batch outcomes and must be
+	// at least HardLimits.MaxOpenBatches.
+	StatusRetention uint64
 }
 
 type CreateConfig struct {
@@ -132,11 +135,14 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	if c.DeltaHardLimitBytes == 0 {
 		c.DeltaHardLimitBytes = 512 * mib
 	}
+	if c.StatusRetention == 0 {
+		c.StatusRetention = 1 << 16
+	}
 	return engine.OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: c.MaxQueuedBytes, QueueCapacity: c.AppendQueueCapacity, BufferBytes: c.AppendBufferBytes, BufferRecords: c.AppendBufferRecords},
 		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload},
 		MappingCacheBytes: c.MappingCacheBytes, CheckpointSortBytes: c.CheckpointSortBytes,
 		MaxSegmentStats: c.MaxSegmentStats, DeltaSoftLimitBytes: c.DeltaSoftLimitBytes,
-		DeltaHardLimitBytes: c.DeltaHardLimitBytes,
+		DeltaHardLimitBytes: c.DeltaHardLimitBytes, StatusRetention: c.StatusRetention,
 	}
 }

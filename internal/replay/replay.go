@@ -26,6 +26,7 @@ type Config struct {
 	MaxGroupMutations   uint64
 	IDReserveSize       uint64
 	BatchIDReserveSize  uint64
+	StatusCapacity      uint64
 }
 
 type Checkpoint struct {
@@ -54,12 +55,14 @@ type Result struct {
 	ReservedIDHigh      uint64
 	ReservedBatchIDHigh uint64
 	Statuses            map[model.BatchID]BatchStatus
+	TerminalCount       uint64
 }
 
 func Recover(ctx context.Context, log Log, checkpoint Checkpoint, config Config) (Result, error) {
 	if log == nil || !checkpoint.ReplayStart.Valid() || checkpoint.ReservedIDHigh == 0 || checkpoint.ReservedBatchIDHigh == 0 ||
 		config.MaxValueSize == 0 || config.MaxRecordPayload == 0 || config.MaxGroupDescriptors == 0 || config.MaxGroupMutations == 0 ||
-		config.IDReserveSize == 0 || config.BatchIDReserveSize == 0 || checkpoint.Mapping == nil || checkpoint.Mapping.CoveredCommitSeq() == model.CommitSeq(math.MaxUint64) {
+		config.IDReserveSize == 0 || config.BatchIDReserveSize == 0 || config.StatusCapacity == 0 ||
+		uint64(len(checkpoint.OpenBatchIDs)) > config.StatusCapacity || checkpoint.Mapping == nil || checkpoint.Mapping.CoveredCommitSeq() == model.CommitSeq(math.MaxUint64) {
 		return Result{}, base.ErrInvalidConfig
 	}
 	if ctx == nil {
@@ -105,7 +108,9 @@ func Recover(ctx context.Context, log Log, checkpoint Checkpoint, config Config)
 				return corrupt(errors.New("duplicate terminal batch"))
 			}
 			seenTerminal[abort.BatchID] = struct{}{}
-			result.Statuses[abort.BatchID] = BatchStatus{State: BatchAborted}
+			if err := retainStatus(&result, abort.BatchID, BatchStatus{State: BatchAborted}, config.StatusCapacity); err != nil {
+				return err
+			}
 		case recordcodec.RecordTypeIDReserve, recordcodec.RecordTypeBatchIDReserve:
 			record, err := recordcodec.DecodeReserve(payload, typ)
 			if err != nil {
@@ -132,6 +137,7 @@ func Recover(ctx context.Context, log Log, checkpoint Checkpoint, config Config)
 	if err != nil {
 		return Result{}, err
 	}
+	result.TerminalCount = uint64(len(result.Statuses))
 	return result, nil
 }
 
@@ -139,6 +145,25 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 	group, err := recordcodec.DecodeCommitGroup(payload, config.MaxRecordPayload, config.MaxGroupDescriptors, config.MaxGroupMutations)
 	if err != nil || group.Descriptors[0].CommitSeq != result.NextCommitSeq {
 		return corruptAt("commit sequence", err)
+	}
+	newStatuses := uint64(0)
+	for _, descriptor := range group.Descriptors {
+		if uint64(descriptor.BatchID) >= result.ReservedBatchIDHigh {
+			return corrupt(errors.New("descriptor batch outside reserved range"))
+		}
+		if descriptor.Kind != recordcodec.DescriptorUserCommit {
+			continue
+		}
+		if _, exists := seenTerminal[descriptor.BatchID]; exists {
+			return corrupt(errors.New("duplicate terminal batch"))
+		}
+		seenTerminal[descriptor.BatchID] = struct{}{}
+		if _, retained := result.Statuses[descriptor.BatchID]; !retained {
+			newStatuses++
+		}
+	}
+	if newStatuses > config.StatusCapacity || uint64(len(result.Statuses)) > config.StatusCapacity-newStatuses {
+		return base.ErrStatusCapacity
 	}
 	proposals := make([]mapping.Proposal, len(group.Descriptors))
 	reservations := make([]mapping.DeltaReservation, len(group.Descriptors))
@@ -150,14 +175,9 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 		}
 	}
 	for i, descriptor := range group.Descriptors {
-		if uint64(descriptor.BatchID) >= result.ReservedBatchIDHigh {
-			return corrupt(errors.New("descriptor batch outside reserved range"))
-		}
-		if _, exists := seenTerminal[descriptor.BatchID]; exists {
-			return corrupt(errors.New("duplicate terminal batch"))
-		}
 		proposal, err := descriptorProposal(ctx, log, descriptor, physical.Addr, result.ReservedIDHigh, config.MaxValueSize)
 		if err != nil {
+			releaseReservations()
 			return err
 		}
 		proposals[i] = proposal
@@ -171,7 +191,6 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 			return errors.Join(base.ErrInvalidConfig, err)
 		}
 		reservations[i] = reservation
-		seenTerminal[descriptor.BatchID] = struct{}{}
 	}
 	plan, err := current.ResolveGroup(proposals)
 	if err != nil {
@@ -180,9 +199,12 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 	}
 	for i, proposal := range plan.Proposals {
 		if !proposal.Accepted {
+			releaseReservations()
 			return corrupt(errors.New("replayed proposal was rejected"))
 		}
-		result.Statuses[group.Descriptors[i].BatchID] = BatchStatus{State: BatchCommitted, CommitSeq: group.Descriptors[i].CommitSeq}
+		if group.Descriptors[i].Kind == recordcodec.DescriptorUserCommit {
+			result.Statuses[group.Descriptors[i].BatchID] = BatchStatus{State: BatchCommitted, CommitSeq: group.Descriptors[i].CommitSeq}
+		}
 	}
 	if _, err := current.PublishGroup(result.NextCommitSeq, plan, reservations); err != nil {
 		releaseReservations()
@@ -193,6 +215,14 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 		return corrupt(errors.New("commit sequence exhausted"))
 	}
 	result.NextCommitSeq = last + 1
+	return nil
+}
+
+func retainStatus(result *Result, id model.BatchID, status BatchStatus, capacity uint64) error {
+	if _, exists := result.Statuses[id]; !exists && uint64(len(result.Statuses)) >= capacity {
+		return base.ErrStatusCapacity
+	}
+	result.Statuses[id] = status
 	return nil
 }
 

@@ -176,7 +176,23 @@ IDReserveRecord 和 BatchIDReserveRecord 使用 `sync=true`。只有 Append 成�
 
 允许跳过一段 ID，绝不允许回退或复用。
 
-## 10. Fail-closed 条件
+## 10. Batch Status 的有界恢复
+
+Manifest 只持久化 checkpoint cut 时仍未终结的公开 BatchID；完整终态由 cut 之后的 Abort 或用户
+Commit Descriptor 恢复。Replay 的状态表受 `StatusRetention` 硬限制，超过限制返回
+`ErrStatusCapacity`，不能无界分配内存。
+
+运行时 admission 保证：
+
+```text
+terminal user batches after cut + currently open user batches <= StatusRetention
+```
+
+达到上限时必须先完成 Checkpoint，不能继续接收会制造新终态的 Batch。Relocation Descriptor 不属于
+用户可查询状态，因此不占用该容量。Checkpoint 推进后，旧终态允许从内存保留窗口中逐步淘汰；查询
+无法再证明的历史结果返回 `ErrStatusExpired`，不能把保留 BatchID 区间推断成确定的 Aborted。
+
+## 11. Fail-closed 条件
 
 以下情况必须停止写入并要求重新 Open 或离线修复：
 
@@ -190,7 +206,7 @@ IDReserveRecord 和 BatchIDReserveRecord 使用 `sync=true`。只有 Append 成�
 
 不能通过跳过损坏 Record、猜测最新文件或继续复用 active tail 来保持服务。
 
-## 11. 必须验证的崩溃点
+## 12. 必须验证的崩溃点
 
 - Append 地址预留前后；
 - 地址预留后、write 前；
