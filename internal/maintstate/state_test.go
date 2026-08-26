@@ -3,6 +3,7 @@ package maintstate
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/akzj/ridstore/internal/model"
@@ -59,5 +60,19 @@ func TestInstallLoadRemove(t *testing.T) {
 	}
 	if _, err := os.Stat(Path(root)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal remains: %v", err)
+	}
+}
+
+func TestLoadRejectsSymlinkTemp(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "journal")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target", filepath.Join(dir, tempName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(root); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err=%v", err)
 	}
 }

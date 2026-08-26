@@ -211,6 +211,37 @@ func TestRetireRemovesCatalogBeforePhysicalFile(t *testing.T) {
 	}
 }
 
+func TestCleanupRetiredSegmentIsIdempotentAcrossRestartStates(t *testing.T) {
+	root := t.TempDir()
+	state := initialCatalog(512, 256)
+	if err := CreateInitialSegment(root, state.LogID, state.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	catalog := &memoryCatalog{state: state}
+	log, err := Open(root, testLogConfig(), catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupRetiredSegment(root, 1, 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupRetiredSegment(root, 1, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(recordsPath(root), sealedSegmentName(1))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sealed file remains: %v", err)
+	}
+}
+
 func TestRotationJournalRejectsCorruption(t *testing.T) {
 	state := initialCatalog(1024, 512)
 	addr, err := NewVAddr(1, SegmentHeaderSize, 64)

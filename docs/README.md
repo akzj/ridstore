@@ -15,6 +15,8 @@ ridstore 当前定位为嵌入式、单机、单目录独占的 Stable-ID Log-St
 9. [ridstore v2 Delta Admission](v2-delta-admission.md)：Mapping 内存上界、reservation 和无死锁 Checkpoint 时序；
 10. [v2 M1 Review](v2-m1-review.md)：基础格式实现、验证证据和进入 M2 前的 Review 项。
 11. [v2 M2 Review](v2-m2-review.md)：RecordLog 运行实现、崩溃边界和进入 M3 前的 Review 项。
+12. [v2 Maintenance Marker](v2-maintenance-format.md)：Data GC 不可逆边界与 Catalog 驱动恢复。
+13. [v2 M5 Review](v2-m5-review.md)：Relocation、退休证明、物理清理与剩余 fault matrix。
 
 v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构。以下 Format v1 文档仍用于理解
 已实现系统和提取不变量，不自动成为 v2 的实现约束。
@@ -60,6 +62,8 @@ v2 禁止通过 Adapter、dual-write 或旧格式兼容层延续不合理结构�
 | `v2-m2-review.md` | Implemented, pending review | v2 RecordLog、rotation recovery 与 Reader Pin 审计 |
 | `v2-m3-review.md` | Implemented | v2 transaction、Coordinator 与最小 Engine 闭环 |
 | `v2-m4-review.md` | Core implemented, crash review pending | v2 Persistent Mapping、Replay 与原子 Checkpoint 闭环 |
+| `v2-maintenance-format.md` | Implemented, fault review pending | v2 Data GC durable marker 与恢复判定 |
+| `v2-m5-review.md` | Core implemented, crash review pending | v2 Data GC relocation、退休证明与物理清理 |
 | `design.md` | Accepted architecture | 总体边界与不变量 |
 | `positioning-vs-lsm.md` | Accepted boundary | 防止漂移成 RocksDB 替代品 |
 | `api-contract.md` | Development contract v1 | 第一版 Library API |

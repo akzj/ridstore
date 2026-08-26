@@ -153,7 +153,13 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	if err := s.maintenance.RetireSegment(ctx, source, proof.CatalogGeneration); err != nil {
 		current := s.catalog.Snapshot()
 		if current.Generation == proof.CatalogGeneration && containsSealedSegment(current, proof.Source) {
-			return result, errors.Join(err, maintstate.Remove(s.root))
+			cleanupErr := maintstate.Remove(s.root)
+			if cleanupErr == nil {
+				return result, err
+			}
+			recoveryErr := errors.Join(base.ErrRecoveryRequired, err, cleanupErr)
+			s.setFault(recoveryErr)
+			return result, recoveryErr
 		}
 		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
 		s.setFault(recoveryErr)
