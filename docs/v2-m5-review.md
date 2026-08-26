@@ -103,9 +103,20 @@ Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺
 
 当前缺口不再是“能否安全删除一个已指定 Segment”，而是 GC 策略和长期收敛：
 
-- 基于 checkpoint stats 的 bounded candidate selection；
 - ENOSPC 下 relocation/Checkpoint 的空间预算与退避；
 - relocation 与前台更新交错的模型测试；
 - 重复 GC、重启和空间回收的长时 convergence soak。
 
 这些工作不能削弱当前删除门禁；SegmentStats 仍只筛选候选，不能独立授权删除。
+
+### 6.1 已完成的候选选择
+
+`CompactNextSegment` 先生成 exact Checkpoint，再以单遍、有界工作空间选择至多一个 Segment。候选必须：
+
+- sealed Segment 的 end 不晚于 ReplayStart；
+- 不被任何 open Batch 的最终 Put 引用；
+- 同时满足调用者提供的最小 reclaimable bytes 与最小 reclaimable ratio；
+- 在多个候选中优先 reclaimable bytes 最大、live bytes 更小、SegmentID 更早者。
+
+候选结果明确携带 Catalog generation 和 StatsCoveredCommitSeq，但只是调度提示。执行阶段仍重新 relocation、
+Checkpoint 和 exact proof；没有把统计结果升级为删除令牌。

@@ -54,6 +54,16 @@ reclaimableLowerBound = max(0, reclaimablePhysicalBytes - LiveUpperBytes)
 
 上界可能因 cut 后多次覆盖而高估 live，只会漏选一时值得清理的 Segment，不会把 live 空间误报为可回收。即使 `LiveUpperBytes == 0`，删除前仍必须完成本协议的精确 Mapping 扫描、Relocation 后复查、Checkpoint、Pin、Manifest 和 Trash 全部门禁；SegmentStats 永不授权删除。
 
+v2 的 `CompactNextSegment` 在选择前主动创建一次 Checkpoint，并且只考虑 `segment.end <= ReplayStart`
+的 sealed Segment。这样的 Segment 不再接受新 append；同一时刻又只有一个 maintenance 操作，因此 cut
+后的用户提交只能减少、不能增加指向该 source 的 Mapping。于是该 Checkpoint 的 exact live bytes 对选择
+时刻自然成为 live upper bound，不需要在热路径维护第二套全局计数。
+
+选择器单遍扫描 Manifest，额外空间只与被 open Batch 引用的 Segment 集合有关，并且一次最多返回一个
+候选。排序依次采用 reclaimable bytes 降序、live bytes 升序、SegmentID 升序。调用方可以同时设置最小
+可回收字节数和最小回收比例（basis points）；两个非零门槛都必须满足。被 open Batch 最终 Put 引用、
+或尚未完全位于 ReplayStart 之前的 Segment 不进入候选集。
+
 ## 4. 存活判定
 
 扫描 PutRecord，得到 `(ID, OldVAddr)`：
