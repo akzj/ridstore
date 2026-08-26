@@ -1,6 +1,6 @@
 # ridstore v2 M4 Review
 
-状态：核心运行闭环、Delta hard admission 与 bounded builder 已实现
+状态：M4 durable boundary 已闭合；M5 Relocation 已开始
 
 ## 1. 本阶段结果
 
@@ -101,5 +101,5 @@ Engine fail closed，重启以 durable Manifest 为准。
 - 顶层公开 API 切换和旧 v1 模块删除。
 
 因此 M4 目前证明正常执行、重启恢复、Delta 有界接纳与 Checkpoint 有界构建闭环，不构成
-production-ready 声明。下一优先级是复核完整 M4 durable boundary，再决定是否进入 Relocation/GC，
-不能先删除旧公开路径。
+production-ready 声明。M5 首先让 Relocation 原生进入唯一 Coordinator 的 CommitSeq、group fsync 与
+Mapping publish 顺序；在精确 liveness、checkpoint 和 retire 门禁闭合前，不启用文件删除。

@@ -31,6 +31,19 @@ type Result struct {
 	CommitSeq model.CommitSeq
 }
 
+type Relocation struct {
+	BatchID             model.BatchID
+	Changes             []mapping.Change
+	LogicalPayloadBytes uint64
+}
+
+type RelocationResult struct {
+	BatchID   model.BatchID
+	CommitSeq model.CommitSeq
+	Applied   uint32
+	Skipped   uint32
+}
+
 type response struct {
 	result Result
 	err    error
@@ -58,12 +71,19 @@ type checkpointResponse struct {
 	err error
 }
 
+type relocationResponse struct {
+	result RelocationResult
+	err    error
+}
+
 type request struct {
-	batch    *transaction.Batch
-	prepared transaction.Prepared
-	reserve  mapping.DeltaReservation
-	result   chan response
-	barrier  chan checkpointResponse
+	batch      *transaction.Batch
+	prepared   transaction.Prepared
+	relocation *Relocation
+	reserve    mapping.DeltaReservation
+	result     chan response
+	relocated  chan relocationResponse
+	barrier    chan checkpointResponse
 }
 
 type Coordinator struct {
@@ -100,6 +120,53 @@ func (c *Coordinator) Commit(ctx context.Context, batch *transaction.Batch) (Res
 		return Result{}, err
 	}
 	return receipt.Wait()
+}
+
+// Relocate durably publishes physical-address CAS changes through the same
+// ordering and fsync path as user commits. The caller must append and validate
+// every NewAddr Put before admission and must allocate BatchID from the shared
+// durable BatchID allocator.
+func (c *Coordinator) Relocate(ctx context.Context, relocation Relocation) (RelocationResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return RelocationResult{}, err
+	}
+	if err := c.Fault(); err != nil {
+		return RelocationResult{}, errors.Join(base.ErrReadOnly, err)
+	}
+	proposal := relocationProposal(relocation)
+	if relocation.BatchID == 0 || mapping.ValidateProposal(proposal) != nil {
+		return RelocationResult{}, base.ErrInvalidConfig
+	}
+	ids := make([]model.ID, len(relocation.Changes))
+	for i := range relocation.Changes {
+		ids[i] = relocation.Changes[i].RecordID
+	}
+	reservation, _, err := c.mapping.ReserveDelta(ids)
+	if err != nil {
+		return RelocationResult{}, err
+	}
+	owned := relocation
+	owned.Changes = append([]mapping.Change(nil), relocation.Changes...)
+	req := request{relocation: &owned, reserve: reservation, relocated: make(chan relocationResponse, 1)}
+	c.submitMu.Lock()
+	if c.closed {
+		c.submitMu.Unlock()
+		reservation.Release()
+		return RelocationResult{}, base.ErrClosed
+	}
+	select {
+	case c.requests <- req:
+		c.submitMu.Unlock()
+	case <-ctx.Done():
+		c.submitMu.Unlock()
+		reservation.Release()
+		return RelocationResult{}, ctx.Err()
+	}
+	answer := <-req.relocated
+	return answer.result, answer.err
 }
 
 // Submit reserves Delta capacity, transitions the Batch to Committing and
@@ -222,7 +289,7 @@ func (c *Coordinator) run() {
 			continue
 		}
 		group := []request{first}
-		descriptorBytes, err := descriptorPayloadSize(first.prepared)
+		descriptorBytes, err := requestDescriptorSize(first)
 		bytes := uint64(recordcodec.CommitGroupHeadSize) + descriptorBytes
 		if err != nil || bytes > c.config.MaxGroupPayload {
 			c.rejectInvalid(first, errors.Join(base.ErrBatchTooLarge, err))
@@ -241,7 +308,7 @@ func (c *Coordinator) run() {
 					group = nil
 					break
 				}
-				nextBytes, sizeErr := descriptorPayloadSize(next.prepared)
+				nextBytes, sizeErr := requestDescriptorSize(next)
 				if sizeErr != nil || uint64(recordcodec.CommitGroupHeadSize)+nextBytes > c.config.MaxGroupPayload {
 					c.rejectInvalid(next, errors.Join(base.ErrBatchTooLarge, sizeErr))
 					continue
@@ -296,9 +363,7 @@ func (c *Coordinator) processCheckpoint(req request) {
 func (c *Coordinator) process(group []request) {
 	if fault := c.Fault(); fault != nil {
 		for _, req := range group {
-			req.reserve.Release()
-			_ = req.batch.MarkAborted()
-			req.result <- response{err: errors.Join(base.ErrReadOnly, fault)}
+			c.completeFailure(req, errors.Join(base.ErrReadOnly, fault), false, false)
 		}
 		return
 	}
@@ -306,7 +371,7 @@ func (c *Coordinator) process(group []request) {
 	proposals := make([]mapping.Proposal, 0, len(group))
 	for _, req := range group {
 		active = append(active, req)
-		proposals = append(proposals, req.prepared.Proposal())
+		proposals = append(proposals, requestProposal(req))
 	}
 	if len(active) == 0 {
 		return
@@ -332,14 +397,12 @@ func (c *Coordinator) process(group []request) {
 			return
 		}
 		sequences[i] = next
-		descriptors = append(descriptors, descriptor(active[i].prepared, next))
+		descriptors = append(descriptors, requestDescriptor(active[i], next))
 		next++
 	}
 	if len(descriptors) == 0 {
 		for _, req := range active {
-			req.reserve.Release()
-			_ = req.batch.MarkAborted()
-			req.result <- response{err: base.ErrConflict}
+			c.completeFailure(req, base.ErrConflict, false, false)
 		}
 		return
 	}
@@ -353,19 +416,11 @@ func (c *Coordinator) process(group []request) {
 		c.fail(err)
 		unknown := c.log.Status().Poisoned
 		for i, req := range active {
-			req.reserve.Release()
 			if !plan.Proposals[i].Accepted {
-				_ = req.batch.MarkAborted()
-				req.result <- response{err: base.ErrConflict}
+				c.completeFailure(req, base.ErrConflict, false, false)
 				continue
 			}
-			if unknown {
-				_ = req.batch.MarkCommitUnknown()
-				req.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
-			} else {
-				_ = req.batch.MarkAborted()
-				req.result <- response{err: err}
-			}
+			c.completeFailure(req, err, unknown, true)
 		}
 		return
 	}
@@ -375,26 +430,30 @@ func (c *Coordinator) process(group []request) {
 	}
 	published, err := c.mapping.PublishGroup(descriptors[0].CommitSeq, plan, reservations)
 	if err == nil {
-		var mutations uint64
-		for _, item := range descriptors {
-			mutations += uint64(len(item.Mutations))
+		var applied, skipped uint64
+		for _, proposal := range plan.Proposals {
+			if !proposal.Accepted {
+				continue
+			}
+			for _, change := range proposal.Changes {
+				if change.Apply {
+					applied++
+				} else {
+					skipped++
+				}
+			}
 		}
-		if published.Committed != uint32(len(descriptors)) || uint64(published.Applied) != mutations || published.Skipped != 0 {
+		if published.Committed != uint32(len(descriptors)) || uint64(published.Applied) != applied || uint64(published.Skipped) != skipped {
 			err = fmt.Errorf("mapping publish result: %w", base.ErrCorrupt)
 		}
 	}
 	if err != nil {
-		for _, reservation := range reservations {
-			reservation.Release()
-		}
 		c.fail(err)
 		for i, req := range active {
 			if plan.Proposals[i].Accepted {
-				_ = req.batch.MarkCommitUnknown()
-				req.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
+				c.completeFailure(req, err, true, true)
 			} else {
-				_ = req.batch.MarkAborted()
-				req.result <- response{err: base.ErrConflict}
+				c.completeFailure(req, base.ErrConflict, false, false)
 			}
 		}
 		return
@@ -404,27 +463,94 @@ func (c *Coordinator) process(group []request) {
 	c.stateMu.Unlock()
 	for i, req := range active {
 		if !plan.Proposals[i].Accepted {
-			_ = req.batch.MarkAborted()
-			req.result <- response{err: base.ErrConflict}
+			c.completeFailure(req, base.ErrConflict, false, false)
 			continue
 		}
 		seq := sequences[i]
-		if err := req.batch.MarkCommitted(seq); err != nil {
+		if err := c.completeSuccess(req, seq, plan.Proposals[i]); err != nil {
 			c.fail(err)
-			_ = req.batch.MarkCommitUnknown()
-			req.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
-			continue
 		}
-		req.result <- response{result: Result{BatchID: req.prepared.BatchID, CommitSeq: seq}}
 	}
 }
 
-func descriptorPayloadSize(prepared transaction.Prepared) (uint64, error) {
-	descriptorSize, err := recordcodec.DescriptorSize(uint64(len(prepared.Mutations)))
+func requestDescriptorSize(req request) (uint64, error) {
+	mutations := len(req.prepared.Mutations)
+	if req.relocation != nil {
+		mutations = len(req.relocation.Changes)
+	}
+	descriptorSize, err := recordcodec.DescriptorSize(uint64(mutations))
 	if err != nil {
 		return 0, err
 	}
 	return uint64(descriptorSize), nil
+}
+
+func requestProposal(req request) mapping.Proposal {
+	if req.relocation != nil {
+		return relocationProposal(*req.relocation)
+	}
+	return req.prepared.Proposal()
+}
+
+func relocationProposal(relocation Relocation) mapping.Proposal {
+	return mapping.Proposal{Kind: mapping.ProposalRelocation, Changes: append([]mapping.Change(nil), relocation.Changes...)}
+}
+
+func requestDescriptor(req request, seq model.CommitSeq) recordcodec.Descriptor {
+	if req.relocation == nil {
+		return descriptor(req.prepared, seq)
+	}
+	mutations := make([]recordcodec.Mutation, len(req.relocation.Changes))
+	for i, change := range req.relocation.Changes {
+		mutations[i] = recordcodec.Mutation{
+			RecordID: change.RecordID, NewAddr: change.NewAddr,
+			ExpectedOldAddr: change.ExpectedOldAddr, Operation: recordcodec.OperationRelocate,
+		}
+	}
+	return recordcodec.Descriptor{
+		Kind: recordcodec.DescriptorRelocation, BatchID: req.relocation.BatchID, CommitSeq: seq,
+		LogicalPayloadBytes: req.relocation.LogicalPayloadBytes, Mutations: mutations,
+	}
+}
+
+func (c *Coordinator) completeSuccess(req request, seq model.CommitSeq, resolved mapping.ResolvedProposal) error {
+	if req.relocation != nil {
+		result := RelocationResult{BatchID: req.relocation.BatchID, CommitSeq: seq}
+		for _, change := range resolved.Changes {
+			if change.Apply {
+				result.Applied++
+			} else {
+				result.Skipped++
+			}
+		}
+		req.relocated <- relocationResponse{result: result}
+		return nil
+	}
+	if err := req.batch.MarkCommitted(seq); err != nil {
+		_ = req.batch.MarkCommitUnknown()
+		req.result <- response{err: errors.Join(base.ErrCommitUnknown, err)}
+		return err
+	}
+	req.result <- response{result: Result{BatchID: req.prepared.BatchID, CommitSeq: seq}}
+	return nil
+}
+
+func (c *Coordinator) completeFailure(req request, cause error, unknown, accepted bool) {
+	req.reserve.Release()
+	if req.relocation != nil {
+		if unknown && accepted {
+			cause = errors.Join(base.ErrCommitUnknown, cause)
+		}
+		req.relocated <- relocationResponse{err: cause}
+		return
+	}
+	if unknown && accepted {
+		_ = req.batch.MarkCommitUnknown()
+		cause = errors.Join(base.ErrCommitUnknown, cause)
+	} else {
+		_ = req.batch.MarkAborted()
+	}
+	req.result <- response{err: cause}
 }
 
 func descriptor(prepared transaction.Prepared, seq model.CommitSeq) recordcodec.Descriptor {
@@ -443,16 +569,12 @@ func descriptor(prepared transaction.Prepared, seq model.CommitSeq) recordcodec.
 }
 
 func (c *Coordinator) rejectInvalid(req request, err error) {
-	req.reserve.Release()
-	_ = req.batch.MarkAborted()
-	req.result <- response{err: err}
+	c.completeFailure(req, err, false, false)
 }
 
 func (c *Coordinator) rejectGroup(group []request, err error) {
 	for _, req := range group {
-		req.reserve.Release()
-		_ = req.batch.MarkAborted()
-		req.result <- response{err: err}
+		c.completeFailure(req, err, false, false)
 	}
 }
 

@@ -192,6 +192,80 @@ func TestCommitWritesDurableDescriptorBeforeMappingPublish(t *testing.T) {
 	}
 }
 
+func TestRelocationSharesCommitOrderAndUsesAddressCAS(t *testing.T) {
+	log := &fakeLog{}
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+
+	user := newBatch(t, 7, log)
+	if err := user.Put(context.Background(), 3, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := c.Commit(context.Background(), user)
+	if err != nil || committed.CommitSeq != 1 {
+		t.Fatalf("user commit=%+v err=%v", committed, err)
+	}
+	oldAddr, exists, err := current.Lookup(3)
+	if err != nil || !exists {
+		t.Fatalf("old addr=%v exists=%v err=%v", oldAddr, exists, err)
+	}
+	copiedPayload, err := recordcodec.EncodePut(recordcodec.PutRecord{OriginBatchID: 7, RecordID: 3, Value: []byte("value")}, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied, err := log.Append(context.Background(), copiedPayload, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relocated, err := c.Relocate(context.Background(), Relocation{
+		BatchID: 8, LogicalPayloadBytes: 5,
+		Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewAddr: copied.Addr, Operation: mapping.OperationRelocate}},
+	})
+	if err != nil || relocated.CommitSeq != 2 || relocated.Applied != 1 || relocated.Skipped != 0 {
+		t.Fatalf("relocation=%+v err=%v", relocated, err)
+	}
+	if got, exists, err := current.Lookup(3); err != nil || !exists || got != copied.Addr {
+		t.Fatalf("relocated addr=%v exists=%v err=%v", got, exists, err)
+	}
+
+	staleCopy, err := log.Append(context.Background(), copiedPayload, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := c.Relocate(context.Background(), Relocation{
+		BatchID: 9, LogicalPayloadBytes: 5,
+		Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewAddr: staleCopy.Addr, Operation: mapping.OperationRelocate}},
+	})
+	if err != nil || stale.CommitSeq != 3 || stale.Applied != 0 || stale.Skipped != 1 {
+		t.Fatalf("stale relocation=%+v err=%v", stale, err)
+	}
+	if got, _, _ := current.Lookup(3); got != copied.Addr {
+		t.Fatalf("stale relocation overwrote current addr=%v", got)
+	}
+	groups := log.snapshotGroups()
+	if len(groups) != 3 || groups[1].Descriptors[0].Kind != recordcodec.DescriptorRelocation ||
+		groups[1].Descriptors[0].Mutations[0].ExpectedOldAddr != oldAddr ||
+		groups[2].Descriptors[0].Kind != recordcodec.DescriptorRelocation {
+		t.Fatalf("groups=%+v", groups)
+	}
+}
+
+func TestRelocationDurabilityFailureIsCommitUnknown(t *testing.T) {
+	wantErr := errors.New("sync failed")
+	log := &fakeLog{syncErr: wantErr, poisoned: true}
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+	oldAddr, _ := recordlog.NewVAddr(1, 64, 64)
+	newAddr, _ := recordlog.NewVAddr(1, 128, 64)
+	result, err := c.Relocate(context.Background(), Relocation{
+		BatchID: 1, LogicalPayloadBytes: 1,
+		Changes: []mapping.Change{{RecordID: 1, ExpectedOldAddr: oldAddr, NewAddr: newAddr, Operation: mapping.OperationRelocate}},
+	})
+	if result != (RelocationResult{}) || !errors.Is(err, base.ErrCommitUnknown) || !errors.Is(err, wantErr) || c.Fault() == nil {
+		t.Fatalf("result=%+v err=%v fault=%v", result, err, c.Fault())
+	}
+}
+
 func TestQueuedCommitsFormOneVirtualMappingGroup(t *testing.T) {
 	log := &fakeLog{firstSync: make(chan struct{}), releaseSync: make(chan struct{})}
 	current := mapping.NewEmpty()

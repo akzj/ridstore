@@ -1,10 +1,6 @@
-# GC 与空间回收协议
+# ridstore v2 GC 与空间回收协议
 
-> Format v1 历史契约：v2 仍以 `Mapping[ID] == scanned VAddr` 证明 live，但不再承诺 relocation 前后
-> LogicalRevision 不变。v2 relocation 会改变地址 observation token，Value 与 OriginBatchID 仅作为内容和
-> 来源验证字段保留；见 [v2 API 与一致性契约](v2-api-contract.md)。
-
-状态：Development contract v1
+状态：M5 implementation contract
 
 ## 1. 目标与边界
 
@@ -15,7 +11,7 @@ Data GC 回收：
 - 被后续 Put 覆盖的旧 Record；
 - Delete 后不再映射的 Record；
 - GC CAS 失败产生的副本；
-- Mapping Checkpoint 已覆盖的旧 Commit/系统 Frame。
+- Mapping Checkpoint 已覆盖的旧 Commit/系统 Record。
 
 GC 不理解 Page、Blob、TTL、Stream 或业务生命周期。唯一逻辑存活依据是当前 Mapping。
 
@@ -27,7 +23,7 @@ Mapping 文件的不可达 Node 回收由 Mapping GC 负责，见 `mapping-desig
 Active -> Sealed -> Cleaning -> Retired -> Trash -> Deleted
 ```
 
-- Active：append sequencer 正在写；
+- Active：RecordLog writer 正在写；
 - Sealed：Footer durable，可读但不可写；
 - Cleaning：GC 正在扫描/复制；
 - Retired：没有 Mapping 应继续指向它，等待 reader/open-batch refs；
@@ -67,10 +63,10 @@ current = Mapping.Lookup(ID)
 live iff current == OldVAddr
 ```
 
-其他 Frame：
+其他 Record：
 
 - Commit/Abort/IDReserve 在 Mapping Checkpoint 覆盖后不作为用户 live data 复制；
-- 未覆盖的系统 Frame 所在 Segment不能成为候选；
+- 未覆盖的系统 Record 所在 Segment不能成为候选；
 - Segment Header/Footer 不复制；
 - 无法解析或 CRC 错误立即停止 GC 并标记 corruption。
 
@@ -85,11 +81,15 @@ copy payload to new PutRecord
 record {ID, ExpectedOldVAddr, NewVAddr}
 ```
 
-RelocationPart/Seal 使用新的内部 GC BatchID；copied PutRecord 则必须保留旧 PutRecord Header 的 OriginBatchID 并复制用户 Value。OriginBatchID 就是 LogicalRevision，因此 GC 不能制造用户可见的新版本。
+Relocation Descriptor 使用共享 durable allocator 发放的内部 BatchID；copied PutRecord 必须保留旧
+PutRecord Header 的 OriginBatchID 并复制用户 Value。OriginBatchID 只用于来源追踪，不是业务版本；
+GC 不能改变逻辑内容。
 
 Relocation 可以分多个有限 Batch，避免单次占用过多内存或阻塞 group commit。
 
-Relocation 使用独立 Frame Type，但共享 append sequencer、fsync 和 CommitSeq 顺序。Commit Coordinator 在 pre-Seal virtual Mapping 顺序中对每条 Entry 解析 CAS：
+Relocation 不增加顶层 Record 类型。它是 `CommitGroupRecord` 中的 Descriptor kind，与 UserCommit 进入
+同一个 Coordinator queue，共享分组、RecordLog append/fsync、CommitSeq 和 Mapping publish 顺序。
+Coordinator 在 durable append 前的 virtual Mapping 顺序中对每条 mutation 解析 CAS：
 
 ```text
 if Mapping[ID] == ExpectedOldVAddr:
@@ -98,7 +98,9 @@ else:
     skip
 ```
 
-Coordinator 将 apply/skip plan 传给 fsync 后的 Mapping Publisher，Publisher 在短内存临界区执行该计划，不在 `publishMu` 内做冷 Lookup。Recovery 按 Descriptor/CommitSeq 重算相同 CAS。Relocation CAS 成功和失败数量必须记录；失败副本不重试覆盖，它是新垃圾。
+Coordinator 将 apply/skip plan 传给 fsync 后的 Mapping Publisher，Publisher 在短内存临界区执行该计划，
+不在 Mapping 锁内做冷 Lookup。Recovery 按 Descriptor/CommitSeq 重算相同 CAS。Relocation CAS 成功和
+失败数量必须返回；失败副本不重试覆盖，它是新垃圾。
 
 ## 6. 持久化顺序
 
@@ -106,8 +108,7 @@ Coordinator 将 apply/skip plan 传给 fsync 后的 Mapping Publisher，Publishe
 
 ```text
 append copied PutRecords
--> append RelocationPart(s)
--> append RelocationSeal
+-> append one Relocation Descriptor in CommitGroupRecord
 -> fsync
 -> publish resolved CAS plan to Mapping
 ```
@@ -232,7 +233,7 @@ write new Manifest without source
 第一版：
 
 - 同时只清理一个 Data Segment；
-- GC copy 通过普通 append sequencer；
+- GC copy 通过唯一 RecordLog writer；
 - 用户 Commit 优先级高于 GC copy；
 - 每个 Relocation Batch 有字节/Mutation 上限；
 - 磁盘压力过高时允许 backpressure 新写，但不破坏已开始 Commit；
@@ -285,7 +286,7 @@ Checkpoint 与 GC 保持可运行，以免水位门禁阻塞自身的收敛路�
 
 Scrub 与 GC 分离：
 
-- 顺序验证 Segment Header/Footer/Frame CRC；
+- 顺序验证 Segment Header/Footer/Record CRC；
 - 验证 Mapping 指向正确 ID 的 PutRecord；
 - 验证 Manifest/Mapping Root 文件引用；
 - 报告 orphan/dead bytes；
@@ -298,11 +299,11 @@ GC 遇到 corruption 不能通过复制“看起来可读”的部分掩盖错�
 
 - Reader Lookup 后、Acquire 前 Retire；
 - Acquire 后 GC 等待 pin；
-- Copy 后、RelocationSeal 前崩溃；
+- Copy 后、Relocation Descriptor durable 前崩溃；
 - Relocation fsync 后、CAS 前崩溃；
 - CAS 一半后崩溃；
 - 用户 Put 与 Relocation CAS 两种顺序；
-- Relocation 前后 `GetRecord.Revision` 完全相同；
+- Relocation 前后 Value 与 OriginBatchID 完全相同，VAddr observation token 允许改变；
 - Mapping Checkpoint 构建/安装各阶段崩溃；
 - Manifest 移除前后崩溃；
 - rename-to-trash 前后崩溃；

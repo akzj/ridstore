@@ -370,6 +370,10 @@ func validateProposal(proposal Proposal) error {
 	return nil
 }
 
+// ValidateProposal validates a proposal before it is admitted to the shared
+// commit coordinator. ResolveGroup repeats this check at the Mapping boundary.
+func ValidateProposal(proposal Proposal) error { return validateProposal(proposal) }
+
 func validateResolvedPlan(plan GroupPlan) error {
 	for _, proposal := range plan.Proposals {
 		if !proposal.Accepted {
