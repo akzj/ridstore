@@ -75,10 +75,9 @@ func OpenVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapsh
 		if err != nil {
 			return fail(err)
 		}
-		scanErr := segment.scan(SegmentHeaderSize, func(AppendResult, []byte) error { return ctx.Err() })
+		scanErr := verifySealedRecords(ctx, segment, summary)
 		if scanErr != nil {
-			_ = segment.close()
-			return fail(scanErr)
+			return fail(errors.Join(scanErr, segment.close()))
 		}
 		reader.files[summary.SegmentID] = segment
 		report.Records += summary.RecordCount
@@ -94,18 +93,39 @@ func OpenVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapsh
 		return ctx.Err()
 	})
 	if scanErr != nil {
-		_ = file.Close()
-		return fail(scanErr)
+		return fail(errors.Join(scanErr, file.Close()))
 	}
 	if partial {
-		_ = file.Close()
-		return fail(ErrRecoveryRequired)
+		return fail(errors.Join(ErrRecoveryRequired, file.Close()))
 	}
 	reader.files[snapshot.ActiveSegmentID] = &sealedSegment{file: file, path: activePath, header: snapshot.headerFor(snapshot.ActiveSegmentID), summary: summary}
 	report.Records += summary.RecordCount
 	report.PhysicalBytes += uint64(summary.ValidEnd)
 	report.ActiveEnd = LogPos{SegmentID: snapshot.ActiveSegmentID, Offset: summary.ValidEnd}
 	return reader, report, nil
+}
+
+func verifySealedRecords(ctx context.Context, segment *sealedSegment, want SegmentSummary) error {
+	got := SegmentSummary{SegmentID: want.SegmentID, ValidEnd: SegmentHeaderSize}
+	err := segment.scan(SegmentHeaderSize, func(result AppendResult, _ []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if got.RecordCount == 0 {
+			got.FirstAddr = result.Addr
+		}
+		got.LastAddr = result.Addr
+		got.RecordCount++
+		got.ValidEnd = result.End.Offset
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("sealed record summary: %w", ErrCorrupt)
+	}
+	return nil
 }
 
 func (r *ReadOnly) Read(ctx context.Context, addr VAddr) ([]byte, error) {

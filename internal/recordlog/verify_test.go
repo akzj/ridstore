@@ -126,6 +126,52 @@ func TestOpenVerifiedReaderScansAndReadsAcrossSegments(t *testing.T) {
 	}
 }
 
+func TestVerifyFilesRejectsSealedSummaryThatDoesNotMatchRecords(t *testing.T) {
+	root := t.TempDir()
+	snapshot := initialCatalog(512, 256)
+	if err := CreateInitialSegment(root, snapshot.LogID, snapshot.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	catalog := &memoryCatalog{state: snapshot}
+	log, err := Open(root, testLogConfig(), catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(context.Background(), make([]byte, 200), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = catalog.SnapshotRecordLog()
+	snapshot.SealedSegments[0].RecordCount++
+	summary := snapshot.SealedSegments[0]
+	footer, err := EncodeSegmentFooter(SegmentFooter{
+		SegmentID: summary.SegmentID, DataEnd: summary.ValidEnd, FirstAddr: summary.FirstAddr,
+		LastAddr: summary.LastAddr, RecordCount: summary.RecordCount,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(recordsPath(root), sealedSegmentName(summary.SegmentID))
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(footer[:], int64(summary.ValidEnd)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyFiles(context.Background(), root, snapshot); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("verify err=%v", err)
+	}
+}
+
 func TestVerifyFilesRejectsPartialTailWithoutRepair(t *testing.T) {
 	root := t.TempDir()
 	snapshot := initialCatalog(1024, 512)
