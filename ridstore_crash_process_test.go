@@ -41,6 +41,17 @@ func TestPublicRecoveryAcrossProcessExit(t *testing.T) {
 			}
 			crashed := readPublicCrashResult(t, resultPath)
 			config := testCreateConfig(root)
+			verified, err := Verify(context.Background(), VerifyConfig{Dir: root})
+			if err != nil {
+				t.Fatalf("offline verify after process exit: %v", err)
+			}
+			wantLive := uint64(0)
+			if phase == "committed" || phase == "checkpoint-committed" {
+				wantLive = 1
+			}
+			if verified.Stage != VerifyStageExact || verified.LiveIDs != wantLive {
+				t.Fatalf("phase=%s verify=%+v", phase, verified)
+			}
 			store, err := Open(context.Background(), OpenConfig{Dir: root, Runtime: config.Runtime})
 			if err != nil {
 				t.Fatal(err)

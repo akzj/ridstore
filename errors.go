@@ -1,6 +1,10 @@
 package ridstore
 
-import "github.com/akzj/ridstore/internal/base"
+import (
+	"errors"
+
+	"github.com/akzj/ridstore/internal/base"
+)
 
 var (
 	ErrInvalidID           = base.ErrInvalidID
@@ -28,4 +32,5 @@ var (
 	ErrUnsupported         = base.ErrUnsupported
 	ErrInsufficientSpace   = base.ErrInsufficientSpace
 	ErrRecoveryRequired    = base.ErrRecoveryRequired
+	ErrVerifyLimit         = errors.New("ridstore: verification resource limit reached")
 )

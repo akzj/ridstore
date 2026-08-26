@@ -73,6 +73,44 @@ func TestPublicV2LifecycleAndTokenAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestPublicOfflineVerify(t *testing.T) {
+	ctx := context.Background()
+	config := testCreateConfig(filepath.Join(t.TempDir(), "store"))
+	store, err := Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(ctx, VerifyConfig{Dir: config.Dir}); !errors.Is(err, ErrLocked) {
+		t.Fatalf("verify open store err=%v", err)
+	}
+	batch, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(ctx, []byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(ctx, []byte("tail-two")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Verify(ctx, VerifyConfig{Dir: config.Dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Stage != VerifyStageExact || report.StoreID == ([16]byte{}) || report.CheckpointLiveIDs != 0 || report.LiveIDs != 2 || report.ReplayedCommits != 1 || report.VerifiedPuts != 2 {
+		t.Fatalf("report=%+v", report)
+	}
+	if _, err := Verify(ctx, VerifyConfig{Dir: config.Dir, MaxLiveIDs: 1, MaxReplayStatuses: 1, MappingCacheBytes: 1}); !errors.Is(err, ErrVerifyLimit) || errors.Is(err, ErrCorrupt) {
+		t.Fatalf("verify limit err=%v", err)
+	}
+}
+
 func TestVersionTokenRejectsZeroAndOtherStore(t *testing.T) {
 	ctx := context.Background()
 	firstConfig := testCreateConfig(filepath.Join(t.TempDir(), "first"))

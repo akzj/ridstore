@@ -7,8 +7,8 @@
 M6 已完成代码层面的单路径切换：根包公开 API 直接包装 `internal/engine`，仓库不再编译或保留
 Format v1 runtime。没有 adapter、fallback、dual-write 或格式自动探测。
 
-这意味着“v1 清理完成”，不意味着“production-ready”。被删除的 Backup、Verify、Metrics、Soak 和
-离线 CLI 必须以后按 v2 格式重新设计；它们不是继续保留 v1 的理由。
+这意味着“v1 清理完成”，不意味着“production-ready”。当时删除的 Backup、Verify、Metrics、Soak 和
+离线 CLI 必须按 v2 格式重新设计；其中 v2 原生 Verify 现已重新实现，它不是继续保留 v1 的理由。
 
 ## 2. 公开契约
 
@@ -69,9 +69,8 @@ relocation CAS、Reader Pin 和退休前精确证明。
 
 后续优先级：
 
-1. 按 `v2-verify-design.md` 实现 Offline Verify；
-2. 按需重新设计 Backup、Metrics 与长时 soak；
-3. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
+1. 按需重新设计 Backup、Metrics 与长时 soak；
+2. 在真实 workload 上建立吞吐、写放大、读放大和 GC 收敛基线。
 
 M6 后的第一个完整性迭代已经为 terminal Batch Status 增加有界保留、admission 驱动的 Checkpoint 和
 Replay 容量门禁；CommitUnknown 的恢复查询语义保持不变。

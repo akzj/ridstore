@@ -46,6 +46,7 @@ type Config struct {
 type Report struct {
 	Stage              Stage
 	ManifestGeneration uint64
+	StoreID            [16]byte
 	Data               recordlog.PhysicalReport
 	Mapping            mapstore.PhysicalReport
 	CheckpointLiveIDs  uint64
@@ -96,6 +97,7 @@ func Verify(ctx context.Context, root string, config Config) (report Report, res
 	}
 	report.Stage = StageManifest
 	report.ManifestGeneration = manifest.Generation
+	report.StoreID = manifest.StoreUUID
 
 	dataReader, dataReport, err := recordlog.OpenVerifiedReader(ctx, root, manifest.RecordLogSnapshot())
 	if err != nil {

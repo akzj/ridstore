@@ -33,10 +33,10 @@
 
 未以 `v2-` 开头的设计及 `phase-*.md` 记录 Format v1 的历史决策和曾经验证过的性质。它们只用于提取
 经验，不是当前 API、格式、模块名或生产能力的事实来源。尤其其中的 Revision、旧命令、旧 metrics、
-Backup/Verify/Soak 实现均已删除，后续能力必须按 v2 原生重写。
+Backup/Soak 的旧实现均已删除，后续能力必须按 v2 原生重写；Verify 已按 v2 格式独立重写。
 
 ## 当前完整性
 
 v2 已具备 Create/Open、CRUD、原子 Batch、group commit、Checkpoint、Replay、CommitUnknown 查询、
-有界状态恢复、用户写入磁盘水位、GC 候选选择、Relocation、安全退休和崩溃恢复。它仍不是
-production-ready：v2 原生 Verify/Backup/Metrics、并发模型测试和长期 soak 是后续完整性工作。
+有界状态恢复、用户写入磁盘水位、GC 候选选择、Relocation、安全退休、崩溃恢复和原生只读 Verify。
+它仍不是 production-ready：Backup、Metrics、长时 soak 与真实 workload 基线是后续完整性工作。

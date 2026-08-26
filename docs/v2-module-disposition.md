@@ -42,7 +42,7 @@
 | `data_gc.go` | Deleted/Rewritten | 旧文件已删除；v2 GC 原生位于 `internal/engine`、`recordlog`、`segmentstats` 和 `maintstate` |
 | `internal/maintenance` | Deleted/Rewritten | 旧 journal 已删除；v2 marker 位于 `internal/maintstate` |
 | `internal/backup` | Deleted, future rewrite | v2 原生 Backup 尚未实现，不保留旧格式代码 |
-| `internal/verify` | Deleted, future rewrite | v2 原生 verifier 尚未实现，不保留旧格式代码 |
+| `internal/verify` | Deleted | 旧 verifier 已删除；v2 原生实现为 `internal/verifier`，根包公开只读 `Verify` |
 | metrics/export | Deleted, future rewrite | v2 原生 metrics 尚未实现，不保留旧 runtime 采集结构 |
 | fault/crash/model tests | Keep 测试意图 | 测试代码按新接口重写，故障矩阵和性质继续作为验收标准 |
 

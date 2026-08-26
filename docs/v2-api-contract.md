@@ -170,3 +170,11 @@ OriginBatchID 不进入 Mapping、不由 Get 返回、不参与用户条件，�
 
 GC relocation 使用共享的 durable BatchID/CommitSeq 顺序，但不是用户提交，不进入公开 Status 保留集。
 Replay 仍验证其 CommitSeq、Descriptor 和 mutation，只是不为它生成可查询状态。
+
+## 11. 离线 Verify
+
+根包公开 `Verify(ctx, VerifyConfig)`。它必须在 Store 关闭时取得同一目录独占锁，并按
+physical files、checkpoint Mapping、semantic replay、exact join 的顺序验证；成功报告的终态 Stage
+固定为 `VerifyStageExact`。`MaxLiveIDs` 和 `MaxReplayStatuses` 是 verifier 自身的显式内存上限，命中时
+返回 `ErrVerifyLimit` 或 `ErrStatusCapacity`，不把资源不足误报为数据损坏。Verify 不调用正常 `Open`，
+不截断 tail、不完成 Journal、不清理垃圾文件，也不修改 Manifest。

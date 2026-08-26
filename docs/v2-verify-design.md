@@ -1,6 +1,6 @@
 # ridstore v2 Offline Verify
 
-状态：M1-M4 implemented；M5 pending
+状态：Implemented
 
 ## 1. 定位
 
@@ -116,7 +116,8 @@ replayed commit 数和完成阶段。`error == nil` 才表示 clean；报告即�
 4. **M4 exact join（已实现）**：逐项读取 final Mapping 指向的完整 Put，校验 Segment membership、
    Put identity 和最终地址唯一性；独立从 checkpoint Root 重建 sealed SegmentStats，并与 Manifest
    的同 cut 稀疏表逐项精确比较。final Mapping 与 checkpoint SegmentStats 明确属于不同时间切面；
-5. **M5 public/report**：公开 API、corruption/process-exit tests、CLI 可选封装。
+5. **M5 public/report（已实现）**：根包公开 `Verify`、稳定的阶段/统计报告、资源上限错误，且由
+   corruption 与 process-exit tests 覆盖。CLI 仍是可选包装，不属于 verifier 正确性边界。
 
 每个阶段只能声称它实际证明的范围。M1 通过不能称为 Store clean；在 M4 完成以前 API 不对外发布。
 
