@@ -58,6 +58,8 @@ Engine fail closed，重启以 durable Manifest 为准。
 ## 4. 已验证
 
 - checkpoint marker 位于此前 Commit 之后并返回精确 ReplayStart；
+- checkpoint barrier 返回后，已 durable 但客户端尚未消费结果的 Batch 按 transaction terminal state 排除，
+  `OpenBatchIDsAtCut` 只记录真正未终结的 Open/Failed Batch；
 - Persistent Mapping Freeze/Build/Install 期间的新 Commit 不丢失；
 - 高位 ID 的 Radix Walk 顺序与地址一致；
 - SegmentStats 覆盖多 Segment、active 排除、身份错误、未知 Segment和预算上限；

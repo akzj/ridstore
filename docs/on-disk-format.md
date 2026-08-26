@@ -520,7 +520,7 @@ ExactLiveRecords uint64
 
 `MaintenanceGeneration` 是已安装维护操作的单调 generation。开始新 MAINTENANCE operation 时取 `current MaintenanceGeneration + 1`，该值在本操作所有 Journal 重写中保持不变；本操作安装 Manifest 时必须把同一值写入新 Manifest。操作在 Manifest 安装前回滚时可以不推进该值，OperationID 仍用于区分遗留临时文件。加法溢出后禁止新维护操作并返回 `ErrGenerationExhausted`。
 
-`IssuedBatchIDHighExclusiveAtCut` 是 checkpoint barrier 时已经由用户 `Begin` 或内部 Relocation allocator 取用的最大连续 BatchID 上界。`OpenBatchIDsAtCut` 是该时刻仍为 Open/Committing 的用户 BatchID 排序数组，数量不得超过持久化的 `MaxOpenBatches` 硬限制；maintenance coordinator 保证建立 checkpoint cut 时没有未完成的 Relocation Batch。二者只用于恢复 Batch Status：切点前已经结束且不在保留状态索引中的 Batch 返回 `ErrStatusExpired`；切点时开放或切点后可能发放的 Batch，可以由 ReplayStart 后的 Seal/Abort 或其缺失确定结果。
+`IssuedBatchIDHighExclusiveAtCut` 是 checkpoint barrier 时已经由用户 `Begin` 或内部 Relocation allocator 取用的最大连续 BatchID 上界。Coordinator barrier 返回前会完成此前 admission 的 Commit，因此 `OpenBatchIDsAtCut` 只包含此时仍为 Open/Failed 的用户 BatchID 排序数组；已 durable 但调用方尚未消费结果、尚未来得及从内存 open map 移除的 terminal Batch 必须排除。数组数量不得超过持久化的 `MaxOpenBatches` 硬限制；maintenance coordinator 保证建立 checkpoint cut 时没有未完成的 Relocation Batch。二者只用于恢复 Batch Status：切点前已经结束且不在保留状态索引中的 Batch 返回 `ErrStatusExpired`；切点时开放或切点后可能发放的 Batch，可以由 ReplayStart 后的 Seal/Abort 或其缺失确定结果。
 
 Checkpoint 构建期间 Data/Mapping 文件集合仍可能因 append rotation 而变化。安装新 Root 时必须持有 Manifest 安装串行器，读取最新 durable 文件目录，再把新的 `(MappingRootAddr, CoveredCommitSeq, CutFrameSeq, ReplayStartLogPos, StatsCoveredCommitSeq, SegmentStatsTable, IssuedBatchIDHighExclusiveAtCut, OpenBatchIDsAtCut)` 合并进去生成完整新 Manifest。Root、cut 和 Stats 必须由同一个 Manifest generation 原子安装；不得从 Checkpoint 开始时保存的旧 Manifest 整体覆盖当前文件集合。Mapping Checkpoint、Mapping GC 和 Data GC 的 Manifest 安装都经过同一个串行器，并用 generation CAS 拒绝基于过期 generation 的安装。
 

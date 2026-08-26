@@ -252,12 +252,12 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		s.ops.Unlock()
 		return err
 	}
-	s.mu.Lock()
-	open := make([]model.BatchID, 0, len(s.open))
-	for id := range s.open {
-		open = append(open, id)
+	open, err := s.openBatchIDsAtCut()
+	if err != nil {
+		s.ops.Unlock()
+		s.setFault(err)
+		return err
 	}
-	s.mu.Unlock()
 	sort.Slice(open, func(i, j int) bool { return open[i] < open[j] })
 	reservedIDHigh := s.ids.DurableHigh()
 	reservedBatchIDHigh := s.batches.DurableHigh()
@@ -303,6 +303,31 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		return errors.Join(base.ErrReadOnly, err)
 	}
 	return nil
+}
+
+// openBatchIDsAtCut runs after the Coordinator barrier. Every Commit admitted
+// before that barrier has already reached a terminal transaction state even
+// when its caller has not yet consumed the response and removed the Batch from
+// Store.open. Only genuinely non-terminal, non-committing batches belong in
+// the recovery snapshot.
+func (s *Store) openBatchIDsAtCut() ([]model.BatchID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	open := make([]model.BatchID, 0, len(s.open))
+	for id, batch := range s.open {
+		state, _ := batch.inner.State()
+		switch state {
+		case transaction.StateOpen, transaction.StateFailed:
+			open = append(open, id)
+		case transaction.StateCommitted, transaction.StateAborted, transaction.StateCommitUnknown:
+			// Client-side finish may lag behind the durable terminal state.
+		case transaction.StateCommitting:
+			return nil, errors.Join(base.ErrCorrupt, errors.New("committing batch remained after checkpoint barrier"))
+		default:
+			return nil, errors.Join(base.ErrCorrupt, errors.New("unknown batch state at checkpoint"))
+		}
+	}
+	return open, nil
 }
 
 func (s *Store) setFault(err error) {

@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
+	"github.com/akzj/ridstore/internal/transaction"
 )
 
 func TestCheckpointCatalogFailureRecoversFromAuthoritativeManifest(t *testing.T) {
@@ -229,6 +230,60 @@ func TestCommitSyncFailureWithPartialRecordRecoversAsAborted(t *testing.T) {
 		t.Fatalf("torn commit became visible err=%v", err)
 	}
 	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckpointExcludesCommittedBatchWhoseCallerHasNotFinished(t *testing.T) {
+	root, config := prepareCheckpointStore(t)
+	store, err := Open(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := committed.Create(context.Background(), []byte("committed before checkpoint barrier")); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := store.submitCommit(context.Background(), committed.inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := receipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := committed.inner.State(); state != transaction.StateCommitted {
+		t.Fatalf("committed batch state=%v", state)
+	}
+	store.mu.Lock()
+	_, stillTracked := store.open[committed.ID()]
+	store.mu.Unlock()
+	if !stillTracked {
+		t.Fatal("test did not preserve the client-finish race window")
+	}
+
+	open, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := storecatalog.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.OpenBatchIDsAtCut) != 1 || manifest.OpenBatchIDsAtCut[0] != open.ID() {
+		t.Fatalf("open batches=%v committed=%d open=%d", manifest.OpenBatchIDsAtCut, committed.ID(), open.ID())
+	}
+
+	committed.finish()
+	if err := open.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -249,7 +249,9 @@ Barrier 请求排在 Commit publish 序列中。轮到它时，coordinator 先�
 - ReplayStart 精确位于 F 后，不依赖“寻找下一条 Commit”。
 - F 是已确认 durable 的连续物理前缀，不能指向仅 write、尚未 fsync 的 Active 尾部；
 - captured/frozen 中不包含 `CommitSeq > C` 的 mutation。
-- 同时捕获 `IssuedBatchIDHighExclusiveAtCut` 和排序后的 `OpenBatchIDsAtCut`；后者包含 barrier 时所有 Open/Committing Batch。
+- 同时捕获 `IssuedBatchIDHighExclusiveAtCut` 和排序后的 `OpenBatchIDsAtCut`。Coordinator barrier 会先完成此前
+  admission 的 Commit；因此后者只包含 barrier 返回后仍为 Open/Failed 的 Batch。已 durable 但调用方尚未
+  消费结果、尚未来得及从进程内 open map 移除的 terminal Batch 必须排除。
 
 随后：
 
