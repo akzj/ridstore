@@ -19,6 +19,9 @@ Checkpoint 的额外工作集有界。
 MappingCacheBytes 约束，SegmentStats 由独立的 MaxSegmentStats 约束；三者不能共享一个含义模糊的配置。
 进程内 `RecordMetaCacheEntries` 只是 SegmentStats 的随机读加速层，miss 仍读取并验证
 Record/Put header，它不改变 Builder 或 SegmentStats 的正确性边界。
+SegmentStats 直接从上一代精确表应用 folded base-to-candidate changes，不再遍历全部
+live Mapping。active Data Segment 转动后，只顺序扫描 former-active segment 补齐上一代未记录的
+基线。folded changes 复用 Mapping Builder 已受 `CheckpointSortBytes` 约束的 mutation slice，不再建第二份 ID 集合。
 
 ## 2. 选择
 

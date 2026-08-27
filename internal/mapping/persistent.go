@@ -269,10 +269,54 @@ type CheckpointCandidate struct {
 	tree       *radix.Tree
 	root       model.MapAddr
 	covered    model.CommitSeq
+	changes    []radix.Mutation
 }
 
 func (c CheckpointCandidate) Root() model.MapAddr               { return c.root }
 func (c CheckpointCandidate) CoveredCommitSeq() model.CommitSeq { return c.covered }
+
+func (c CheckpointCandidate) BaseCoveredCommitSeq() model.CommitSeq {
+	if c.checkpoint == nil || c.checkpoint.base == nil {
+		return 0
+	}
+	return c.checkpoint.base.Covered()
+}
+
+func (c CheckpointCandidate) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
+	if c.tree == nil {
+		return 0, false, ErrInvalid
+	}
+	return c.tree.Lookup(id)
+}
+
+// WalkChanges visits the folded base-to-candidate transition once per changed
+// ID. It reads old values only from the immutable base root and never observes
+// commits published after the checkpoint cut.
+func (c CheckpointCandidate) WalkChanges(ctx context.Context, visit func(model.ID, recordlog.VAddr, bool, recordlog.VAddr, bool) error) error {
+	if c.checkpoint == nil || c.checkpoint.base == nil || c.tree == nil || visit == nil {
+		return ErrInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for _, change := range c.changes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		oldAddr, oldExists, err := c.checkpoint.base.Lookup(change.ID)
+		if err != nil {
+			return err
+		}
+		newExists := change.Addr != 0
+		if oldExists == newExists && (!oldExists || oldAddr == change.Addr) {
+			continue
+		}
+		if err := visit(change.ID, oldAddr, oldExists, change.Addr, newExists); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (c CheckpointCandidate) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
 	if c.tree == nil {
@@ -347,7 +391,10 @@ func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCa
 	if err := m.syncer.Sync(); err != nil {
 		return CheckpointCandidate{}, err
 	}
-	return CheckpointCandidate{checkpoint: checkpoint, tree: tree, root: tree.Root(), covered: tree.Covered()}, nil
+	return CheckpointCandidate{
+		checkpoint: checkpoint, tree: tree, root: tree.Root(), covered: tree.Covered(),
+		changes: mutations,
+	}, nil
 }
 
 // InstallCheckpoint is called only after the Catalog generation containing

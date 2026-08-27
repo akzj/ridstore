@@ -11,7 +11,8 @@
 - 同地址 Cache miss 合并，避免并发冷读重复放大；
 - Commit queue barrier 原子取得 durable Data cut、CommitSeq cut 与 frozen Delta，新 Commit 在 Root 构建期间继续进入新 active Delta；
 - Checkpoint 采用脏路径 bottom-up COW，不再全树重写；Root 可以引用更早 checkpoint 的 immutable 子树；
-- Builder 按 `CheckpointMemoryBytes` 分 chunk，SegmentStats 通过 Root walk 和 Header-only 读取精确构建；
+- Builder 按 `CheckpointMemoryBytes` 分 chunk；SegmentStats 增量应用 folded changes，active 转动后
+  顺序扫描 former-active segment 并与 candidate Mapping join；
 - Root、Stats、ReplayStart、allocator high watermark、Open Batch IDs 由同一 Manifest generation 安装；
 - active+frozen+admitted reservation 纳入 Delta hard limit，soft limit 自动调度 Checkpoint；
 - Node/Delta/Checkpoint cancellation、Close 与 Manifest 安装后的 fail-closed 路径均有自动化覆盖；

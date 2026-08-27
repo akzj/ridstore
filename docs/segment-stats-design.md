@@ -1,6 +1,6 @@
 # SegmentStats 设计
 
-状态：Development contract v1
+状态：Implemented hybrid incremental builder
 
 ## 1. 定位
 
@@ -65,11 +65,17 @@ base SegmentStats at C0
 2. 从 base Root 查出该 ID 的 OldVAddr；
 3. 根据最终 mutation 得到 NewVAddr 或 NotFound；
 4. OldVAddr==NewVAddr 时跳过；
-5. 对非零 Old/New VAddr 按 SegmentID、offset 排序，批量读取并校验 64-byte PutRecord Header；
-6. 从 Header.TotalSize 获得物理 Record bytes；
-7. 从 old Segment 的 live bytes/count 扣减，从 new Segment 增加；
-8. 删除归零的表项，按 SegmentID 排序编码；
-9. 与新 Mapping Root 一起写入同一 Manifest generation。
+5. 对 sealed Old/New VAddr 优先查 metadata cache，miss 时读取并校验 Record/Put Header；
+6. active 转动时顺序扫描 former-active，以 candidate Mapping 精确 join；
+7. 从 metadata 或扫描边界获得物理 Record bytes；
+8. 从 old Segment 的 live bytes/count 扣减，从 new Segment 增加；
+9. 删除归零的表项，按 SegmentID 排序编码；
+10. 与新 Mapping Root 一起写入同一 Manifest generation。
+
+当前实现执行上述 base-to-final 差分，不遍历未变的 Mapping ID。如果 active 已转动，
+上一代 stats 中被省略的 active segment 通过单 Segment 顺序扫描与 candidate Mapping join
+重建；转动后新建 Segment 中的 live 记录完全来自 frozen changes。只有基线拓扑无法证明
+匹配时才保留全量 candidate Root 回退。
 
 同一 ID 在两个 checkpoint 之间被覆盖多次，只统计：
 

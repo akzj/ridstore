@@ -261,7 +261,7 @@ func TestDeltaSoftPressureSchedulesBackgroundCheckpoint(t *testing.T) {
 	}
 }
 
-func TestRecordMetaCacheWarmsFromPutAndGetButRestartsCold(t *testing.T) {
+func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
 	config.Runtime.RecordMetaCacheEntries = 64
@@ -286,7 +286,7 @@ func TestRecordMetaCacheWarmsFromPutAndGetButRestartsCold(t *testing.T) {
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheHits != 1 || metrics.RecordMetaCacheMisses != 0 {
+	if metrics := store.Metrics(); metrics.RecordMetaCacheHits != 0 || metrics.RecordMetaCacheMisses != 0 {
 		t.Fatalf("warm checkpoint metrics=%+v", metrics)
 	}
 	if err := store.Close(); err != nil {
@@ -301,16 +301,26 @@ func TestRecordMetaCacheWarmsFromPutAndGetButRestartsCold(t *testing.T) {
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 0 || metrics.RecordMetaCacheMisses != 1 {
+	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 0 || metrics.RecordMetaCacheMisses != 0 {
 		t.Fatalf("cold checkpoint metrics=%+v", metrics)
 	}
 	if _, err := store.Get(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
+	batch, err = store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(context.Background(), id, []byte("new value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 1 || metrics.RecordMetaCacheHits != 1 || metrics.RecordMetaCacheMisses != 1 {
+	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 2 || metrics.RecordMetaCacheHits != 0 || metrics.RecordMetaCacheMisses != 0 {
 		t.Fatalf("read-warmed checkpoint metrics=%+v", metrics)
 	}
 }

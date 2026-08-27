@@ -20,7 +20,9 @@ Engine.Checkpoint
   -> capture allocator/open-batch state + freeze Delta
   -> resume API operations
   -> build and fsync candidate Root
-  -> walk candidate Root and build exact sealed SegmentStats
+  -> incrementally apply folded changes
+  -> sequentially scan the former active Segment after Data rotation
+  -> build exact sealed SegmentStats
   -> Catalog generation CAS
   -> install candidate in runtime Mapping
 ```
@@ -44,9 +46,12 @@ Engine fail closed，重启以 durable Manifest 为准。
 
 ## 3. 精确统计路径
 
-第一版按设计选择有界内存、顺序遍历 candidate Root：
+当前实现基于上一代精确 stats 只处理 folded changes；active 转动后顺序扫描
+former-active segment 并与 candidate Mapping join，不回到全量 live-ID walk：
 
-- Radix `Walk` 按 ID 顺序遍历 immutable checkpoint；
+- folded changes 按 ID 排序，old VAddr 只从 immutable base Root 查询；
+- former-active 按 RecordLog 物理顺序扫描，对 Put 执行 candidate Mapping 精确 join；
+- 只有 base cut 与 Catalog topology 无法证明匹配时才执行 candidate Root `Walk`；
 - 热 `VAddr` 先使用进程内 record metadata cache，hit 时不读盘；
 - cache miss 才由 `RecordLog.Inspect` 读取物理 Header 和固定 Put header，不读取 Value body；
 - Put metadata 必须与 Mapping ID、VAddr、物理大小和 Segment 边界一致；

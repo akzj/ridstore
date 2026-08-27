@@ -37,8 +37,13 @@ Record Header + 32-byte Put Header 读取与验证。Record immutable，因此�
 - `ridstore_record_meta_cache_entries`；
 - `ridstore_record_meta_cache_evictions_total`。
 
-## 4. 尚未解决
+## 4. 与增量 SegmentStats 的关系
 
-该缓存可以消除热数据和当前进程新 Put 的 Stats 随机读，但不改变全量 Mapping Walk
-的 `O(live IDs)` 复杂度。冷启动或工作集远大于 cache 时仍会回退随机 I/O。将来的根本改进
-仍是增量 SegmentStats：以上一代精确 stats 为基线，只处理 changed IDs 和新 sealed Segment。
+当两次 Checkpoint 之间 Data active segment 未轮转时，SegmentStats 以上一代精确
+stats 为基线，只处理 frozen layers 折叠后的 changed IDs。新旧 VAddr 位于 sealed
+segment 时才需要 metadata；active segment 不输出 stats，因此不读 Header。
+
+如果 active segment 已轮转，上一代被省略的 active 已变成 sealed。此时只顺序扫描
+这一个 former-active segment，并与 candidate Mapping join 得到它的精确值；转动后的其他
+segment 由 folded changes 完整覆盖。只有基线 Mapping/Data topology 无法证明匹配时才回退
+全量 Root walk。

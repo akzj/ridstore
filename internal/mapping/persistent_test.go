@@ -1,6 +1,7 @@
 package mapping
 
 import (
+	"context"
 	"errors"
 	"math"
 	"sync"
@@ -181,6 +182,27 @@ func TestPersistentRelocationFromRootUsesAddressCAS(t *testing.T) {
 	if err != nil || !exists || got != newAddr {
 		t.Fatalf("got=%+v exists=%v err=%v", got, exists, err)
 	}
+	frozen, err = current.Freeze(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err = current.BuildCheckpoint(frozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visited := 0
+	if err := candidate.WalkChanges(context.Background(), func(id model.ID, old recordlog.VAddr, oldExists bool, next recordlog.VAddr, nextExists bool) error {
+		visited++
+		if id != 9 || !oldExists || old != oldAddr || !nextExists || next != newAddr {
+			t.Fatalf("id=%d old=%v/%v next=%v/%v", id, old, oldExists, next, nextExists)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if visited != 1 || candidate.BaseCoveredCommitSeq() != 1 {
+		t.Fatalf("visited=%d base=%d", visited, candidate.BaseCoveredCommitSeq())
+	}
 }
 
 func TestPersistentAbortCheckpointRetainsFrozenLayers(t *testing.T) {
@@ -323,6 +345,19 @@ func TestPersistentCheckpointKeepsNewestMutationAcrossFrozenLayers(t *testing.T)
 	candidate, err := current.BuildCheckpoint(second)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var changes []Change
+	if err := candidate.WalkChanges(context.Background(), func(id model.ID, old recordlog.VAddr, oldExists bool, next recordlog.VAddr, nextExists bool) error {
+		if oldExists || !nextExists {
+			t.Fatalf("old=%v/%v next=%v/%v", old, oldExists, next, nextExists)
+		}
+		changes = append(changes, Change{RecordID: id, NewAddr: next})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if candidate.BaseCoveredCommitSeq() != 0 || len(changes) != 1 || changes[0].RecordID != 1 || changes[0].NewAddr != newAddr {
+		t.Fatalf("base=%d changes=%+v", candidate.BaseCoveredCommitSeq(), changes)
 	}
 	if err := current.InstallCheckpoint(candidate); err != nil {
 		t.Fatal(err)

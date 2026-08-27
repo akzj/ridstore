@@ -422,9 +422,20 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		return abort(err)
 	}
 	manifest := s.catalog.Snapshot()
-	stats, err := segmentstats.Build(ctx, candidate, s.log, s.recordMeta, segmentstats.FileSet{
+	files := segmentstats.FileSet{
 		Active: manifest.ActiveDataSegmentID, Sealed: manifest.SealedDataSegments,
-	}, manifest.HardLimits.MaxValueSize, s.maxStats)
+	}
+	var stats []storecatalog.SegmentStats
+	if manifest.CoveredCommitSeq == candidate.BaseCoveredCommitSeq() &&
+		manifest.StatsCoveredCommitSeq == manifest.CoveredCommitSeq &&
+		containsDataSegment(manifest, manifest.ReplayStart.SegmentID) {
+		stats, err = segmentstats.BuildIncremental(ctx, candidate, s.log, s.maintenance, s.recordMeta, manifest.SegmentStats,
+			manifest.ReplayStart.SegmentID, files, manifest.HardLimits.MaxValueSize, s.maxStats)
+	} else {
+		// Retain a full-root recovery path for a baseline whose Mapping or Data
+		// topology cannot be proven to match the candidate.
+		stats, err = segmentstats.Build(ctx, candidate, s.log, s.recordMeta, files, manifest.HardLimits.MaxValueSize, s.maxStats)
+	}
 	if err != nil {
 		if errors.Is(err, base.ErrCorrupt) {
 			s.setFault(err)
@@ -454,6 +465,16 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 	s.signalLocked()
 	s.mu.Unlock()
 	return nil
+}
+
+func containsDataSegment(manifest storecatalog.Manifest, id recordlog.SegmentID) bool {
+	if id == manifest.ActiveDataSegmentID {
+		return true
+	}
+	index := sort.Search(len(manifest.SealedDataSegments), func(index int) bool {
+		return manifest.SealedDataSegments[index].SegmentID >= id
+	})
+	return index < len(manifest.SealedDataSegments) && manifest.SealedDataSegments[index].SegmentID == id
 }
 
 // openBatchIDsAtCut runs after the Coordinator barrier. Every Commit admitted

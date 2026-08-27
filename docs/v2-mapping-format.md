@@ -90,6 +90,7 @@ v2 Open/Replay 已接线。Engine 只接受 `mapping.Persistent`；旧的全量�
 后端，仅待迁移为 Mapping 模型测试 oracle 后删除生产定义。
 
 当前已实现 soft-limit 后台主动调度；显式 Mapping GC 与 MapStore/RecordLog syscall/crash matrix
-已经接入。v2 Create 与目录锁已经接入。第一版精确 SegmentStats 通过顺序遍历 candidate Root，优先使用
-进程内 record metadata cache；cache miss 时才由 `RecordLog.Inspect` 读取物理 Header 与 Put protocol
-header，不读取 Value body。
+已经接入。v2 Create 与目录锁已经接入。精确 SegmentStats 在 active segment 未转动时从上一代
+表增量应用 folded changes；active 转动后顺序扫描 former-active segment 并与 candidate
+Mapping join。需要 metadata 时优先使用
+进程内 cache，miss 才由 `RecordLog.Inspect` 读取物理 Header 与 Put protocol header，不读取 Value body。
