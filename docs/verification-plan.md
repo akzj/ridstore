@@ -326,7 +326,7 @@ Backup artifact syscall matrix 覆盖 root/子目录 create，INCOMPLETE、Verif
 
 Restore artifact syscall matrix 覆盖 root/`.payload`/子目录 create，RESTORING、LOCK、payload、Segment Header、Manifest replacement 的 write/file sync/rename/cleanup，prepared directories、Manifest rewrite directory、布局 publication 的 source/destination directory sync，八个 payload entry rename、`.payload` remove、Marker remove/final sync 与补偿路径。每个逻辑边界分别注入 `EIO/ENOSPC/EACCES`；额外在第二至第八个 rename 以及第二个 Segment Header rewrite 前失败，证明部分发布/部分 UUID rewrite 仍由 RESTORING fail closed。Manifest temp cleanup 和最终 Marker 补偿的双重错误必须同时保留 cause。除 root create 前失败外，所有失败目标都必须拒绝 Open/public Verify，且源 artifact 仍通过 Inspect。
 
-离线命令默认使用与运行时相同的 65,536 terminal replay 上限：`ridstore-tool verify --dir <dir> --status-limit <n>`。超过上限明确返回 `ErrStatusCapacity`；操作者可以给一次离线诊断提高预算，但零值和静默无界扫描均不允许。
+离线命令默认使用与运行时相同的 65,536 terminal replay 上限：`ridstore-tool verify --dir <dir> --status-limit <n>`。另可显式设置 `--mapping-cache-bytes` 与 `--max-live-ids`；三个限制均拒绝零值。超过上限明确返回 `ErrStatusCapacity` 或 `ErrVerifyLimit`，操作者可以为一次离线诊断提高预算，但不能静默无界扫描。stdout 只有在 Stage 到达 `exact-join` 时报告 `clean=true`。
 
 最低合并门禁：
 

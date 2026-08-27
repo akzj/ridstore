@@ -31,6 +31,68 @@ func TestMigratePlanCommand(t *testing.T) {
 	}
 }
 
+func TestVerifyCommandReportsExactCleanStore(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	store, err := ridstore.Create(context.Background(), toolTestConfig(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(context.Background(), []byte("verify-cli")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	status := run(context.Background(), []string{"verify", "--dir", dir, "--max-live-ids", "8", "--status-limit", "8"}, &stdout, &stderr)
+	if status != 0 || stderr.Len() != 0 {
+		t.Fatalf("status=%d stderr=%q", status, stderr.String())
+	}
+	var output verifyOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Clean || output.Report.Stage != ridstore.VerifyStageExact || output.Report.LiveIDs != 1 {
+		t.Fatalf("output=%+v", output)
+	}
+}
+
+func TestVerifyCommandReportsLockedStore(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	store, err := ridstore.Create(context.Background(), toolTestConfig(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var stdout, stderr bytes.Buffer
+	if status := run(context.Background(), []string{"verify", "--dir", dir}, &stdout, &stderr); status != 1 || stderr.Len() == 0 {
+		t.Fatalf("status=%d stderr=%q", status, stderr.String())
+	}
+	var output verifyOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.Clean || output.Report.Stage == ridstore.VerifyStageExact {
+		t.Fatalf("output=%+v", output)
+	}
+}
+
+func TestVerifyCommandRejectsZeroResourceLimit(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if status := run(context.Background(), []string{"verify", "--dir", "store", "--status-limit", "0"}, &stdout, &stderr); status != 2 || stdout.Len() != 0 || stderr.Len() == 0 {
+		t.Fatalf("status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
+
 func TestUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if status := run(context.Background(), nil, &stdout, &stderr); status != 2 || stderr.Len() == 0 {

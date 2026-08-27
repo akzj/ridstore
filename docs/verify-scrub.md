@@ -5,14 +5,23 @@
 ## 1. 命令
 
 ```text
-go run ./cmd/ridstore-tool verify --dir /path/to/store
+go run ./cmd/ridstore-tool verify \
+  --dir /path/to/store \
+  --mapping-cache-bytes 268435456 \
+  --max-live-ids 1048576 \
+  --status-limit 65536
 ```
+
+后三个资源上限可以省略并使用上面的默认值，但显式传入 0 非法，不表示无界。
 
 退出码：
 
 - `0`：报告 `clean=true`；
 - `1`：检测到 corruption、需要先恢复、目录被占用或 I/O 失败；stdout 仍尽可能输出 JSON report，诊断写入 stderr；
 - `2`：命令参数错误。
+
+stdout 固定输出 `{ "clean": bool, "report": ... }`。只有无错误到达 `exact-join` 才有
+`clean=true`；失败仍输出截至失败 Stage 已证明的部分 report，原始错误写入 stderr。
 
 Verify 必须离线运行并取得 Store 的独占 `LOCK`。它不会调用正常 `ridstore.Open`，因为 Open 可以完成 Journal、截断 invalid active tail 或安装恢复状态，这些写操作会污染只读审计证据。
 
