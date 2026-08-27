@@ -1,9 +1,11 @@
-.PHONY: fmt test test-race test-fuzz-smoke test-fuzz-harness-smoke test-fuzz-long test-crash test-soak-smoke soak-72h vet check verify tool
+.PHONY: fmt test test-race test-fuzz-smoke test-fuzz-harness-smoke test-fuzz-long test-crash test-integration test-soak-smoke test-bench-harness-smoke soak-72h bench vet check verify tool
 
 FUZZ_TIME ?= 2s
 FUZZ_PARALLEL ?= 4
 FUZZ_LONG_TIME ?= 30m
 SOAK_DURATION ?= 72h
+BENCH_TIME ?= 3s
+BENCH_COUNT ?= 3
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -type f)
@@ -55,20 +57,40 @@ test-fuzz-long:
 test-crash:
 	go test . ./internal/recordlog ./internal/mapstore ./internal/engine ./internal/backuprestore -run 'RecoveryAcrossProcessExit' -count=1 -timeout=10m
 
+test-integration:
+	go test . -run '^TestPublicBackupRestoreRoundTrip$$' -count=1 -timeout=10m
+
 test-soak-smoke:
 	go test ./internal/soak -run 'TestShortRunValidatesHarnessWithoutClaimingLongSoak|TestCanceledRunClosesStoreAndLeavesExactEvidence' -count=1 -timeout=2m
+
+test-bench-harness-smoke:
+	@set -eu; \
+	tmp_root="$$(mktemp -d)"; \
+	trap 'rm -rf -- "$$tmp_root"' EXIT; \
+	BENCH_REPORT_DIR="$$tmp_root/report" BENCH_TIME=1x BENCH_COUNT=1 ./scripts/run-benchmarks.sh >/dev/null; \
+	test -f "$$tmp_root/report/COMPLETED"; \
+	test ! -e "$$tmp_root/report/FAILED"; \
+	test -s "$$tmp_root/report/metadata.txt"; \
+	test -s "$$tmp_root/report/benchmark.txt"; \
+	if BENCH_REPORT_DIR="$$tmp_root/report" BENCH_TIME=1x BENCH_COUNT=1 ./scripts/run-benchmarks.sh >/dev/null 2>&1; then exit 1; fi; \
+	if BENCH_REPORT_DIR="$$tmp_root/invalid" BENCH_COUNT=0 ./scripts/run-benchmarks.sh >/dev/null 2>&1; then exit 1; fi; \
+	test ! -e "$$tmp_root/invalid"
 
 soak-72h:
 	@test -n "$(SOAK_DIR)" || (echo "SOAK_DIR is required" >&2; exit 2)
 	@test -n "$(SOAK_REPORT)" || (echo "SOAK_REPORT is required" >&2; exit 2)
 	go run ./cmd/ridstore-soak --dir "$(SOAK_DIR)" --report "$(SOAK_REPORT)" --duration "$(SOAK_DURATION)" --git-commit "$$(git rev-parse HEAD)" --git-dirty="$$(test -z "$$(git status --porcelain)" && echo false || echo true)"
 
+bench:
+	@test -n "$(BENCH_REPORT_DIR)" || (echo "BENCH_REPORT_DIR is required" >&2; exit 2)
+	BENCH_REPORT_DIR="$(BENCH_REPORT_DIR)" BENCH_TIME="$(BENCH_TIME)" BENCH_COUNT="$(BENCH_COUNT)" ./scripts/run-benchmarks.sh
+
 vet:
 	go vet ./...
 
 check: test vet
 
-verify: test test-race vet test-fuzz-smoke test-fuzz-harness-smoke test-crash test-soak-smoke
+verify: test test-race vet test-fuzz-smoke test-fuzz-harness-smoke test-crash test-integration test-soak-smoke test-bench-harness-smoke
 
 tool:
 	mkdir -p .build

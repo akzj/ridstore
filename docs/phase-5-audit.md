@@ -18,7 +18,7 @@
 | Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；当前已识别 v2 durable writer 的 `EIO/ENOSPC/EACCES` syscall-error matrix | 没有设备 power-loss 证据；代码级 syscall matrix 不能证明 flush 硬件语义 |
 | Long fuzz/nightly | Harness 完成，证据未完成 | 9-target v2 runner、每日/手动 workflow、原始日志/corpus/terminal marker、短 harness smoke | 尚无全部 target 自然结束的 long-fuzz artifact |
 | 72h steady-state soak | Harness 完成，证据未完成 | v2 bounded-ID 模型、维护排空、exact offline Verify、资源收敛与终态 JSONL smoke | 尚无 72h 自然结束 artifact |
-| Same-durability benchmark | 未完成 | 单一 ridstore durable commit benchmark | 无 append baseline、Pebble/RocksDB 同 durability 稳定态对比和原始报告 |
+| Same-durability benchmark | Harness 局部完成 | v2 durable create/hot-overwrite、raw append+fsync lower bound、带环境元数据和终态 marker 的 report runner | 无 Pebble/RocksDB 同 durability 稳定态对比、完整 workload matrix 和可发布原始报告 |
 | Known limits/checklist | 进行中 | 本文、前台 write-stop admission | 长时/环境证据及最终 Review 尚未完成 |
 
 ## 2. 当前实现审计发现
@@ -80,7 +80,7 @@ requested/completed/failed）和无第三方依赖的 Prometheus adapter；
 
 ### P1：长时与对比证据
 
-72h soak、长期 fuzz、power-loss、异机 restore drill 和同 durability benchmark 都必须自然完成并保存原始产物。仓库现已提供 soak、long-fuzz/nightly harness 和短 smoke，但当前本机短测试不能替代这些结论。
+72h soak、长期 fuzz、power-loss、异机 restore drill 和同 durability benchmark 都必须自然完成并保存原始产物。仓库现已提供 soak、long-fuzz/nightly 和初步 durable benchmark harness，但当前本机短测试不能替代这些结论。
 
 ## 3. 当前可重复门禁
 
