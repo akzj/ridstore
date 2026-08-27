@@ -1,8 +1,6 @@
 # 72h Steady-State Soak
 
-状态：Format v1 历史设计；v2 soak command 与 harness 尚未实现。
-
-以下内容保留为 v2 重建时的验收要求，不代表当前仓库存在可执行的 `ridstore-soak` 或 `soak-72h` target。
+状态：v2 soak command 与 harness 已实现；72h 自然结束证据尚未完成。
 
 `ridstore-soak` 在一个必须不存在的新目录中先建立有界 stable-ID 工作集，再从 seed
 完成时开始计算完整 duration，持续执行
@@ -25,13 +23,13 @@ make test-soak-smoke
 ```
 
 维护在 interval 或累计 committed batches 任一门限到达时执行，避免前台速度高时积压到
-结束阶段。最终 Data GC 以 allocated bytes 是否继续下降判断 quiescence；GC 自身会追加
-Relocation/Checkpoint 记录，因此不能错误地把“候选数必须为零”当作唯一收敛条件。
+结束阶段。最终 Data GC 持续调用当前 v2 的 `CompactNextSegment`，直到精确候选选择返回
+`found=false`；设置 256 轮上限，防止维护异常时静默无限运行。随后重写 Mapping 并做最终 Checkpoint。
 
-每个 sample 保存 commit/GC/Delta/Mapping Cache metrics、Mapping reachable/unreachable、
-Data/Mapping active/sealed 文件数、trash/tmp、Manifest/Stats cut、logical/allocated disk、
+每个 sample 保存 commit/GC/Delta/Mapping Cache metrics、Data/Mapping active/sealed 文件数、
+trash/staging、Manifest/Stats cut、logical/allocated disk、
 RSS、FD 和 goroutine。最终 summary 只有在指定 duration 自然结束、维护收敛、逐记录
-最终维护完成、逐记录模型一致、offline Verify clean，且 FD/goroutine 回到基线附近时才写出
+模型一致、offline Verify 到达 `exact-join`，且 FD/goroutine 回到基线附近时才写出
 `completed_naturally=true` 与 `verified_clean=true`。
 
 空间收敛不能由单个 summary 布尔值替代：Review 必须检查整个 JSONL 中 steady-state
