@@ -203,6 +203,92 @@ func TestCommitAdvancesCheckpointUnderDeltaHardPressure(t *testing.T) {
 	}
 }
 
+func TestDeltaSoftPressureSchedulesBackgroundCheckpoint(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.DeltaSoftLimitBytes = 64
+	config.Runtime.DeltaHardLimitBytes = 256
+	store, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil && !errors.Is(err, base.ErrClosed) {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		metrics := store.Metrics()
+		if metrics.BackgroundCheckpointCompleted != 0 {
+			if metrics.BackgroundCheckpointRequested != 1 || metrics.BackgroundCheckpointFailed != 0 || metrics.DeltaChargedBytes != 0 {
+				t.Fatalf("metrics=%+v", metrics)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background checkpoint did not complete: %+v", metrics)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "value" || store.mapping.CoveredCommitSeq() != 1 {
+		t.Fatalf("record=%+v covered=%d err=%v", record, store.mapping.CoveredCommitSeq(), err)
+	}
+}
+
+func TestCloseStopsBackgroundCheckpointBeforeClosingStorage(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.DeltaSoftLimitBytes = 64
+	config.Runtime.DeltaHardLimitBytes = 256
+	store, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.checkpointDone:
+	default:
+		t.Fatal("background checkpoint worker still running after Close")
+	}
+	reopened, err := Open(context.Background(), root, config.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	record, err := reopened.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "value" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
 func TestConcurrentCommitCheckpointAndClose(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	store, err := Create(context.Background(), root, testCreateConfig())

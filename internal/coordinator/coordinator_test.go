@@ -193,6 +193,25 @@ func TestCommitWritesDurableDescriptorBeforeMappingPublish(t *testing.T) {
 	}
 }
 
+func TestSubmitPropagatesDeltaSoftPressure(t *testing.T) {
+	log := &fakeLog{}
+	current := newPersistentMapping(t)
+	c := newCoordinator(t, log, current)
+	batch := newBatch(t, 7, log)
+	for id := model.ID(1); id <= 8; id++ {
+		if err := batch.Put(context.Background(), id, []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receipt, err := c.Submit(context.Background(), batch)
+	if err != nil || !receipt.DeltaPressure() {
+		t.Fatalf("pressure=%v err=%v", receipt.DeltaPressure(), err)
+	}
+	if _, err := receipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRelocationSharesCommitOrderAndUsesAddressCAS(t *testing.T) {
 	log := &fakeLog{}
 	current := mapping.NewEmpty()

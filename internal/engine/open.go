@@ -243,6 +243,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.mappingCacheBytes = config.MappingCacheBytes
 	store.dirLock = dirLock
 	store.identity = [16]byte(manifest.StoreUUID)
+	store.startBackgroundCheckpoint()
 	return store, nil
 }
 

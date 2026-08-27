@@ -85,6 +85,8 @@ Engine fail closed，重启以 durable Manifest 为准。
   active hot ID 不重复计费，Freeze/Abort 不释放，Install 只释放精确 frozen prefix；
 - Delta hard pressure 会在不持有 `ops.RLock` 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
   Close 的并发路径已纳入 race 测试；
+- Delta soft pressure 会在 Commit admission 后、`ops.RLock` 释放后非阻塞调度合并的
+  后台 Checkpoint；worker 执行期间允许再排队一次 post-cut pressure，Close 会先等待 worker 退出；
 - Open replay 超过本次 Delta hard limit 时确定返回配置错误，不部分发布、不等待运行期 Checkpoint；
 - 配置拒绝 `floor(DeltaHardLimitBytes / 64) > floor(CheckpointSortBytes / 16)`，保证 Builder 至少能处理
   admission 允许形成的最坏 frozen entry 数；Mapping sort 与 SegmentStats 使用独立预算；
@@ -96,7 +98,6 @@ Engine fail closed，重启以 durable Manifest 为准。
 
 - checkpoint Catalog、MapStore append/sync/tail-repair/rotation，以及 RecordLog append/sync/rotation 的
   syscall fault matrix 已覆盖；详见 [v2-fault-matrix.md](v2-fault-matrix.md)；
-- soft-limit 后台 Checkpoint；
 - Relocation、Data GC、Mapping GC；
 - 顶层公开 API 切换和旧 v1 模块删除。
 

@@ -116,6 +116,10 @@ type Store struct {
 	identity               [16]byte
 	space                  *spaceGate
 	metrics                runtimeMetrics
+	checkpointRequests     chan struct{}
+	checkpointStop         chan struct{}
+	checkpointDone         chan struct{}
+	checkpointStopOnce     sync.Once
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -296,6 +300,7 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 }
 
 func (s *Store) Close() error {
+	s.stopBackgroundCheckpoint()
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
 	s.ops.Lock()
@@ -568,6 +573,9 @@ func (b *Batch) Commit(ctx context.Context) (coordinator.Result, error) {
 				b.finish()
 			}
 			return coordinator.Result{}, err
+		}
+		if receipt.DeltaPressure() {
+			b.store.requestBackgroundCheckpoint()
 		}
 		result, err := receipt.Wait()
 		if err == nil || terminal(b.inner) {

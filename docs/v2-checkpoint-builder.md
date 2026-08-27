@@ -69,5 +69,6 @@ cache 和 stats 各有独立边界，不能把 CheckpointSortBytes 描述为整�
 - 不创建 checkpoint scratch 文件或第二套文件生命周期；
 - 不改变 immutable Radix Node 的磁盘格式；
 - 不把 SegmentStats 塞入 Mapping builder；
-- 不宣称 soft-limit 后台调度已经实现；
+- 不把 soft-limit 后台调度描述为 Builder 的内部职责；调度属于 Engine，
+  Builder 仍只消费一个已 freeze 的有界输入；
 - 不把固定 entry charge 描述成 Go heap 的精确测量。

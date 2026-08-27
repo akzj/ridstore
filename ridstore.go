@@ -99,6 +99,9 @@ func (s *Store) Metrics() Metrics {
 		GCNoCandidate: current.GCNoCandidate,
 		GCCopiedBytes: current.GCCopiedBytes, GCReclaimedBytes: current.GCReclaimedBytes,
 		GCRelocated: current.GCRelocated, GCSkipped: current.GCSkipped, GCDurationNanos: current.GCDurationNanos,
+		BackgroundCheckpointRequested: current.BackgroundCheckpointRequested,
+		BackgroundCheckpointCompleted: current.BackgroundCheckpointCompleted,
+		BackgroundCheckpointFailed:    current.BackgroundCheckpointFailed,
 	}
 }
 

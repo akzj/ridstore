@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/coordinator"
@@ -133,6 +134,62 @@ func TestCheckpointMapStoreFailureKeepsOldManifestRecoverable(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestBackgroundCheckpointFailureFailsStoreClosed(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.DeltaSoftLimitBytes = 64
+	config.Runtime.DeltaHardLimitBytes = 256
+	store, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected background checkpoint failure")
+	var armed atomic.Bool
+	store, err = open(context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+		if armed.Load() && point == mapstore.FaultBeforeAppendWrite {
+			return injected
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(context.Background(), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for store.Metrics().BackgroundCheckpointFailed == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background checkpoint did not fail: %+v", store.Metrics())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	metrics := store.Metrics()
+	if metrics.BackgroundCheckpointRequested != 1 || metrics.BackgroundCheckpointCompleted != 0 || metrics.BackgroundCheckpointFailed != 1 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+	if _, err := store.Begin(context.Background()); !errors.Is(err, base.ErrReadOnly) || !errors.Is(err, injected) {
+		t.Fatalf("begin after background checkpoint failure err=%v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
