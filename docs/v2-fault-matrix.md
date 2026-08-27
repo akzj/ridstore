@@ -28,7 +28,7 @@ v2 对每个 durable writer 分开验证：
 | v2 Data GC | marker temp/write/file-sync/close/rename/dir-sync/remove；retire rename、records/trash dir-sync、trash unlink/final dir-sync | 每个 fault point 可由 fresh Open 重试；子进程覆盖 marker-only、Catalog removed、trash、deleted 四个状态 | durable fault/crash matrix 已闭合 |
 | Public Batch lifecycle | 复用底层 durable writer 边界 | 子进程退出覆盖 uncommitted Put、Checkpoint-open、committed tail、checkpoint-committed；公开 Open 验证 Value 与 Status | 已覆盖公开恢复语义 |
 | v2 Mapping GC | generation header/node/footer/sync、marker、promotion、Manifest rewrite、rollback、retirement、cleanup；多文件 partial failure | fresh Open old/new Catalog 收敛；staging/marker/Catalog/trash/deleted 五阶段 process-exit；Offline Verify 与空间收敛 | G1-G5 durable fault/crash matrix 已闭合 |
-| v2 Backup / Restore | staging、逐文件 create/write/sync、metadata、marker、Verify、no-replace rename 的关键 fault hook | Backup staging/partial/metadata/marker-removed/published 与 Restore partial/verified/marker-removed/published 子进程退出 | 离线全量主路径已闭合；完整 syscall backend 矩阵和远端传输不在当前结论内 |
+| v2 Backup / Restore | 每次 lstat/readDir/open/openFile/mkdir/mkdirTemp/remove/rename/read/write/stat/sync/close 注入 EIO、ENOSPC、EACCES；另含 short-write 与 cleanup 双故障 | Backup staging/partial/metadata/marker-removed/published 与 Restore partial/verified/marker-removed/published 子进程退出 | 离线全量 writer fault/crash matrix 已闭合；远端传输不在范围内 |
 
 ## 3. MapStore 已确认语义
 

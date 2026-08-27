@@ -18,12 +18,14 @@ func TestBackupFaultsDoNotPublishPartialArtifacts(t *testing.T) {
 	root := t.TempDir()
 	source := createClosedStore(t, filepath.Join(root, "source"))
 	points := []backuprestore.FaultPoint{
+		backuprestore.FaultBackupBeforeSourceVerify,
 		backuprestore.FaultBackupBeforeStaging,
 		backuprestore.FaultBackupAfterIncomplete,
 		backuprestore.FaultBackupBeforeFileCreate,
 		backuprestore.FaultBackupBeforeFileWrite,
 		backuprestore.FaultBackupBeforeFileSync,
 		backuprestore.FaultBackupAfterPayload,
+		backuprestore.FaultBackupBeforePayloadVerify,
 		backuprestore.FaultBackupAfterVerify,
 		backuprestore.FaultBackupBeforeMetadata,
 		backuprestore.FaultBackupAfterMetadata,
@@ -89,6 +91,7 @@ func TestRestoreFaultsDoNotPublishPartialStores(t *testing.T) {
 		backuprestore.FaultRestoreBeforeFileWrite,
 		backuprestore.FaultRestoreBeforeFileSync,
 		backuprestore.FaultRestoreAfterPayload,
+		backuprestore.FaultRestoreBeforeVerify,
 		backuprestore.FaultRestoreAfterVerify,
 		backuprestore.FaultRestoreBeforeMarkerRemove,
 		backuprestore.FaultRestoreBeforePublish,

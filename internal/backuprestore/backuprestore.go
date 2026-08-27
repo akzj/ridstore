@@ -24,6 +24,7 @@ type Config struct {
 	DestDir   string
 	Verify    verifier.Config
 	Hook      FaultHook
+	files     fileBackend
 }
 
 type FaultPoint string
@@ -31,24 +32,27 @@ type FaultPoint string
 type FaultHook func(FaultPoint) error
 
 const (
-	FaultBackupBeforeStaging      FaultPoint = "backup.before-staging"
-	FaultBackupAfterIncomplete    FaultPoint = "backup.after-incomplete"
-	FaultBackupBeforeFileCreate   FaultPoint = "backup.before-file-create"
-	FaultBackupBeforeFileWrite    FaultPoint = "backup.before-file-write"
-	FaultBackupBeforeFileSync     FaultPoint = "backup.before-file-sync"
-	FaultBackupAfterPayload       FaultPoint = "backup.after-payload"
-	FaultBackupAfterVerify        FaultPoint = "backup.after-verify"
-	FaultBackupBeforeMetadata     FaultPoint = "backup.before-metadata"
-	FaultBackupAfterMetadata      FaultPoint = "backup.after-metadata"
-	FaultBackupBeforeMarkerRemove FaultPoint = "backup.before-marker-remove"
-	FaultBackupBeforePublish      FaultPoint = "backup.before-publish"
-	FaultBackupAfterPublish       FaultPoint = "backup.after-publish"
+	FaultBackupBeforeStaging       FaultPoint = "backup.before-staging"
+	FaultBackupBeforeSourceVerify  FaultPoint = "backup.before-source-verify"
+	FaultBackupAfterIncomplete     FaultPoint = "backup.after-incomplete"
+	FaultBackupBeforeFileCreate    FaultPoint = "backup.before-file-create"
+	FaultBackupBeforeFileWrite     FaultPoint = "backup.before-file-write"
+	FaultBackupBeforeFileSync      FaultPoint = "backup.before-file-sync"
+	FaultBackupAfterPayload        FaultPoint = "backup.after-payload"
+	FaultBackupBeforePayloadVerify FaultPoint = "backup.before-payload-verify"
+	FaultBackupAfterVerify         FaultPoint = "backup.after-verify"
+	FaultBackupBeforeMetadata      FaultPoint = "backup.before-metadata"
+	FaultBackupAfterMetadata       FaultPoint = "backup.after-metadata"
+	FaultBackupBeforeMarkerRemove  FaultPoint = "backup.before-marker-remove"
+	FaultBackupBeforePublish       FaultPoint = "backup.before-publish"
+	FaultBackupAfterPublish        FaultPoint = "backup.after-publish"
 
 	FaultRestoreBeforeStaging      FaultPoint = "restore.before-staging"
 	FaultRestoreBeforeFileCreate   FaultPoint = "restore.before-file-create"
 	FaultRestoreBeforeFileWrite    FaultPoint = "restore.before-file-write"
 	FaultRestoreBeforeFileSync     FaultPoint = "restore.before-file-sync"
 	FaultRestoreAfterPayload       FaultPoint = "restore.after-payload"
+	FaultRestoreBeforeVerify       FaultPoint = "restore.before-verify"
 	FaultRestoreAfterVerify        FaultPoint = "restore.after-verify"
 	FaultRestoreBeforeMarkerRemove FaultPoint = "restore.before-marker-remove"
 	FaultRestoreBeforePublish      FaultPoint = "restore.before-publish"
@@ -69,16 +73,20 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 	if err := ctx.Err(); err != nil {
 		return report, err
 	}
+	files := config.files
+	if files == nil {
+		files = osFileBackend{}
+	}
 	if err := validateDistinctPaths(config.SourceDir, config.DestDir); err != nil {
 		return report, err
 	}
 	if !publicationSupported() {
 		return report, base.ErrUnsupported
 	}
-	if err := requireAbsent(config.DestDir); err != nil {
+	if err := requireAbsent(files, config.DestDir); err != nil {
 		return report, err
 	}
-	if err := requireRealDirectory(filepath.Dir(config.DestDir)); err != nil {
+	if err := requireRealDirectory(files, filepath.Dir(config.DestDir)); err != nil {
 		return report, err
 	}
 	lease, err := filelock.AcquireExisting(config.SourceDir)
@@ -86,6 +94,9 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 		return report, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lease.Close()) }()
+	if err := hit(config.Hook, FaultBackupBeforeSourceVerify); err != nil {
+		return report, err
+	}
 	verified, err := verifier.VerifyHeld(ctx, config.SourceDir, config.Verify)
 	if err != nil {
 		return report, err
@@ -101,17 +112,17 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 	if err := hit(config.Hook, FaultBackupBeforeStaging); err != nil {
 		return report, err
 	}
-	staging, err := makeStaging(config.DestDir, "backup")
+	staging, err := makeStaging(files, config.DestDir, "backup")
 	if err != nil {
 		return report, err
 	}
 	published := false
 	defer func() {
 		if !published {
-			resultErr = errors.Join(resultErr, os.RemoveAll(staging))
+			resultErr = errors.Join(resultErr, files.removeAll(staging))
 		}
 	}()
-	if err := createBackupLayout(staging); err != nil {
+	if err := createBackupLayout(files, staging); err != nil {
 		return report, err
 	}
 	if err := hit(config.Hook, FaultBackupAfterIncomplete); err != nil {
@@ -122,7 +133,7 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
-		entry, err := copyAndHash(ctx, filepath.Join(config.SourceDir, relative), filepath.Join(staging, PayloadDirectory, relative), relative, config.Hook,
+		entry, err := copyAndHash(ctx, files, filepath.Join(config.SourceDir, relative), filepath.Join(staging, PayloadDirectory, relative), relative, config.Hook,
 			FaultBackupBeforeFileCreate, FaultBackupBeforeFileWrite, FaultBackupBeforeFileSync)
 		if err != nil {
 			return report, err
@@ -134,11 +145,14 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 		return report, err
 	}
 	payload := filepath.Join(staging, PayloadDirectory)
-	if err := createLock(payload); err != nil {
+	if err := createLock(files, payload); err != nil {
+		return report, err
+	}
+	if err := hit(config.Hook, FaultBackupBeforePayloadVerify); err != nil {
 		return report, err
 	}
 	payloadReport, err := verifier.Verify(ctx, payload, config.Verify)
-	removeErr := removeAndSync(filepath.Join(payload, filelock.FileName), payload)
+	removeErr := removeAndSync(files, filepath.Join(payload, filelock.FileName), payload)
 	if err != nil || removeErr != nil {
 		return report, errors.Join(err, removeErr)
 	}
@@ -159,22 +173,22 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 	if err := hit(config.Hook, FaultBackupBeforeMetadata); err != nil {
 		return report, err
 	}
-	if err := writeSync(filepath.Join(staging, MetadataName), encoded, 0o600); err != nil {
+	if err := writeSync(files, filepath.Join(staging, MetadataName), encoded, 0o600); err != nil {
 		return report, err
 	}
 	if err := hit(config.Hook, FaultBackupAfterMetadata); err != nil {
 		return report, err
 	}
-	if err := syncBackupTree(staging); err != nil {
+	if err := syncBackupTree(files, staging); err != nil {
 		return report, err
 	}
 	if err := hit(config.Hook, FaultBackupBeforeMarkerRemove); err != nil {
 		return report, err
 	}
-	if err := removeAndSync(filepath.Join(staging, IncompleteName), staging); err != nil {
+	if err := removeAndSync(files, filepath.Join(staging, IncompleteName), staging); err != nil {
 		return report, err
 	}
-	if err := publish(staging, config.DestDir, config.Hook, FaultBackupBeforePublish, FaultBackupAfterPublish); err != nil {
+	if err := publish(files, staging, config.DestDir, config.Hook, FaultBackupBeforePublish, FaultBackupAfterPublish); err != nil {
 		return report, err
 	}
 	published = true
@@ -191,49 +205,53 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 	if err := ctx.Err(); err != nil {
 		return report, err
 	}
+	files := config.files
+	if files == nil {
+		files = osFileBackend{}
+	}
 	if err := validateDistinctPaths(config.SourceDir, config.DestDir); err != nil {
 		return report, err
 	}
 	if !publicationSupported() {
 		return report, base.ErrUnsupported
 	}
-	if err := requireAbsent(config.DestDir); err != nil {
+	if err := requireAbsent(files, config.DestDir); err != nil {
 		return report, err
 	}
-	if err := requireRealDirectory(config.SourceDir); err != nil {
+	if err := requireRealDirectory(files, config.SourceDir); err != nil {
 		return report, err
 	}
-	if err := requireRealDirectory(filepath.Dir(config.DestDir)); err != nil {
+	if err := requireRealDirectory(files, filepath.Dir(config.DestDir)); err != nil {
 		return report, err
 	}
-	metadata, err := readMetadata(config.SourceDir)
+	metadata, err := readMetadata(files, config.SourceDir)
 	if err != nil {
 		return report, classify(err)
 	}
-	if err := validateArtifact(ctx, config.SourceDir, metadata); err != nil {
+	if err := validateArtifact(ctx, files, config.SourceDir, metadata); err != nil {
 		return report, classify(err)
 	}
 	if err := hit(config.Hook, FaultRestoreBeforeStaging); err != nil {
 		return report, err
 	}
-	staging, err := makeStaging(config.DestDir, "restore")
+	staging, err := makeStaging(files, config.DestDir, "restore")
 	if err != nil {
 		return report, err
 	}
 	published := false
 	defer func() {
 		if !published {
-			resultErr = errors.Join(resultErr, os.RemoveAll(staging))
+			resultErr = errors.Join(resultErr, files.removeAll(staging))
 		}
 	}()
-	if err := createStoreLayout(staging); err != nil {
+	if err := createStoreLayout(files, staging); err != nil {
 		return report, err
 	}
 	for _, entry := range metadata.Entries {
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
-		got, err := copyAndHash(ctx, filepath.Join(config.SourceDir, PayloadDirectory, entry.Path), filepath.Join(staging, entry.Path), entry.Path, config.Hook,
+		got, err := copyAndHash(ctx, files, filepath.Join(config.SourceDir, PayloadDirectory, entry.Path), filepath.Join(staging, entry.Path), entry.Path, config.Hook,
 			FaultRestoreBeforeFileCreate, FaultRestoreBeforeFileWrite, FaultRestoreBeforeFileSync)
 		if err != nil {
 			return report, err
@@ -246,10 +264,13 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 	if err := hit(config.Hook, FaultRestoreAfterPayload); err != nil {
 		return report, err
 	}
-	if err := createLock(staging); err != nil {
+	if err := createLock(files, staging); err != nil {
 		return report, err
 	}
-	if err := syncStoreTree(staging); err != nil {
+	if err := syncStoreTree(files, staging); err != nil {
+		return report, err
+	}
+	if err := hit(config.Hook, FaultRestoreBeforeVerify); err != nil {
 		return report, err
 	}
 	verified, err := verifier.Verify(ctx, staging, config.Verify)
@@ -265,10 +286,10 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 	if err := hit(config.Hook, FaultRestoreBeforeMarkerRemove); err != nil {
 		return report, err
 	}
-	if err := removeAndSync(filepath.Join(staging, RestoreIncompleteName), staging); err != nil {
+	if err := removeAndSync(files, filepath.Join(staging, RestoreIncompleteName), staging); err != nil {
 		return report, err
 	}
-	if err := publish(staging, config.DestDir, config.Hook, FaultRestoreBeforePublish, FaultRestoreAfterPublish); err != nil {
+	if err := publish(files, staging, config.DestDir, config.Hook, FaultRestoreBeforePublish, FaultRestoreAfterPublish); err != nil {
 		return report, err
 	}
 	published = true
@@ -293,41 +314,41 @@ func manifestPaths(manifest storecatalog.Manifest) []string {
 	return paths
 }
 
-func readMetadata(root string) (Metadata, error) {
+func readMetadata(files fileBackend, root string) (metadata Metadata, resultErr error) {
 	path := filepath.Join(root, MetadataName)
-	info, err := os.Lstat(path)
+	info, err := files.lstat(path)
 	if err != nil {
-		return Metadata{}, err
+		return metadata, err
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxMetadataSize {
-		return Metadata{}, errInvalid
+		return metadata, errInvalid
 	}
-	file, err := os.Open(path)
+	file, err := files.open(path)
 	if err != nil {
-		return Metadata{}, err
+		return metadata, err
 	}
-	defer file.Close()
+	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
 	opened, err := file.Stat()
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return Metadata{}, errors.Join(errInvalid, err)
+		return metadata, errors.Join(errInvalid, err)
 	}
 	encoded, err := io.ReadAll(io.LimitReader(file, maxMetadataSize+1))
 	if err != nil {
-		return Metadata{}, err
+		return metadata, err
 	}
 	if len(encoded) > maxMetadataSize {
-		return Metadata{}, errInvalid
+		return metadata, errInvalid
 	}
 	return DecodeMetadata(encoded)
 }
 
-func validateArtifact(ctx context.Context, root string, metadata Metadata) error {
-	if _, err := os.Lstat(filepath.Join(root, IncompleteName)); err == nil {
+func validateArtifact(ctx context.Context, files fileBackend, root string, metadata Metadata) error {
+	if _, err := files.lstat(filepath.Join(root, IncompleteName)); err == nil {
 		return errInvalid
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := requireNames(root, map[string]bool{MetadataName: false, PayloadDirectory: true}); err != nil {
+	if err := requireNames(files, root, map[string]bool{MetadataName: false, PayloadDirectory: true}); err != nil {
 		return err
 	}
 	payload := filepath.Join(root, PayloadDirectory)
@@ -349,7 +370,7 @@ func validateArtifact(ctx context.Context, root string, metadata Metadata) error
 	if manifestCount != 1 {
 		return errInvalid
 	}
-	if err := requireArtifactFiles(payload, expected); err != nil {
+	if err := requireArtifactFiles(files, payload, expected); err != nil {
 		return err
 	}
 	manifest, err := storecatalog.LoadStrict(payload)
@@ -369,7 +390,7 @@ func validateArtifact(ctx context.Context, root string, metadata Metadata) error
 		}
 	}
 	for _, entry := range metadata.Entries {
-		got, err := hashRegular(ctx, filepath.Join(payload, entry.Path), entry.Path)
+		got, err := hashRegular(ctx, files, filepath.Join(payload, entry.Path), entry.Path)
 		if err != nil {
 			return err
 		}
@@ -380,8 +401,8 @@ func validateArtifact(ctx context.Context, root string, metadata Metadata) error
 	return nil
 }
 
-func requireArtifactFiles(payload string, expected map[string]Entry) error {
-	entries, err := os.ReadDir(payload)
+func requireArtifactFiles(files fileBackend, payload string, expected map[string]Entry) error {
+	entries, err := files.readDir(payload)
 	if err != nil {
 		return err
 	}
@@ -402,15 +423,15 @@ func requireArtifactFiles(payload string, expected map[string]Entry) error {
 				want[strings.TrimPrefix(path, prefix)] = false
 			}
 		}
-		if err := requireNames(filepath.Join(payload, directory), want); err != nil {
+		if err := requireNames(files, filepath.Join(payload, directory), want); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func requireNames(root string, want map[string]bool) error {
-	entries, err := os.ReadDir(root)
+func requireNames(files fileBackend, root string, want map[string]bool) error {
+	entries, err := files.readDir(root)
 	if err != nil {
 		return err
 	}
@@ -434,56 +455,56 @@ func checkEntries(entries []os.DirEntry, want map[string]bool) error {
 	return nil
 }
 
-func createBackupLayout(staging string) error {
-	if err := writeSync(filepath.Join(staging, IncompleteName), nil, 0o600); err != nil {
+func createBackupLayout(files fileBackend, staging string) error {
+	if err := writeSync(files, filepath.Join(staging, IncompleteName), nil, 0o600); err != nil {
 		return err
 	}
 	payload := filepath.Join(staging, PayloadDirectory)
-	if err := os.Mkdir(payload, 0o700); err != nil {
+	if err := files.mkdir(payload, 0o700); err != nil {
 		return err
 	}
-	if err := os.Mkdir(filepath.Join(payload, "records"), 0o700); err != nil {
+	if err := files.mkdir(filepath.Join(payload, "records"), 0o700); err != nil {
 		return err
 	}
-	if err := os.Mkdir(filepath.Join(payload, "mapping-v2"), 0o700); err != nil {
+	if err := files.mkdir(filepath.Join(payload, "mapping-v2"), 0o700); err != nil {
 		return err
 	}
-	return syncDirectory(staging)
+	return syncDirectory(files, staging)
 }
 
-func createStoreLayout(staging string) error {
-	if err := writeSync(filepath.Join(staging, RestoreIncompleteName), nil, 0o600); err != nil {
+func createStoreLayout(files fileBackend, staging string) error {
+	if err := writeSync(files, filepath.Join(staging, RestoreIncompleteName), nil, 0o600); err != nil {
 		return err
 	}
 	for _, directory := range []string{"records", "mapping-v2", "journal"} {
-		if err := os.Mkdir(filepath.Join(staging, directory), 0o700); err != nil {
+		if err := files.mkdir(filepath.Join(staging, directory), 0o700); err != nil {
 			return err
 		}
 	}
-	return syncDirectory(staging)
+	return syncDirectory(files, staging)
 }
 
-func makeStaging(destination, operation string) (string, error) {
+func makeStaging(files fileBackend, destination, operation string) (string, error) {
 	parent := filepath.Dir(destination)
-	staging, err := os.MkdirTemp(parent, "."+filepath.Base(destination)+"."+operation+"-")
+	staging, err := files.mkdirTemp(parent, "."+filepath.Base(destination)+"."+operation+"-")
 	if err != nil {
 		return "", err
 	}
-	if err := syncDirectory(parent); err != nil {
-		return "", errors.Join(err, os.RemoveAll(staging))
+	if err := syncDirectory(files, parent); err != nil {
+		return "", errors.Join(err, files.removeAll(staging))
 	}
 	return staging, nil
 }
 
-func copyAndHash(ctx context.Context, source, destination, relative string, hook FaultHook, beforeCreate, beforeWrite, beforeSync FaultPoint) (entry Entry, resultErr error) {
-	info, err := os.Lstat(source)
+func copyAndHash(ctx context.Context, files fileBackend, source, destination, relative string, hook FaultHook, beforeCreate, beforeWrite, beforeSync FaultPoint) (entry Entry, resultErr error) {
+	info, err := files.lstat(source)
 	if err != nil {
 		return entry, err
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return entry, errInvalid
 	}
-	input, err := os.Open(source)
+	input, err := files.open(source)
 	if err != nil {
 		return entry, err
 	}
@@ -495,7 +516,7 @@ func copyAndHash(ctx context.Context, source, destination, relative string, hook
 	if err := hit(hook, beforeCreate); err != nil {
 		return entry, err
 	}
-	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	output, err := files.openFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return entry, err
 	}
@@ -525,15 +546,15 @@ func copyAndHash(ctx context.Context, source, destination, relative string, hook
 	return entry, nil
 }
 
-func hashRegular(ctx context.Context, path, relative string) (entry Entry, resultErr error) {
-	info, err := os.Lstat(path)
+func hashRegular(ctx context.Context, files fileBackend, path, relative string) (entry Entry, resultErr error) {
+	info, err := files.lstat(path)
 	if err != nil {
 		return entry, err
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 0 {
 		return entry, errInvalid
 	}
-	file, err := os.Open(path)
+	file, err := files.open(path)
 	if err != nil {
 		return entry, err
 	}
@@ -579,8 +600,8 @@ func copyWithContext(ctx context.Context, destination io.Writer, source io.Reade
 	}
 }
 
-func writeSync(path string, value []byte, mode os.FileMode) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+func writeSync(files fileBackend, path string, value []byte, mode os.FileMode) error {
+	file, err := files.openFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
@@ -590,64 +611,64 @@ func writeSync(path string, value []byte, mode os.FileMode) error {
 	return errors.Join(file.Sync(), file.Close())
 }
 
-func createLock(root string) error {
-	if err := writeSync(filepath.Join(root, filelock.FileName), nil, 0o600); err != nil {
+func createLock(files fileBackend, root string) error {
+	if err := writeSync(files, filepath.Join(root, filelock.FileName), nil, 0o600); err != nil {
 		return err
 	}
-	return syncDirectory(root)
+	return syncDirectory(files, root)
 }
 
-func removeAndSync(path, parent string) error {
-	if err := os.Remove(path); err != nil {
+func removeAndSync(files fileBackend, path, parent string) error {
+	if err := files.remove(path); err != nil {
 		return err
 	}
-	return syncDirectory(parent)
+	return syncDirectory(files, parent)
 }
 
-func syncBackupTree(root string) error {
+func syncBackupTree(files fileBackend, root string) error {
 	for _, directory := range []string{
 		filepath.Join(root, PayloadDirectory, "records"),
 		filepath.Join(root, PayloadDirectory, "mapping-v2"),
 		filepath.Join(root, PayloadDirectory), root,
 	} {
-		if err := syncDirectory(directory); err != nil {
+		if err := syncDirectory(files, directory); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func syncStoreTree(root string) error {
+func syncStoreTree(files fileBackend, root string) error {
 	for _, directory := range []string{filepath.Join(root, "records"), filepath.Join(root, "mapping-v2"), filepath.Join(root, "journal"), root} {
-		if err := syncDirectory(directory); err != nil {
+		if err := syncDirectory(files, directory); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
+func syncDirectory(files fileBackend, path string) error {
+	directory, err := files.open(path)
 	if err != nil {
 		return err
 	}
 	return errors.Join(directory.Sync(), directory.Close())
 }
 
-func publish(staging, destination string, hook FaultHook, before, after FaultPoint) error {
-	if err := requireAbsent(destination); err != nil {
+func publish(files fileBackend, staging, destination string, hook FaultHook, before, after FaultPoint) error {
+	if err := requireAbsent(files, destination); err != nil {
 		return err
 	}
 	if err := hit(hook, before); err != nil {
 		return err
 	}
-	if err := renameNoReplace(staging, destination); err != nil {
+	if err := files.renameNoReplace(staging, destination); err != nil {
 		return err
 	}
 	if err := hit(hook, after); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(destination))
+	return syncDirectory(files, filepath.Dir(destination))
 }
 
 func hit(hook FaultHook, point FaultPoint) error {
@@ -657,8 +678,8 @@ func hit(hook FaultHook, point FaultPoint) error {
 	return hook(point)
 }
 
-func requireAbsent(path string) error {
-	if _, err := os.Lstat(path); err == nil {
+func requireAbsent(files fileBackend, path string) error {
+	if _, err := files.lstat(path); err == nil {
 		return base.ErrAlreadyExists
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -666,8 +687,8 @@ func requireAbsent(path string) error {
 	return nil
 }
 
-func requireRealDirectory(path string) error {
-	info, err := os.Lstat(path)
+func requireRealDirectory(files fileBackend, path string) error {
+	info, err := files.lstat(path)
 	if err != nil {
 		return err
 	}

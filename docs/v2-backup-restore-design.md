@@ -1,6 +1,6 @@
 # ridstore v2 Backup / Restore
 
-状态：Implemented；离线全量 v2 主路径、关键 fault 边界与 process-crash matrix 已覆盖
+状态：Implemented；离线全量 v2 主路径、writer syscall fault matrix 与 process-crash matrix 已覆盖
 
 ## 1. 第一版边界
 
@@ -149,6 +149,11 @@ metadata write/sync、各层 directory sync、marker remove、final rename 和 p
 
 Restore fault points：artifact read、每个 payload copy、LOCK/journal create、各层 sync、Verify、final rename 和
 parent sync。每个错误必须保留原始 cause，且不得覆盖已有目标。
+
+当前测试通过可注入 filesystem backend 对每次 `lstat/readDir/open/openFile/mkdir/mkdirTemp/remove/rename`
+以及 file `read/write/stat/sync/close` 分别注入 `EIO`、`ENOSPC`、`EACCES`，并覆盖 short write 和主错误加
+staging cleanup 双重失败。发布前失败不得出现最终目标；rename 后 sync/close 失败只允许留下可完整
+Restore/Verify 的最终目录。Verifier 和 Manifest codec 的底层读取故障由各自测试负责，不在这里复制实现。
 
 子进程退出至少覆盖：Backup staging、部分 files、metadata durable、marker removed、published；Restore
 staging、部分 files、payload verified、published。成功 artifact 必须可重复 Restore 到多个新目录，但这些
