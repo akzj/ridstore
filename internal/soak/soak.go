@@ -169,13 +169,13 @@ func Run(ctx context.Context, opts Options, output io.Writer) (summary Summary, 
 		}
 		epoch++
 		if err := applyBatch(ctx, store, model, marks, epoch, rng, opts, &summary); err != nil {
-			return summary, err
+			return summary, fmt.Errorf("apply batch %d: %w", epoch, err)
 		}
 		now := time.Now()
 		if !now.Before(nextMaintenance) || summary.Batches-lastMaintenanceBatch >= opts.MaintenanceBatches {
 			maintenanceCycles++
 			if err := maintain(ctx, store, maintenanceCycles%10 == 0); err != nil {
-				return summary, err
+				return summary, fmt.Errorf("maintenance cycle %d after batch %d: %w", maintenanceCycles, summary.Batches, err)
 			}
 			nextMaintenance, lastMaintenanceBatch = now.Add(opts.MaintenanceInterval), summary.Batches
 		}

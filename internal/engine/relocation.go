@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -151,12 +152,12 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	if err := s.Checkpoint(ctx); err != nil {
-		return NextSegmentCompactionResult{}, false, err
+		return NextSegmentCompactionResult{}, false, fmt.Errorf("checkpoint before candidate selection: %w", err)
 	}
 	manifest := s.catalog.Snapshot()
 	excluded, err := s.openBatchSegmentReferences(manifest.SealedDataSegments)
 	if err != nil {
-		return NextSegmentCompactionResult{}, false, err
+		return NextSegmentCompactionResult{}, false, fmt.Errorf("collect open batch segment references: %w", err)
 	}
 	candidate, found, err := selectCompactionCandidate(manifest, policy, excluded)
 	if err != nil {
@@ -173,6 +174,9 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	started := time.Now()
 	compaction, err := s.compactSegmentLocked(ctx, candidate.Source.SegmentID)
 	s.recordCompactionMetrics(started, compaction, err)
+	if err != nil {
+		err = fmt.Errorf("compact segment %d: %w", candidate.Source.SegmentID, err)
+	}
 	return NextSegmentCompactionResult{Candidate: candidate, Compaction: compaction}, true, err
 }
 
@@ -201,10 +205,10 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 	relocated, err := s.relocateSegment(ctx, source)
 	result := SegmentCompactionResult{Relocation: relocated}
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("relocate segment %d: %w", source, err)
 	}
 	if err := s.Checkpoint(ctx); err != nil {
-		return result, err
+		return result, fmt.Errorf("checkpoint relocated segment %d: %w", source, err)
 	}
 
 	s.ops.Lock()
@@ -212,11 +216,11 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 	proof, err := s.proveSegmentRetirementLocked(ctx, source, relocated.LastCommitSeq)
 	result.Proof = proof
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("prove retirement of segment %d: %w", source, err)
 	}
 	manifest := s.catalog.Snapshot()
 	if s.root == "" || manifest.Generation != proof.CatalogGeneration || manifest.RecordLogID == (recordlog.LogID{}) {
-		return result, base.ErrInvalidConfig
+		return result, fmt.Errorf("retirement proof generation=%d current=%d: %w", proof.CatalogGeneration, manifest.Generation, base.ErrInvalidConfig)
 	}
 	state := maintstate.State{
 		Operation: maintstate.DataRetire, StoreUUID: manifest.StoreUUID, LogID: manifest.RecordLogID,
@@ -393,6 +397,9 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 		if len(pending) == 0 {
 			return nil
 		}
+		// Segment scan order is physical append order, while Mapping proposals
+		// require changes to be strictly ordered by RecordID.
+		sort.Slice(pending, func(i, j int) bool { return pending[i].id < pending[j].id })
 		rawBatchID, err := s.batches.Allocate(ctx)
 		if err != nil {
 			return err

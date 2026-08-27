@@ -391,7 +391,23 @@ func (l *Log) ScanSegment(ctx context.Context, id SegmentID, visit func(AppendRe
 	if closed {
 		return ErrClosed
 	}
-	pin, err := l.registry.pin(id)
+	if l.catalog == nil {
+		return ErrInvalidConfig
+	}
+	// Catalog publication is the durable visibility boundary for rotation.
+	// It deliberately precedes Registry publication, so a Catalog-sealed
+	// segment may still appear active in Registry for a short window.
+	snapshot := l.catalog.SnapshotRecordLog()
+	if err := snapshot.validate(); err != nil {
+		return err
+	}
+	if snapshot.ActiveSegmentID == id {
+		return ErrInvalidConfig
+	}
+	if _, ok := snapshot.sealedSummary(id); !ok {
+		return ErrSegmentMissing
+	}
+	pin, err := l.registry.pinSealed(ctx, id)
 	if err != nil {
 		return err
 	}

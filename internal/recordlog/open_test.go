@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 type memoryCatalog struct {
@@ -129,6 +130,95 @@ func TestOpenUsesCatalogAndDurablyRotates(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestScanSegmentWaitsForPublishedRotation(t *testing.T) {
+	log, registry, sealed, active, want := catalogPublishedRotation(t)
+	result := make(chan error, 1)
+	go func() {
+		result <- log.ScanSegment(context.Background(), 1, func(got AppendResult, payload []byte) error {
+			if got != want || string(payload) != "before rotation" {
+				t.Errorf("got=%+v payload=%q", got, payload)
+			}
+			return nil
+		})
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("ScanSegment returned before Registry publication: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := registry.publishRotation(1, sealed, active); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ScanSegment did not observe Registry publication")
+	}
+	if err := registry.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScanSegmentWaitForRotationHonorsCancellation(t *testing.T) {
+	log, registry, sealed, active, _ := catalogPublishedRotation(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- log.ScanSegment(ctx, 1, func(AppendResult, []byte) error { return nil })
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("ScanSegment returned before cancellation: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ScanSegment err=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ScanSegment ignored cancellation")
+	}
+	if err := registry.publishRotation(1, sealed, active); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func catalogPublishedRotation(t *testing.T) (*Log, *segmentRegistry, *sealedSegment, *activeSegment, AppendResult) {
+	t.Helper()
+	root := t.TempDir()
+	state := initialCatalog(16<<10, 8<<10)
+	old, err := createActiveSegment(root, state.headerFor(1), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := appendTestRecords(t, old, []byte("before rotation"))[0]
+	registry, err := newSegmentRegistry(old, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, summary, err := old.seal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := createActiveSegment(root, state.headerFor(2), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := &memoryCatalog{state: state}
+	if _, err := catalog.InstallRecordLogRotation(state.Generation, summary, 2, 3); err != nil {
+		t.Fatal(err)
+	}
+	return &Log{catalog: catalog, registry: registry}, registry, sealed, active, want
 }
 
 func TestRecoverPreparedRotationWithPartialFooter(t *testing.T) {

@@ -52,6 +52,67 @@ func TestRelocateSegmentReportsCommitSequenceRangeAcrossBatches(t *testing.T) {
 	}
 }
 
+func TestRelocateSegmentOrdersChangesByRecordID(t *testing.T) {
+	store := newRelocationStore(t)
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	low, err := batch.Create(context.Background(), []byte("low-initial"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	high, err := batch.Create(context.Background(), []byte("high-initial"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, update := range []struct {
+		id    model.ID
+		value string
+	}{{high, "high-current"}, {low, "low-current"}} {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Put(context.Background(), update.id, []byte(update.value)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := store.catalog.Snapshot().ActiveDataSegmentID
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := store.RelocateSegment(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied < 2 {
+		t.Fatalf("result=%+v", result)
+	}
+	for id, want := range map[model.ID]string{low: "low-current", high: "high-current"} {
+		record, err := store.Get(context.Background(), id)
+		if err != nil || string(record.Value) != want || record.Addr.SegmentID() == source {
+			t.Fatalf("id=%d record=%+v err=%v", id, record, err)
+		}
+	}
+}
+
 func TestPrepareSegmentRetirementCheckpointsAndProvesNoLiveMapping(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	proof, relocated, err := store.PrepareSegmentRetirement(context.Background(), source)

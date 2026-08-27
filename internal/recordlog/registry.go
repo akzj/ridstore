@@ -116,6 +116,52 @@ func (r *segmentRegistry) pin(id SegmentID) (*segmentPin, error) {
 	return &segmentPin{registry: r, id: id, entry: entry}, nil
 }
 
+// pinSealed waits for a Catalog-published rotation to reach the Registry,
+// then pins the sealed segment. Callers must establish that id is sealed in
+// the Catalog before calling this method; otherwise waiting on an active
+// segment would have no completion condition.
+func (r *segmentRegistry) pinSealed(ctx context.Context, id SegmentID) (*segmentPin, error) {
+	if id == 0 {
+		return nil, ErrInvalidVAddr
+	}
+	for {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, ErrClosed
+		}
+		entry := r.entries[id]
+		if entry == nil {
+			r.mu.Unlock()
+			return nil, ErrSegmentMissing
+		}
+		switch entry.state {
+		case segmentSealed:
+			if entry.sealed == nil {
+				r.mu.Unlock()
+				return nil, ErrInvalidConfig
+			}
+			entry.pins++
+			r.mu.Unlock()
+			return &segmentPin{registry: r, id: id, entry: entry}, nil
+		case segmentRetiring:
+			r.mu.Unlock()
+			return nil, ErrSegmentRetiring
+		case segmentActive:
+			changed := r.changed
+			r.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-changed:
+			}
+		default:
+			r.mu.Unlock()
+			return nil, ErrInvalidConfig
+		}
+	}
+}
+
 func (p *segmentPin) read(addr VAddr) ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
