@@ -15,6 +15,7 @@ import (
 	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
+	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -181,6 +182,19 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return fail(err)
 	}
+	if len(recovered.StatusOrder) != len(recovered.Statuses) {
+		return fail(errors.Join(base.ErrCorrupt, errors.New("replay status order is incomplete")))
+	}
+	orderedStatuses := make(map[model.BatchID]struct{}, len(recovered.StatusOrder))
+	for _, id := range recovered.StatusOrder {
+		if _, ok := recovered.Statuses[id]; !ok {
+			return fail(errors.Join(base.ErrCorrupt, errors.New("replay status order references missing batch")))
+		}
+		if _, duplicate := orderedStatuses[id]; duplicate {
+			return fail(errors.Join(base.ErrCorrupt, errors.New("replay status order contains duplicate batch")))
+		}
+		orderedStatuses[id] = struct{}{}
+	}
 	ids, err := idalloc.New(idalloc.RecordID, manifest.HardLimits.IDReserveSize, recovered.ReservedIDHigh, log)
 	if err != nil {
 		return fail(err)
@@ -214,7 +228,8 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.maintenanceHook = hooks.maintenance
 	store.mapStoreHook = hooks.mapStore
 	store.mappingGCHook = hooks.mapGC
-	for id, status := range recovered.Statuses {
+	for _, id := range recovered.StatusOrder {
+		status := recovered.Statuses[id]
 		state := BatchStateAborted
 		if status.State == replay.BatchCommitted {
 			state = BatchStateCommitted

@@ -12,6 +12,7 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/mapstore"
+	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
@@ -148,6 +149,10 @@ func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	openBatch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	batch, err := store.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -167,6 +172,12 @@ func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	}
 	if _, err := store.Begin(context.Background()); !errors.Is(err, base.ErrReadOnly) {
 		t.Fatalf("begin after commit uncertainty err=%v", err)
+	}
+	if _, err := store.Get(context.Background(), model.ID(999)); !errors.Is(err, base.ErrReadOnly) {
+		t.Fatalf("get after commit uncertainty err=%v", err)
+	}
+	if _, err := openBatch.Create(context.Background(), []byte("must fail closed")); !errors.Is(err, base.ErrReadOnly) {
+		t.Fatalf("batch mutation after commit uncertainty err=%v", err)
 	}
 	if err := store.Close(); !errors.Is(err, recordlog.ErrPoisoned) {
 		t.Fatalf("close err=%v", err)

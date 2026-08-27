@@ -192,13 +192,7 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 			s.ops.RUnlock()
 			return nil, base.ErrClosed
 		}
-		if s.fault != nil {
-			err := s.fault
-			s.mu.Unlock()
-			s.ops.RUnlock()
-			return nil, errors.Join(base.ErrReadOnly, err)
-		}
-		if fault := s.commits.Fault(); fault != nil {
+		if fault := s.operationFaultLocked(); fault != nil {
 			s.mu.Unlock()
 			s.ops.RUnlock()
 			return nil, errors.Join(base.ErrReadOnly, fault)
@@ -258,7 +252,7 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 			return Record{}, err
 		}
 		s.mu.Lock()
-		closed, fault := s.closed, s.fault
+		closed, fault := s.closed, s.operationFaultLocked()
 		s.mu.Unlock()
 		if closed {
 			return Record{}, base.ErrClosed
@@ -372,10 +366,9 @@ func (s *Store) prepareCheckpointLocked(ctx context.Context) (checkpointWork, er
 		s.mu.Unlock()
 		return checkpointWork{}, base.ErrClosed
 	}
-	if s.fault != nil {
-		err := s.fault
+	if fault := s.operationFaultLocked(); fault != nil {
 		s.mu.Unlock()
-		return checkpointWork{}, errors.Join(base.ErrReadOnly, err)
+		return checkpointWork{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	if s.catalog == nil || s.mapStore == nil || s.maxStats == 0 {
 		s.mu.Unlock()
@@ -483,6 +476,16 @@ func (s *Store) setFault(err error) {
 	s.mu.Unlock()
 }
 
+// operationFaultLocked returns the single fail-closed view used by public data
+// operations. The caller holds s.mu; Coordinator never acquires s.mu, so
+// consulting its terminal state here does not introduce a lock cycle.
+func (s *Store) operationFaultLocked() error {
+	if s.fault != nil {
+		return s.fault
+	}
+	return s.commits.Fault()
+}
+
 func (s *Store) signalLocked() {
 	close(s.notify)
 	s.notify = make(chan struct{})
@@ -580,10 +583,9 @@ func (s *Store) submitCommit(ctx context.Context, batch *transaction.Batch) (coo
 		s.mu.Unlock()
 		return coordinator.Receipt{}, base.ErrClosed
 	}
-	if s.fault != nil {
-		err := s.fault
+	if fault := s.operationFaultLocked(); fault != nil {
 		s.mu.Unlock()
-		return coordinator.Receipt{}, errors.Join(base.ErrReadOnly, err)
+		return coordinator.Receipt{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	s.mu.Unlock()
 	return s.commits.Submit(ctx, batch)
@@ -605,7 +607,7 @@ func withBatch[T any](b *Batch, run func() (T, error)) (T, error) {
 	b.store.ops.RLock()
 	defer b.store.ops.RUnlock()
 	b.store.mu.Lock()
-	closed, fault := b.store.closed, b.store.fault
+	closed, fault := b.store.closed, b.store.operationFaultLocked()
 	b.store.mu.Unlock()
 	if closed {
 		return zero, base.ErrClosed

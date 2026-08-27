@@ -2,6 +2,7 @@ package mapping
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"testing"
 
@@ -103,6 +104,52 @@ func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
 	}
 	if candidate.Root() == 0 || candidate.CoveredCommitSeq() != 1 || current.CoveredCommitSeq() != 2 {
 		t.Fatalf("candidate root=%v covered=%d runtime=%d", candidate.Root(), candidate.CoveredCommitSeq(), current.CoveredCommitSeq())
+	}
+}
+
+func TestPersistentPublishGroupReservationFailureDoesNotExposePartialGroup(t *testing.T) {
+	current, physical := newPersistentForTest(t)
+	defer physical.Close()
+	plan, err := current.ResolveGroup([]Proposal{
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: testAddr(t, 1, 64), Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewAddr: testAddr(t, 1, 128), Operation: OperationPut}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations := reservePlan(t, current, plan)
+	reservations[1] = failingReservation{}
+	if _, err := current.PublishGroup(1, plan, reservations); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("publish err=%v", err)
+	}
+	for _, id := range []model.ID{1, 2} {
+		if _, exists, err := current.Lookup(id); err != nil || exists {
+			t.Fatalf("id=%d exists=%v err=%v", id, exists, err)
+		}
+	}
+	if current.CoveredCommitSeq() != 0 {
+		t.Fatalf("covered=%d", current.CoveredCommitSeq())
+	}
+}
+
+func TestPersistentPublishGroupChargeOverflowDoesNotExposeGroup(t *testing.T) {
+	current, physical := newPersistentForTest(t)
+	defer physical.Close()
+	plan, err := current.ResolveGroup([]Proposal{{
+		Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: testAddr(t, 1, 64), Operation: OperationPut}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.active.charge = 1
+	if _, err := current.PublishGroup(1, plan, []DeltaReservation{fixedReservation(math.MaxUint64)}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("publish err=%v", err)
+	}
+	if _, exists, err := current.Lookup(1); err != nil || exists {
+		t.Fatalf("exists=%v err=%v", exists, err)
+	}
+	if current.CoveredCommitSeq() != 0 {
+		t.Fatalf("covered=%d", current.CoveredCommitSeq())
 	}
 }
 

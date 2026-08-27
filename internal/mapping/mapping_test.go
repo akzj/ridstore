@@ -55,6 +55,30 @@ func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 	}
 }
 
+func TestPublishGroupReservationFailureDoesNotExposePartialGroup(t *testing.T) {
+	current := NewEmpty()
+	plan, err := current.ResolveGroup([]Proposal{
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: testAddr(t, 1, 64), Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewAddr: testAddr(t, 1, 128), Operation: OperationPut}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations := reservePlan(t, current, plan)
+	reservations[1] = failingReservation{}
+	if _, err := current.PublishGroup(1, plan, reservations); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("publish err=%v", err)
+	}
+	for _, id := range []model.ID{1, 2} {
+		if _, exists, err := current.Lookup(id); err != nil || exists {
+			t.Fatalf("id=%d exists=%v err=%v", id, exists, err)
+		}
+	}
+	if current.CoveredCommitSeq() != 0 {
+		t.Fatalf("covered=%d", current.CoveredCommitSeq())
+	}
+}
+
 func TestResolveGroupRejectsConflictWithoutAffectingLaterProposal(t *testing.T) {
 	old := testAddr(t, 1, 64)
 	mapping, err := New(Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.VAddr{1: old}})

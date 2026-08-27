@@ -303,6 +303,53 @@ func TestStatusCapacityAdvancesCheckpointBeforeNextBatch(t *testing.T) {
 	}
 }
 
+func TestRecoveredStatusesEvictInDurableOrder(t *testing.T) {
+	ctx := context.Background()
+	config := testCreateConfig()
+	config.HardLimits.MaxOpenBatches = 3
+	config.Runtime.StatusRetention = 3
+	root := filepath.Join(t.TempDir(), "store")
+	store, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]model.BatchID, 0, 4)
+	for range 3 {
+		batch, err := store.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, batch.ID())
+		if err := batch.Abort(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(ctx, root, config.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fourth, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids = append(ids, fourth.ID())
+	if err := fourth.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Status(ctx, ids[0]); !errors.Is(err, base.ErrStatusExpired) {
+		t.Fatalf("oldest status err=%v", err)
+	}
+	for _, id := range ids[1:] {
+		if status, err := store.Status(ctx, id); err != nil || status.State != BatchStateAborted {
+			t.Fatalf("batch=%d status=%+v err=%v", id, status, err)
+		}
+	}
+}
+
 func testCreateConfig() CreateConfig {
 	return CreateConfig{
 		HardLimits: storecatalog.HardLimits{

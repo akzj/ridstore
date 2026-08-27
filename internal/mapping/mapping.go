@@ -244,6 +244,13 @@ func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan, r
 		if _, err := consumeReservation(reservations[index], proposal.DeltaEntries); err != nil {
 			return PublishResult{}, err
 		}
+	}
+	// Validate/consume the complete reservation set before changing visible
+	// entries, so an invariant failure cannot expose a partial group.
+	for _, proposal := range plan.Proposals {
+		if !proposal.Accepted {
+			continue
+		}
 		for _, resolved := range proposal.Changes {
 			if !resolved.Apply {
 				result.Skipped++

@@ -1,6 +1,6 @@
 # RecordLog v2 Contract
 
-状态：Draft for Review
+状态：已实现的 v2 RecordLog 契约
 
 RecordLog 是 ridstore v2 唯一的物理追加和 Segment I/O 子系统。它只存储不透明字节，不认识
 ridstore 的 ID、Batch、Commit、Mapping 或 GC 语义。
@@ -301,5 +301,5 @@ RecordLog 不独立持久化一份配置；这些硬限制来自唯一 Manifest�
 - `internal/storecatalog/catalog.go`：直接实现 RecordLog Catalog port，不存在兼容 adapter；
 - `internal/recordlog/*_test.go`：golden、边界、corruption、Reader Pin、group commit、process crash 和 fuzz。
 
-M2 已实现本契约的物理主路径，但尚未接入 v2 Store/Coordinator。旧 Format v1 runtime 仍然编译，
-不调用上述 v2 实现。
+本契约已经接入 v2 Store、Coordinator、Checkpoint、Data GC、Offline Verify 与 Backup/Restore
+主路径。当前分支不存在 Format v1 runtime、兼容 adapter 或双写路径；历史 v1 文档只作为设计演化记录。

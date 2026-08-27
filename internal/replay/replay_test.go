@@ -95,7 +95,7 @@ func TestRecoverRebuildsMappingAllocatorsAndStatuses(t *testing.T) {
 	start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
 	result, err := Recover(context.Background(), log, Checkpoint{
 		Mapping: mapping.NewEmpty(), ReplayStart: start, ReservedIDHigh: 5, ReservedBatchIDHigh: 5,
-		OpenBatchIDs: []model.BatchID{2, 3},
+		OpenBatchIDs: []model.BatchID{2, 3, 4},
 	}, replayConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +109,9 @@ func TestRecoverRebuildsMappingAllocatorsAndStatuses(t *testing.T) {
 	}
 	if result.Statuses[2] != (BatchStatus{State: BatchCommitted, CommitSeq: 1}) || result.Statuses[3].State != BatchAborted {
 		t.Fatalf("statuses=%+v", result.Statuses)
+	}
+	if len(result.StatusOrder) != 3 || result.StatusOrder[0] != 2 || result.StatusOrder[1] != 3 || result.StatusOrder[2] != 4 {
+		t.Fatalf("status order=%v", result.StatusOrder)
 	}
 }
 

@@ -6,6 +6,18 @@ import (
 	"github.com/akzj/ridstore/internal/model"
 )
 
+type failingReservation struct{}
+
+func (failingReservation) Release() {}
+
+func (failingReservation) consume(uint64) (uint64, error) { return 0, ErrCorrupt }
+
+type fixedReservation uint64
+
+func (fixedReservation) Release() {}
+
+func (r fixedReservation) consume(uint64) (uint64, error) { return uint64(r), nil }
+
 func reservePlan(t *testing.T, index Index, plan GroupPlan) []DeltaReservation {
 	t.Helper()
 	reservations := make([]DeltaReservation, len(plan.Proposals))

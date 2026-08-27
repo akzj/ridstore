@@ -214,6 +214,16 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan, reserva
 			return PublishResult{}, ErrCorrupt
 		}
 		charged += consumed
+	}
+	if m.active.charge > math.MaxUint64-charged {
+		return PublishResult{}, ErrCorrupt
+	}
+	// Consume every reservation before changing the visible Delta. An invariant
+	// failure must not leave a partially published durable commit group.
+	for _, proposal := range plan.Proposals {
+		if !proposal.Accepted {
+			continue
+		}
 		for _, resolved := range proposal.Changes {
 			if !resolved.Apply {
 				result.Skipped++
@@ -226,9 +236,6 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan, reserva
 			}
 			result.Applied++
 		}
-	}
-	if m.active.charge > math.MaxUint64-charged {
-		return PublishResult{}, ErrCorrupt
 	}
 	m.active.charge += charged
 	m.covered = model.CommitSeq(uint64(first) + accepted - 1)

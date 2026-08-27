@@ -55,6 +55,7 @@ type Result struct {
 	ReservedIDHigh      uint64
 	ReservedBatchIDHigh uint64
 	Statuses            map[model.BatchID]BatchStatus
+	StatusOrder         []model.BatchID
 	TerminalCount       uint64
 }
 
@@ -137,6 +138,14 @@ func Recover(ctx context.Context, log Log, checkpoint Checkpoint, config Config)
 	if err != nil {
 		return Result{}, err
 	}
+	// Batches open at the checkpoint and without a later terminal record become
+	// aborted at recovery. Append them after the durable terminal stream in the
+	// checkpoint's stable BatchID order.
+	for _, id := range checkpoint.OpenBatchIDs {
+		if _, terminal := seenTerminal[id]; !terminal {
+			result.StatusOrder = append(result.StatusOrder, id)
+		}
+	}
 	result.TerminalCount = uint64(len(result.Statuses))
 	return result, nil
 }
@@ -203,7 +212,9 @@ func replayGroup(ctx context.Context, log Log, current mapping.Index, result *Re
 			return corrupt(errors.New("replayed proposal was rejected"))
 		}
 		if group.Descriptors[i].Kind == recordcodec.DescriptorUserCommit {
-			result.Statuses[group.Descriptors[i].BatchID] = BatchStatus{State: BatchCommitted, CommitSeq: group.Descriptors[i].CommitSeq}
+			id := group.Descriptors[i].BatchID
+			result.Statuses[id] = BatchStatus{State: BatchCommitted, CommitSeq: group.Descriptors[i].CommitSeq}
+			result.StatusOrder = append(result.StatusOrder, id)
 		}
 	}
 	if _, err := current.PublishGroup(result.NextCommitSeq, plan, reservations); err != nil {
@@ -223,6 +234,7 @@ func retainStatus(result *Result, id model.BatchID, status BatchStatus, capacity
 		return base.ErrStatusCapacity
 	}
 	result.Statuses[id] = status
+	result.StatusOrder = append(result.StatusOrder, id)
 	return nil
 }
 
