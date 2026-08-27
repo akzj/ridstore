@@ -21,7 +21,7 @@ type Manager struct {
 }
 
 func OpenManager(root string, hook FaultHook) (*Manager, error) {
-	manifest, err := Load(root)
+	manifest, err := LoadRecovering(root, hook)
 	if err != nil {
 		return nil, err
 	}

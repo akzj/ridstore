@@ -20,6 +20,7 @@ import (
 type fakeAllocator struct{}
 
 func (fakeAllocator) Allocate(context.Context) (uint64, error) { return 1, nil }
+func (fakeAllocator) CanUse(uint64) bool                       { return true }
 
 type fakeLog struct {
 	mu          sync.Mutex

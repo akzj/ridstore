@@ -22,13 +22,14 @@ test-fuzz-smoke:
 		internal/recordlog:FuzzDecodeSegmentFooter \
 		internal/recordlog:FuzzDecodeRotationJournal \
 		internal/mapstore:FuzzDecodeNode \
+		internal/backuprestore:FuzzDecodeMetadata \
 		internal/storecatalog:FuzzDecodeManifest; do \
 		package=$${item%%:*}; target=$${item##*:}; \
 		go test ./$$package -run '^$$' -fuzz "^$${target}$$" -fuzztime "$(FUZZ_TIME)" -parallel "$(FUZZ_PARALLEL)"; \
 	done
 
 test-crash:
-	go test . ./internal/recordlog ./internal/mapstore ./internal/engine -run 'RecoveryAcrossProcessExit' -count=1 -timeout=10m
+	go test . ./internal/recordlog ./internal/mapstore ./internal/engine ./internal/backuprestore -run 'RecoveryAcrossProcessExit' -count=1 -timeout=10m
 
 vet:
 	go vet ./...

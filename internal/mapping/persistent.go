@@ -392,6 +392,44 @@ func (m *Persistent) AbortCheckpoint(checkpoint *FrozenCheckpoint) error {
 	return nil
 }
 
+// ReplaceCheckpointRoot switches the physical owner of an already installed
+// checkpoint without changing its logical contents. Callers must quiesce all
+// Mapping users before calling it. A rewrite is only valid when checkpointing
+// has drained every delta layer into the current root.
+func (m *Persistent) ReplaceCheckpointRoot(root *radix.Tree, syncer NodeSyncer) error {
+	if root == nil || syncer == nil {
+		return ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.inCheckpoint || len(m.active.values) != 0 || len(m.frozen) != 0 ||
+		m.active.charge != 0 || root.Covered() != m.covered {
+		return ErrStalePlan
+	}
+	charged, reserved, _, _ := m.budget.usage()
+	if charged != 0 || reserved != 0 {
+		return ErrStalePlan
+	}
+	m.root = root
+	m.syncer = syncer
+	m.epoch++
+	return nil
+}
+
+// WalkCheckpoint visits the fully checkpointed root. It rejects a Mapping
+// with any overlay state so callers cannot accidentally omit committed deltas.
+func (m *Persistent) WalkCheckpoint(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
+	if visit == nil {
+		return ErrInvalid
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.inCheckpoint || len(m.active.values) != 0 || len(m.frozen) != 0 || m.active.charge != 0 {
+		return ErrStalePlan
+	}
+	return m.root.Walk(ctx, visit)
+}
+
 func lookupLayers(active *deltaLayer, frozen []*deltaLayer, id model.ID) (persistentDelta, bool) {
 	if value, found := active.values[id]; found {
 		return value, true

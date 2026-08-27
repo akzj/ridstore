@@ -218,21 +218,38 @@ func Install(root string, state State, hook FaultHook) error {
 }
 
 func Load(root string) (State, bool, error) {
+	return LoadWithFaultHook(root, nil)
+}
+
+func LoadWithFaultHook(root string, hook FaultHook) (State, bool, error) {
 	if root == "" {
 		return State{}, false, ErrInvalid
 	}
 	dir := filepath.Join(root, "journal")
-	removed, err := removeRegular(filepath.Join(dir, tempName), nil, FaultBeforeTempRemove)
+	info, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return State{}, false, nil
+	}
 	if err != nil {
 		return State{}, false, err
 	}
-	if removed {
-		if err := syncDir(dir); err != nil {
-			return State{}, false, err
-		}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return State{}, false, ErrCorrupt
+	}
+	_, err = removeRegular(filepath.Join(dir, tempName), hook, FaultBeforeTempRemove)
+	if err != nil {
+		return State{}, false, err
+	}
+	// Always sync: a previous process may have removed temp or final marker and
+	// then observed an uncertain directory-sync result.
+	if err := hit(hook, FaultBeforeCleanupDirSync); err != nil {
+		return State{}, false, err
+	}
+	if err := syncDir(dir); err != nil {
+		return State{}, false, err
 	}
 	path := filepath.Join(dir, markerName)
-	info, err := os.Lstat(path)
+	info, err = os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return State{}, false, nil
 	}
@@ -255,16 +272,23 @@ func Remove(root string, hook FaultHook) error {
 		return ErrInvalid
 	}
 	dir := filepath.Join(root, "journal")
-	removedFinal, err := removeRegular(filepath.Join(dir, markerName), hook, FaultBeforeMarkerRemove)
-	if err != nil {
-		return err
-	}
-	removedTemp, err := removeRegular(filepath.Join(dir, tempName), hook, FaultBeforeTempRemove)
-	if err != nil {
-		return err
-	}
-	if !removedFinal && !removedTemp {
+	info, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrCorrupt
+	}
+	_, err = removeRegular(filepath.Join(dir, markerName), hook, FaultBeforeMarkerRemove)
+	if err != nil {
+		return err
+	}
+	_, err = removeRegular(filepath.Join(dir, tempName), hook, FaultBeforeTempRemove)
+	if err != nil {
+		return err
 	}
 	if err := hit(hook, FaultBeforeCleanupDirSync); err != nil {
 		return err
@@ -279,6 +303,11 @@ func RecoveryArtifacts(root string) (bool, error) {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return false, err
 		}
+	}
+	if _, err := os.Lstat(StagingRoot(root)); err == nil {
+		return true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
 	}
 	return false, nil
 }

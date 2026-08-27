@@ -89,6 +89,6 @@ Coordinator checkpoint barrier、RecordLog durable cut、Catalog checkpoint tupl
 v2 Open/Replay 已接线。Engine 只接受 `mapping.Persistent`；旧的全量内存 Mapping 不再是 Engine
 后端，仅待迁移为 Mapping 模型测试 oracle 后删除生产定义。
 
-当前尚未实现 soft-limit 后台调度、Mapping GC、完整 MapStore/RecordLog syscall
-crash matrix。v2 Create 与目录锁已经接入。第一版精确 SegmentStats 通过顺序遍历 candidate Root，并利用
+当前尚未实现 soft-limit 后台主动调度；显式 Mapping GC 与 MapStore/RecordLog syscall/crash matrix
+已经接入。v2 Create 与目录锁已经接入。第一版精确 SegmentStats 通过顺序遍历 candidate Root，并利用
 `RecordLog.Inspect` 只读取物理 Header 与 Put protocol header，不读取 Value body。

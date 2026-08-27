@@ -134,7 +134,15 @@ PutRecord 保留 OriginBatchID，用于：
 
 OriginBatchID 不进入 Mapping、不由 Get 返回、不参与用户条件，也不是 MVCC timestamp 或 LogicalRevision。
 
-## 9. Changed / unchanged
+## 9. ID 发放边界
+
+`Put` 只能接受已经越过当前 allocator 发放点的 ID。`Allocate` 或 `Create` 在返回 ID 前先持久化其预留
+区间；同一进程中，尚可能被后续 `Allocate` 返回的 ID 必须在追加 PutRecord 前以 `ErrInvalidID` 拒绝。
+
+崩溃恢复从 durable reserved high 之后继续发放，因此上一个进程预留区间内无法证明是否实际返回给
+调用者的 ID 全部保守地视为已消耗。它们可能形成永久空洞，但不会与未来 Allocate 结果碰撞。
+
+## 10. Changed / unchanged
 
 本次改变：
 
@@ -152,7 +160,7 @@ OriginBatchID 不进入 Mapping、不由 Get 返回、不参与用户条件，�
 - Relocation 的 expected-old-VAddr CAS、Reader Pin 和删除门禁；
 - 单次 Get 的 Mapping revalidation。
 
-## 10. Batch Status 保留边界
+## 11. Batch Status 保留边界
 
 `Status(BatchID)` 只为不确定提交恢复提供有界查询窗口，不是永久业务历史。`RuntimeConfig.StatusRetention`
 同时限制：
@@ -171,10 +179,32 @@ OriginBatchID 不进入 Mapping、不由 Get 返回、不参与用户条件，�
 GC relocation 使用共享的 durable BatchID/CommitSeq 顺序，但不是用户提交，不进入公开 Status 保留集。
 Replay 仍验证其 CommitSeq、Descriptor 和 mutation，只是不为它生成可查询状态。
 
-## 11. 离线 Verify
+## 12. 离线 Verify
 
 根包公开 `Verify(ctx, VerifyConfig)`。它必须在 Store 关闭时取得同一目录独占锁，并按
 physical files、checkpoint Mapping、semantic replay、exact join 的顺序验证；成功报告的终态 Stage
 固定为 `VerifyStageExact`。`MaxLiveIDs` 和 `MaxReplayStatuses` 是 verifier 自身的显式内存上限，命中时
 返回 `ErrVerifyLimit` 或 `ErrStatusCapacity`，不把资源不足误报为数据损坏。Verify 不调用正常 `Open`，
 不截断 tail、不完成 Journal、不清理垃圾文件，也不修改 Manifest。
+
+## 13. Mapping 物理重写
+
+根包公开 `CompactMapping(ctx)` 作为显式维护入口。它在固定
+`maintenanceMu -> checkpointMu -> ops.Lock` 顺序下先推进完整 Checkpoint，再把全部可达
+`ID -> VAddr` 流式复制到新 Mapping generation。新 Manifest durable 后，Engine 原子替换
+Persistent root 与物理 owner；只有旧 owner 关闭后才允许 retirement。该操作不改变 Value、VAddr、
+CoveredCommitSeq、ReplayStart、allocator high、Batch Status 或 SegmentStats。
+
+第一版不自动调度 Mapping GC。显式入口的 syscall fault、process-exit、Offline Verify、重复 GC 与
+空间收敛证据已经闭合；自动触发阈值和限速属于后续策略层。
+
+## 14. 离线 Backup / Restore
+
+Linux 上根包公开 `Backup(ctx, BackupConfig)` 和 `Restore(ctx, RestoreConfig)`。Backup 要求源 Store 已关闭，
+并在同一个独占目录 lease 内完成 Exact Verify、Manifest 文件集确定和逐文件复制；artifact 只含当前权威
+Manifest、其引用的 RecordLog/Mapping 文件和带 CRC 的 `BACKUP-v2` 元数据。
+
+Restore 只接受严格白名单、size/SHA-256 全匹配且可通过 v2 Exact Verify 的 artifact，并通过同父目录
+`RENAME_NOREPLACE` 原子发布到不存在的目标。两者的 verification budget 可显式配置，零值使用 Verify
+默认值。Restore 按字节保留 StoreUUID/RecordLogID，因此是灾难恢复而不是 Clone；原目录和任一恢复目录
+不得同时作为 writer。非 Linux 平台在无法提供原子 no-replace directory rename 时返回 `ErrUnsupported`。

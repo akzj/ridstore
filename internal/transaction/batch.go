@@ -38,6 +38,7 @@ type Appender interface {
 
 type IDAllocator interface {
 	Allocate(context.Context) (uint64, error)
+	CanUse(uint64) bool
 }
 
 type Mutation struct {
@@ -321,6 +322,9 @@ func (b *Batch) allocateLocked(ctx context.Context) (model.ID, error) {
 func (b *Batch) putLocked(ctx context.Context, id model.ID, value []byte) error {
 	if err := b.validatePut(id, value, false); err != nil {
 		return err
+	}
+	if !b.allocator.CanUse(uint64(id)) {
+		return base.ErrInvalidID
 	}
 	if ctx == nil {
 		ctx = context.Background()

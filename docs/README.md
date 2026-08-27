@@ -20,6 +20,7 @@
 13. [磁盘空间 Admission](v2-space-admission.md)：用户写入水位、控制面 headroom 与 ENOSPC 边界。
 14. [v2 Offline Verify](v2-verify-design.md)：只读审计边界、证据分层与实现阶段。
 15. [v2 Mapping GC](v2-mapping-gc-design.md)：Root 全量重建、文件集原子替换与崩溃恢复。
+16. [v2 Backup / Restore](v2-backup-restore-design.md)：离线全量 artifact、精确文件集与原子发布协议。
 
 阶段 Review：
 
@@ -34,10 +35,12 @@
 
 未以 `v2-` 开头的设计及 `phase-*.md` 记录 Format v1 的历史决策和曾经验证过的性质。它们只用于提取
 经验，不是当前 API、格式、模块名或生产能力的事实来源。尤其其中的 Revision、旧命令、旧 metrics、
-Backup/Soak 的旧实现均已删除，后续能力必须按 v2 原生重写；Verify 已按 v2 格式独立重写。
+Backup/Soak 的旧实现均已删除；Verify 与 Backup/Restore 已按 v2 格式独立重写，其他后续能力不得复用
+v1 协议。
 
 ## 当前完整性
 
 v2 已具备 Create/Open、CRUD、原子 Batch、group commit、Checkpoint、Replay、CommitUnknown 查询、
-有界状态恢复、用户写入磁盘水位、GC 候选选择、Relocation、安全退休、崩溃恢复和原生只读 Verify。
-它仍不是 production-ready：Backup、Metrics、长时 soak 与真实 workload 基线是后续完整性工作。
+有界状态恢复、用户写入磁盘水位、Data/Mapping GC、崩溃恢复、原生只读 Verify，以及 Linux 上的离线全量
+Backup/Restore。它仍不是 production-ready：Metrics、长时 soak、真实 workload 基线和远端备份传输是后续
+完整性工作。

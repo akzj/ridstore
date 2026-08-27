@@ -79,6 +79,35 @@ func TestOpenRejectsIncompleteInitializationAndCreateResumes(t *testing.T) {
 	}
 }
 
+func TestOpenCleansUnpublishedManifestTemp(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	store, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(root, "MANIFEST-v2-0.tmp")
+	if err := os.WriteFile(temp, []byte("unpublished"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), root, config.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(temp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp err=%v", err)
+	}
+	if _, err := storecatalog.LoadStrict(root); err != nil {
+		t.Fatalf("strict load after open: %v", err)
+	}
+}
+
 func TestCreateRejectsUncheckpointableDeltaBudgetBeforeBootstrap(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
@@ -101,6 +130,25 @@ func TestCreateRejectsStatusRetentionBelowOpenLimitBeforeBootstrap(t *testing.T)
 	}
 	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("invalid create changed root err=%v", err)
+	}
+}
+
+func TestCreateRejectsCommitPayloadOutsidePersistentBounds(t *testing.T) {
+	for _, mutate := range []func(*CreateConfig){
+		func(config *CreateConfig) {
+			config.Runtime.Commit.MaxGroupPayload = config.HardLimits.MaxRecordLogPayload + 1
+		},
+		func(config *CreateConfig) { config.Runtime.Commit.MaxGroupPayload = 128 },
+	} {
+		root := filepath.Join(t.TempDir(), "store")
+		config := testCreateConfig()
+		mutate(&config)
+		if _, err := Create(context.Background(), root, config); !errors.Is(err, base.ErrInvalidConfig) {
+			t.Fatalf("create err=%v", err)
+		}
+		if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("invalid create changed root err=%v", err)
+		}
 	}
 }
 

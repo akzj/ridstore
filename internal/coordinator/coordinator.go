@@ -101,8 +101,7 @@ type Coordinator struct {
 }
 
 func New(next model.CommitSeq, log Appender, current mapping.Index, config Config) (*Coordinator, error) {
-	if next == 0 || log == nil || current == nil || config.QueueCapacity <= 0 || config.MaxGroupBatches <= 0 || config.MaxGroupPayload == 0 ||
-		config.MaxGroupPayload < uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize) ||
+	if next == 0 || log == nil || current == nil || ValidateConfig(config) != nil ||
 		current.CoveredCommitSeq() == model.CommitSeq(math.MaxUint64) || next != current.CoveredCommitSeq()+1 {
 		return nil, fmt.Errorf("coordinator configuration: %w", base.ErrInvalidConfig)
 	}
@@ -112,6 +111,14 @@ func New(next model.CommitSeq, log Appender, current mapping.Index, config Confi
 	}
 	go c.run()
 	return c, nil
+}
+
+func ValidateConfig(config Config) error {
+	if config.QueueCapacity <= 0 || config.MaxGroupBatches <= 0 ||
+		config.MaxGroupPayload < uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize) {
+		return base.ErrInvalidConfig
+	}
+	return nil
 }
 
 func (c *Coordinator) Commit(ctx context.Context, batch *transaction.Batch) (Result, error) {

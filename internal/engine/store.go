@@ -12,6 +12,7 @@ import (
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
 	"github.com/akzj/ridstore/internal/maintstate"
+	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
@@ -81,6 +82,8 @@ type Store struct {
 	log                    Log
 	maintenance            maintenanceLog
 	maintenanceHook        maintstate.FaultHook
+	mapStoreHook           mapstore.FaultHook
+	mappingGCHook          mapgcstate.FaultHook
 	root                   string
 	mapping                *mapping.Persistent
 	mapStore               *mapstore.Store
@@ -107,6 +110,7 @@ type Store struct {
 	closed                 bool
 	fault                  error
 	maxStats               uint64
+	mappingCacheBytes      uint64
 	maxRelocationMutations uint64
 	dirLock                *filelock.Lock
 	identity               [16]byte
@@ -264,6 +268,7 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		}
 		addr, exists, err := s.mapping.Lookup(id)
 		if err != nil {
+			s.setFault(err)
 			return Record{}, err
 		}
 		if !exists {
@@ -271,10 +276,14 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		}
 		payload, err := s.log.Read(ctx, addr)
 		if err != nil {
+			if ctx.Err() == nil {
+				s.setFault(err)
+			}
 			return Record{}, err
 		}
 		current, stillExists, err := s.mapping.Lookup(id)
 		if err != nil {
+			s.setFault(err)
 			return Record{}, err
 		}
 		if !stillExists || current != addr {
@@ -282,7 +291,9 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		}
 		put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
 		if err != nil || put.RecordID != id {
-			return Record{}, errors.Join(base.ErrCorrupt, err)
+			corrupt := errors.Join(base.ErrCorrupt, err)
+			s.setFault(corrupt)
+			return Record{}, corrupt
 		}
 		return Record{Value: put.Value, Addr: addr}, nil
 	}
@@ -334,44 +345,66 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	defer s.checkpointMu.Unlock()
 
 	s.ops.Lock()
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		s.ops.Unlock()
-		return base.ErrClosed
-	}
-	if s.fault != nil {
-		err := s.fault
-		s.mu.Unlock()
-		s.ops.Unlock()
-		return errors.Join(base.ErrReadOnly, err)
-	}
-	if s.catalog == nil || s.mapStore == nil || s.maxStats == 0 {
-		s.mu.Unlock()
-		s.ops.Unlock()
-		return base.ErrInvalidConfig
-	}
-	s.mu.Unlock()
-	cut, err := s.commits.CheckpointCut(ctx)
-	if err != nil {
-		s.ops.Unlock()
-		return err
-	}
-	open, statusCut, err := s.openBatchIDsAtCut()
-	if err != nil {
-		s.ops.Unlock()
-		s.setFault(err)
-		return err
-	}
-	sort.Slice(open, func(i, j int) bool { return open[i] < open[j] })
-	reservedIDHigh := s.ids.DurableHigh()
-	reservedBatchIDHigh := s.batches.DurableHigh()
-	issuedBatchIDHigh := s.batches.IssuedHigh()
-	frozen, err := s.mapping.Freeze(cut.CoveredCommitSeq)
+	work, err := s.prepareCheckpointLocked(ctx)
 	s.ops.Unlock()
 	if err != nil {
 		return err
 	}
+	return s.finishCheckpoint(ctx, work)
+}
+
+type checkpointWork struct {
+	frozen              *mapping.FrozenCheckpoint
+	cut                 coordinator.CheckpointCut
+	open                []model.BatchID
+	statusCut           uint64
+	reservedIDHigh      uint64
+	reservedBatchIDHigh uint64
+	issuedBatchIDHigh   uint64
+}
+
+// prepareCheckpointLocked captures one cut while the caller holds ops.Lock.
+// finishCheckpoint may run with that lock held (Mapping GC) or released (the
+// ordinary Checkpoint path).
+func (s *Store) prepareCheckpointLocked(ctx context.Context) (checkpointWork, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return checkpointWork{}, base.ErrClosed
+	}
+	if s.fault != nil {
+		err := s.fault
+		s.mu.Unlock()
+		return checkpointWork{}, errors.Join(base.ErrReadOnly, err)
+	}
+	if s.catalog == nil || s.mapStore == nil || s.maxStats == 0 {
+		s.mu.Unlock()
+		return checkpointWork{}, base.ErrInvalidConfig
+	}
+	s.mu.Unlock()
+	cut, err := s.commits.CheckpointCut(ctx)
+	if err != nil {
+		return checkpointWork{}, err
+	}
+	open, statusCut, err := s.openBatchIDsAtCut()
+	if err != nil {
+		s.setFault(err)
+		return checkpointWork{}, err
+	}
+	sort.Slice(open, func(i, j int) bool { return open[i] < open[j] })
+	frozen, err := s.mapping.Freeze(cut.CoveredCommitSeq)
+	if err != nil {
+		return checkpointWork{}, err
+	}
+	return checkpointWork{
+		frozen: frozen, cut: cut, open: open, statusCut: statusCut,
+		reservedIDHigh: s.ids.DurableHigh(), reservedBatchIDHigh: s.batches.DurableHigh(),
+		issuedBatchIDHigh: s.batches.IssuedHigh(),
+	}, nil
+}
+
+func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error {
+	frozen := work.frozen
 	abort := func(cause error) error {
 		return errors.Join(cause, s.mapping.AbortCheckpoint(frozen))
 	}
@@ -393,9 +426,9 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		return abort(err)
 	}
 	_, err = s.catalog.InstallCheckpoint(manifest.Generation, storecatalog.Checkpoint{
-		MappingRoot: candidate.Root(), CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: cut.ReplayStart,
-		ReservedIDHigh: reservedIDHigh, ReservedBatchIDHigh: reservedBatchIDHigh, IssuedBatchIDHighAtCut: issuedBatchIDHigh,
-		OpenBatchIDsAtCut: open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,
+		MappingRoot: candidate.Root(), CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
+		ReservedIDHigh: work.reservedIDHigh, ReservedBatchIDHigh: work.reservedBatchIDHigh, IssuedBatchIDHighAtCut: work.issuedBatchIDHigh,
+		OpenBatchIDsAtCut: work.open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,
 	})
 	if err != nil {
 		if !errors.Is(err, storecatalog.ErrConflict) {
@@ -408,8 +441,8 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 		return errors.Join(base.ErrReadOnly, err)
 	}
 	s.mu.Lock()
-	if statusCut > s.terminalBase {
-		s.terminalBase = statusCut
+	if work.statusCut > s.terminalBase {
+		s.terminalBase = work.statusCut
 	}
 	s.recoveryAbortedValid = false
 	s.signalLocked()

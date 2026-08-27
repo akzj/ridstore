@@ -67,6 +67,31 @@ func TestRecordAndBatchReserveAreDurableBeforeIssue(t *testing.T) {
 	}
 }
 
+func TestAllocatorCanUseOnlyConsumedPrefix(t *testing.T) {
+	log := &fakeLog{}
+	allocator, err := New(RecordID, 4, 1, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocator.CanUse(0) || allocator.CanUse(1) {
+		t.Fatal("unissued IDs were accepted")
+	}
+	id, err := allocator.Allocate(context.Background())
+	if err != nil || id != 1 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+	if !allocator.CanUse(id) || allocator.CanUse(2) {
+		t.Fatalf("issued=%v next=%v", allocator.CanUse(id), allocator.CanUse(2))
+	}
+	recovered, err := New(RecordID, 4, allocator.DurableHigh(), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered.CanUse(3) || recovered.CanUse(5) {
+		t.Fatalf("recovered prefix=%v future=%v", recovered.CanUse(3), recovered.CanUse(5))
+	}
+}
+
 func TestRecoveryStartsAfterWholeDurableRange(t *testing.T) {
 	log := &fakeLog{}
 	allocator, err := New(RecordID, 4, 9, log)

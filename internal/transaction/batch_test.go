@@ -20,6 +20,8 @@ func (a *fakeAllocator) Allocate(context.Context) (uint64, error) {
 	return a.next, nil
 }
 
+func (a *fakeAllocator) CanUse(uint64) bool { return true }
+
 type appended struct {
 	payload []byte
 	sync    bool

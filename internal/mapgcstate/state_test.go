@@ -71,6 +71,16 @@ func TestLoadCleansUnpublishedTemp(t *testing.T) {
 	}
 }
 
+func TestRecoveryArtifactsIncludesStagingDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(StagingRoot(root), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := RecoveryArtifacts(root); err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+}
+
 func TestDecodeRejectsNonContiguousNewGeneration(t *testing.T) {
 	state := testState(t)
 	state.New.Active++

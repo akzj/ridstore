@@ -194,6 +194,53 @@ func TestStoreCreateUpdateConflictDelete(t *testing.T) {
 	}
 }
 
+func TestPutRejectsIDThatAllocatorMayStillIssue(t *testing.T) {
+	store := newStore(t, 4)
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(context.Background(), 1, []byte("unissued")); !errors.Is(err, base.ErrInvalidID) {
+		t.Fatalf("unissued put err=%v", err)
+	}
+	id, err := batch.Allocate(context.Background())
+	if err != nil || id != 1 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+	if err := batch.Put(context.Background(), id, []byte("issued")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetCorruptionFailsStoreClosed(t *testing.T) {
+	store := newStore(t, 4)
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	addr, exists, err := store.mapping.Lookup(id)
+	if err != nil || !exists {
+		t.Fatalf("addr=%v exists=%v err=%v", addr, exists, err)
+	}
+	log := store.log.(*memoryLog)
+	log.mu.Lock()
+	log.records[addr][0] ^= 0xff
+	log.mu.Unlock()
+	if _, err := store.Get(context.Background(), id); !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("get err=%v", err)
+	}
+	if _, err := store.Begin(context.Background()); !errors.Is(err, base.ErrReadOnly) {
+		t.Fatalf("begin after corruption err=%v", err)
+	}
+}
+
 func TestOpenBatchLimitBackpressuresAndReleases(t *testing.T) {
 	store := newStore(t, 1)
 	first, err := store.Begin(context.Background())

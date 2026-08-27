@@ -77,6 +77,16 @@ func (a *Allocator) IssuedHigh() uint64 {
 	return a.next
 }
 
+// CanUse reports whether id is already below the allocator's next issuance
+// point. After recovery next starts at the durable reserved high watermark, so
+// abandoned IDs remain conservative holes and can never collide with a future
+// Allocate result.
+func (a *Allocator) CanUse(id uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return id != 0 && id < a.next
+}
+
 func (a *Allocator) reserveRange(ctx context.Context) error {
 	if a.high > math.MaxUint64-a.reserve {
 		return base.ErrIDExhausted

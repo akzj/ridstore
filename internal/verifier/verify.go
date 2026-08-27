@@ -77,6 +77,23 @@ func Verify(ctx context.Context, root string, config Config) (report Report, res
 		return report, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lock.Close()) }()
+	return VerifyHeld(ctx, root, config)
+}
+
+// VerifyHeld is Verify's validation core for callers that already own the
+// store directory's exclusive lease. Keeping verification and a following
+// file-set operation under one lease prevents the validated Manifest and
+// active tails from changing between those operations.
+func VerifyHeld(ctx context.Context, root string, config Config) (report Report, resultErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+	if root == "" || config.MappingCacheBytes == 0 || config.MaxLiveIDs == 0 || config.MaxReplayStatuses == 0 {
+		return report, base.ErrInvalidConfig
+	}
 	report.Stage = StageLocked
 
 	if found, err := bootstrap.RecoveryArtifacts(root); err != nil {

@@ -1,6 +1,6 @@
 # ridstore v2 Mapping GC
 
-状态：G1-G2 implemented；G3-G5 pending
+状态：G1-G5 implemented
 
 ## 1. 目标与边界
 
@@ -132,9 +132,13 @@ trash 已删除但 marker 尚在。成功后必须通过 v2 Offline Verify，且
 
 1. **G1 streaming rebuild（已实现）**：Radix 有界流式 builder 与独立 GenerationWriter；
 2. **G2 catalog transaction（已实现）**：Mapping file-set 原子替换及字段不变性测试；
-3. **G3 durable recovery（进行中）**：独立 marker 的有界格式、CRC、原子发布/清理及 Verify 门禁已实现；
-   staging promotion、旧文件 retirement 和 fresh-open 收敛尚未实现；
-4. **G4 runtime switch**：Engine 锁序、checkpoint cut、Persistent rebase 和公开显式入口；
-5. **G5 evidence**：fault matrix、process-exit、race、Verify 与重复 GC 收敛测试。
+3. **G3 durable recovery（已实现）**：独立 marker、staging promotion、old/new Catalog 判定、发布前回滚、
+   发布后新 Root 验证、旧文件 retirement、fresh-open 幂等收敛及 Verify 门禁；
+4. **G4 runtime switch（已实现）**：Engine 固定锁序、同一独占 cut 下的 checkpoint + rebuild、
+   `Persistent.ReplaceCheckpointRoot`、旧 owner 关闭后 retirement，以及公开 `CompactMapping(ctx)`；
+5. **G5 evidence（已实现）**：generation header/node/footer/sync、marker、promotion、Manifest rewrite、
+   rollback、retirement 和 marker cleanup 的 runtime fault matrix；rollback 自身失败保留恢复证据；多文件
+   partial promote/retire；staging build、marker-only、Catalog published、old files in trash、trash deleted 五个
+   process-exit 恢复点；race、Offline Verify、重复 GC 与物理空间收敛测试。
 
-在 G3 完成前不得发布新 Manifest；在 G4 完成前不得将该实现接入 Store。
+第一版 Mapping GC 到此闭合。自动触发阈值、后台调度和限速仍属于独立策略层，不改变本协议。

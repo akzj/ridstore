@@ -41,6 +41,18 @@ func VerifyFiles(ctx context.Context, root string, snapshot CatalogSnapshot) (Ph
 // OpenVerifiedReader performs the full physical verification and retains a
 // read-only handle for reachable-tree validation.
 func OpenVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapshot) (*ReadOnly, PhysicalReport, error) {
+	return openVerifiedReader(ctx, root, snapshot, true)
+}
+
+// OpenVerifiedGeneration verifies and opens exactly the files named by
+// snapshot while allowing other Mapping files to coexist. Mapping GC recovery
+// uses it after publishing a new generation but before retiring the old one.
+// The caller must derive snapshot from a durable marker and Catalog state.
+func OpenVerifiedGeneration(ctx context.Context, root string, snapshot CatalogSnapshot) (*ReadOnly, PhysicalReport, error) {
+	return openVerifiedReader(ctx, root, snapshot, false)
+}
+
+func openVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapshot, requireExactDirectory bool) (*ReadOnly, PhysicalReport, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -55,8 +67,13 @@ func OpenVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapsh
 	} else if found {
 		return nil, PhysicalReport{}, ErrRecoveryRequired
 	}
-	if err := verifyMappingFileSet(root, snapshot); err != nil {
+	if err := verifyExpectedMappingFiles(root, snapshot); err != nil {
 		return nil, PhysicalReport{}, err
+	}
+	if requireExactDirectory {
+		if err := verifyMappingFileSet(root, snapshot); err != nil {
+			return nil, PhysicalReport{}, err
+		}
 	}
 
 	report := PhysicalReport{Segments: uint64(len(snapshot.SealedSegments)) + 1, SealedSegments: uint64(len(snapshot.SealedSegments))}
@@ -164,20 +181,13 @@ func mappingRecoveryArtifacts(root string) (bool, error) {
 	return false, nil
 }
 
+// RecoveryArtifacts reports incomplete normal Mapping rotation state. Mapping
+// GC must never start or recover concurrently with it.
+func RecoveryArtifacts(root string) (bool, error) { return mappingRecoveryArtifacts(root) }
+
 func verifyMappingFileSet(root string, snapshot CatalogSnapshot) error {
 	dir := filepath.Join(root, mappingDirectory)
-	info, err := os.Lstat(dir)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(ErrCorrupt, errors.New("mapping path is not a directory"))
-	}
-	expected := make(map[string]struct{}, len(snapshot.SealedSegments)+1)
-	expected[activeName(snapshot.ActiveSegment)] = struct{}{}
-	for _, summary := range snapshot.SealedSegments {
-		expected[sealedName(summary.SegmentID)] = struct{}{}
-	}
+	expected := expectedMappingNames(snapshot)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -200,6 +210,36 @@ func verifyMappingFileSet(root string, snapshot CatalogSnapshot) error {
 		return errors.Join(ErrCorrupt, errors.New("mapping file set is incomplete"))
 	}
 	return nil
+}
+
+func verifyExpectedMappingFiles(root string, snapshot CatalogSnapshot) error {
+	dir := filepath.Join(root, mappingDirectory)
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.Join(ErrCorrupt, errors.New("mapping path is not a directory"))
+	}
+	for name := range expectedMappingNames(snapshot) {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("mapping file %q is not regular: %w", name, ErrCorrupt)
+		}
+	}
+	return nil
+}
+
+func expectedMappingNames(snapshot CatalogSnapshot) map[string]struct{} {
+	expected := make(map[string]struct{}, len(snapshot.SealedSegments)+1)
+	expected[activeName(snapshot.ActiveSegment)] = struct{}{}
+	for _, summary := range snapshot.SealedSegments {
+		expected[sealedName(summary.SegmentID)] = struct{}{}
+	}
+	return expected
 }
 
 func openMappingRegularReadOnly(path string) (*os.File, error) {

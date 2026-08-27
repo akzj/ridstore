@@ -12,6 +12,7 @@ import (
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
 	"github.com/akzj/ridstore/internal/maintstate"
+	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/radix"
@@ -57,6 +58,9 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 	if err := bootstrap.ValidateHardLimits(config.HardLimits); err != nil {
 		return nil, err
 	}
+	if err := validateRuntimeAgainstHard(config.Runtime, config.HardLimits); err != nil {
+		return nil, err
+	}
 	if config.Runtime.StatusRetention < config.HardLimits.MaxOpenBatches {
 		return nil, base.ErrInvalidConfig
 	}
@@ -92,6 +96,7 @@ type openFaultHooks struct {
 	mapStore    mapstore.FaultHook
 	recordLog   recordlog.FaultHook
 	maintenance maintstate.FaultHook
+	mapGC       mapgcstate.FaultHook
 }
 
 func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks) (*Store, error) {
@@ -122,12 +127,19 @@ func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHo
 }
 
 func openLocked(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks, dirLock *filelock.Lock) (*Store, error) {
+	manifest, err := storecatalog.Load(root)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRuntimeAgainstHard(config, manifest.HardLimits); err != nil {
+		return nil, base.ErrInvalidConfig
+	}
 	catalog, err := storecatalog.OpenManager(root, hooks.catalog)
 	if err != nil {
 		return nil, err
 	}
-	if config.StatusRetention < catalog.Snapshot().HardLimits.MaxOpenBatches {
-		return nil, base.ErrInvalidConfig
+	if err := recoverMappingGC(ctx, root, catalog, hooks.mapGC, hooks.mapStore); err != nil {
+		return nil, err
 	}
 	if err := recoverMaintenance(root, catalog, hooks.maintenance, hooks.recordLog); err != nil {
 		return nil, err
@@ -146,7 +158,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	fail := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, physicalMapping.Close(), log.Close())
 	}
-	manifest := catalog.Snapshot()
+	manifest = catalog.Snapshot()
 	tree, err := radix.Open(physicalMapping, manifest.MappingRoot, manifest.CoveredCommitSeq, config.MappingCacheBytes)
 	if err != nil {
 		return fail(err)
@@ -200,6 +212,8 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 		}
 	}
 	store.maintenanceHook = hooks.maintenance
+	store.mapStoreHook = hooks.mapStore
+	store.mappingGCHook = hooks.mapGC
 	for id, status := range recovered.Statuses {
 		state := BatchStateAborted
 		if status.State == replay.BatchCommitted {
@@ -213,6 +227,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.recoveryAbortedValid = store.recoveryAbortedStart < store.recoveryAbortedEnd
 	store.root = root
 	store.maxStats = config.MaxSegmentStats
+	store.mappingCacheBytes = config.MappingCacheBytes
 	store.dirLock = dirLock
 	store.identity = [16]byte(manifest.StoreUUID)
 	return store, nil
@@ -221,7 +236,19 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 func validOpenConfig(config OpenConfig) bool {
 	return config.MappingCacheBytes != 0 && config.MaxSegmentStats != 0 && config.StatusRetention != 0 &&
 		(config.WriteStopFreeBytes == 0 || config.SpaceCheckInterval > 0) &&
+		coordinator.ValidateConfig(config.Commit) == nil &&
 		mapping.ValidatePersistentConfig(persistentConfig(config)) == nil
+}
+
+func validateRuntimeAgainstHard(config OpenConfig, hard storecatalog.HardLimits) error {
+	if !validOpenConfig(config) || config.StatusRetention < hard.MaxOpenBatches || config.Commit.MaxGroupPayload > hard.MaxRecordLogPayload {
+		return base.ErrInvalidConfig
+	}
+	descriptor, err := recordcodec.DescriptorSize(hard.MaxBatchMutations)
+	if err != nil || config.Commit.MaxGroupPayload < uint64(recordcodec.CommitGroupHeadSize)+uint64(descriptor) {
+		return base.ErrInvalidConfig
+	}
+	return nil
 }
 
 func persistentConfig(config OpenConfig) mapping.PersistentConfig {

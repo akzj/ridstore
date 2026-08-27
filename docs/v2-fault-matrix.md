@@ -27,7 +27,8 @@ v2 对每个 durable writer 分开验证：
 | RecordLog rotation | journal write/sync/rename/dir-sync、partial-footer truncate/sync、footer write/sync、seal rename/dir-sync、new-active write/sync/rename/dir-sync、journal remove/cleanup dir-sync | 每点 fresh Open 收敛；recovery 失败可重试；journal/sealed/new-active 子进程退出已覆盖 | 已闭合 |
 | v2 Data GC | marker temp/write/file-sync/close/rename/dir-sync/remove；retire rename、records/trash dir-sync、trash unlink/final dir-sync | 每个 fault point 可由 fresh Open 重试；子进程覆盖 marker-only、Catalog removed、trash、deleted 四个状态 | durable fault/crash matrix 已闭合 |
 | Public Batch lifecycle | 复用底层 durable writer 边界 | 子进程退出覆盖 uncommitted Put、Checkpoint-open、committed tail、checkpoint-committed；公开 Open 验证 Value 与 Status | 已覆盖公开恢复语义 |
-| v2 Mapping GC | 设计已冻结，尚未实现 | 设计已冻结，尚未实现 | 按 `v2-mapping-gc-design.md` 的 G1-G5 推进 |
+| v2 Mapping GC | generation header/node/footer/sync、marker、promotion、Manifest rewrite、rollback、retirement、cleanup；多文件 partial failure | fresh Open old/new Catalog 收敛；staging/marker/Catalog/trash/deleted 五阶段 process-exit；Offline Verify 与空间收敛 | G1-G5 durable fault/crash matrix 已闭合 |
+| v2 Backup / Restore | staging、逐文件 create/write/sync、metadata、marker、Verify、no-replace rename 的关键 fault hook | Backup staging/partial/metadata/marker-removed/published 与 Restore partial/verified/marker-removed/published 子进程退出 | 离线全量主路径已闭合；完整 syscall backend 矩阵和远端传输不在当前结论内 |
 
 ## 3. MapStore 已确认语义
 

@@ -40,6 +40,9 @@ func TestPublicV2LifecycleAndTokenAcrossReopen(t *testing.T) {
 	if err := store.Checkpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.CompactMapping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +111,45 @@ func TestPublicOfflineVerify(t *testing.T) {
 	}
 	if _, err := Verify(ctx, VerifyConfig{Dir: config.Dir, MaxLiveIDs: 1, MaxReplayStatuses: 1, MappingCacheBytes: 1}); !errors.Is(err, ErrVerifyLimit) || errors.Is(err, ErrCorrupt) {
 		t.Fatalf("verify limit err=%v", err)
+	}
+}
+
+func TestPublicCompactMappingPassesOfflineVerify(t *testing.T) {
+	ctx := context.Background()
+	config := testCreateConfig(filepath.Join(t.TempDir(), "store"))
+	store, err := Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(ctx, []byte("mapping-gc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompactMapping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Verify(ctx, VerifyConfig{Dir: config.Dir})
+	if err != nil || report.Stage != VerifyStageExact || report.LiveIDs != 1 || report.CheckpointLiveIDs != 1 {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+	reopened, err := Open(ctx, OpenConfig{Dir: config.Dir, Runtime: config.Runtime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	record, err := reopened.Get(ctx, id)
+	if err != nil || string(record.Value) != "mapping-gc" {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }
 

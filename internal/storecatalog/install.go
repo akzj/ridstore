@@ -15,6 +15,8 @@ const (
 	FaultBeforeManifestSync    FaultPoint = "storecatalog.before-sync"
 	FaultBeforeManifestRename  FaultPoint = "storecatalog.before-rename"
 	FaultBeforeManifestDirSync FaultPoint = "storecatalog.before-dir-sync"
+	FaultBeforeTempRemove      FaultPoint = "storecatalog.before-temp-remove"
+	FaultBeforeTempDirSync     FaultPoint = "storecatalog.before-temp-dir-sync"
 )
 
 type FaultHook func(FaultPoint) error
@@ -38,7 +40,16 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 	slot := manifest.Generation & 1
 	tempPath := manifestTempPath(root, slot)
 	finalPath := manifestSlotPath(root, slot)
-	file, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	removed, err := removeManifestTemp(tempPath, hook)
+	if err != nil {
+		return err
+	}
+	if removed {
+		if err := syncManifestDir(root, hook, FaultBeforeTempDirSync); err != nil {
+			return err
+		}
+	}
+	file, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -76,6 +87,29 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 
 func Load(root string) (Manifest, error) {
 	return load(root, false)
+}
+
+// LoadRecovering loads the authoritative Manifest and removes unpublished
+// regular temp slots left by an interrupted install. Callers must hold the
+// directory lease so cleanup cannot race another writer.
+func LoadRecovering(root string, hook FaultHook) (Manifest, error) {
+	manifest, err := Load(root)
+	if err != nil {
+		return Manifest{}, err
+	}
+	for slot := uint64(0); slot < 2; slot++ {
+		_, err := removeManifestTemp(manifestTempPath(root, slot), hook)
+		if err != nil {
+			return Manifest{}, err
+		}
+	}
+	// Always sync: a prior process may have removed a temp slot and then
+	// observed an uncertain directory-sync result. Absence alone does not prove
+	// that deletion durable.
+	if err := syncManifestDir(root, hook, FaultBeforeTempDirSync); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
 }
 
 // LoadStrict loads the authoritative Manifest for offline verification. Unlike
@@ -168,4 +202,32 @@ func hit(hook FaultHook, point FaultPoint) error {
 		return nil
 	}
 	return hook(point)
+}
+
+func removeManifestTemp(path string, hook FaultHook) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false, ErrCorrupt
+	}
+	if err := hit(hook, FaultBeforeTempRemove); err != nil {
+		return false, err
+	}
+	return true, os.Remove(path)
+}
+
+func syncManifestDir(root string, hook FaultHook, point FaultPoint) error {
+	if err := hit(hook, point); err != nil {
+		return err
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
 }

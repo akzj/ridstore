@@ -212,6 +212,7 @@ func TestVerifyRejectsCheckpointSegmentStatsMismatch(t *testing.T) {
 	config := verifyCreateConfig(filepath.Join(t.TempDir(), "store"))
 	config.HardLimits.SegmentSize = 8192
 	config.HardLimits.MaxRecordLogPayload = 4096
+	config.Runtime.MaxGroupPayload = 4096
 	store, err := ridstore.Create(ctx, config)
 	if err != nil {
 		t.Fatal(err)

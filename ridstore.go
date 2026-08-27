@@ -146,6 +146,15 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	return s.inner.Checkpoint(ctx)
 }
 
+// CompactMapping rewrites all reachable Mapping nodes into a fresh physical
+// generation without changing logical records or commit sequence.
+func (s *Store) CompactMapping(ctx context.Context) error {
+	if s == nil || s.inner == nil {
+		return base.ErrClosed
+	}
+	return s.inner.CompactMapping(ctx)
+}
+
 // CompactNextSegment selects and fully retires at most one eligible segment.
 func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy) (CompactionResult, bool, error) {
 	if s == nil || s.inner == nil {

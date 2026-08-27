@@ -35,7 +35,9 @@ _ = result
 ```
 
 离线审计使用 `ridstore.Verify(ctx, ridstore.VerifyConfig{Dir: path})`；它要求 Store 已关闭并取得目录
-独占锁，不执行恢复或修复。设计入口见 [v2 文档索引](docs/README.md)。项目尚未声明 production-ready；
-Backup、迁移、可观测性、长期 soak 与容量/故障验证仍需在 v2 语义上实现和验收。
+独占锁，不执行恢复或修复。Linux 上可用 `ridstore.Backup` / `ridstore.Restore` 创建和恢复 v2 全量灾备
+artifact；Restore 保留 Store identity，不能把原目录和恢复目录同时作为 writer。设计入口见
+[v2 文档索引](docs/README.md)。项目尚未声明 production-ready；可观测性、长期 soak 与真实 workload
+容量基线仍需验收。
 
 ridstore 的交付形态类似 RocksDB：由应用直接链接并独占本地目录；但它不是 RocksDB/LevelDB 的功能替代品。
