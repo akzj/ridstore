@@ -126,7 +126,8 @@ v2 不再存在：
 - durable marker/retire 的 syscall fault matrix 与四阶段 process-crash recovery 已闭合；
 - bounded candidate selection 已基于 fresh Checkpoint、ReplayStart、open-Batch refs 和显式阈值接入；
 - 已完成 GC copy/checkpoint 两阶段空间 admission、运行时 batch 上限和 context-aware pacing；
-- 待完成并发 model test 和 convergence soak。
+- 已完成可复现的并发 model test，组合条件 Put/Delete、Abort、Checkpoint、Data/Mapping GC 与 Close/Reopen，并逐轮对照逻辑模型；
+- 待完成 convergence soak。
 
 ### M6：删除旧系统
 

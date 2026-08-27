@@ -377,6 +377,7 @@ Restore artifact syscall matrix 覆盖 root/`.payload`/子目录 create，RESTOR
 - Data/Mapping GC；
 - Reader pin；
 - Journal crash-resume；
+- 可复现随机 model test 组合条件 Put/Delete、Abort、Checkpoint、Data/Mapping GC 与 Close/Reopen，并持续核对逻辑模型；
 - 空间和资源收敛。
 
 ### Phase 5
