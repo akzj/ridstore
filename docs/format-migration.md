@@ -1,6 +1,8 @@
 # Format Upgrade 与 Migration
 
-状态：Phase 5 migration skeleton v1
+状态：Format v1 历史设计；v2 migration planner 尚未实现
+
+以下内容保留为 v2 planner 的设计输入；其中命令、registry 和实现路径在当前仓库中不存在。
 
 ## 1. 兼容规则
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/coordinator"
@@ -19,15 +20,16 @@ import (
 // SegmentRelocationResult describes only the copy-and-CAS phase of data GC.
 // It does not imply checkpoint coverage or authorize Segment retirement.
 type SegmentRelocationResult struct {
-	ScannedRecords   uint64
-	PutRecords       uint64
-	LiveCandidates   uint64
-	CopiedRecords    uint64
-	CopiedValueBytes uint64
-	Applied          uint64
-	Skipped          uint64
-	FirstCommitSeq   model.CommitSeq
-	LastCommitSeq    model.CommitSeq
+	ScannedRecords      uint64
+	PutRecords          uint64
+	LiveCandidates      uint64
+	CopiedRecords       uint64
+	CopiedValueBytes    uint64
+	CopiedPhysicalBytes uint64
+	Applied             uint64
+	Skipped             uint64
+	FirstCommitSeq      model.CommitSeq
+	LastCommitSeq       model.CommitSeq
 }
 
 // SegmentRetirementProof captures the durable checkpoint at which source was
@@ -126,7 +128,11 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	return s.compactSegmentLocked(ctx, source)
+	s.metrics.gcStarted.Add(1)
+	started := time.Now()
+	result, err := s.compactSegmentLocked(ctx, source)
+	s.recordCompactionMetrics(started, result, err)
+	return result, err
 }
 
 // CompactNextSegment checkpoints current Mapping state, selects at most one
@@ -160,10 +166,33 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 		return NextSegmentCompactionResult{}, false, err
 	}
 	if !found {
+		s.metrics.gcNoCandidate.Add(1)
 		return NextSegmentCompactionResult{}, false, nil
 	}
+	s.metrics.gcStarted.Add(1)
+	started := time.Now()
 	compaction, err := s.compactSegmentLocked(ctx, candidate.Source.SegmentID)
+	s.recordCompactionMetrics(started, compaction, err)
 	return NextSegmentCompactionResult{Candidate: candidate, Compaction: compaction}, true, err
+}
+
+func (s *Store) recordCompactionMetrics(started time.Time, result SegmentCompactionResult, err error) {
+	s.metrics.gcDurationNanos.Add(uint64(time.Since(started)))
+	if err != nil {
+		s.metrics.gcFailed.Add(1)
+		return
+	}
+	s.metrics.gcCompleted.Add(1)
+	s.metrics.gcCopiedBytes.Add(result.Relocation.CopiedPhysicalBytes)
+	s.metrics.gcRelocated.Add(result.Relocation.Applied)
+	s.metrics.gcSkipped.Add(result.Relocation.Skipped)
+	sourceBytes := uint64(result.Proof.Source.ValidEnd)
+	if sourceBytes >= uint64(recordlog.SegmentHeaderSize) {
+		sourceBytes -= uint64(recordlog.SegmentHeaderSize)
+	}
+	if sourceBytes >= result.Relocation.CopiedPhysicalBytes {
+		s.metrics.gcReclaimedBytes.Add(sourceBytes - result.Relocation.CopiedPhysicalBytes)
+	}
 }
 
 // compactSegmentLocked requires maintenanceMu.
@@ -431,6 +460,11 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 		pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: scanned.Addr, newAddr: copied.Addr})
 		pendingBytes += valueBytes
 		result.CopiedRecords++
+		physicalBytes := uint64(scanned.End.Offset - scanned.Addr.Offset())
+		if result.CopiedPhysicalBytes > math.MaxUint64-physicalBytes {
+			return base.ErrBatchTooLarge
+		}
+		result.CopiedPhysicalBytes += physicalBytes
 		if result.CopiedValueBytes > math.MaxUint64-valueBytes {
 			return base.ErrBatchTooLarge
 		}

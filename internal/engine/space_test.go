@@ -37,6 +37,22 @@ func TestSpaceGateAccountsConcurrentReservations(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("statfs calls=%d", calls)
 	}
+	snapshot := gate.snapshot()
+	if snapshot.rejections != 1 || snapshot.checkErrors != 0 || snapshot.minimum != 100 || snapshot.available != 180 || snapshot.stopped {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+}
+
+func TestSpaceGateMetricsRecordCheckFailure(t *testing.T) {
+	injected := errors.New("statfs failed")
+	gate := newSpaceGate("/store", 100, time.Minute, func(string) (uint64, error) { return 0, injected })
+	if _, err := gate.reserve(context.Background(), 1); !errors.Is(err, injected) {
+		t.Fatalf("reserve err=%v", err)
+	}
+	snapshot := gate.snapshot()
+	if snapshot.checkErrors != 1 || !snapshot.stopped {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
 }
 
 func TestSpaceGateInvalidatesEstimateAfterAppendFailure(t *testing.T) {

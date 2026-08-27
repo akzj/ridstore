@@ -8,7 +8,7 @@
 磁盘 I/O。快照用于调度、容量观察和诊断，不是事务一致 snapshot，也不能授权
 Checkpoint、GC candidate 或文件删除。
 
-`Metrics.AppendMetricSamples(dst)` 把快照转换为固定 32 个稳定 sample。调用方提供
+`Metrics.AppendMetricSamples(dst)` 把快照转换为固定 30 个稳定 sample。调用方提供
 足够容量的 slice 时不分配。Counter 是当前进程生命周期累计值，进程重启后归零；
 Gauge 是采样时刻的内存值。所有 latency/duration 使用整数 nanoseconds，避免在
 内核层损失精度；外部 backend 可转换为 seconds。
@@ -44,6 +44,10 @@ Prometheus SDK 引入 ridstore 内核。OpenTelemetry 或自有 exporter 可直�
   `ridstore_write_stopped`、拒绝和检查错误 counter；
 - GC counters：`ridstore_gc_*_total`，copied/reclaimed 使用 bytes，relocated/skipped
   使用 records。
+
+Commit pipeline 数据直接来自 v2 Coordinator；终态计数由 v2 Batch 生命周期产生；Delta、Cache、
+space admission 是即时 gauge；Data GC copied/reclaimed 使用物理 Record bytes。v2 当前没有 GC throttle
+或独立 GC space admission，因此不导出永远为零的旧 runtime 指标。
 
 名称、kind 和 base unit 属于 public adapter contract。新增 metric 可以 append，
 已有名称不能静默改义；删除或改名需要版本化迁移。

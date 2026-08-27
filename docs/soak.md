@@ -1,6 +1,8 @@
 # 72h Steady-State Soak
 
-状态：harness 已实现；72 小时自然运行证据未完成。
+状态：Format v1 历史设计；v2 soak command 与 harness 尚未实现。
+
+以下内容保留为 v2 重建时的验收要求，不代表当前仓库存在可执行的 `ridstore-soak` 或 `soak-72h` target。
 
 `ridstore-soak` 在一个必须不存在的新目录中先建立有界 stable-ID 工作集，再从 seed
 完成时开始计算完整 duration，持续执行

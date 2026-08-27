@@ -79,6 +79,29 @@ type Store struct {
 	identity [16]byte
 }
 
+// Metrics returns one bounded observational snapshot without disk I/O.
+func (s *Store) Metrics() Metrics {
+	if s == nil || s.inner == nil {
+		return Metrics{}
+	}
+	current := s.inner.Metrics()
+	return Metrics{
+		CommitQueued: current.CommitQueued, CommitGroups: current.CommitGroups, GroupBatches: current.GroupBatches,
+		Committed: current.Committed, Aborted: current.Aborted, Conflicts: current.Conflicts, CommitUnknown: current.CommitUnknown,
+		QueueWaitNanos: current.QueueWaitNanos, ValidationNanos: current.ValidationNanos,
+		WriteSyncNanos: current.WriteSyncNanos, PublishNanos: current.PublishNanos,
+		DeltaChargedBytes: current.DeltaChargedBytes, DeltaReservedBytes: current.DeltaReservedBytes,
+		DeltaSoftLimitBytes: current.DeltaSoftLimitBytes, DeltaHardLimitBytes: current.DeltaHardLimitBytes,
+		MappingCacheBytes: current.MappingCacheBytes, DiskAvailableEstimateBytes: current.DiskAvailableEstimateBytes,
+		WriteStopFreeBytes: current.WriteStopFreeBytes, WriteStopped: current.WriteStopped,
+		WriteStopRejections: current.WriteStopRejections, DiskSpaceCheckErrors: current.DiskSpaceCheckErrors,
+		GCStarted: current.GCStarted, GCCompleted: current.GCCompleted, GCFailed: current.GCFailed,
+		GCNoCandidate: current.GCNoCandidate,
+		GCCopiedBytes: current.GCCopiedBytes, GCReclaimedBytes: current.GCReclaimedBytes,
+		GCRelocated: current.GCRelocated, GCSkipped: current.GCSkipped, GCDurationNanos: current.GCDurationNanos,
+	}
+}
+
 // Create initializes and opens a new v2 Store. Interrupted initialization can
 // be resumed by calling Create again with the same hard limits.
 func Create(ctx context.Context, config CreateConfig) (*Store, error) {

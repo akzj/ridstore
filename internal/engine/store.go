@@ -114,6 +114,8 @@ type Store struct {
 	maxRelocationMutations uint64
 	dirLock                *filelock.Lock
 	identity               [16]byte
+	space                  *spaceGate
+	metrics                runtimeMetrics
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -628,6 +630,14 @@ func (b *Batch) finish() {
 		state, seq := b.inner.State()
 		b.store.mu.Lock()
 		if terminalState := publicBatchState(state); terminalState == BatchStateCommitted || terminalState == BatchStateAborted || terminalState == BatchStateCommitUnknown {
+			switch terminalState {
+			case BatchStateCommitted:
+				b.store.metrics.committed.Add(1)
+			case BatchStateAborted:
+				b.store.metrics.aborted.Add(1)
+			case BatchStateCommitUnknown:
+				b.store.metrics.unknown.Add(1)
+			}
 			if b.store.terminalTotal == math.MaxUint64 {
 				b.store.fault = errors.Join(base.ErrReadOnly, base.ErrStatusCapacity)
 			} else {

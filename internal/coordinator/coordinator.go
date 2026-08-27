@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/mapping"
@@ -84,6 +85,7 @@ type request struct {
 	result     chan response
 	relocated  chan relocationResponse
 	barrier    chan checkpointResponse
+	queuedAt   time.Time
 }
 
 type Coordinator struct {
@@ -98,6 +100,7 @@ type Coordinator struct {
 	closed   bool
 	requests chan request
 	done     chan struct{}
+	metrics  runtimeMetrics
 }
 
 func New(next model.CommitSeq, log Appender, current mapping.Index, config Config) (*Coordinator, error) {
@@ -210,7 +213,7 @@ func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Rec
 		_ = batch.MarkAborted()
 		return Receipt{}, err
 	}
-	req := request{batch: batch, prepared: prepared, reserve: reservation, result: make(chan response, 1)}
+	req := request{batch: batch, prepared: prepared, reserve: reservation, result: make(chan response, 1), queuedAt: time.Now()}
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()
@@ -220,6 +223,7 @@ func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Rec
 	}
 	select {
 	case c.requests <- req:
+		c.metrics.commitQueued.Add(1)
 		c.submitMu.Unlock()
 	case <-ctx.Done():
 		c.submitMu.Unlock()
@@ -368,6 +372,14 @@ func (c *Coordinator) processCheckpoint(req request) {
 }
 
 func (c *Coordinator) process(group []request) {
+	started := time.Now()
+	userRequests := uint64(0)
+	for _, req := range group {
+		if req.relocation == nil {
+			userRequests++
+			c.metrics.queueWaitNanos.Add(uint64(started.Sub(req.queuedAt)))
+		}
+	}
 	if fault := c.Fault(); fault != nil {
 		for _, req := range group {
 			c.completeFailure(req, errors.Join(base.ErrReadOnly, fault), false, false)
@@ -385,6 +397,9 @@ func (c *Coordinator) process(group []request) {
 	}
 	plan, err := c.mapping.ResolveGroup(proposals)
 	if err != nil {
+		if userRequests != 0 {
+			c.metrics.validationNanos.Add(uint64(time.Since(started)))
+		}
 		c.fail(err)
 		c.rejectGroup(active, err)
 		return
@@ -395,6 +410,7 @@ func (c *Coordinator) process(group []request) {
 	c.stateMu.Unlock()
 	descriptors := make([]recordcodec.Descriptor, 0, len(active))
 	sequences := make([]model.CommitSeq, len(active))
+	acceptedUsers := uint64(0)
 	for i, resolved := range plan.Proposals {
 		if !resolved.Accepted {
 			continue
@@ -405,25 +421,52 @@ func (c *Coordinator) process(group []request) {
 		}
 		sequences[i] = next
 		descriptors = append(descriptors, requestDescriptor(active[i], next))
+		if active[i].relocation == nil {
+			acceptedUsers++
+		}
 		next++
 	}
 	if len(descriptors) == 0 {
+		if userRequests != 0 {
+			c.metrics.validationNanos.Add(uint64(time.Since(started)))
+		}
 		for _, req := range active {
+			if req.relocation == nil {
+				c.metrics.conflicts.Add(1)
+			}
 			c.completeFailure(req, base.ErrConflict, false, false)
 		}
 		return
 	}
 	payload, err := recordcodec.EncodeCommitGroup(recordcodec.CommitGroup{Descriptors: descriptors}, c.config.MaxGroupPayload)
 	if err != nil {
+		if userRequests != 0 {
+			c.metrics.validationNanos.Add(uint64(time.Since(started)))
+		}
 		c.fail(err)
 		c.rejectGroup(active, err)
 		return
 	}
-	if _, err := c.log.Append(context.Background(), payload, true); err != nil {
+	if userRequests != 0 {
+		c.metrics.validationNanos.Add(uint64(time.Since(started)))
+	}
+	if acceptedUsers != 0 {
+		c.metrics.commitGroups.Add(1)
+		c.metrics.groupBatches.Add(acceptedUsers)
+	}
+	writeStarted := time.Now()
+	_, err = c.log.Append(context.Background(), payload, true)
+	if acceptedUsers != 0 {
+		c.metrics.writeSyncNanos.Add(uint64(time.Since(writeStarted)))
+	}
+	if err != nil {
 		c.fail(err)
 		unknown := c.log.Status().Poisoned
 		for i, req := range active {
 			if !plan.Proposals[i].Accepted {
+				if req.relocation == nil {
+					c.metrics.conflicts.Add(1)
+				}
 				c.completeFailure(req, base.ErrConflict, false, false)
 				continue
 			}
@@ -435,7 +478,11 @@ func (c *Coordinator) process(group []request) {
 	for index := range active {
 		reservations[index] = active[index].reserve
 	}
+	publishStarted := time.Now()
 	published, err := c.mapping.PublishGroup(descriptors[0].CommitSeq, plan, reservations)
+	if acceptedUsers != 0 {
+		c.metrics.publishNanos.Add(uint64(time.Since(publishStarted)))
+	}
 	if err == nil {
 		var applied, skipped uint64
 		for _, proposal := range plan.Proposals {
@@ -460,6 +507,9 @@ func (c *Coordinator) process(group []request) {
 			if plan.Proposals[i].Accepted {
 				c.completeFailure(req, err, true, true)
 			} else {
+				if req.relocation == nil {
+					c.metrics.conflicts.Add(1)
+				}
 				c.completeFailure(req, base.ErrConflict, false, false)
 			}
 		}
@@ -470,6 +520,9 @@ func (c *Coordinator) process(group []request) {
 	c.stateMu.Unlock()
 	for i, req := range active {
 		if !plan.Proposals[i].Accepted {
+			if req.relocation == nil {
+				c.metrics.conflicts.Add(1)
+			}
 			c.completeFailure(req, base.ErrConflict, false, false)
 			continue
 		}

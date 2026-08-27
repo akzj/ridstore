@@ -389,6 +389,12 @@ func (m *Persistent) DeltaUsage() (charged, reserved, soft, hard uint64) {
 	return m.budget.usage()
 }
 
+func (m *Persistent) CacheBytes() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.root.CacheBytes()
+}
+
 func (m *Persistent) AbortCheckpoint(checkpoint *FrozenCheckpoint) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

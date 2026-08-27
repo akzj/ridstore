@@ -10,14 +10,14 @@
 
 | 计划项 | 当前状态 | 当前证据 | 尚缺证据 |
 |---|---|---|---|
-| Offline Verify/Scrub | 完成 | `internal/verify`、`ridstore-tool verify`、corruption/lease/active-tail tests | 超大 Store 的 external-sort verifier 不在 v1；当前 O(live IDs) 内存限制已记录 |
+| Offline Verify/Scrub | 完成 | `internal/verifier`、根包 `Verify`、corruption/lease/active-tail tests | 超大 Store 的 external-sort verifier 不在 v2；当前 O(live IDs) 内存限制已记录 |
 | 一致 Backup | 完成 | 同一 source lease、hash metadata、payload Verify、SIGKILL matrix | 远端传输、压缩、加密不在 v1 |
 | Restore/UUID 策略 | 完成 | 新目录发布、RESTORING marker、默认新 UUID、preserve 显式开关、SIGKILL matrix | 应用级异机演练尚未执行 |
-| Metrics adapter | 完成 | 固定 bounded samples、Prometheus adapter tests | dashboard/告警属于部署层 |
-| Migration skeleton | 完成 | 只读 planner、registry、非 v1 明确 `ErrUnsupported` | 没有可执行跨版本迁移；skeleton 不代表升级路径已存在 |
-| Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；当前已识别 Format v1 durable writer 的 `EIO/ENOSPC/EACCES` syscall-error matrix | 没有设备 power-loss 证据；代码级 syscall matrix 不能证明 flush 硬件语义 |
-| Long fuzz/nightly | Harness 完成，证据未完成 | 8-target runner、每日/手动 workflow、原始日志/corpus/terminal marker、短 harness smoke | 尚无全部 target 自然结束的 long-fuzz artifact |
-| 72h steady-state soak | Harness 完成，证据未完成 | `ridstore-soak`、JSONL 资源时间序列、模型/Verify/FD/goroutine 收敛 gate、短 smoke | 尚无自然结束的 72h 报告及环境元数据 |
+| Metrics adapter | 完成 | v2 Coordinator/Engine 原生固定 bounded samples、Prometheus adapter tests | dashboard/告警属于部署层 |
+| Migration skeleton | 未完成 | v1 planner 已随旧 runtime 删除 | v2 只读 planner、registry 与跨版本 fixture 均未实现 |
+| Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；当前已识别 v2 durable writer 的 `EIO/ENOSPC/EACCES` syscall-error matrix | 没有设备 power-loss 证据；代码级 syscall matrix 不能证明 flush 硬件语义 |
+| Long fuzz/nightly | 未完成 | 9-target fuzz smoke；nightly workflow 文件仍在 | v2 runner、Make target、artifact/terminal 状态机与自然结束证据均缺失，当前 workflow 不可执行 |
+| 72h steady-state soak | 未完成 | v1 设计文档仍在 | v2 soak command、模型/Verify/资源收敛 gate 与 72h 自然结束证据均缺失 |
 | Same-durability benchmark | 未完成 | 单一 ridstore durable commit benchmark | 无 append baseline、Pebble/RocksDB 同 durability 稳定态对比和原始报告 |
 | Known limits/checklist | 进行中 | 本文、前台 write-stop admission | 长时/环境证据及最终 Review 尚未完成 |
 
@@ -61,13 +61,21 @@ Initialize 现已覆盖 Marker temp 清理/write/file sync/rename/root sync、�
 
 Backup artifact publication 现已覆盖 root/子目录 create，INCOMPLETE、临时 Verify LOCK、payload 和 metadata 的 write/file sync，Verify cleanup/Marker remove，以及 prepared root、parent、各 payload child、metadata root、最终 publication root 和补偿路径的 directory sync；所有逻辑边界分别注入 `EIO/ENOSPC/EACCES`。root 创建前失败不产生目标，此后失败由 INCOMPLETE 明确拒绝 Inspect。最终 root sync 失败会补偿恢复 Marker；补偿 write/file sync/root sync 自身失败时，返回值同时保留 publication 与 compensation cause，源 Store 保持 clean。Backup 不使用 rename，且失败 artifact 不在原路径重试或隐式覆盖。该结果只证明 Backup writer；Restore 的独立证据如下。
 
-Restore artifact publication 现已覆盖 root/`.payload`/子目录 create，RESTORING、LOCK、payload、Segment Header UUID rewrite、Manifest replacement 的 write/file sync/rename/cleanup，prepared/rewrite/publish 两侧 directory sync，八个 payload entry rename、`.payload` remove、Marker remove/final sync 与补偿路径；各逻辑边界分别注入 `EIO/ENOSPC/EACCES`。第二个 Header rewrite 及第二至第八个布局 rename 失败证明部分变换仍由 RESTORING fail closed，Open/public Verify 拒绝且源 artifact 保持可 Inspect。审计同时修复布局 rename 只 sync 目标目录的问题：现在在 `.payload` 尚存在时先 sync source，随后 remove 并 sync destination。Manifest cleanup 和 Marker 补偿失败保留双重 cause。至此当前已识别的 Format v1 durable writer 代码级 syscall matrix 闭合，但不能替代 power-loss 或异机恢复证据。
+Restore artifact publication 现已覆盖 root/`.payload`/子目录 create，RESTORING、LOCK、payload、Segment Header UUID rewrite、Manifest replacement 的 write/file sync/rename/cleanup，prepared/rewrite/publish 两侧 directory sync，八个 payload entry rename、`.payload` remove、Marker remove/final sync 与补偿路径；各逻辑边界分别注入 `EIO/ENOSPC/EACCES`。第二个 Header rewrite 及第二至第八个布局 rename 失败证明部分变换仍由 RESTORING fail closed，Open/public Verify 拒绝且源 artifact 保持可 Inspect。审计同时修复布局 rename 只 sync 目标目录的问题：现在在 `.payload` 尚存在时先 sync source，随后 remove 并 sync destination。Manifest cleanup 和 Marker 补偿失败保留双重 cause。至此当前已识别的 v2 durable writer 代码级 syscall matrix 闭合，但不能替代 power-loss 或异机恢复证据。
 
 ### 已修复：磁盘耗尽停止水位
 
 当前实现增加 runtime `WriteStopFreeBytes` 与 `DiskSpaceCheckInterval`：Begin、ID Allocate、Put 在产生新的 reserve/payload append 前执行缓存式空间 admission，间隔内按获准物理字节保守扣减，并以共享 refresh gate 覆盖 admission 到 append 返回的窗口；低于水位返回 `ErrInsufficientSpace`，不 fault Store。已有 Batch 的 Commit/Abort、Get、Checkpoint 与 GC 保持可运行，避免保护机制阻塞收敛路径；空间恢复后新写可重试。指标导出最近 available 估计、水位、stopped、拒绝与检查错误。
 
 该水位是 admission signal 而非文件系统配额：其他进程以及门禁外的 Commit/Checkpoint/GC 可并发消耗空间，真实 write/fsync 仍可能 ENOSPC。部署层仍必须提供独立文件系统/配额、容量告警和基于最大并发 Batch 的余量；代码不把水位误称为绝对空间保证。
+
+### 已修复：v2 切换后 Metrics 实现缺失
+
+公开 API 切换到 v2 Engine 时，旧 runtime metrics 实现随 v1 一并删除，但本文与 Metrics 契约仍错误标记为完成。
+当前实现已从 v2 的真实所有者重新建立 bounded snapshot：Coordinator 记录用户 Commit queue/group 与分段耗时，
+Batch 生命周期记录 committed/aborted/unknown，Persistent Mapping 和 space gate 提供即时 gauge，完整 Data GC
+记录物理 copied/reclaimed bytes 与结果计数。根包恢复固定 30 个样本和无第三方依赖的 Prometheus adapter；
+不存在的旧 GC throttle/独立 GC space-admission 指标没有被伪造为恒定零值。
 
 ### P1：长时与对比证据
 
@@ -81,22 +89,21 @@ make test-race
 make vet
 make test-fuzz-smoke
 make test-crash
-make test-integration
-make bench
 make verify
 ```
 
-`make verify` 聚合普通、race、vet、fuzz smoke、long-fuzz harness smoke、process-crash 和 integration。它不包含自然 long fuzz、benchmark、72h soak 或 power-loss，因此成功只能证明当前开发门禁通过。
+`make verify` 聚合普通、race、vet、fuzz smoke 和 process-crash。它不包含自然 long fuzz、benchmark、
+72h soak、异机恢复或 power-loss，因此成功只能证明当前开发门禁通过。
 
 ## 4. Production checklist
 
-- [x] Format v1 frozen，golden/decoder fuzz smoke 可重复；
+- [x] v2 format/contracts frozen，golden/decoder fuzz smoke 可重复；
 - [x] Commit/Recovery、Checkpoint、Mapping/Data GC 主路径有阶段 Review；
-- [x] Offline Verify、Backup/Restore、Metrics、Migration planner 已实现；
+- [x] Offline Verify、Backup/Restore、Metrics 已实现；
 - [x] 本机 `make verify` 通过；
 - [x] Open recovery 不再全量扫描/保存历史 PutRecord；
 - [x] Status retention 与 recovery transient memory 有明确上界；
-- [x] 所有当前已识别的 Format v1 durable writer 完成 syscall error matrix；
+- [x] 所有当前已识别的 v2 durable writer 完成 syscall error matrix；
 - [x] write-stop 水位完成，并明确部署层配额/告警与并发余量契约；
 - [ ] long fuzz/nightly 自然结束且无未解释 failure；
 - [ ] 72h steady-state soak 自然结束，空间/RSS/FD/goroutine 收敛；

@@ -43,7 +43,7 @@
 | `internal/maintenance` | Deleted/Rewritten | 旧 journal 已删除；v2 marker 位于 `internal/maintstate` |
 | `internal/backup` | Deleted | v1 实现不保留；v2 原生实现位于 `internal/backuprestore`，协议见 `v2-backup-restore-design.md` |
 | `internal/verify` | Deleted | 旧 verifier 已删除；v2 原生实现为 `internal/verifier`，根包公开只读 `Verify` |
-| metrics/export | Deleted, future rewrite | v2 原生 metrics 尚未实现，不保留旧 runtime 采集结构 |
+| metrics/export | Rewritten | v2 Engine 原生 bounded snapshot；根包稳定样本与无第三方依赖 Prometheus adapter 已恢复，不依赖旧 runtime |
 | fault/crash/model tests | Keep 测试意图 | 测试代码按新接口重写，故障矩阵和性质继续作为验收标准 |
 
 矩阵中的决定面向最终主路径。Rewrite 可以复用经过证明的不变量、算法和测试性质，但不复制旧

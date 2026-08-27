@@ -220,10 +220,8 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.catalog = catalog
 	store.maintenance = log
 	if config.WriteStopFreeBytes != 0 {
-		store.userAppender = &spaceAppender{
-			next: log,
-			gate: newSpaceGate(root, config.WriteStopFreeBytes, config.SpaceCheckInterval, filesystemAvailable),
-		}
+		store.space = newSpaceGate(root, config.WriteStopFreeBytes, config.SpaceCheckInterval, filesystemAvailable)
+		store.userAppender = &spaceAppender{next: log, gate: store.space}
 	}
 	store.maintenanceHook = hooks.maintenance
 	store.mapStoreHook = hooks.mapStore

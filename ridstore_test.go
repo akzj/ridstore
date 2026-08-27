@@ -254,6 +254,46 @@ func TestUserPutStopsBeforeReservedFilesystemHeadroom(t *testing.T) {
 	}
 }
 
+func TestPublicMetricsReportV2Runtime(t *testing.T) {
+	ctx := context.Background()
+	config := testCreateConfig(filepath.Join(t.TempDir(), "store"))
+	store, err := Create(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	committed, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := committed.Create(ctx, []byte("metrics")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := committed.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	aborted, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := aborted.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := store.Metrics()
+	if metrics.CommitQueued != 1 || metrics.CommitGroups != 1 || metrics.GroupBatches != 1 || metrics.Committed != 1 || metrics.Aborted != 1 {
+		t.Fatalf("pipeline metrics=%+v", metrics)
+	}
+	if metrics.DeltaChargedBytes == 0 || metrics.DeltaReservedBytes != 0 ||
+		metrics.DeltaSoftLimitBytes != config.Runtime.DeltaSoftLimitBytes || metrics.DeltaHardLimitBytes != config.Runtime.DeltaHardLimitBytes {
+		t.Fatalf("delta metrics=%+v", metrics)
+	}
+	if metrics.WriteStopFreeBytes != config.Runtime.WriteStopFreeBytes || metrics.DiskAvailableEstimateBytes == 0 {
+		t.Fatalf("space metrics=%+v", metrics)
+	}
+}
+
 func testCreateConfig(dir string) CreateConfig {
 	return CreateConfig{
 		Dir: dir,

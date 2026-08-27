@@ -143,6 +143,10 @@ func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	if record, err := store.Get(context.Background(), id); err != nil || string(record.Value) != "source-value" {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
+	metrics := store.Metrics()
+	if metrics.GCStarted != 1 || metrics.GCCompleted != 1 || metrics.GCFailed != 0 || metrics.GCCopiedBytes == 0 || metrics.GCRelocated == 0 || metrics.GCDurationNanos == 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
 }
 
 func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
@@ -153,6 +157,9 @@ func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
 	}
 	if !containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
 		t.Fatal("policy-rejected source was retired")
+	}
+	if metrics := store.Metrics(); metrics.GCNoCandidate != 1 || metrics.GCStarted != 0 {
+		t.Fatalf("metrics=%+v", metrics)
 	}
 }
 

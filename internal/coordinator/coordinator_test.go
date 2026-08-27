@@ -436,3 +436,36 @@ func TestCheckpointCutFollowsPublishedCommits(t *testing.T) {
 		t.Fatalf("status=%+v", status)
 	}
 }
+
+func TestMetricsObserveUserCommitPipelineAndConflict(t *testing.T) {
+	log := &fakeLog{}
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+
+	committed := newBatch(t, 1, log)
+	if err := committed.Put(context.Background(), 1, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Commit(context.Background(), committed); err != nil {
+		t.Fatal(err)
+	}
+
+	conflict := newBatch(t, 2, log)
+	if err := conflict.Put(context.Background(), 1, []byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conflict.ExpectAbsent(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Commit(context.Background(), conflict); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("conflict err=%v", err)
+	}
+
+	metrics := c.Metrics()
+	if metrics.CommitQueued != 2 || metrics.CommitGroups != 1 || metrics.GroupBatches != 1 || metrics.Conflicts != 1 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+	if metrics.QueueWaitNanos == 0 || metrics.ValidationNanos == 0 || metrics.WriteSyncNanos == 0 || metrics.PublishNanos == 0 {
+		t.Fatalf("missing duration metrics: %+v", metrics)
+	}
+}

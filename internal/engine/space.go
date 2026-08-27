@@ -24,10 +24,12 @@ type spaceGate struct {
 	available availableBytes
 	now       func() time.Time
 
-	valid      bool
-	lastSample time.Time
-	free       uint64
-	reserved   uint64
+	valid       bool
+	lastSample  time.Time
+	free        uint64
+	reserved    uint64
+	rejections  uint64
+	checkErrors uint64
 }
 
 type spaceReservation struct {
@@ -63,6 +65,7 @@ func (g *spaceGate) reserve(ctx context.Context, bytes uint64) (*spaceReservatio
 		}
 	}
 	if !fitsBelow(g.reserved, bytes, g.free, g.minimum) {
+		g.rejections++
 		return nil, base.ErrInsufficientSpace
 	}
 	g.reserved += bytes
@@ -73,10 +76,32 @@ func (g *spaceGate) refreshLocked(now time.Time) error {
 	free, err := g.available(g.root)
 	if err != nil {
 		g.valid = false
+		g.checkErrors++
 		return errors.Join(base.ErrInsufficientSpace, err)
 	}
 	g.free, g.lastSample, g.valid = free, now, true
 	return nil
+}
+
+type spaceSnapshot struct {
+	available, minimum, rejections, checkErrors uint64
+	stopped                                     bool
+}
+
+func (g *spaceGate) snapshot() spaceSnapshot {
+	if g == nil {
+		return spaceSnapshot{}
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	available := uint64(0)
+	if g.valid && g.free >= g.reserved {
+		available = g.free - g.reserved
+	}
+	return spaceSnapshot{
+		available: available, minimum: g.minimum, rejections: g.rejections, checkErrors: g.checkErrors,
+		stopped: g.valid && available <= g.minimum || !g.valid && g.checkErrors != 0,
+	}
 }
 
 func fitsBelow(reserved, requested, free, minimum uint64) bool {
