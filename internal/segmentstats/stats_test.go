@@ -9,6 +9,7 @@ import (
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/recordmeta"
 )
 
 type mappingEntry struct {
@@ -69,7 +70,7 @@ func TestBuildExactSealedStats(t *testing.T) {
 	b := addPut(t, records, 1, 128, 2, 80)
 	c := addPut(t, records, 2, 64, 3, 1)
 	active := addPut(t, records, 3, 64, 4, 900)
-	stats, err := Build(context.Background(), fakeMapping{{1, a}, {2, b}, {3, c}, {4, active}}, records, FileSet{
+	stats, err := Build(context.Background(), fakeMapping{{1, a}, {2, b}, {3, c}, {4, active}}, records, nil, FileSet{
 		Active: 3,
 		Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}, {SegmentID: 2, ValidEnd: 512}},
 	}, 1024, 2)
@@ -111,7 +112,7 @@ func TestBuildRejectsWrongIdentityUnknownSegmentAndBudget(t *testing.T) {
 			case "budget":
 				mapping = append(mapping, mappingEntry{2, b})
 			}
-			_, err := Build(context.Background(), mapping, records, files, 1024, test.maxEntries)
+			_, err := Build(context.Background(), mapping, records, nil, files, 1024, test.maxEntries)
 			if test.name == "budget" {
 				if !errors.Is(err, base.ErrOverflow) {
 					t.Fatalf("err=%v", err)
@@ -120,5 +121,34 @@ func TestBuildRejectsWrongIdentityUnknownSegmentAndBudget(t *testing.T) {
 				t.Fatalf("err=%v", err)
 			}
 		})
+	}
+}
+
+func TestBuildUsesValidatedCachedMetadataWithoutInspect(t *testing.T) {
+	records := make(fakeInspector)
+	addr := addPut(t, records, 1, 64, 7, 80)
+	physical, _ := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize + 80))
+	cache := recordmeta.New(64)
+	cache.Remember(addr, 7, physical)
+	stats, err := Build(context.Background(), fakeMapping{{7, addr}}, fakeInspector{}, cache, FileSet{
+		Active: 2, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}},
+	}, 1024, 1)
+	if err != nil || len(stats) != 1 || stats[0].LiveBytes != uint64(physical) || cache.Stats().Hits != 1 {
+		t.Fatalf("stats=%+v cache=%+v err=%v", stats, cache.Stats(), err)
+	}
+}
+
+func TestBuildRejectsCachedIdentityMismatch(t *testing.T) {
+	addr, err := recordlog.NewVAddr(1, 64, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := recordmeta.New(64)
+	cache.Remember(addr, 8, 64)
+	_, err = Build(context.Background(), fakeMapping{{7, addr}}, fakeInspector{}, cache, FileSet{
+		Active: 2, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}},
+	}, 1024, 1)
+	if !errors.Is(err, base.ErrCorrupt) {
+		t.Fatalf("err=%v", err)
 	}
 }

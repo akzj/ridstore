@@ -17,6 +17,8 @@ Checkpoint 的额外工作集有界。
 
 本模块只解决 Mapping COW build 的临时内存。Delta 本体由 Delta hard limit 约束，Radix cache 由
 MappingCacheBytes 约束，SegmentStats 由独立的 MaxSegmentStats 约束；三者不能共享一个含义模糊的配置。
+进程内 `RecordMetaCacheEntries` 只是 SegmentStats 的随机读加速层，miss 仍读取并验证
+Record/Put header，它不改变 Builder 或 SegmentStats 的正确性边界。
 
 ## 2. 选择
 

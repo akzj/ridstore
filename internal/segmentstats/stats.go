@@ -10,6 +10,7 @@ import (
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/recordmeta"
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
@@ -21,6 +22,10 @@ type Inspector interface {
 	Inspect(context.Context, recordlog.VAddr, uint32) (recordlog.RecordMetadata, []byte, error)
 }
 
+type MetadataLookup interface {
+	Lookup(recordlog.VAddr) (recordmeta.Metadata, bool)
+}
+
 type FileSet struct {
 	Active recordlog.SegmentID
 	Sealed []recordlog.SegmentSummary
@@ -29,7 +34,7 @@ type FileSet struct {
 // Build derives exact live statistics for one immutable Mapping checkpoint.
 // Active-segment records are validated but omitted because the Manifest stats
 // table describes only sealed segments.
-func Build(ctx context.Context, current Mapping, records Inspector, files FileSet, maxValueSize, maxEntries uint64) ([]storecatalog.SegmentStats, error) {
+func Build(ctx context.Context, current Mapping, records Inspector, cache MetadataLookup, files FileSet, maxValueSize, maxEntries uint64) ([]storecatalog.SegmentStats, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -54,18 +59,27 @@ func Build(ctx context.Context, current Mapping, records Inspector, files FileSe
 		if !isSealed && addr.SegmentID() != files.Active {
 			return base.ErrCorrupt
 		}
-		header, prefix, err := records.Inspect(ctx, addr, recordcodec.PutHeaderSize)
-		if err != nil {
-			return errors.Join(base.ErrCorrupt, err)
-		}
-		put, err := recordcodec.DecodePutMetadata(prefix, header.PayloadSize, maxValueSize)
-		if err != nil || put.RecordID != id || header.Addr != addr || !addr.MatchesPhysicalSize(header.PhysicalSize) {
-			return errors.Join(base.ErrCorrupt, err)
+		var physicalSize uint32
+		if cached, ok := lookupMetadata(cache, addr); ok {
+			if cached.RecordID != id || !addr.MatchesPhysicalSize(cached.PhysicalSize) {
+				return base.ErrCorrupt
+			}
+			physicalSize = cached.PhysicalSize
+		} else {
+			header, prefix, err := records.Inspect(ctx, addr, recordcodec.PutHeaderSize)
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			put, err := recordcodec.DecodePutMetadata(prefix, header.PayloadSize, maxValueSize)
+			if err != nil || put.RecordID != id || header.Addr != addr || !addr.MatchesPhysicalSize(header.PhysicalSize) {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			physicalSize = header.PhysicalSize
 		}
 		if !isSealed {
 			return nil
 		}
-		if addr.Offset() > summary.ValidEnd || header.PhysicalSize > summary.ValidEnd-addr.Offset() {
+		if addr.Offset() > summary.ValidEnd || physicalSize > summary.ValidEnd-addr.Offset() {
 			return base.ErrCorrupt
 		}
 		stat, exists := stats[summary.SegmentID]
@@ -75,10 +89,10 @@ func Build(ctx context.Context, current Mapping, records Inspector, files FileSe
 			}
 			stat.SegmentID = summary.SegmentID
 		}
-		if stat.LiveBytes > math.MaxUint64-uint64(header.PhysicalSize) || stat.LiveRecords == math.MaxUint64 {
+		if stat.LiveBytes > math.MaxUint64-uint64(physicalSize) || stat.LiveRecords == math.MaxUint64 {
 			return base.ErrOverflow
 		}
-		stat.LiveBytes += uint64(header.PhysicalSize)
+		stat.LiveBytes += uint64(physicalSize)
 		stat.LiveRecords++
 		stats[summary.SegmentID] = stat
 		return nil
@@ -92,4 +106,11 @@ func Build(ctx context.Context, current Mapping, records Inspector, files FileSe
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].SegmentID < result[j].SegmentID })
 	return result, nil
+}
+
+func lookupMetadata(cache MetadataLookup, addr recordlog.VAddr) (recordmeta.Metadata, bool) {
+	if cache == nil {
+		return recordmeta.Metadata{}, false
+	}
+	return cache.Lookup(addr)
 }

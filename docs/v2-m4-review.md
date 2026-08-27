@@ -47,7 +47,8 @@ Engine fail closed，重启以 durable Manifest 为准。
 第一版按设计选择有界内存、顺序遍历 candidate Root：
 
 - Radix `Walk` 按 ID 顺序遍历 immutable checkpoint；
-- `RecordLog.Inspect` 读取物理 Header 和固定 Put header，不读取 Value body；
+- 热 `VAddr` 先使用进程内 record metadata cache，hit 时不读盘；
+- cache miss 才由 `RecordLog.Inspect` 读取物理 Header 和固定 Put header，不读取 Value body；
 - Put metadata 必须与 Mapping ID、VAddr、物理大小和 Segment 边界一致；
 - 只为 sealed Segment 输出非零统计，按 SegmentID 排序；
 - 未知 Segment、统计溢出、身份不一致或损坏都会阻止 Manifest 安装。

@@ -186,6 +186,7 @@ RecordLog 统一解析 VAddr：
 - sealed Record：经内部 Registry 和 Reader Pin 读取；
 - retired Segment：拒绝新 pin，等待已有 pin 后才允许删除。
 
+SegmentStats 优先使用进程内 `VAddr -> {RecordID, PhysicalSize}` cache；hit 时跳过物理读。miss 时
 `Inspect` 只读取并校验物理 Record Header 与调用者要求的 payload prefix；它返回不含 checksum
 字段的 `RecordMetadata`，避免让 buffered Record 假装已经拥有磁盘 Header CRC。Checkpoint 用它读取
 32-byte Put protocol header，因此统计阶段不读取大 Value body，也不声称验证未读取的 payload CRC。

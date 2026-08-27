@@ -19,22 +19,24 @@ import (
 	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/recordmeta"
 	"github.com/akzj/ridstore/internal/replay"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
 )
 
 type OpenConfig struct {
-	RecordLog           recordlog.Config
-	Commit              coordinator.Config
-	MappingCacheBytes   uint64
-	CheckpointSortBytes uint64
-	MaxSegmentStats     uint64
-	DeltaSoftLimitBytes uint64
-	DeltaHardLimitBytes uint64
-	StatusRetention     uint64
-	WriteStopFreeBytes  uint64
-	SpaceCheckInterval  time.Duration
+	RecordLog              recordlog.Config
+	Commit                 coordinator.Config
+	MappingCacheBytes      uint64
+	RecordMetaCacheEntries uint64
+	CheckpointSortBytes    uint64
+	MaxSegmentStats        uint64
+	DeltaSoftLimitBytes    uint64
+	DeltaHardLimitBytes    uint64
+	StatusRetention        uint64
+	WriteStopFreeBytes     uint64
+	SpaceCheckInterval     time.Duration
 }
 
 type CreateConfig struct {
@@ -243,12 +245,15 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.mappingCacheBytes = config.MappingCacheBytes
 	store.dirLock = dirLock
 	store.identity = [16]byte(manifest.StoreUUID)
+	store.recordMeta = recordmeta.New(config.RecordMetaCacheEntries)
+	store.userAppender = &metadataAppender{next: store.userAppender, cache: store.recordMeta, maxValueSize: store.limits.MaxValueSize}
 	store.startBackgroundCheckpoint()
 	return store, nil
 }
 
 func validOpenConfig(config OpenConfig) bool {
 	return config.MappingCacheBytes != 0 && config.MaxSegmentStats != 0 && config.StatusRetention != 0 &&
+		recordmeta.ValidCapacity(config.RecordMetaCacheEntries) &&
 		(config.WriteStopFreeBytes == 0 || config.SpaceCheckInterval > 0) &&
 		coordinator.ValidateConfig(config.Commit) == nil &&
 		mapping.ValidatePersistentConfig(persistentConfig(config)) == nil

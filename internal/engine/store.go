@@ -18,6 +18,7 @@ import (
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/recordmeta"
 	"github.com/akzj/ridstore/internal/segmentstats"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
@@ -116,6 +117,7 @@ type Store struct {
 	identity               [16]byte
 	space                  *spaceGate
 	metrics                runtimeMetrics
+	recordMeta             *recordmeta.Cache
 	checkpointRequests     chan struct{}
 	checkpointStop         chan struct{}
 	checkpointDone         chan struct{}
@@ -295,6 +297,10 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 			s.setFault(corrupt)
 			return Record{}, corrupt
 		}
+		physical, sizeErr := recordlog.PhysicalRecordSize(uint64(len(payload)))
+		if sizeErr == nil {
+			s.recordMeta.Remember(addr, id, physical)
+		}
 		return Record{Value: put.Value, Addr: addr}, nil
 	}
 }
@@ -416,7 +422,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		return abort(err)
 	}
 	manifest := s.catalog.Snapshot()
-	stats, err := segmentstats.Build(ctx, candidate, s.log, segmentstats.FileSet{
+	stats, err := segmentstats.Build(ctx, candidate, s.log, s.recordMeta, segmentstats.FileSet{
 		Active: manifest.ActiveDataSegmentID, Sealed: manifest.SealedDataSegments,
 	}, manifest.HardLimits.MaxValueSize, s.maxStats)
 	if err != nil {

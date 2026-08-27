@@ -22,6 +22,7 @@
 15. [v2 Mapping GC](v2-mapping-gc-design.md)：Root 全量重建、文件集原子替换与崩溃恢复。
 16. [v2 Backup / Restore](v2-backup-restore-design.md)：离线全量 artifact、精确文件集与原子发布协议。
 17. [v2 Durable Benchmark Harness](benchmark.md)：可归档的 ridstore/raw-fsync 基线与跨引擎待办边界。
+18. [v2 Record Metadata Cache](v2-record-meta-cache.md)：SegmentStats 的有界 metadata 加速层。
 
 阶段 Review：
 

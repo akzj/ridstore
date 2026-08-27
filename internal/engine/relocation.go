@@ -457,6 +457,10 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 		if err != nil {
 			return err
 		}
+		physical, sizeErr := recordlog.PhysicalRecordSize(uint64(len(payload)))
+		if sizeErr == nil {
+			s.recordMeta.Remember(copied.Addr, put.RecordID, physical)
+		}
 		pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: scanned.Addr, newAddr: copied.Addr})
 		pendingBytes += valueBytes
 		result.CopiedRecords++

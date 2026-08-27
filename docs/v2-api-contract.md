@@ -179,6 +179,10 @@ OriginBatchID 不进入 Mapping、不由 Get 返回、不参与用户条件，�
 GC relocation 使用共享的 durable BatchID/CommitSeq 顺序，但不是用户提交，不进入公开 Status 保留集。
 Replay 仍验证其 CommitSeq、Descriptor 和 mutation，只是不为它生成可查询状态。
 
+`RuntimeConfig.RecordMetaCacheEntries` 限制进程内 VAddr metadata cache 的近似条目数，
+零值使用 65,536。该配置不持久化，可在每次 Open 时更换；缓存 miss 不改变 API 结果或
+任何恢复/GC 决策。
+
 ## 12. 离线 Verify
 
 根包公开 `Verify(ctx, VerifyConfig)`。它必须在 Store 关闭时取得同一目录独占锁，并按

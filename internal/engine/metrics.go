@@ -3,23 +3,25 @@ package engine
 import "sync/atomic"
 
 type Metrics struct {
-	CommitQueued, CommitGroups, GroupBatches       uint64
-	Committed, Aborted, Conflicts, CommitUnknown   uint64
-	QueueWaitNanos, ValidationNanos                uint64
-	WriteSyncNanos, PublishNanos                   uint64
-	DeltaChargedBytes, DeltaReservedBytes          uint64
-	DeltaSoftLimitBytes, DeltaHardLimitBytes       uint64
-	MappingCacheBytes                              uint64
-	DiskAvailableEstimateBytes, WriteStopFreeBytes uint64
-	WriteStopped                                   uint64
-	WriteStopRejections, DiskSpaceCheckErrors      uint64
-	GCStarted, GCCompleted, GCFailed               uint64
-	GCNoCandidate                                  uint64
-	GCCopiedBytes, GCReclaimedBytes                uint64
-	GCRelocated, GCSkipped, GCDurationNanos        uint64
-	BackgroundCheckpointRequested                  uint64
-	BackgroundCheckpointCompleted                  uint64
-	BackgroundCheckpointFailed                     uint64
+	CommitQueued, CommitGroups, GroupBatches         uint64
+	Committed, Aborted, Conflicts, CommitUnknown     uint64
+	QueueWaitNanos, ValidationNanos                  uint64
+	WriteSyncNanos, PublishNanos                     uint64
+	DeltaChargedBytes, DeltaReservedBytes            uint64
+	DeltaSoftLimitBytes, DeltaHardLimitBytes         uint64
+	MappingCacheBytes                                uint64
+	DiskAvailableEstimateBytes, WriteStopFreeBytes   uint64
+	WriteStopped                                     uint64
+	WriteStopRejections, DiskSpaceCheckErrors        uint64
+	GCStarted, GCCompleted, GCFailed                 uint64
+	GCNoCandidate                                    uint64
+	GCCopiedBytes, GCReclaimedBytes                  uint64
+	GCRelocated, GCSkipped, GCDurationNanos          uint64
+	BackgroundCheckpointRequested                    uint64
+	BackgroundCheckpointCompleted                    uint64
+	BackgroundCheckpointFailed                       uint64
+	RecordMetaCacheHits, RecordMetaCacheMisses       uint64
+	RecordMetaCacheEntries, RecordMetaCacheEvictions uint64
 }
 
 type runtimeMetrics struct {
@@ -51,6 +53,11 @@ func (s *Store) Metrics() Metrics {
 		BackgroundCheckpointRequested: s.metrics.backgroundCheckpointRequested.Load(),
 		BackgroundCheckpointCompleted: s.metrics.backgroundCheckpointCompleted.Load(),
 		BackgroundCheckpointFailed:    s.metrics.backgroundCheckpointFailed.Load(),
+	}
+	if s.recordMeta != nil {
+		cache := s.recordMeta.Stats()
+		result.RecordMetaCacheHits, result.RecordMetaCacheMisses = cache.Hits, cache.Misses
+		result.RecordMetaCacheEntries, result.RecordMetaCacheEvictions = cache.Entries, cache.Evictions
 	}
 	if s.mapping != nil {
 		result.DeltaChargedBytes, result.DeltaReservedBytes, result.DeltaSoftLimitBytes, result.DeltaHardLimitBytes = s.mapping.DeltaUsage()
