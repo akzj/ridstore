@@ -101,6 +101,7 @@ func (s *Store) Metrics() Metrics {
 		GCRelocated: current.GCRelocated, GCSkipped: current.GCSkipped, GCDurationNanos: current.GCDurationNanos,
 		GCThrottledNanos: current.GCThrottledNanos, GCSpaceRejections: current.GCSpaceRejections,
 		GCMinFreeBytes:                current.GCMinFreeBytes,
+		GCBytesPerSecond:              current.GCBytesPerSecond,
 		BackgroundCheckpointRequested: current.BackgroundCheckpointRequested,
 		BackgroundCheckpointCompleted: current.BackgroundCheckpointCompleted,
 		BackgroundCheckpointFailed:    current.BackgroundCheckpointFailed,
@@ -109,6 +110,16 @@ func (s *Store) Metrics() Metrics {
 		RecordMetaCacheEntries:        current.RecordMetaCacheEntries,
 		RecordMetaCacheEvictions:      current.RecordMetaCacheEvictions,
 	}
+}
+
+// SetGCBytesPerSecond changes the copy-rate budget used by the next Data
+// compaction. It does not retime a compaction already in progress. Zero is
+// invalid; pause maintenance by not invoking another compaction.
+func (s *Store) SetGCBytesPerSecond(rate uint64) error {
+	if s == nil || s.inner == nil {
+		return base.ErrClosed
+	}
+	return s.inner.SetGCBytesPerSecond(rate)
 }
 
 // Create initializes and opens a new v2 Store. Interrupted initialization can

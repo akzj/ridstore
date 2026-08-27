@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
@@ -116,7 +117,7 @@ type Store struct {
 	maxRelocationBytes     uint64
 	maxRelocationMutations uint64
 	gcMinFreeBytes         uint64
-	gcBytesPerSecond       uint64
+	gcBytesPerSecond       atomic.Uint64
 	gcNow                  func() time.Time
 	gcWait                 func(context.Context, time.Duration) error
 	dirLock                *filelock.Lock
@@ -138,6 +139,23 @@ func (s *Store) Identity() [16]byte {
 		return [16]byte{}
 	}
 	return s.identity
+}
+
+// SetGCBytesPerSecond changes the copy-rate budget sampled by the next Data
+// compaction. An already running compaction retains the rate it sampled when
+// its pacer was created. Zero is rejected rather than overloaded as pause or
+// unlimited; callers pause maintenance by not starting another compaction.
+func (s *Store) SetGCBytesPerSecond(rate uint64) error {
+	if rate == 0 {
+		return base.ErrInvalidConfig
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return base.ErrClosed
+	}
+	s.gcBytesPerSecond.Store(rate)
+	return nil
 }
 
 func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, config Config) (*Store, error) {

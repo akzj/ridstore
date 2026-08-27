@@ -97,6 +97,34 @@ func TestCompactMappingSwitchesRuntimeAndSurvivesReopen(t *testing.T) {
 	}
 }
 
+func TestCompactMappingSpaceAdmissionRejectsBeforeStaging(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	store, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	id := createMappingGCRecord(t, ctx, store, "space-safe")
+	store.space = newSpaceGate(root, 1, time.Second, func(string) (uint64, error) { return 1, nil })
+	store.gcMinFreeBytes = 1
+
+	if err := store.CompactMapping(ctx); !errors.Is(err, base.ErrInsufficientSpace) {
+		t.Fatalf("compact err=%v", err)
+	}
+	if _, err := os.Lstat(mapgcstate.StagingRoot(root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging exists after rejected admission: %v", err)
+	}
+	if artifacts, err := mapgcstate.RecoveryArtifacts(root); err != nil || artifacts {
+		t.Fatalf("recovery artifacts=%v err=%v", artifacts, err)
+	}
+	record, err := store.Get(ctx, id)
+	if err != nil || string(record.Value) != "space-safe" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
 func TestCompactMappingPromotionFailureRollsBackAndFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "store")

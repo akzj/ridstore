@@ -19,7 +19,7 @@ type Metrics struct {
 	GCCopiedBytes, GCReclaimedBytes                  uint64
 	GCRelocated, GCSkipped, GCDurationNanos          uint64
 	GCThrottledNanos, GCSpaceRejections              uint64
-	GCMinFreeBytes                                   uint64
+	GCMinFreeBytes, GCBytesPerSecond                 uint64
 	BackgroundCheckpointRequested                    uint64
 	BackgroundCheckpointCompleted                    uint64
 	BackgroundCheckpointFailed                       uint64
@@ -34,7 +34,7 @@ const (
 	MetricGauge
 )
 
-const MetricSampleCount = 40
+const MetricSampleCount = 41
 
 type MetricSample struct {
 	Name  string
@@ -84,5 +84,6 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_record_meta_cache_misses_total", MetricCounter, m.RecordMetaCacheMisses},
 		MetricSample{"ridstore_record_meta_cache_entries", MetricGauge, m.RecordMetaCacheEntries},
 		MetricSample{"ridstore_record_meta_cache_evictions_total", MetricCounter, m.RecordMetaCacheEvictions},
+		MetricSample{"ridstore_gc_bytes_per_second", MetricGauge, m.GCBytesPerSecond},
 	)
 }

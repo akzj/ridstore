@@ -18,7 +18,7 @@ type Metrics struct {
 	GCCopiedBytes, GCReclaimedBytes                  uint64
 	GCRelocated, GCSkipped, GCDurationNanos          uint64
 	GCThrottledNanos, GCSpaceRejections              uint64
-	GCMinFreeBytes                                   uint64
+	GCMinFreeBytes, GCBytesPerSecond                 uint64
 	BackgroundCheckpointRequested                    uint64
 	BackgroundCheckpointCompleted                    uint64
 	BackgroundCheckpointFailed                       uint64
@@ -54,6 +54,7 @@ func (s *Store) Metrics() Metrics {
 		GCRelocated: s.metrics.gcRelocated.Load(), GCSkipped: s.metrics.gcSkipped.Load(),
 		GCDurationNanos: s.metrics.gcDurationNanos.Load(), GCThrottledNanos: s.metrics.gcThrottledNanos.Load(),
 		GCSpaceRejections: s.metrics.gcSpaceRejections.Load(), GCMinFreeBytes: s.gcMinFreeBytes,
+		GCBytesPerSecond:              s.gcBytesPerSecond.Load(),
 		BackgroundCheckpointRequested: s.metrics.backgroundCheckpointRequested.Load(),
 		BackgroundCheckpointCompleted: s.metrics.backgroundCheckpointCompleted.Load(),
 		BackgroundCheckpointFailed:    s.metrics.backgroundCheckpointFailed.Load(),

@@ -57,7 +57,7 @@ func TestRelocateSegmentAccountsForRateLimitDelay(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	now := time.Unix(100, 0)
 	var waited time.Duration
-	store.gcBytesPerSecond = 1024
+	store.gcBytesPerSecond.Store(1024)
 	store.gcNow = func() time.Time { return now }
 	store.gcWait = func(_ context.Context, delay time.Duration) error {
 		waited += delay
@@ -75,14 +75,14 @@ func TestRelocateSegmentAccountsForRateLimitDelay(t *testing.T) {
 func TestRelocateSegmentCancellationDuringPacingReleasesSourcePin(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	now := time.Unix(100, 0)
-	store.gcBytesPerSecond = 1
+	store.gcBytesPerSecond.Store(1)
 	store.gcNow = func() time.Time { return now }
 	store.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
 	partial, err := store.RelocateSegment(context.Background(), source)
 	if !errors.Is(err, context.Canceled) || partial.Applied == 0 {
 		t.Fatalf("partial=%+v err=%v", partial, err)
 	}
-	store.gcBytesPerSecond = ^uint64(0)
+	store.gcBytesPerSecond.Store(^uint64(0))
 	store.gcWait = func(_ context.Context, delay time.Duration) error {
 		now = now.Add(delay)
 		return nil

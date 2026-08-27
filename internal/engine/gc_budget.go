@@ -36,7 +36,7 @@ type gcPacer struct {
 	wait    func(context.Context, time.Duration) error
 }
 
-func (s *Store) newGCPacer() gcPacer {
+func (s *Store) newGCPacer(rate uint64) gcPacer {
 	now := s.gcNow
 	if now == nil {
 		now = time.Now
@@ -45,7 +45,7 @@ func (s *Store) newGCPacer() gcPacer {
 	if wait == nil {
 		wait = waitContext
 	}
-	return gcPacer{started: now(), rate: s.gcBytesPerSecond, now: now, wait: wait}
+	return gcPacer{started: now(), rate: rate, now: now, wait: wait}
 }
 
 func (p *gcPacer) pace(ctx context.Context, copied uint64) (time.Duration, error) {
@@ -137,6 +137,58 @@ func (s *Store) reserveGCCheckpoint(ctx context.Context, manifest storecatalog.M
 		return nil, base.ErrOverflow
 	}
 	estimate, ok := checkedGCAdd(nodeBytes, manifest.HardLimits.SegmentSize)
+	if !ok {
+		return nil, base.ErrOverflow
+	}
+	reservation, err := s.space.reserveWithMinimum(ctx, estimate, s.gcMinFreeBytes, false)
+	if errors.Is(err, base.ErrInsufficientSpace) {
+		s.metrics.gcSpaceRejections.Add(1)
+	}
+	return reservation, err
+}
+
+// reserveMappingGC covers the complete replacement generation. SegmentStats
+// and the Mapping Root come from the same checkpoint, so their live-record
+// count is an exact entry count. A radix rebuild emits at most one node per
+// entry at each level. Charging every possible node as dense and every output
+// segment at its full configured size also covers headers, footers, and tail
+// slack without depending on the eventual sparse encoding.
+func (s *Store) reserveMappingGC(ctx context.Context, manifest storecatalog.Manifest) (*spaceReservation, error) {
+	if s.space == nil || s.gcMinFreeBytes == 0 {
+		return nil, nil
+	}
+	if manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq {
+		return nil, base.ErrCorrupt
+	}
+	var entries uint64
+	for _, stat := range manifest.SegmentStats {
+		var ok bool
+		entries, ok = checkedGCAdd(entries, stat.LiveRecords)
+		if !ok {
+			return nil, base.ErrOverflow
+		}
+	}
+	nodes, ok := checkedGCMul(entries, uint64(mapstore.MaxLevel)+1)
+	if !ok {
+		return nil, base.ErrOverflow
+	}
+	segmentSize := manifest.HardLimits.SegmentSize
+	overhead := uint64(mapstore.SegmentHeaderSize) + uint64(mapstore.SegmentFooterSize)
+	if segmentSize <= overhead {
+		return nil, base.ErrCorrupt
+	}
+	nodesPerSegment := (segmentSize - overhead) / uint64(mapstore.DenseNodeSize)
+	if nodesPerSegment == 0 {
+		return nil, base.ErrCorrupt
+	}
+	segments := uint64(1)
+	if nodes != 0 {
+		segments = nodes / nodesPerSegment
+		if nodes%nodesPerSegment != 0 {
+			segments++
+		}
+	}
+	estimate, ok := checkedGCMul(segments, segmentSize)
 	if !ok {
 		return nil, base.ErrOverflow
 	}

@@ -49,6 +49,10 @@ append 失败会立即使样本失效；此时即使仍有 outstanding reservati
   `WriteStopFreeBytes` 的一个 Segment。
 - `GCBytesPerSecond`：按本轮累计 copied physical bytes 计算的 relocation 速率；默认 64 MiB/s。
 
+Store 打开后可以用 `SetGCBytesPerSecond` 修改复制速率。每次 Data Compact 创建 pacer 时只读取
+一次，因此新值从下一次 Compact 生效，不改变正在运行的一次 Compact。零值不表示暂停或无限速；
+暂停由外部调度器停止发起新的 Compact。
+
 内部 Engine 配置允许 `WriteStopFreeBytes == 0` 关闭该策略，便于纯内存/单元测试；公开 API 的零值会
 应用默认值。
 
@@ -73,6 +77,11 @@ Data GC 与用户 Put 共用同一个进程内空间 reservation 账本，但使
 
 第二阶段拒绝时，已复制 Record 与 relocation Delta 保留为可恢复状态，source 仍在 Catalog，调用者可在
 空间恢复后重试。任何 admission 都只是保守信号；真实 write/fsync 错误仍按原 durable 协议处理。
+
+Mapping GC 在创建 staging/marker 前单独 admission。精确 live-record 数来自刚安装的 Checkpoint；
+上界按每条记录最多八层 Dense Node，再按每个输出 Mapping Segment 的完整 `SegmentSize` 计费。
+拒绝时旧 Mapping generation 保持唯一可见，且不留下恢复 artifact。它与 Data GC 共用进程内
+reservation 账本，但不受 `GCBytesPerSecond` 控制。
 
 Relocation 每次 durable batch 后根据本轮累计 copied physical bytes 做 context-aware pacing。等待期间不持有
 Coordinator 队列锁，已排队的用户 Commit 可以继续执行；取消只终止后续 GC 工作，不回滚已经 durable

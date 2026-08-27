@@ -187,6 +187,10 @@ Data GC 的运行时资源由 `GCBatchBytes`、`GCBatchMutations`、`GCMinFreeBy
 `GCBytesPerSecond` 约束。它们可以在每次 Open 时调整，但不能超过持久化 Batch 上限，也不能改变
 relocation CAS、Checkpoint coverage 或 source retirement proof。
 
+`SetGCBytesPerSecond(rate)` 只修改后续 Data Compact 的复制速率。`rate == 0` 返回
+`ErrInvalidConfig`；已经运行的 Compact 使用开始时的速率快照，调用方通过取消该次 Context 停止它。
+时间窗、容量水位和调用频率属于外部 maintenance scheduler，不进入 Store 的持久化状态。
+
 ## 12. 离线 Verify
 
 根包公开 `Verify(ctx, VerifyConfig)`。它必须在 Store 关闭时取得同一目录独占锁，并按

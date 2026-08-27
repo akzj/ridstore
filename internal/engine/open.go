@@ -252,7 +252,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.maxRelocationBytes = config.GCBatchBytes
 	store.maxRelocationMutations = min(store.maxRelocationMutations, config.GCBatchMutations)
 	store.gcMinFreeBytes = config.GCMinFreeBytes
-	store.gcBytesPerSecond = config.GCBytesPerSecond
+	store.gcBytesPerSecond.Store(config.GCBytesPerSecond)
 	store.gcNow = time.Now
 	store.gcWait = waitContext
 	store.dirLock = dirLock

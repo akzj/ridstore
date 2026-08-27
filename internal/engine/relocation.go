@@ -80,7 +80,8 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	return s.relocateSegment(ctx, source)
+	rate := s.gcBytesPerSecond.Load()
+	return s.relocateSegment(ctx, source, rate)
 }
 
 // PrepareSegmentRetirement relocates current live records, checkpoints every
@@ -99,7 +100,8 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	relocated, err := s.relocateSegment(ctx, source)
+	rate := s.gcBytesPerSecond.Load()
+	relocated, err := s.relocateSegment(ctx, source, rate)
 	if err != nil {
 		return SegmentRetirementProof{}, relocated, err
 	}
@@ -129,9 +131,10 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
+	rate := s.gcBytesPerSecond.Load()
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
-	result, err := s.compactSegmentLocked(ctx, source)
+	result, err := s.compactSegmentLocked(ctx, source, rate)
 	s.recordCompactionMetrics(started, result, err)
 	return result, err
 }
@@ -151,6 +154,7 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
+	rate := s.gcBytesPerSecond.Load()
 	if err := s.checkpoint(ctx, true); err != nil {
 		return NextSegmentCompactionResult{}, false, fmt.Errorf("checkpoint before candidate selection: %w", err)
 	}
@@ -172,7 +176,7 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	}
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
-	compaction, err := s.compactSegmentLocked(ctx, candidate.Source.SegmentID)
+	compaction, err := s.compactSegmentLocked(ctx, candidate.Source.SegmentID, rate)
 	s.recordCompactionMetrics(started, compaction, err)
 	if err != nil {
 		err = fmt.Errorf("compact segment %d: %w", candidate.Source.SegmentID, err)
@@ -200,9 +204,9 @@ func (s *Store) recordCompactionMetrics(started time.Time, result SegmentCompact
 }
 
 // compactSegmentLocked requires maintenanceMu.
-func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.SegmentID) (SegmentCompactionResult, error) {
+func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentCompactionResult, error) {
 
-	relocated, err := s.relocateSegment(ctx, source)
+	relocated, err := s.relocateSegment(ctx, source, rate)
 	result := SegmentCompactionResult{Relocation: relocated}
 	if err != nil {
 		return result, fmt.Errorf("relocate segment %d: %w", source, err)
@@ -363,7 +367,7 @@ func (s *Store) proveSegmentRetirementLocked(ctx context.Context, source recordl
 // relocateSegment requires maintenanceMu. Keeping orchestration ownership at
 // Store lets a later complete GC operation compose relocation, checkpoint and
 // retirement without recursively acquiring the maintenance lock.
-func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID) (SegmentRelocationResult, error) {
+func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentRelocationResult, error) {
 	s.ops.RLock()
 	defer s.ops.RUnlock()
 
@@ -399,7 +403,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 	pending := make([]copiedRecord, 0, min(s.limits.MaxBatchMutations, s.maxRelocationMutations))
 	var pendingBytes uint64
 	var pendingPhysical uint64
-	pacer := s.newGCPacer()
+	pacer := s.newGCPacer(rate)
 	flush := func() error {
 		if len(pending) == 0 {
 			return nil

@@ -63,6 +63,12 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 	}
 
 	manifest := s.catalog.Snapshot()
+	space, err := s.reserveMappingGC(ctx, manifest)
+	if err != nil {
+		return err
+	}
+	spaceCommitted := false
+	defer func() { space.complete(spaceCommitted) }()
 	staging := mapgcstate.StagingRoot(s.root)
 	if err := os.Mkdir(staging, 0o700); err != nil {
 		return err
@@ -186,6 +192,7 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
+	spaceCommitted = true
 	return nil
 }
 

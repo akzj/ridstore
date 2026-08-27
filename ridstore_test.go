@@ -294,6 +294,32 @@ func TestPublicMetricsReportV2Runtime(t *testing.T) {
 	}
 }
 
+func TestPublicGCThrottleUpdateAppliesToNextCompaction(t *testing.T) {
+	ctx := context.Background()
+	store, err := Create(ctx, testCreateConfig(filepath.Join(t.TempDir(), "store")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetGCBytesPerSecond(12345); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Metrics().GCBytesPerSecond; got != 12345 {
+		t.Fatalf("gc bytes per second=%d", got)
+	}
+	if err := store.SetGCBytesPerSecond(0); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("zero rate err=%v", err)
+	}
+	if got := store.Metrics().GCBytesPerSecond; got != 12345 {
+		t.Fatalf("invalid update changed rate=%d", got)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetGCBytesPerSecond(1); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed update err=%v", err)
+	}
+}
+
 func testCreateConfig(dir string) CreateConfig {
 	return CreateConfig{
 		Dir: dir,

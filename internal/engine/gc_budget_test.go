@@ -100,6 +100,41 @@ func TestGCCheckpointSpaceAdmissionUsesDensePathUpperBound(t *testing.T) {
 	reservation.complete(false)
 }
 
+func TestMappingGCSpaceAdmissionUsesFullSegmentUpperBound(t *testing.T) {
+	const minimum = uint64(10)
+	segmentSize := uint64(mapstore.SegmentHeaderSize + mapstore.SegmentFooterSize + 2*mapstore.DenseNodeSize)
+	manifest := storecatalog.Manifest{
+		HardLimits:            storecatalog.HardLimits{SegmentSize: segmentSize},
+		CoveredCommitSeq:      7,
+		StatsCoveredCommitSeq: 7,
+		SegmentStats: []storecatalog.SegmentStats{
+			{SegmentID: 1, LiveBytes: 100, LiveRecords: 1},
+			{SegmentID: 2, LiveBytes: 200, LiveRecords: 2},
+		},
+	}
+	// Three entries permit at most 24 nodes. Two dense nodes fit per segment,
+	// so the complete replacement generation is charged as 12 full segments.
+	want := uint64(12) * segmentSize
+	free := want + minimum
+	gate := newSpaceGate("test", 100, time.Second, func(string) (uint64, error) { return free, nil })
+	store := &Store{space: gate, gcMinFreeBytes: minimum}
+	reservation, err := store.reserveMappingGC(context.Background(), manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation.bytes != want {
+		t.Fatalf("reserved=%d want=%d", reservation.bytes, want)
+	}
+	reservation.complete(false)
+	free--
+	if _, err := store.reserveMappingGC(context.Background(), manifest); !errors.Is(err, base.ErrInsufficientSpace) {
+		t.Fatalf("reserve err=%v", err)
+	}
+	if got := store.metrics.gcSpaceRejections.Load(); got != 1 {
+		t.Fatalf("rejections=%d", got)
+	}
+}
+
 func TestGCSpaceAdmissionRejectsOverflow(t *testing.T) {
 	gate := newSpaceGate("test", 1, time.Second, func(string) (uint64, error) { return ^uint64(0), nil })
 	store := &Store{space: gate, gcMinFreeBytes: 1, maxRelocationBytes: 1, maxRelocationMutations: 1}
@@ -110,6 +145,11 @@ func TestGCSpaceAdmissionRejectsOverflow(t *testing.T) {
 	}
 	if _, err := store.reserveGCCheckpoint(context.Background(), manifest, ^uint64(0)); !errors.Is(err, base.ErrOverflow) {
 		t.Fatalf("checkpoint reserve err=%v", err)
+	}
+	manifest.CoveredCommitSeq, manifest.StatsCoveredCommitSeq = 1, 1
+	manifest.SegmentStats = []storecatalog.SegmentStats{{SegmentID: 1, LiveBytes: 1, LiveRecords: ^uint64(0)}}
+	if _, err := store.reserveMappingGC(context.Background(), manifest); !errors.Is(err, base.ErrOverflow) {
+		t.Fatalf("mapping gc reserve err=%v", err)
 	}
 }
 

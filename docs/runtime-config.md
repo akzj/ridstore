@@ -108,7 +108,16 @@ RecordLog payload 和 Segment 上限。
 
 GC 受 `GCBatchBytes/GCBatchMutations`、`GCBytesPerSecond`、Delta reservation、前台队列优先级和可用磁盘共同限制。每个 durable Relocation Batch 后按本轮累计 copied bytes 对 wall clock 做 Context-aware pacing；已经排队的用户 Commit 优先于下一批 Relocation，已经选中的单个有限 Relocation Batch 不被拆开。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
 
+`SetGCBytesPerSecond(rate)` 原子修改后续 Data Compact 的复制速率。每次 Compact 只在创建 pacer
+时读取一次，新值不影响正在运行的 Compact；`rate == 0` 非法。暂停、时间窗、容量水位和调用频率
+属于外部 maintenance scheduler，不进入 Store 的持久化状态。
+
 Data GC 使用两段磁盘 admission。copy 前按 source 全部物理 bytes、最坏 Relocation Descriptor、两个 rotation Segment 与 `GCMinFreeBytes` 检查空间；该上界对显式指定 Segment 和自动候选路径都成立，不依赖可能继续下降的 live estimate。copy 完成后，GC-required Checkpoint barrier 先冻结其实际 Delta layers，再按冻结 entry 数乘以每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment与 `GCMinFreeBytes` 重新检查。第二段失败时 Relocation 已是可恢复的 durable garbage/Delta，但源 Segment 和旧 checkpoint 仍保留。这样前台 Commit 可以继续运行，又不会把只按源 live 数得到的估计误称为整个 Checkpoint 上界。任一检查低于上界均返回 `ErrInsufficientSpace`。可用空间检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
+
+Mapping GC 在创建 staging 目录前，以同一 Checkpoint 的精确 live-record 数计算完整替换 generation
+上界：每条记录最多八层 Mapping Node，每个 Node 按 Dense 编码、每个输出 Segment 按完整
+`SegmentSize` 计费。空间不足不创建 staging/marker、不改变旧 Mapping。该检查与 Data GC 共用
+reservation 账本和 `GCMinFreeBytes`；真实 ENOSPC 仍遵守 Mapping GC 恢复协议。
 
 ## 7. 前台新写停止水位
 
