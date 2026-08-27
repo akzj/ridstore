@@ -16,7 +16,7 @@
 | Metrics adapter | 完成 | v2 Coordinator/Engine 原生固定 bounded samples、Prometheus adapter tests | dashboard/告警属于部署层 |
 | Migration skeleton | 未完成 | v1 planner 已随旧 runtime 删除 | v2 只读 planner、registry 与跨版本 fixture 均未实现 |
 | Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；当前已识别 v2 durable writer 的 `EIO/ENOSPC/EACCES` syscall-error matrix | 没有设备 power-loss 证据；代码级 syscall matrix 不能证明 flush 硬件语义 |
-| Long fuzz/nightly | 未完成 | 9-target fuzz smoke；nightly workflow 文件仍在 | v2 runner、Make target、artifact/terminal 状态机与自然结束证据均缺失，当前 workflow 不可执行 |
+| Long fuzz/nightly | Harness 完成，证据未完成 | 9-target v2 runner、每日/手动 workflow、原始日志/corpus/terminal marker、短 harness smoke | 尚无全部 target 自然结束的 long-fuzz artifact |
 | 72h steady-state soak | 未完成 | v1 设计文档仍在 | v2 soak command、模型/Verify/资源收敛 gate 与 72h 自然结束证据均缺失 |
 | Same-durability benchmark | 未完成 | 单一 ridstore durable commit benchmark | 无 append baseline、Pebble/RocksDB 同 durability 稳定态对比和原始报告 |
 | Known limits/checklist | 进行中 | 本文、前台 write-stop admission | 长时/环境证据及最终 Review 尚未完成 |
@@ -92,7 +92,7 @@ make test-crash
 make verify
 ```
 
-`make verify` 聚合普通、race、vet、fuzz smoke 和 process-crash。它不包含自然 long fuzz、benchmark、
+`make verify` 聚合普通、race、vet、fuzz smoke、long-fuzz harness smoke 和 process-crash。它不包含自然 long fuzz、benchmark、
 72h soak、异机恢复或 power-loss，因此成功只能证明当前开发门禁通过。
 
 ## 4. Production checklist
