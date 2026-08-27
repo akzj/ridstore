@@ -14,7 +14,7 @@
 | 一致 Backup | 完成 | 同一 source lease、hash metadata、payload Verify、SIGKILL matrix | 远端传输、压缩、加密不在 v1 |
 | Restore/UUID 策略 | 完成 | 新目录发布、RESTORING marker、默认新 UUID、preserve 显式开关、SIGKILL matrix | 应用级异机演练尚未执行 |
 | Metrics adapter | 完成 | v2 Coordinator/Engine 原生固定 bounded samples、Prometheus adapter tests | dashboard/告警属于部署层 |
-| Migration skeleton | 未完成 | v1 planner 已随旧 runtime 删除 | v2 只读 planner、registry 与跨版本 fixture 均未实现 |
+| Migration planner | 完成 | v2 双 Manifest 槽只读识别、严格 header/CRC、空 registry、当前格式 exact Verify、未知版本 fixture | 无 v1 数据迁移；未来格式尚无执行 step |
 | Full crash/fault matrix | 局部证据 | 各主协议的 process SIGKILL；当前已识别 v2 durable writer 的 `EIO/ENOSPC/EACCES` syscall-error matrix | 没有设备 power-loss 证据；代码级 syscall matrix 不能证明 flush 硬件语义 |
 | Long fuzz/nightly | Harness 完成，证据未完成 | 9-target v2 runner、每日/手动 workflow、原始日志/corpus/terminal marker、短 harness smoke | 尚无全部 target 自然结束的 long-fuzz artifact |
 | 72h steady-state soak | Harness 完成，证据未完成 | v2 bounded-ID 模型、维护排空、exact offline Verify、资源收敛与终态 JSONL smoke | 尚无 72h 自然结束 artifact |

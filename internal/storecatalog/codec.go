@@ -39,6 +39,16 @@ var (
 	manifestCRC   = crc32.MakeTable(crc32.Castagnoli)
 )
 
+// ContainerHeader is the version-independent, checksummed Manifest envelope.
+// It can be inspected before a decoder for the contained format exists.
+type ContainerHeader struct {
+	FormatMajor uint16
+	FormatMinor uint16
+	Generation  uint64
+	StoreUUID   StoreUUID
+	PayloadSize uint64
+}
+
 type tlv struct {
 	typ   uint16
 	value []byte
@@ -90,28 +100,20 @@ func Encode(m Manifest) ([]byte, error) {
 }
 
 func Decode(src []byte) (Manifest, error) {
-	if len(src) < containerHeaderSize || string(src[:8]) != string(manifestMagic[:]) {
-		return Manifest{}, fmt.Errorf("manifest magic or size: %w", ErrCorrupt)
-	}
-	if binary.LittleEndian.Uint16(src[8:10]) != FormatMajor || binary.LittleEndian.Uint16(src[10:12]) > FormatMinor {
+	if len(src) >= containerHeaderSize && string(src[:8]) == string(manifestMagic[:]) &&
+		(binary.LittleEndian.Uint16(src[8:10]) != FormatMajor || binary.LittleEndian.Uint16(src[10:12]) > FormatMinor) {
 		return Manifest{}, ErrUnsupported
 	}
-	if binary.LittleEndian.Uint16(src[12:14]) != containerHeaderSize || binary.LittleEndian.Uint16(src[14:16]) != 0 || !zero(src[56:64]) ||
-		binary.LittleEndian.Uint32(src[52:56]) != crc32.Checksum(src[:52], manifestCRC) {
-		return Manifest{}, fmt.Errorf("manifest header: %w", ErrCorrupt)
-	}
-	payloadSize := binary.LittleEndian.Uint64(src[40:48])
-	if payloadSize > maxManifestPayload || payloadSize != uint64(len(src)-containerHeaderSize) ||
-		binary.LittleEndian.Uint32(src[48:52]) != crc32.Checksum(src[containerHeaderSize:], manifestCRC) {
-		return Manifest{}, fmt.Errorf("manifest payload: %w", ErrCorrupt)
+	header, err := InspectHeader(src)
+	if err != nil {
+		return Manifest{}, err
 	}
 	items, err := decodeTLVs(src[containerHeaderSize:])
 	if err != nil {
 		return Manifest{}, err
 	}
 	var m Manifest
-	m.Generation = binary.LittleEndian.Uint64(src[16:24])
-	copy(m.StoreUUID[:], src[24:40])
+	m.Generation, m.StoreUUID = header.Generation, header.StoreUUID
 	if m.HardLimits, err = decodeHardLimits(items[tlvHardLimits]); err != nil {
 		return Manifest{}, err
 	}
@@ -152,6 +154,29 @@ func Decode(src []byte) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("manifest values: %w", ErrCorrupt)
 	}
 	return m, nil
+}
+
+func InspectHeader(src []byte) (ContainerHeader, error) {
+	if len(src) < containerHeaderSize || string(src[:8]) != string(manifestMagic[:]) {
+		return ContainerHeader{}, fmt.Errorf("manifest magic or size: %w", ErrCorrupt)
+	}
+	if binary.LittleEndian.Uint16(src[12:14]) != containerHeaderSize || binary.LittleEndian.Uint16(src[14:16]) != 0 || !zero(src[56:64]) ||
+		binary.LittleEndian.Uint32(src[52:56]) != crc32.Checksum(src[:52], manifestCRC) {
+		return ContainerHeader{}, fmt.Errorf("manifest header: %w", ErrCorrupt)
+	}
+	header := ContainerHeader{
+		FormatMajor: binary.LittleEndian.Uint16(src[8:10]), FormatMinor: binary.LittleEndian.Uint16(src[10:12]),
+		Generation: binary.LittleEndian.Uint64(src[16:24]), PayloadSize: binary.LittleEndian.Uint64(src[40:48]),
+	}
+	copy(header.StoreUUID[:], src[24:40])
+	if header.FormatMajor == 0 || header.Generation == 0 || header.StoreUUID == (StoreUUID{}) {
+		return ContainerHeader{}, fmt.Errorf("manifest identity: %w", ErrCorrupt)
+	}
+	if header.PayloadSize > maxManifestPayload || header.PayloadSize != uint64(len(src)-containerHeaderSize) ||
+		binary.LittleEndian.Uint32(src[48:52]) != crc32.Checksum(src[containerHeaderSize:], manifestCRC) {
+		return ContainerHeader{}, fmt.Errorf("manifest payload: %w", ErrCorrupt)
+	}
+	return header, nil
 }
 
 func Validate(m Manifest) error {

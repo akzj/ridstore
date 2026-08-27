@@ -1,8 +1,6 @@
 # Format Upgrade 与 Migration
 
-状态：Format v1 历史设计；v2 migration planner 尚未实现
-
-以下内容保留为 v2 planner 的设计输入；其中命令、registry 和实现路径在当前仓库中不存在。
+状态：v2 只读 migration planner 已实现；当前没有迁移执行 step。
 
 ## 1. 兼容规则
 
@@ -23,14 +21,14 @@
 go run ./cmd/ridstore-tool migrate plan --dir /path/to/offline-store
 ```
 
-planner 先取得既有 `LOCK`，只读取 CURRENT 指向的 Manifest fixed header。Header
-检查 magic、CRC、generation、StoreUUID、payload length，但允许报告当前 decoder
+planner 先取得既有 `LOCK`，严格读取两个 `MANIFEST-v2-{0,1}` 槽并选择最高 generation。
+Header 检查 magic、header/payload CRC、slot generation、StoreUUID、payload length，但允许报告当前 decoder
 不支持的版本。若磁盘已经是当前版本，planner 在同一 lease 下运行完整 Verify，
 输出 `verified_current=true`；这是真正的 no-op，不改写任何字节。
 
-若 registry 中不存在从 source 到当前版本的连续路径，plan 连同
-`ErrUnsupported` 返回。当前 v1.0 没有历史 migration step，因此任何非 v1.0
-格式都明确不支持；skeleton 的存在不等于已经具备跨版本升级能力。
+若 registry 中不存在从 source 到当前版本的严格递增连续路径，plan 连同
+`ErrUnsupported` 返回。当前 registry 为空：开发期 v1 没有生产数据，不迁移、不兼容；任何非当前
+v2.0 格式都明确不支持。planner 的存在不等于已经具备跨版本升级能力。
 
 ## 3. 未来 step 契约
 
@@ -39,7 +37,7 @@ planner 先取得既有 `LOCK`，只读取 CURRENT 指向的 Manifest fixed head
 
 1. source decoder 与 corruption 边界；
 2. destination 格式、UUID 策略和资源上界；
-3. Record/ID/Revision/CommitSeq/Batch atomicity 保持证明；
+3. Record/ID/VAddr/CommitSeq/Batch atomicity 保持证明；
 4. crash matrix、golden fixture 和 rollback 策略；
 5. Backup/Restore 演练以及旧 binary 对新格式的明确拒绝。
 

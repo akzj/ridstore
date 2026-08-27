@@ -36,12 +36,13 @@
 未以 `v2-` 开头的设计及 `phase-*.md` 记录 Format v1 的历史决策和曾经验证过的性质。它们只用于提取
 经验，不是当前 API、格式、模块名或生产能力的事实来源。尤其其中的 Revision、旧命令、旧 metrics、
 Backup/Soak 的旧实现均已删除；Verify 与 Backup/Restore 已按 v2 格式独立重写，其他后续能力不得复用
-v1 协议。`metrics/prometheus`、long-fuzz runner 与 soak harness 已按 v2 runtime 重新实现；Migration
-仍需生成 v2 原生版本。
+v1 协议。`metrics/prometheus`、long-fuzz runner、soak harness 与只读 migration planner 已按 v2
+runtime 重新实现；当前没有需要执行的历史数据迁移 step。
 
 ## 当前完整性
 
 v2 已具备 Create/Open、CRUD、原子 Batch、group commit、Checkpoint、Replay、CommitUnknown 查询、
 有界状态恢复、用户写入磁盘水位、Data/Mapping GC、崩溃恢复、原生只读 Verify，以及 Linux 上的离线全量
 Backup/Restore、有界 Metrics/Prometheus adapter，以及 long-fuzz/nightly 与 soak harness。它仍不是
-production-ready：Migration、long-fuzz/72h soak 自然结束证据、真实 workload 基线和远端备份传输是后续完整性工作。
+production-ready：未来格式的实际 Migration step、long-fuzz/72h soak 自然结束证据、真实 workload
+基线和远端备份传输是后续完整性工作。

@@ -1,4 +1,4 @@
-.PHONY: fmt test test-race test-fuzz-smoke test-fuzz-harness-smoke test-fuzz-long test-crash test-soak-smoke soak-72h vet check verify
+.PHONY: fmt test test-race test-fuzz-smoke test-fuzz-harness-smoke test-fuzz-long test-crash test-soak-smoke soak-72h vet check verify tool
 
 FUZZ_TIME ?= 2s
 FUZZ_PARALLEL ?= 4
@@ -69,3 +69,8 @@ vet:
 check: test vet
 
 verify: test test-race vet test-fuzz-smoke test-fuzz-harness-smoke test-crash test-soak-smoke
+
+tool:
+	mkdir -p .build
+	go build -o .build/ridstore-tool ./cmd/ridstore-tool
+	go build -o .build/ridstore-soak ./cmd/ridstore-soak

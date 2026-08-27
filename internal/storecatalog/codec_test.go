@@ -3,6 +3,7 @@ package storecatalog
 import (
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"testing"
 
 	"github.com/akzj/ridstore/internal/model"
@@ -57,6 +58,22 @@ func TestManifestRoundTrip(t *testing.T) {
 	got.OpenBatchIDsAtCut[0] = 99
 	if want.OpenBatchIDsAtCut[0] == 99 {
 		t.Fatal("decoded manifest must own slices")
+	}
+}
+
+func TestInspectHeaderAcceptsChecksummedFutureVersion(t *testing.T) {
+	encoded, err := Encode(testManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(encoded[8:10], FormatMajor+1)
+	binary.LittleEndian.PutUint32(encoded[52:56], crc32.Checksum(encoded[:52], crc32.MakeTable(crc32.Castagnoli)))
+	header, err := InspectHeader(encoded)
+	if err != nil || header.FormatMajor != FormatMajor+1 || header.Generation != testManifest().Generation || header.StoreUUID != testManifest().StoreUUID {
+		t.Fatalf("header=%+v error=%v", header, err)
+	}
+	if _, err := Decode(encoded); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("decode error=%v", err)
 	}
 }
 

@@ -122,6 +122,69 @@ func LoadStrict(root string) (Manifest, error) {
 	return load(root, true)
 }
 
+// InspectLatestHeader strictly reads the two durable Manifest slots without
+// requiring a decoder for their declared format version.
+func InspectLatestHeader(root string) (ContainerHeader, error) {
+	if root == "" {
+		return ContainerHeader{}, ErrInvalid
+	}
+	type candidate struct {
+		header  ContainerHeader
+		encoded []byte
+	}
+	values := make([]candidate, 0, 2)
+	for slot := uint64(0); slot < 2; slot++ {
+		if _, err := os.Lstat(manifestTempPath(root, slot)); err == nil {
+			return ContainerHeader{}, ErrRecoveryRequired
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return ContainerHeader{}, err
+		}
+		info, err := os.Lstat(manifestSlotPath(root, slot))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return ContainerHeader{}, err
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return ContainerHeader{}, ErrCorrupt
+		}
+		if info.Size() < containerHeaderSize || info.Size() > containerHeaderSize+maxManifestPayload {
+			return ContainerHeader{}, ErrCorrupt
+		}
+		encoded, err := os.ReadFile(manifestSlotPath(root, slot))
+		if err != nil {
+			return ContainerHeader{}, err
+		}
+		header, err := InspectHeader(encoded)
+		if err != nil {
+			return ContainerHeader{}, err
+		}
+		if header.Generation&1 != slot {
+			return ContainerHeader{}, fmt.Errorf("manifest slot generation mismatch: %w", ErrCorrupt)
+		}
+		values = append(values, candidate{header: header, encoded: encoded})
+	}
+	if len(values) == 0 {
+		return ContainerHeader{}, os.ErrNotExist
+	}
+	if len(values) == 2 {
+		if values[0].header.StoreUUID != values[1].header.StoreUUID {
+			return ContainerHeader{}, fmt.Errorf("manifest slots disagree on store identity: %w", ErrCorrupt)
+		}
+		if values[0].header.Generation == values[1].header.Generation {
+			if string(values[0].encoded) != string(values[1].encoded) {
+				return ContainerHeader{}, fmt.Errorf("equal manifest generations differ: %w", ErrCorrupt)
+			}
+			return values[0].header, nil
+		}
+		if values[1].header.Generation > values[0].header.Generation {
+			return values[1].header, nil
+		}
+	}
+	return values[0].header, nil
+}
+
 func load(root string, strict bool) (Manifest, error) {
 	type candidate struct {
 		manifest Manifest
