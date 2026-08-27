@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/model"
@@ -49,6 +50,45 @@ func TestRelocateSegmentReportsCommitSequenceRangeAcrossBatches(t *testing.T) {
 	if result.Applied < 2 || result.FirstCommitSeq == 0 ||
 		uint64(result.LastCommitSeq-result.FirstCommitSeq)+1 != result.Applied {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestRelocateSegmentAccountsForRateLimitDelay(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	now := time.Unix(100, 0)
+	var waited time.Duration
+	store.gcBytesPerSecond = 1024
+	store.gcNow = func() time.Time { return now }
+	store.gcWait = func(_ context.Context, delay time.Duration) error {
+		waited += delay
+		now = now.Add(delay)
+		return nil
+	}
+	if _, err := store.RelocateSegment(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	if waited == 0 || store.Metrics().GCThrottledNanos != uint64(waited) {
+		t.Fatalf("waited=%v metrics=%+v", waited, store.Metrics())
+	}
+}
+
+func TestRelocateSegmentCancellationDuringPacingReleasesSourcePin(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	now := time.Unix(100, 0)
+	store.gcBytesPerSecond = 1
+	store.gcNow = func() time.Time { return now }
+	store.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
+	partial, err := store.RelocateSegment(context.Background(), source)
+	if !errors.Is(err, context.Canceled) || partial.Applied == 0 {
+		t.Fatalf("partial=%+v err=%v", partial, err)
+	}
+	store.gcBytesPerSecond = ^uint64(0)
+	store.gcWait = func(_ context.Context, delay time.Duration) error {
+		now = now.Add(delay)
+		return nil
+	}
+	if _, err := store.RelocateSegment(context.Background(), source); err != nil {
+		t.Fatalf("retry after paced cancellation: %v", err)
 	}
 }
 
@@ -98,12 +138,16 @@ func TestRelocateSegmentOrdersChangesByRecordID(t *testing.T) {
 		}
 	}
 
+	store.maxRelocationBytes = 1
 	result, err := store.RelocateSegment(context.Background(), source)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Applied < 2 {
 		t.Fatalf("result=%+v", result)
+	}
+	if uint64(result.LastCommitSeq-result.FirstCommitSeq)+1 != result.Applied {
+		t.Fatalf("byte budget did not isolate oversized records: %+v", result)
 	}
 	for id, want := range map[model.ID]string{low: "low-current", high: "high-current"} {
 		record, err := store.Get(context.Background(), id)
@@ -221,6 +265,63 @@ func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
 	}
 	if metrics := store.Metrics(); metrics.GCNoCandidate != 1 || metrics.GCStarted != 0 {
 		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestRelocateSegmentRejectsInsufficientCopySpaceWithoutMutation(t *testing.T) {
+	store, source, id, oldAddr, _ := relocationFixture(t)
+	store.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return 1, nil })
+	store.gcMinFreeBytes = 1
+	if _, err := store.RelocateSegment(context.Background(), source); !errors.Is(err, base.ErrInsufficientSpace) {
+		t.Fatalf("relocate err=%v", err)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || record.Addr != oldAddr || string(record.Value) != "source-value" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	if metrics := store.Metrics(); metrics.GCSpaceRejections != 1 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T) {
+	store, source, id, oldAddr, _ := relocationFixture(t)
+	manifest := store.catalog.Snapshot()
+	var summary recordlog.SegmentSummary
+	for _, candidate := range manifest.SealedDataSegments {
+		if candidate.SegmentID == source {
+			summary = candidate
+			break
+		}
+	}
+	commitPhysical, err := recordlog.PhysicalRecordSize(uint64(recordcodec.CommitGroupHeadSize + recordcodec.DescriptorHeadSize + recordcodec.MutationSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservePhysical, err := recordlog.PhysicalRecordSize(uint64(recordcodec.FixedRecordSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyEstimate := uint64(summary.ValidEnd-recordlog.SegmentHeaderSize) +
+		uint64(summary.RecordCount)*(uint64(commitPhysical)+uint64(reservePhysical)) + 2*manifest.HardLimits.SegmentSize
+	store.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return copyEstimate + 1, nil })
+	store.gcMinFreeBytes = 1
+	result, err := store.CompactSegment(context.Background(), source)
+	if !errors.Is(err, base.ErrInsufficientSpace) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if !containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
+		t.Fatal("source retired after checkpoint admission failure")
+	}
+	record, getErr := store.Get(context.Background(), id)
+	if getErr != nil || record.Addr == oldAddr || string(record.Value) != "source-value" {
+		t.Fatalf("record=%+v err=%v", record, getErr)
+	}
+	if metrics := store.Metrics(); metrics.GCSpaceRejections != 1 || metrics.GCFailed != 1 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatalf("checkpoint retry after GC admission failure: %v", err)
 	}
 }
 

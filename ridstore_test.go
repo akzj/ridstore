@@ -308,7 +308,7 @@ func testCreateConfig(dir string) CreateConfig {
 			MaxGroupPayload: 64 << 10, MappingCacheBytes: 1 << 20,
 			CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
 			DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
-			WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second,
+			WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second, GCBytesPerSecond: ^uint64(0),
 		},
 	}
 }

@@ -1,6 +1,6 @@
 # 配置、预算与 Backpressure
 
-状态：Development contract v1
+状态：v2 runtime contract；字段以根包 `HardLimits` / `RuntimeConfig` 为准
 
 ## 1. 配置分类
 
@@ -13,37 +13,9 @@
 
 ## 2. 第一版 Config
 
-```go
-type Config struct {
-    Dir string
-
-    // Persisted format hard limits.
-    SegmentSize        int64
-    MaxValueSize       int64
-    MaxBatchBytes      int64
-    MaxBatchMutations  int
-    MaxBatchConditions int
-    MaxOpenBatches     int
-    IDReserveSize      uint64
-    BatchIDReserveSize uint64
-
-    // Runtime memory and scheduling budgets.
-    MappingCacheBytes     int64
-    DeltaSoftLimitBytes   int64
-    DeltaHardLimitBytes   int64
-    CheckpointMemoryBytes int64
-    StatusRetention       int
-    MaxGroupBytes         int64
-    MaxGroupBatches       int
-    MaxGroupDelay         time.Duration
-    GCBatchBytes          int64
-    GCBatchMutations      int
-    GCMinFreeBytes        int64
-    GCBytesPerSecond      int64
-    WriteStopFreeBytes    int64
-    DiskSpaceCheckInterval time.Duration
-}
-```
+公开配置分为 `CreateConfig{HardLimits, Runtime}` 与 `OpenConfig{Runtime}`。持久化字段使用 `uint64`；
+runtime 包含 RecordLog queue/buffer、Commit group、Mapping/metadata cache、Checkpoint sort、Delta、Status、
+前台空间水位，以及 `GCBatchBytes`、`GCBatchMutations`、`GCMinFreeBytes`、`GCBytesPerSecond`。
 
 第一版默认值：
 
@@ -60,17 +32,18 @@ type Config struct {
 | MappingCacheBytes | 256 MiB |
 | DeltaSoftLimitBytes | 256 MiB |
 | DeltaHardLimitBytes | 512 MiB |
-| CheckpointMemoryBytes | 256 MiB |
+| CheckpointSortBytes | 256 MiB |
+| RecordMetaCacheEntries | 65,536 |
+| MaxSegmentStats | 65,536 |
 | StatusRetention | 65,536 |
-| MaxGroupBytes | 8 MiB |
+| MaxGroupPayload | 64 MiB |
 | MaxGroupBatches | 64 |
-| MaxGroupDelay | 0 |
 | GCBatchBytes | 16 MiB |
 | GCBatchMutations | 4,096 |
-| GCMinFreeBytes | SegmentSize |
+| GCMinFreeBytes | min(SegmentSize, WriteStopFreeBytes) |
 | GCBytesPerSecond | 64 MiB/s |
-| WriteStopFreeBytes | max(2 * SegmentSize, GCMinFreeBytes) |
-| DiskSpaceCheckInterval | 100 ms |
+| WriteStopFreeBytes | 512 MiB |
+| SpaceCheckInterval | 100 ms |
 
 这些是可运行的安全起点，不是性能承诺；基准可以改变后续默认值，但持久化 hard limits 的改变必须遵守 Open 兼容规则。
 
@@ -85,14 +58,14 @@ Create 先填充零值、再验证、最后把 8 个 FormatHardLimits 写入 INI
 - 最大合法 Commit/Relocation Descriptor 可完整放入一个 Segment；
 - count 字段能安全转换为实现使用的 `int` 和分配大小；
 - `0 < DeltaSoftLimitBytes < DeltaHardLimitBytes`；
-- `CheckpointMemoryBytes` 至少容纳一个最大编码 Node、排序块和 Header 批读窗口，但不要求容纳整个 Delta；
+- `CheckpointSortBytes` 必须能覆盖 Delta hard limit 允许形成的最坏 frozen entry 数；
 - `StatusRetention >= MaxOpenBatches`；该预算同时约束近期查询缓存与 Manifest replay cut 后的 terminal Batch 数；
-- `MaxGroupBytes > 0` 并限制多请求 group buffer；若单 Descriptor 更大，则该请求单独成组，不能拒绝一个已由 FormatHardLimits 允许的 Batch；
+- `MaxGroupPayload > 0` 并限制多请求 group buffer；若单 Descriptor 更大，则该请求单独成组，不能拒绝一个已由 HardLimits 允许的 Batch；
 - `GCBatchBytes <= MaxBatchBytes` 且 `GCBatchMutations <= MaxBatchMutations`；
-- `GCMinFreeBytes >= 0`；零值采用一个 Segment 的保留空间，不能用零值关闭预检；
+- `GCMinFreeBytes >= 0`；公开层零值采用不高于写停水位的一个 Segment；内部关闭 space gate 时不执行预检；
 - `GCBytesPerSecond > 0`；零值采用 64 MiB/s；
-- `WriteStopFreeBytes >= GCMinFreeBytes`；零值采用两个 Segment 与 GC 保留线中的较大值；
-- `0 < DiskSpaceCheckInterval <= 1min`；零值采用 100ms，不能关闭或无限延迟前台水位；
+- `WriteStopFreeBytes >= GCMinFreeBytes`；公开层零值采用 512 MiB；
+- `SpaceCheckInterval > 0`；公开层零值采用 100ms；
 - 任何 runtime budget 不能解释为允许绕过持久化 hard limit。
 
 ## 4. Delta 计费
@@ -121,34 +94,26 @@ Checkpoint 在 log barrier **之前**捕获 terminal 完成计数。已计数的
 
 ## 5. Checkpoint 有界构建
 
-`CheckpointMemoryBytes` 是 Builder 私有工作集上限，不包含共享 Node Cache 和已计费 Delta。Builder 必须使用外部/分块排序或有界 run merge，不能假设所有 dirty ID、Header 或 SegmentStats 同时装入内存。
+`CheckpointSortBytes` 是 Builder 的 mutation 排序预算，不包含共享 Node Cache 和已计费 Delta。当前实现要求它能容纳 Delta hard limit 允许形成的最坏 frozen entry 数，并在超限时保留旧 Root/Stats 与 frozen Delta。
 
 Header validation 按 `(SegmentID, offset)` 排序并使用有界窗口；生成的 SegmentStats 可流式 merge。若单个合法操作仍无法在预算内完成，返回明确配置错误并保留旧 Root/Stats/frozen Delta，不能 OOM 或安装部分 checkpoint。
 
 ## 6. Group Commit 与 GC 调度
 
-`MaxGroupBytes` 限制 Append Sequencer 的 pending Frame buffer，并同时作为 Commit
-Coordinator 的 group admission 预算。Put 与随后形成的 Commit Descriptor 可以共存于
-同一物理 append buffer；达到 Frame/byte 上限时 append 层允许提前 write，但不提前 fsync。
-`MaxGroupBatches` 在 append 层作为 pending Frame 数软上限，在 commit 层作为 Batch 数
-上限；单个合法 Frame 或完整 Descriptor 可以超过聚合预算独立执行。Append Sequencer
-不使用主动 delay；`MaxGroupDelay` 只作用于 Commit Coordinator。详见
-[Append Engine](append-engine.md)。
-
-有效 group byte 上限为 `min(MaxGroupBytes, DataAppendCapacity)`，其中后者已经扣除
-Segment Header、Footer 与 terminal SegmentSeal。Descriptor 预算按真实 v1 编码计算：
-每个 mutation 32 bytes，加实际 Part Frame Header 和 DescriptorSeal Frame；不使用逻辑
-Value bytes 或近似的 entry 大小。单个合法请求可以超过 group 预算，但必须由持久化
-HardLimits 保证它自身能完整落入空 Segment。
+`MaxGroupPayload` 与 `MaxGroupBatches` 限制 Commit Coordinator 一次 durable CommitGroup 的
+payload 和 Batch 数。RecordLog 自身再由 `MaxQueuedBytes`、`AppendQueueCapacity`、
+`AppendBufferBytes` 与 `AppendBufferRecords` 约束。实现不主动 sleep 等待更多请求；并发到达与 fsync
+自然形成 batching window。单个合法 Descriptor 可以超过聚合目标独立执行，但仍必须满足持久化
+RecordLog payload 和 Segment 上限。
 
 GC 受 `GCBatchBytes/GCBatchMutations`、`GCBytesPerSecond`、Delta reservation、前台队列优先级和可用磁盘共同限制。每个 durable Relocation Batch 后按本轮累计 copied bytes 对 wall clock 做 Context-aware pacing；已经排队的用户 Commit 优先于下一批 Relocation，已经选中的单个有限 Relocation Batch 不被拆开。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
 
-Data GC 使用两段磁盘 admission。安装 Maintenance Journal 前按 exact live bytes、Relocation Descriptor、两个 rotation Segment 与 `GCMinFreeBytes` 检查 copy 阶段空间；copy 完成后，GC-required Checkpoint barrier 先冻结其实际 Delta layers，再按冻结 entry 数乘以每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment与 `GCMinFreeBytes` 重新检查。第二段失败时 Relocation 已是可恢复的 durable garbage/Delta，但源 Segment 和旧 checkpoint 仍保留，Journal 安全撤销。这样前台 Commit 可以继续运行，又不会把只按源 live 数得到的估计误称为整个 Checkpoint 上界。任一检查低于上界均返回 `ErrInsufficientSpace`。可用空间检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
+Data GC 使用两段磁盘 admission。copy 前按 source 全部物理 bytes、最坏 Relocation Descriptor、两个 rotation Segment 与 `GCMinFreeBytes` 检查空间；该上界对显式指定 Segment 和自动候选路径都成立，不依赖可能继续下降的 live estimate。copy 完成后，GC-required Checkpoint barrier 先冻结其实际 Delta layers，再按冻结 entry 数乘以每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment与 `GCMinFreeBytes` 重新检查。第二段失败时 Relocation 已是可恢复的 durable garbage/Delta，但源 Segment 和旧 checkpoint 仍保留。这样前台 Commit 可以继续运行，又不会把只按源 live 数得到的估计误称为整个 Checkpoint 上界。任一检查低于上界均返回 `ErrInsufficientSpace`。可用空间检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
 
 ## 7. 前台新写停止水位
 
-`WriteStopFreeBytes` 是进程级前台 admission 水位。Begin、ID Allocate 和所有 Create/Upsert/Update 写入在产生新的
-reserve/payload append 前检查可用空间；低于“水位 + 本次保守物理字节估计”时返回
+`WriteStopFreeBytes` 是进程级前台 admission 水位。所有 Create/Put/CompareAndPut 在产生新的
+Put payload append 前检查可用空间；低于“水位 + 本次精确物理 Record 大小”时返回
 `ErrInsufficientSpace`。拒绝不把 Store 标记为 fault/read-only，释放空间后可以重试。
 
 已有 Batch 的 Commit/Abort，以及 Get、Checkpoint、Data/Mapping GC 不受该门禁阻塞。
@@ -156,8 +121,8 @@ reserve/payload append 前检查可用空间；低于“水位 + 本次保守物
 仍可能返回 ENOSPC 并遵守原协议。水位不是磁盘预留，也不能保证所有已打开 Batch 可以
 同时提交，部署方必须按最大并发 Batch/Checkpoint 和外部同文件系统写入量设置余量。
 
-为避免每个 Put 都执行 `statfs`，Guard 在 `DiskSpaceCheckInterval` 内缓存一次观察值，并对
-每个获准的新 payload/reserve 做保守扣减；间隔到期后重新读取文件系统。其他进程写入、
+为避免每个 Put 都执行 `statfs`，Guard 在 `SpaceCheckInterval` 内缓存一次观察值，并对
+每个获准的新 payload 做保守扣减；间隔到期后重新读取文件系统。其他进程写入、
 Commit/Checkpoint/GC 的并发增长仍可能使观察值过时，因此所有底层 ENOSPC 处理保持不变。
 受控 payload/reserve 从 admission 到 append 返回期间持有共享 refresh gate，刷新不会覆盖
 仍在途的保守扣减；不同前台 append 之间仍可并发。
@@ -165,6 +130,8 @@ Commit/Checkpoint/GC 的并发增长仍可能使观察值过时，因此所有�
 
 ## 8. 可观测性与验收
 
-至少导出：active/frozen/reserved Delta charge、soft/hard limit、backpressure waiters/time、Checkpoint working bytes、group batch/bytes/wait/fsync、GC throttled time。
+当前导出 active/frozen/reserved Delta charge、soft/hard limit、group batch/wait/fsync、GC copied/reclaimed、
+GC throttled time、GC space rejection，以及前台空间水位。Checkpoint working bytes 与独立 Delta
+backpressure wait time 仍属于后续可观测性收口。
 
-验收必须覆盖：所有 frozen layer 计费、reservation 取消归还、fsync 后 Publish 不被限额阻塞、Checkpoint 连续失败时内存不越 hard limit、极小/溢出/不相容配置拒绝、Open 的 hard-limit mismatch，以及低水位拒绝新 Put/Begin 但不阻塞已有 Batch Commit/Abort、Get 和 Checkpoint。
+验收必须覆盖：所有 frozen layer 计费、reservation 取消归还、fsync 后 Publish 不被限额阻塞、Checkpoint 连续失败时内存不越 hard limit、极小/溢出/不相容配置拒绝、Open 的 hard-limit mismatch，以及低水位拒绝新 Put 但不阻塞已有 Batch Commit/Abort、Get 和 Checkpoint。

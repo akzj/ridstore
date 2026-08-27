@@ -17,6 +17,8 @@ type Metrics struct {
 	GCNoCandidate                                    uint64
 	GCCopiedBytes, GCReclaimedBytes                  uint64
 	GCRelocated, GCSkipped, GCDurationNanos          uint64
+	GCThrottledNanos, GCSpaceRejections              uint64
+	GCMinFreeBytes                                   uint64
 	BackgroundCheckpointRequested                    uint64
 	BackgroundCheckpointCompleted                    uint64
 	BackgroundCheckpointFailed                       uint64
@@ -30,6 +32,7 @@ type runtimeMetrics struct {
 	gcNoCandidate                           atomic.Uint64
 	gcCopiedBytes, gcReclaimedBytes         atomic.Uint64
 	gcRelocated, gcSkipped, gcDurationNanos atomic.Uint64
+	gcThrottledNanos, gcSpaceRejections     atomic.Uint64
 	backgroundCheckpointRequested           atomic.Uint64
 	backgroundCheckpointCompleted           atomic.Uint64
 	backgroundCheckpointFailed              atomic.Uint64
@@ -49,7 +52,8 @@ func (s *Store) Metrics() Metrics {
 		GCNoCandidate: s.metrics.gcNoCandidate.Load(),
 		GCCopiedBytes: s.metrics.gcCopiedBytes.Load(), GCReclaimedBytes: s.metrics.gcReclaimedBytes.Load(),
 		GCRelocated: s.metrics.gcRelocated.Load(), GCSkipped: s.metrics.gcSkipped.Load(),
-		GCDurationNanos:               s.metrics.gcDurationNanos.Load(),
+		GCDurationNanos: s.metrics.gcDurationNanos.Load(), GCThrottledNanos: s.metrics.gcThrottledNanos.Load(),
+		GCSpaceRejections: s.metrics.gcSpaceRejections.Load(), GCMinFreeBytes: s.gcMinFreeBytes,
 		BackgroundCheckpointRequested: s.metrics.backgroundCheckpointRequested.Load(),
 		BackgroundCheckpointCompleted: s.metrics.backgroundCheckpointCompleted.Load(),
 		BackgroundCheckpointFailed:    s.metrics.backgroundCheckpointFailed.Load(),

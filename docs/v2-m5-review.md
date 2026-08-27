@@ -1,6 +1,6 @@
 # ridstore v2 M5 Review
 
-状态：Data GC 主路径与 durable fault/crash matrix 已闭合；候选策略和长期收敛测试待实现
+状态：Data GC 主路径、候选策略、空间 admission 与 durable fault/crash matrix 已闭合；长期收敛测试进行中
 
 ## 1. 本阶段解决的问题
 
@@ -101,9 +101,8 @@ Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺
 
 ## 6. M5 剩余范围
 
-当前缺口不再是“能否安全删除一个已指定 Segment”，而是 GC 策略和长期收敛：
+当前缺口不再是“能否安全删除一个已指定 Segment”，而是长期并发与收敛证据：
 
-- ENOSPC 下 relocation/Checkpoint 的空间预算与退避；
 - relocation 与前台更新交错的模型测试；
 - 重复 GC、重启和空间回收的长时 convergence soak。
 
@@ -120,3 +119,12 @@ Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺
 
 候选结果明确携带 Catalog generation 和 StatsCoveredCommitSeq，但只是调度提示。执行阶段仍重新 relocation、
 Checkpoint 和 exact proof；没有把统计结果升级为删除令牌。
+
+### 6.2 已完成的资源门禁
+
+- relocation batch 同时受 runtime bytes/mutations、持久化 Batch 上限和 descriptor 上限约束；
+- copy 前保守预算 source、descriptor 与 rotation 空间；
+- relocation 后按实际 frozen Delta entry 上界预算最坏八层 Dense Mapping COW；
+- 第二阶段空间不足不会退休 source，也不会撤销已经 durable 的 relocation；
+- 每个 durable relocation batch 后按累计 copied physical bytes 限速，等待支持 context 取消；
+- 导出 GC throttled time 与 space rejection 计数。

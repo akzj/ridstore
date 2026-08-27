@@ -42,13 +42,20 @@ func newSpaceGate(root string, minimum uint64, interval time.Duration, available
 }
 
 func (g *spaceGate) reserve(ctx context.Context, bytes uint64) (*spaceReservation, error) {
+	if g == nil {
+		return nil, base.ErrInvalidConfig
+	}
+	return g.reserveWithMinimum(ctx, bytes, g.minimum, true)
+}
+
+func (g *spaceGate) reserveWithMinimum(ctx context.Context, bytes, minimum uint64, countRejection bool) (*spaceReservation, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if bytes == 0 || g == nil || g.root == "" || g.minimum == 0 || g.interval <= 0 || g.available == nil || g.now == nil {
+	if bytes == 0 || minimum == 0 || g == nil || g.root == "" || g.minimum == 0 || g.interval <= 0 || g.available == nil || g.now == nil {
 		return nil, base.ErrInvalidConfig
 	}
 	g.mu.Lock()
@@ -59,13 +66,15 @@ func (g *spaceGate) reserve(ctx context.Context, bytes uint64) (*spaceReservatio
 			return nil, err
 		}
 	}
-	if !fitsBelow(g.reserved, bytes, g.free, g.minimum) && g.reserved == 0 {
+	if !fitsBelow(g.reserved, bytes, g.free, minimum) && g.reserved == 0 {
 		if err := g.refreshLocked(now); err != nil {
 			return nil, err
 		}
 	}
-	if !fitsBelow(g.reserved, bytes, g.free, g.minimum) {
-		g.rejections++
+	if !fitsBelow(g.reserved, bytes, g.free, minimum) {
+		if countRejection {
+			g.rejections++
+		}
 		return nil, base.ErrInsufficientSpace
 	}
 	g.reserved += bytes

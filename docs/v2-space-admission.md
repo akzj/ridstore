@@ -1,6 +1,6 @@
 # ridstore v2 磁盘空间 Admission
 
-状态：Implemented baseline
+状态：Implemented
 
 ## 1. 目标与边界
 
@@ -41,6 +41,13 @@ append 失败会立即使样本失效；此时即使仍有 outstanding reservati
 
 - `WriteStopFreeBytes`：用户 Put 完成后必须留下的最小可用字节；公开层默认 512 MiB；
 - `SpaceCheckInterval`：无并发 reservation 时刷新 statfs 样本的最长间隔；默认 100 ms。
+- `GCBatchBytes`：一个 relocation batch 的 Value bytes 上限；默认 16 MiB，并受持久化
+  `MaxBatchBytes` 上限约束。单个合法 Value 可以超过该运行时预算并独占一个 batch。
+- `GCBatchMutations`：一个 relocation batch 的 mutation 上限；默认 4096，并受持久化
+  `MaxBatchMutations` 与 Commit descriptor 上限共同约束。
+- `GCMinFreeBytes`：GC copy 和其后必要 Checkpoint 必须保留的空间；默认不高于
+  `WriteStopFreeBytes` 的一个 Segment。
+- `GCBytesPerSecond`：按本轮累计 copied physical bytes 计算的 relocation 速率；默认 64 MiB/s。
 
 内部 Engine 配置允许 `WriteStopFreeBytes == 0` 关闭该策略，便于纯内存/单元测试；公开 API 的零值会
 应用默认值。
@@ -53,3 +60,20 @@ append 失败会立即使样本失效；此时即使仍有 outstanding reservati
 - 真正的 ENOSPC、short write 或 fsync 失败仍由各 durable writer 按原协议 fail-closed。
 
 因此该机制改善可恢复性和错误时机，但不替代独占 filesystem、quota、容量告警或故障测试。
+
+## 6. GC 两阶段 admission
+
+Data GC 与用户 Put 共用同一个进程内空间 reservation 账本，但使用独立的
+`GCMinFreeBytes` 水位：
+
+1. copy 前按 source 全部物理数据、最坏每 Record 一个 relocation descriptor，以及两个 Segment
+   rotation 余量保守预留；这允许低层 `RelocateSegment` 在没有 fresh stats 时仍保持安全上界；
+2. relocation durable 后、GC-required Checkpoint freeze 后，按 frozen entry 数乘以八层 Dense Mapping
+   Node 上界，再加一个 Mapping Segment 余量重新准入。
+
+第二阶段拒绝时，已复制 Record 与 relocation Delta 保留为可恢复状态，source 仍在 Catalog，调用者可在
+空间恢复后重试。任何 admission 都只是保守信号；真实 write/fsync 错误仍按原 durable 协议处理。
+
+Relocation 每次 durable batch 后根据本轮累计 copied physical bytes 做 context-aware pacing。等待期间不持有
+Coordinator 队列锁，已排队的用户 Commit 可以继续执行；取消只终止后续 GC 工作，不回滚已经 durable
+的 relocation。

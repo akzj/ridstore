@@ -103,7 +103,7 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	if err != nil {
 		return SegmentRetirementProof{}, relocated, err
 	}
-	if err := s.Checkpoint(ctx); err != nil {
+	if err := s.checkpoint(ctx, true); err != nil {
 		return SegmentRetirementProof{}, relocated, err
 	}
 
@@ -151,7 +151,7 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	if err := s.Checkpoint(ctx); err != nil {
+	if err := s.checkpoint(ctx, true); err != nil {
 		return NextSegmentCompactionResult{}, false, fmt.Errorf("checkpoint before candidate selection: %w", err)
 	}
 	manifest := s.catalog.Snapshot()
@@ -207,7 +207,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 	if err != nil {
 		return result, fmt.Errorf("relocate segment %d: %w", source, err)
 	}
-	if err := s.Checkpoint(ctx); err != nil {
+	if err := s.checkpoint(ctx, true); err != nil {
 		return result, fmt.Errorf("checkpoint relocated segment %d: %w", source, err)
 	}
 
@@ -389,10 +389,17 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 	if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source {
 		return SegmentRelocationResult{}, recordlog.ErrSegmentMissing
 	}
+	space, err := s.reserveGCCopy(ctx, manifest, manifest.SealedDataSegments[index])
+	if err != nil {
+		return SegmentRelocationResult{}, err
+	}
+	defer space.complete(false)
 
 	var result SegmentRelocationResult
 	pending := make([]copiedRecord, 0, min(s.limits.MaxBatchMutations, s.maxRelocationMutations))
 	var pendingBytes uint64
+	var pendingPhysical uint64
+	pacer := s.newGCPacer()
 	flush := func() error {
 		if len(pending) == 0 {
 			return nil
@@ -426,12 +433,20 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 		result.LastCommitSeq = published.CommitSeq
 		result.Applied += uint64(published.Applied)
 		result.Skipped += uint64(published.Skipped)
+		waited, err := pacer.pace(ctx, pendingPhysical)
+		if waited > 0 {
+			s.metrics.gcThrottledNanos.Add(uint64(waited))
+		}
+		if err != nil {
+			return err
+		}
 		pending = pending[:0]
 		pendingBytes = 0
+		pendingPhysical = 0
 		return nil
 	}
 
-	err := s.maintenance.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
+	err = s.maintenance.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
 		result.ScannedRecords++
 		typ, err := recordcodec.TypeOf(payload)
 		if err != nil {
@@ -454,8 +469,10 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 		}
 		result.LiveCandidates++
 		valueBytes := uint64(len(put.Value))
+		exceeds := func(limit uint64) bool { return valueBytes > limit || pendingBytes > limit-valueBytes }
 		if len(pending) != 0 && (uint64(len(pending)) == s.limits.MaxBatchMutations ||
-			uint64(len(pending)) == s.maxRelocationMutations || pendingBytes > s.limits.MaxBatchBytes-valueBytes) {
+			uint64(len(pending)) == s.maxRelocationMutations || exceeds(s.limits.MaxBatchBytes) ||
+			exceeds(s.maxRelocationBytes)) {
 			if err := flush(); err != nil {
 				return err
 			}
@@ -470,6 +487,11 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 		}
 		pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: scanned.Addr, newAddr: copied.Addr})
 		pendingBytes += valueBytes
+		physicalCopied := uint64(copied.End.Offset - copied.Addr.Offset())
+		if pendingPhysical > math.MaxUint64-physicalCopied {
+			return base.ErrOverflow
+		}
+		pendingPhysical += physicalCopied
 		result.CopiedRecords++
 		physicalBytes := uint64(scanned.End.Offset - scanned.Addr.Offset())
 		if result.CopiedPhysicalBytes > math.MaxUint64-physicalBytes {
@@ -491,5 +513,6 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID)
 		}
 		return result, err
 	}
+	space.complete(true)
 	return result, nil
 }

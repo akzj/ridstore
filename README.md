@@ -16,6 +16,7 @@ dual-write、旧 CLI 与旧内部模块均已删除。
 - `Get` 返回不可拆解的 `VersionToken`，条件写只比较当前 Mapping 地址；
 - token 绑定持久化 Store identity，同一 Store 重开后仍有效，跨 Store token 被拒绝；
 - GC relocation 可能让旧 token 安全冲突，但不会改变 Value；
+- Data GC 具有独立 batch、空间 admission 和复制速率预算，空间不足不会越过 source 退休门禁；
 - 不提供业务 Revision、MVCC、Snapshot、KV 排序、RPC、复制或分布式能力。
 
 最小使用方式：

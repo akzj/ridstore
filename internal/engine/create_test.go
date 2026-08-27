@@ -164,6 +164,27 @@ func TestCreateRejectsCommitPayloadOutsidePersistentBounds(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsGCConfigOutsidePersistentBounds(t *testing.T) {
+	for _, mutate := range []func(*CreateConfig){
+		func(config *CreateConfig) { config.Runtime.GCBatchBytes = config.HardLimits.MaxBatchBytes + 1 },
+		func(config *CreateConfig) { config.Runtime.GCBatchMutations = config.HardLimits.MaxBatchMutations + 1 },
+		func(config *CreateConfig) {
+			config.Runtime.WriteStopFreeBytes = 100
+			config.Runtime.GCMinFreeBytes = 101
+		},
+	} {
+		root := filepath.Join(t.TempDir(), "store")
+		config := testCreateConfig()
+		mutate(&config)
+		if _, err := Create(context.Background(), root, config); !errors.Is(err, base.ErrInvalidConfig) {
+			t.Fatalf("create err=%v", err)
+		}
+		if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("invalid create changed root err=%v", err)
+		}
+	}
+}
+
 func TestCommitAdvancesCheckpointUnderDeltaHardPressure(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
@@ -524,7 +545,7 @@ func testCreateConfig() CreateConfig {
 			Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
 			MappingCacheBytes: 1 << 20, CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
 			DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
-			StatusRetention: 64,
+			StatusRetention: 64, GCBytesPerSecond: ^uint64(0),
 		},
 	}
 }

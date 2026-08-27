@@ -55,6 +55,21 @@ func TestSpaceGateMetricsRecordCheckFailure(t *testing.T) {
 	}
 }
 
+func TestSpaceGateLetsGCKeepOnlyItsLowerHeadroom(t *testing.T) {
+	gate := newSpaceGate("/store", 100, time.Minute, func(string) (uint64, error) { return 80, nil })
+	if _, err := gate.reserve(context.Background(), 1); !errors.Is(err, base.ErrInsufficientSpace) {
+		t.Fatalf("user reserve err=%v", err)
+	}
+	reservation, err := gate.reserveWithMinimum(context.Background(), 60, 20, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.complete(true)
+	if snapshot := gate.snapshot(); snapshot.available != 20 || snapshot.rejections != 1 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+}
+
 func TestSpaceGateInvalidatesEstimateAfterAppendFailure(t *testing.T) {
 	available := []uint64{200, 150}
 	gate := newSpaceGate("/store", 100, time.Minute, func(string) (uint64, error) {

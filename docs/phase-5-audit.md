@@ -65,7 +65,7 @@ Restore artifact publication 现已覆盖 root/`.payload`/子目录 create，RES
 
 ### 已修复：磁盘耗尽停止水位
 
-当前实现增加 runtime `WriteStopFreeBytes` 与 `DiskSpaceCheckInterval`：Begin、ID Allocate、Put 在产生新的 reserve/payload append 前执行缓存式空间 admission，间隔内按获准物理字节保守扣减，并以共享 refresh gate 覆盖 admission 到 append 返回的窗口；低于水位返回 `ErrInsufficientSpace`，不 fault Store。已有 Batch 的 Commit/Abort、Get、Checkpoint 与 GC 保持可运行，避免保护机制阻塞收敛路径；空间恢复后新写可重试。指标导出最近 available 估计、水位、stopped、拒绝与检查错误。
+当前实现增加 runtime `WriteStopFreeBytes` 与 `SpaceCheckInterval`：Put 在产生新的 payload append 前执行缓存式空间 admission，间隔内按获准物理字节保守扣减，并以共享 refresh gate 覆盖 admission 到 append 返回的窗口；低于水位返回 `ErrInsufficientSpace`，不 fault Store。已有 Batch 的 Commit/Abort、Get 与普通 Checkpoint 保持可运行，避免保护机制阻塞收敛路径；空间恢复后新写可重试。GC 使用同一 reservation 账本和独立较低水位执行 copy/checkpoint 两阶段 admission。
 
 该水位是 admission signal 而非文件系统配额：其他进程以及门禁外的 Commit/Checkpoint/GC 可并发消耗空间，真实 write/fsync 仍可能 ENOSPC。部署层仍必须提供独立文件系统/配额、容量告警和基于最大并发 Batch 的余量；代码不把水位误称为绝对空间保证。
 
@@ -74,9 +74,8 @@ Restore artifact publication 现已覆盖 root/`.payload`/子目录 create，RES
 公开 API 切换到 v2 Engine 时，旧 runtime metrics 实现随 v1 一并删除，但本文与 Metrics 契约仍错误标记为完成。
 当前实现已从 v2 的真实所有者重新建立 bounded snapshot：Coordinator 记录用户 Commit queue/group 与分段耗时，
 Batch 生命周期记录 committed/aborted/unknown，Persistent Mapping 和 space gate 提供即时 gauge，完整 Data GC
-记录物理 copied/reclaimed bytes 与结果计数。根包导出固定 37 个样本（含后台 Checkpoint
-requested/completed/failed 和 Record metadata cache hit/miss/entries/evictions）以及无第三方依赖的 Prometheus adapter；
-不存在的旧 GC throttle/独立 GC space-admission 指标没有被伪造为恒定零值。
+记录物理 copied/reclaimed bytes 与结果计数。根包导出固定 40 个样本（含 GC throttle/space admission、
+后台 Checkpoint requested/completed/failed 和 Record metadata cache hit/miss/entries/evictions）以及无第三方依赖的 Prometheus adapter。
 
 ### P1：长时与对比证据
 

@@ -37,6 +37,10 @@ type OpenConfig struct {
 	StatusRetention        uint64
 	WriteStopFreeBytes     uint64
 	SpaceCheckInterval     time.Duration
+	GCBatchBytes           uint64
+	GCBatchMutations       uint64
+	GCMinFreeBytes         uint64
+	GCBytesPerSecond       uint64
 }
 
 type CreateConfig struct {
@@ -61,6 +65,7 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 	if err := bootstrap.ValidateHardLimits(config.HardLimits); err != nil {
 		return nil, err
 	}
+	config.Runtime = normalizeGCRuntime(config.Runtime, config.HardLimits)
 	if err := validateRuntimeAgainstHard(config.Runtime, config.HardLimits); err != nil {
 		return nil, err
 	}
@@ -134,6 +139,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return nil, err
 	}
+	config = normalizeGCRuntime(config, manifest.HardLimits)
 	if err := validateRuntimeAgainstHard(config, manifest.HardLimits); err != nil {
 		return nil, base.ErrInvalidConfig
 	}
@@ -243,6 +249,12 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.root = root
 	store.maxStats = config.MaxSegmentStats
 	store.mappingCacheBytes = config.MappingCacheBytes
+	store.maxRelocationBytes = config.GCBatchBytes
+	store.maxRelocationMutations = min(store.maxRelocationMutations, config.GCBatchMutations)
+	store.gcMinFreeBytes = config.GCMinFreeBytes
+	store.gcBytesPerSecond = config.GCBytesPerSecond
+	store.gcNow = time.Now
+	store.gcWait = waitContext
 	store.dirLock = dirLock
 	store.identity = [16]byte(manifest.StoreUUID)
 	store.recordMeta = recordmeta.New(config.RecordMetaCacheEntries)
@@ -260,7 +272,9 @@ func validOpenConfig(config OpenConfig) bool {
 }
 
 func validateRuntimeAgainstHard(config OpenConfig, hard storecatalog.HardLimits) error {
-	if !validOpenConfig(config) || config.StatusRetention < hard.MaxOpenBatches || config.Commit.MaxGroupPayload > hard.MaxRecordLogPayload {
+	if !validOpenConfig(config) || config.StatusRetention < hard.MaxOpenBatches || config.Commit.MaxGroupPayload > hard.MaxRecordLogPayload ||
+		config.GCBatchBytes == 0 || config.GCBatchBytes > hard.MaxBatchBytes || config.GCBatchMutations == 0 ||
+		config.GCBatchMutations > hard.MaxBatchMutations || config.GCBytesPerSecond == 0 || config.GCMinFreeBytes > config.WriteStopFreeBytes {
 		return base.ErrInvalidConfig
 	}
 	descriptor, err := recordcodec.DescriptorSize(hard.MaxBatchMutations)
@@ -268,6 +282,25 @@ func validateRuntimeAgainstHard(config OpenConfig, hard storecatalog.HardLimits)
 		return base.ErrInvalidConfig
 	}
 	return nil
+}
+
+func normalizeGCRuntime(config OpenConfig, hard storecatalog.HardLimits) OpenConfig {
+	const defaultGCBatchBytes = uint64(16 << 20)
+	const defaultGCBatchMutations = uint64(4096)
+	const defaultGCBytesPerSecond = uint64(64 << 20)
+	if config.GCBatchBytes == 0 {
+		config.GCBatchBytes = min(defaultGCBatchBytes, hard.MaxBatchBytes)
+	}
+	if config.GCBatchMutations == 0 {
+		config.GCBatchMutations = min(defaultGCBatchMutations, hard.MaxBatchMutations)
+	}
+	if config.GCMinFreeBytes == 0 && config.WriteStopFreeBytes != 0 {
+		config.GCMinFreeBytes = min(hard.SegmentSize, config.WriteStopFreeBytes)
+	}
+	if config.GCBytesPerSecond == 0 {
+		config.GCBytesPerSecond = defaultGCBytesPerSecond
+	}
+	return config
 }
 
 func persistentConfig(config OpenConfig) mapping.PersistentConfig {

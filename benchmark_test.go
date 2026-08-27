@@ -127,6 +127,7 @@ func openBenchmarkStore(b *testing.B, valueSize int) *Store {
 			CheckpointSortBytes: 64 << 20, MaxSegmentStats: 1 << 16,
 			DeltaSoftLimitBytes: 64 << 20, DeltaHardLimitBytes: 128 << 20,
 			StatusRetention: 1 << 16, WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second,
+			GCBytesPerSecond: ^uint64(0),
 		},
 	}
 	store, err := Create(context.Background(), config)

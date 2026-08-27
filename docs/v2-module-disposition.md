@@ -125,7 +125,8 @@ v2 不再存在：
 - 最小 durable maintenance marker、retire gate、Catalog remove、trash/delete 与 Open 恢复已接入；
 - durable marker/retire 的 syscall fault matrix 与四阶段 process-crash recovery 已闭合；
 - bounded candidate selection 已基于 fresh Checkpoint、ReplayStart、open-Batch refs 和显式阈值接入；
-- 待完成 ENOSPC/backpressure、并发 model test 和 convergence soak。
+- 已完成 GC copy/checkpoint 两阶段空间 admission、运行时 batch 上限和 context-aware pacing；
+- 待完成并发 model test 和 convergence soak。
 
 ### M6：删除旧系统
 

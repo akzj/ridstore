@@ -183,6 +183,10 @@ Replay 仍验证其 CommitSeq、Descriptor 和 mutation，只是不为它生成�
 零值使用 65,536。该配置不持久化，可在每次 Open 时更换；缓存 miss 不改变 API 结果或
 任何恢复/GC 决策。
 
+Data GC 的运行时资源由 `GCBatchBytes`、`GCBatchMutations`、`GCMinFreeBytes` 与
+`GCBytesPerSecond` 约束。它们可以在每次 Open 时调整，但不能超过持久化 Batch 上限，也不能改变
+relocation CAS、Checkpoint coverage 或 source retirement proof。
+
 ## 12. 离线 Verify
 
 根包公开 `Verify(ctx, VerifyConfig)`。它必须在 Store 关闭时取得同一目录独占锁，并按

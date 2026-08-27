@@ -9,10 +9,11 @@ func TestAppendMetricSamplesMapsEveryFieldInStableOrder(t *testing.T) {
 		DeltaChargedBytes: 12, DeltaReservedBytes: 13, DeltaSoftLimitBytes: 14, DeltaHardLimitBytes: 15,
 		MappingCacheBytes: 16, GCStarted: 17, GCCompleted: 18, GCFailed: 19, GCNoCandidate: 20,
 		GCCopiedBytes: 21, GCReclaimedBytes: 22, GCRelocated: 23, GCSkipped: 24, GCDurationNanos: 25,
-		DiskAvailableEstimateBytes: 26, WriteStopFreeBytes: 27, WriteStopped: 28,
-		WriteStopRejections: 29, DiskSpaceCheckErrors: 30,
-		BackgroundCheckpointRequested: 31, BackgroundCheckpointCompleted: 32, BackgroundCheckpointFailed: 33,
-		RecordMetaCacheHits: 34, RecordMetaCacheMisses: 35, RecordMetaCacheEntries: 36, RecordMetaCacheEvictions: 37,
+		GCThrottledNanos: 26, GCSpaceRejections: 27, GCMinFreeBytes: 28,
+		DiskAvailableEstimateBytes: 29, WriteStopFreeBytes: 30, WriteStopped: 31,
+		WriteStopRejections: 32, DiskSpaceCheckErrors: 33,
+		BackgroundCheckpointRequested: 34, BackgroundCheckpointCompleted: 35, BackgroundCheckpointFailed: 36,
+		RecordMetaCacheHits: 37, RecordMetaCacheMisses: 38, RecordMetaCacheEntries: 39, RecordMetaCacheEvictions: 40,
 	}
 	buffer := make([]MetricSample, 0, MetricSampleCount)
 	samples := metrics.AppendMetricSamples(buffer)

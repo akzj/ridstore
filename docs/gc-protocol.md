@@ -279,11 +279,11 @@ score = reclaimableBytes / (copyBytes + fixedCost)
 - GC 带宽/并发限制；
 - trash 最大停留时间告警。
 
-内核以 `WriteStopFreeBytes` 承接“新写停止水位”：Begin、ID Allocate 和 Put 会在新
-reserve/payload append 前执行缓存式空间 admission；已有 Batch 的 Commit/Abort、读取、
-Checkpoint 与 GC 保持可运行，以免水位门禁阻塞自身的收敛路径。该检查不预留文件系统
-空间，不能替代所有 write/fsync 的 ENOSPC 传播，也不能替代部署层独立文件系统、容量
-告警和外部写入隔离。
+内核以 `WriteStopFreeBytes` 承接“新写停止水位”：Put 在 payload append 前执行缓存式空间
+admission；已有 Batch 的 Commit/Abort、读取和普通 Checkpoint 保持可运行。Data GC 与前台 Put
+共用同一个进程内 reservation 账本，但使用独立的 `GCMinFreeBytes` 水位执行 copy/checkpoint
+两阶段准入。该检查不能替代所有 write/fsync 的 ENOSPC 传播，也不能替代部署层独立文件系统、
+容量告警和外部写入隔离。
 
 当可用空间不足以同时保存 live copy 和旧 Segment 时，不能开始无法完成的 GC。返回明确 `ENOSPC`/资源错误并保持旧数据可读。
 

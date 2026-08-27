@@ -18,6 +18,8 @@ type Metrics struct {
 	GCNoCandidate                                    uint64
 	GCCopiedBytes, GCReclaimedBytes                  uint64
 	GCRelocated, GCSkipped, GCDurationNanos          uint64
+	GCThrottledNanos, GCSpaceRejections              uint64
+	GCMinFreeBytes                                   uint64
 	BackgroundCheckpointRequested                    uint64
 	BackgroundCheckpointCompleted                    uint64
 	BackgroundCheckpointFailed                       uint64
@@ -32,7 +34,7 @@ const (
 	MetricGauge
 )
 
-const MetricSampleCount = 37
+const MetricSampleCount = 40
 
 type MetricSample struct {
 	Name  string
@@ -67,6 +69,9 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_gc_relocated_records_total", MetricCounter, m.GCRelocated},
 		MetricSample{"ridstore_gc_skipped_records_total", MetricCounter, m.GCSkipped},
 		MetricSample{"ridstore_gc_duration_nanoseconds_total", MetricCounter, m.GCDurationNanos},
+		MetricSample{"ridstore_gc_throttled_nanoseconds_total", MetricCounter, m.GCThrottledNanos},
+		MetricSample{"ridstore_gc_space_rejections_total", MetricCounter, m.GCSpaceRejections},
+		MetricSample{"ridstore_gc_min_free_bytes", MetricGauge, m.GCMinFreeBytes},
 		MetricSample{"ridstore_disk_available_estimate_bytes", MetricGauge, m.DiskAvailableEstimateBytes},
 		MetricSample{"ridstore_write_stop_free_bytes", MetricGauge, m.WriteStopFreeBytes},
 		MetricSample{"ridstore_write_stopped", MetricGauge, m.WriteStopped},

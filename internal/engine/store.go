@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/coordinator"
@@ -112,7 +113,12 @@ type Store struct {
 	fault                  error
 	maxStats               uint64
 	mappingCacheBytes      uint64
+	maxRelocationBytes     uint64
 	maxRelocationMutations uint64
+	gcMinFreeBytes         uint64
+	gcBytesPerSecond       uint64
+	gcNow                  func() time.Time
+	gcWait                 func(context.Context, time.Duration) error
 	dirLock                *filelock.Lock
 	identity               [16]byte
 	space                  *spaceGate
@@ -147,6 +153,7 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 		log: log, mapping: current, ids: ids, batches: batches, commits: commits,
 		limits: config.Batch, userAppender: log, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
 		statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
+		maxRelocationBytes:     config.Batch.MaxBatchBytes,
 		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
 	}, nil
 }
@@ -345,6 +352,10 @@ func (s *Store) Close() error {
 // Checkpoint installs one atomic Mapping, replay-cut, allocator, open-batch,
 // and exact sealed-segment statistics generation.
 func (s *Store) Checkpoint(ctx context.Context) error {
+	return s.checkpoint(ctx, false)
+}
+
+func (s *Store) checkpoint(ctx context.Context, gcAdmission bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -357,7 +368,23 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return s.finishCheckpoint(ctx, work)
+	var reservation *spaceReservation
+	if gcAdmission {
+		entries, err := work.frozen.EntryUpperBound()
+		if err != nil {
+			return errors.Join(err, s.mapping.AbortCheckpoint(work.frozen))
+		}
+		reservation, err = s.reserveGCCheckpoint(ctx, s.catalog.Snapshot(), entries)
+		if err != nil {
+			return errors.Join(err, s.mapping.AbortCheckpoint(work.frozen))
+		}
+		defer reservation.complete(false)
+	}
+	err = s.finishCheckpoint(ctx, work)
+	if err == nil && reservation != nil {
+		reservation.complete(true)
+	}
+	return err
 }
 
 type checkpointWork struct {

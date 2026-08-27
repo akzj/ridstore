@@ -264,6 +264,22 @@ func (c *FrozenCheckpoint) CoveredCommitSeq() model.CommitSeq {
 	return c.covered
 }
 
+// EntryUpperBound returns the number of frozen Delta entries before duplicate
+// IDs are folded. It is a conservative input for checkpoint disk admission.
+func (c *FrozenCheckpoint) EntryUpperBound() (uint64, error) {
+	if c == nil || c.owner == nil {
+		return 0, ErrInvalid
+	}
+	var total uint64
+	for _, layer := range c.layers {
+		if uint64(len(layer.values)) > math.MaxUint64-total {
+			return 0, ErrBudget
+		}
+		total += uint64(len(layer.values))
+	}
+	return total, nil
+}
+
 type CheckpointCandidate struct {
 	checkpoint *FrozenCheckpoint
 	tree       *radix.Tree

@@ -50,6 +50,15 @@ type RuntimeConfig struct {
 	// and GC after new user Put records have been stopped.
 	WriteStopFreeBytes uint64
 	SpaceCheckInterval time.Duration
+	// GCBatchBytes bounds copied Value bytes and GCBatchMutations bounds changes
+	// in one relocation publication. A single legal value may exceed the
+	// runtime byte budget and is relocated alone.
+	GCBatchBytes     uint64
+	GCBatchMutations uint64
+	// GCMinFreeBytes is the filesystem headroom retained while GC copies data
+	// and builds its required checkpoint. GCBytesPerSecond bounds copy rate.
+	GCMinFreeBytes   uint64
+	GCBytesPerSecond uint64
 }
 
 type CreateConfig struct {
@@ -163,5 +172,7 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 		MaxSegmentStats: c.MaxSegmentStats, DeltaSoftLimitBytes: c.DeltaSoftLimitBytes,
 		DeltaHardLimitBytes: c.DeltaHardLimitBytes, StatusRetention: c.StatusRetention,
 		WriteStopFreeBytes: c.WriteStopFreeBytes, SpaceCheckInterval: c.SpaceCheckInterval,
+		GCBatchBytes: c.GCBatchBytes, GCBatchMutations: c.GCBatchMutations,
+		GCMinFreeBytes: c.GCMinFreeBytes, GCBytesPerSecond: c.GCBytesPerSecond,
 	}
 }
