@@ -370,6 +370,64 @@ func TestCheckpointExcludesCommittedBatchWhoseCallerHasNotFinished(t *testing.T)
 	}
 }
 
+func TestCheckpointSupportsDataRotationAfterCut(t *testing.T) {
+	root, config := prepareCheckpointStore(t)
+	config.CheckpointSortBytes = 1 << 20
+	config.DeltaSoftLimitBytes = 512 << 10
+	config.DeltaHardLimitBytes = 1 << 20
+	config.StatusRetention = 2048
+	store, err := Open(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.stopBackgroundCheckpoint()
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(context.Background(), []byte("covered before checkpoint cut")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	store.ops.Lock()
+	work, err := store.prepareCheckpointLocked(context.Background())
+	store.ops.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := store.catalog.Snapshot()
+	for index := 0; index < 2048 && store.catalog.Snapshot().ActiveDataSegmentID == work.cut.ReplayStart.SegmentID; index++ {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Create(context.Background(), make([]byte, 1024)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rotated := store.catalog.Snapshot()
+	if rotated.ActiveDataSegmentID == work.cut.ReplayStart.SegmentID {
+		t.Fatal("record log did not rotate after checkpoint cut")
+	}
+	if err := store.finishCheckpoint(context.Background(), work); err != nil {
+		t.Fatal(err)
+	}
+	after := store.catalog.Snapshot()
+	if after.Generation != rotated.Generation+1 || after.MappingRoot == before.MappingRoot || after.CoveredCommitSeq != work.cut.CoveredCommitSeq ||
+		after.ReplayStart != work.cut.ReplayStart || after.ActiveDataSegmentID != rotated.ActiveDataSegmentID {
+		t.Fatalf("checkpoint did not publish across data rotation: before=%+v rotated=%+v after=%+v", before, rotated, after)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func prepareCheckpointStore(t *testing.T) (string, OpenConfig) {
 	t.Helper()
 	root := t.TempDir()
