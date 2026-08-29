@@ -467,6 +467,16 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		return abort(err)
 	}
 	manifest := s.catalog.Snapshot()
+	if manifest.MappingRoot != candidate.BaseRoot() || manifest.CoveredCommitSeq != candidate.BaseCoveredCommitSeq() {
+		err := errors.Join(base.ErrCorrupt, errors.New("checkpoint Mapping base differs from Manifest"))
+		s.setFault(err)
+		return abort(err)
+	}
+	mappingEntries, err := candidate.EntryCount(manifest.MappingEntryCount)
+	if err != nil {
+		s.setFault(err)
+		return abort(err)
+	}
 	files := segmentstats.FileSet{
 		Active: manifest.ActiveDataSegmentID, Sealed: manifest.SealedDataSegments,
 	}
@@ -488,7 +498,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		return abort(err)
 	}
 	_, err = s.catalog.InstallCheckpoint(manifest.Generation, storecatalog.Checkpoint{
-		MappingRoot: candidate.Root(), CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
+		MappingRoot: candidate.Root(), MappingEntryCount: mappingEntries, CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
 		ReservedIDHigh: work.reservedIDHigh, ReservedBatchIDHigh: work.reservedBatchIDHigh, IssuedBatchIDHighAtCut: work.issuedBatchIDHigh,
 		OpenBatchIDsAtCut: work.open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,
 	})

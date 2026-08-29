@@ -13,6 +13,13 @@ type Mutation struct {
 	Addr recordlog.VAddr // zero deletes the ID
 }
 
+// EntryDelta describes the logical cardinality change produced by a build.
+// Replacements and relocations do not change either counter.
+type EntryDelta struct {
+	Added   uint64
+	Removed uint64
+}
+
 type childChange struct {
 	prefix uint64
 	addr   model.MapAddr
@@ -30,19 +37,29 @@ func (t *Tree) Build(covered model.CommitSeq, mutations []Mutation) (*Tree, erro
 // It does not retain or copy the input. Parent changes are folded through a
 // fixed-depth pipeline, so auxiliary memory does not grow with mutation count.
 func (t *Tree) BuildSorted(covered model.CommitSeq, ordered []Mutation) (*Tree, error) {
+	tree, _, err := t.BuildSortedWithEntryDelta(covered, ordered)
+	return tree, err
+}
+
+// BuildSortedWithEntryDelta applies one checkpoint cut and reports its exact
+// logical cardinality change. Counting is folded into the leaf update that
+// already reads the old slots, so it performs no additional node reads.
+func (t *Tree) BuildSortedWithEntryDelta(covered model.CommitSeq, ordered []Mutation) (*Tree, EntryDelta, error) {
 	if t.writer == nil || covered < t.covered || (len(ordered) != 0 && covered <= t.covered) {
-		return nil, ErrInvalid
+		return nil, EntryDelta{}, ErrInvalid
 	}
 	for index, mutation := range ordered {
 		if mutation.ID == 0 || (mutation.Addr != 0 && !mutation.Addr.Valid()) || (index != 0 && mutation.ID <= ordered[index-1].ID) {
-			return nil, ErrInvalid
+			return nil, EntryDelta{}, ErrInvalid
 		}
 	}
 	if len(ordered) == 0 {
-		return Open(t.writer, t.root, covered, t.cache.capacity)
+		tree, err := Open(t.writer, t.root, covered, t.cache.capacity)
+		return tree, EntryDelta{}, err
 	}
 
 	builder := streamingBuilder{tree: t, covered: covered, root: t.root}
+	var delta EntryDelta
 	for start := 0; start < len(ordered); {
 		prefix := nodePrefix(ordered[start].ID, 0)
 		end := start + 1
@@ -51,33 +68,41 @@ func (t *Tree) BuildSorted(covered model.CommitSeq, ordered []Mutation) (*Tree, 
 		}
 		oldAddr, err := t.nodeAddress(0, prefix)
 		if err != nil {
-			return nil, err
+			return nil, EntryDelta{}, err
 		}
 		slots, err := t.oldSlots(oldAddr, 0, prefix)
 		if err != nil {
-			return nil, err
+			return nil, EntryDelta{}, err
 		}
 		before := slots
 		for _, mutation := range ordered[start:end] {
-			slots[nodeSlot(mutation.ID, 0)] = uint64(mutation.Addr)
+			slot := nodeSlot(mutation.ID, 0)
+			oldExists, newExists := slots[slot] != 0, mutation.Addr != 0
+			if !oldExists && newExists {
+				delta.Added++
+			} else if oldExists && !newExists {
+				delta.Removed++
+			}
+			slots[slot] = uint64(mutation.Addr)
 		}
 		newAddr, err := t.writeChangedNode(0, prefix, covered, before, slots, oldAddr)
 		if err != nil {
-			return nil, err
+			return nil, EntryDelta{}, err
 		}
 		if newAddr != oldAddr {
 			if err := builder.push(0, childChange{prefix: prefix, addr: newAddr}); err != nil {
-				return nil, err
+				return nil, EntryDelta{}, err
 			}
 		}
 		start = end
 	}
 	for level := uint8(1); level <= mapstore.MaxLevel; level++ {
 		if err := builder.flush(level); err != nil {
-			return nil, err
+			return nil, EntryDelta{}, err
 		}
 	}
-	return Open(t.writer, builder.root, covered, t.cache.capacity)
+	tree, err := Open(t.writer, builder.root, covered, t.cache.capacity)
+	return tree, delta, err
 }
 
 type nodeAccumulator struct {

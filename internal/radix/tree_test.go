@@ -271,6 +271,36 @@ func TestBuildSortedStreamsAcrossDistantPrefixes(t *testing.T) {
 	}
 }
 
+func TestBuildSortedReportsExactEntryDeltaWithoutExtraWalk(t *testing.T) {
+	store := newMemoryNodeStore()
+	tree, _ := Open(store, 0, 0, 1<<20)
+	a := testDataAddr(t, 1, 64)
+	b := testDataAddr(t, 1, 128)
+	c := testDataAddr(t, 2, 64)
+	var delta EntryDelta
+	var err error
+	tree, delta, err = tree.BuildSortedWithEntryDelta(1, []Mutation{{ID: 1, Addr: a}, {ID: 2, Addr: b}})
+	if err != nil || delta != (EntryDelta{Added: 2}) {
+		t.Fatalf("first delta=%+v err=%v", delta, err)
+	}
+	tree, delta, err = tree.BuildSortedWithEntryDelta(2, []Mutation{
+		{ID: 1, Addr: c}, // replacement
+		{ID: 2},          // deletion
+		{ID: 3, Addr: a}, // creation
+		{ID: 4},          // absent deletion
+	})
+	if err != nil || delta != (EntryDelta{Added: 1, Removed: 1}) {
+		t.Fatalf("second delta=%+v err=%v", delta, err)
+	}
+	seen := 0
+	if err := tree.Walk(context.Background(), func(model.ID, recordlog.VAddr) error {
+		seen++
+		return nil
+	}); err != nil || seen != 2 {
+		t.Fatalf("seen=%d err=%v", seen, err)
+	}
+}
+
 func TestOpenRequiresCacheCapacityForPinnedRoot(t *testing.T) {
 	store := newMemoryNodeStore()
 	tree, _ := Open(store, 0, 0, 1<<20)

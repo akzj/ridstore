@@ -17,6 +17,7 @@ func TestManagerDrivesMapStoreRotation(t *testing.T) {
 	manifest.NextMapSegmentID = 2
 	manifest.SealedMapSegments = nil
 	manifest.MappingRoot = 0
+	manifest.MappingEntryCount = 0
 	manifest.HardLimits.SegmentSize = 8192
 	manifest.HardLimits.MaxValueSize = 64
 	manifest.HardLimits.MaxBatchBytes = 4096
@@ -85,7 +86,7 @@ func TestManagerInstallsTypedUpdates(t *testing.T) {
 
 	rootAddr, _ := model.NewMapAddr(2, 128)
 	checkpoint, err := manager.InstallCheckpoint(2, Checkpoint{
-		MappingRoot: rootAddr, CoveredCommitSeq: 4, ReplayStart: rotated.ReplayStart,
+		MappingRoot: rootAddr, MappingEntryCount: 1, CoveredCommitSeq: 4, ReplayStart: rotated.ReplayStart,
 		ReservedIDHigh: 200, ReservedBatchIDHigh: 200, IssuedBatchIDHighAtCut: 100,
 		OpenBatchIDsAtCut: []model.BatchID{9}, StatsCoveredCommitSeq: 4,
 		SegmentStats: []SegmentStats{{SegmentID: 1}, {SegmentID: 2, LiveBytes: 64, LiveRecords: 1}},
@@ -224,7 +225,7 @@ func TestManagerImplementsRecordLogCatalogPort(t *testing.T) {
 	}
 	rootAddr, _ := model.NewMapAddr(2, 128)
 	checkpoint, err := manager.InstallCheckpoint(2, Checkpoint{
-		MappingRoot: rootAddr, CoveredCommitSeq: 1, ReplayStart: initial.ReplayStart,
+		MappingRoot: rootAddr, MappingEntryCount: 1, CoveredCommitSeq: 1, ReplayStart: initial.ReplayStart,
 		ReservedIDHigh: 100, ReservedBatchIDHigh: 100, IssuedBatchIDHighAtCut: 50,
 		OpenBatchIDsAtCut: []model.BatchID{2, 7}, StatsCoveredCommitSeq: 1,
 		SegmentStats: []SegmentStats{{SegmentID: 1}, {SegmentID: 2}},

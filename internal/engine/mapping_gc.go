@@ -16,8 +16,8 @@ import (
 )
 
 // CompactMapping rewrites the current logical Mapping into a fresh physical
-// generation. It intentionally holds the full maintenance lock chain through
-// checkpoint, publication, runtime switch, and old-reader close.
+// generation. The immutable checkpoint Root is rebuilt without blocking data
+// operations; ops.Lock is held only to capture the cut and to publish/switch.
 func (s *Store) CompactMapping(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -30,19 +30,18 @@ func (s *Store) CompactMapping(ctx context.Context) error {
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
 	s.ops.Lock()
-	defer s.ops.Unlock()
-
 	work, err := s.prepareCheckpointLocked(ctx)
+	s.ops.Unlock()
 	if err != nil {
 		return err
 	}
 	if err := s.finishCheckpoint(ctx, work); err != nil {
 		return err
 	}
-	return s.compactCheckpointMappingLocked(ctx)
+	return s.compactCheckpointMapping(ctx)
 }
 
-func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
+func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -63,7 +62,14 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 	}
 
 	manifest := s.catalog.Snapshot()
-	space, err := s.reserveMappingGC(ctx, manifest)
+	view, err := s.mapping.CheckpointView()
+	if err != nil {
+		return err
+	}
+	if view.Root() != manifest.MappingRoot || view.Covered() != manifest.CoveredCommitSeq {
+		return base.ErrCorrupt
+	}
+	space, err := s.reserveMappingGC(ctx, manifest, manifest.MappingEntryCount)
 	if err != nil {
 		return err
 	}
@@ -88,11 +94,17 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 		return cleanupWriter(err)
 	}
 	var oldCount uint64
-	if err := s.mapping.WalkCheckpoint(ctx, func(id model.ID, addr recordlog.VAddr) error {
+	if err := view.Walk(ctx, func(id model.ID, addr recordlog.VAddr) error {
+		if oldCount == ^uint64(0) {
+			return base.ErrOverflow
+		}
 		oldCount++
 		return builder.Add(id, addr)
 	}); err != nil {
 		return cleanupWriter(err)
+	}
+	if oldCount != manifest.MappingEntryCount {
+		return cleanupWriter(base.ErrCorrupt)
 	}
 	newTree, err := builder.Finish()
 	if err != nil {
@@ -104,7 +116,7 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 	}
 	var newCount uint64
 	if err := newTree.Walk(ctx, func(id model.ID, addr recordlog.VAddr) error {
-		oldAddr, exists, lookupErr := s.mapping.Lookup(id)
+		oldAddr, exists, lookupErr := view.Lookup(id)
 		if lookupErr != nil {
 			return lookupErr
 		}
@@ -123,10 +135,29 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
 	}
 
+	// Stop new submissions and drain every commit admitted before the lock.
+	// Newer commits remain in the active Mapping Delta and are preserved when
+	// the physically equivalent checkpoint Root is switched below.
+	s.ops.Lock()
+	opsLocked := true
+	defer func() {
+		if opsLocked {
+			s.ops.Unlock()
+		}
+	}()
+	if _, err := s.commits.CheckpointCut(ctx); err != nil {
+		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
+	}
+	latest := s.catalog.Snapshot()
+	oldSet := mappingGCFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot)
+	if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
+		!manifestMatchesMappingSet(latest, oldSet) {
+		return s.mappingGCPrepublishFailure(base.ErrCorrupt, discardMappingGCStaging(s.root))
+	}
 	state := mapgcstate.State{
-		StoreID: [16]byte(manifest.StoreUUID), BaseGeneration: manifest.Generation,
-		SegmentSize: uint32(manifest.HardLimits.SegmentSize), Covered: manifest.CoveredCommitSeq,
-		Old: mappingGCFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot),
+		StoreID: [16]byte(latest.StoreUUID), BaseGeneration: latest.Generation,
+		SegmentSize: uint32(latest.HardLimits.SegmentSize), Covered: latest.CoveredCommitSeq,
+		Old: oldSet,
 		New: mapgcstate.FileSet{Sealed: generation.SealedSegments, Active: generation.ActiveSegment, Next: generation.NextSegment, Root: generation.Root},
 	}
 	if err := mapgcstate.Install(s.root, state, s.mappingGCHook); err != nil {
@@ -146,7 +177,7 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 	if err := mapstore.PromoteGeneration(s.root, staging, generation, s.mapStoreHook); err != nil {
 		return rollback(err)
 	}
-	installed, err := s.catalog.InstallMappingRewrite(manifest.Generation, storecatalog.MappingRewrite{
+	installed, err := s.catalog.InstallMappingRewrite(latest.Generation, storecatalog.MappingRewrite{
 		SealedSegments: mappingGCSummaries(generation.SealedSegments), ActiveSegment: generation.ActiveSegment,
 		NextSegment: generation.NextSegment, Root: generation.Root, Covered: generation.Covered,
 	})
@@ -161,15 +192,12 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 		return errors.Join(base.ErrReadOnly, err)
 	}
 	newRoot, err := radix.Open(newStore, installed.MappingRoot, installed.CoveredCommitSeq, s.mappingCacheBytes)
-	if err == nil {
-		err = newRoot.Walk(ctx, func(model.ID, recordlog.VAddr) error { return nil })
-	}
 	if err != nil {
 		_ = newStore.Close()
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	if err := s.mapping.ReplaceCheckpointRoot(newRoot, newStore); err != nil {
+	if err := s.mapping.ReplaceCheckpointRoot(view, newRoot, newStore); err != nil {
 		_ = newStore.Close()
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
@@ -180,6 +208,8 @@ func (s *Store) compactCheckpointMappingLocked(ctx context.Context) error {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
+	s.ops.Unlock()
+	opsLocked = false
 	if err := mapstore.RetireGeneration(s.root, generationFromState(state.Old, state.Covered), installed.Generation, s.mapStoreHook); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)

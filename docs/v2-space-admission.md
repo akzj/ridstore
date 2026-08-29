@@ -78,7 +78,7 @@ Data GC 与用户 Put 共用同一个进程内空间 reservation 账本，但使
 第二阶段拒绝时，已复制 Record 与 relocation Delta 保留为可恢复状态，source 仍在 Catalog，调用者可在
 空间恢复后重试。任何 admission 都只是保守信号；真实 write/fsync 错误仍按原 durable 协议处理。
 
-Mapping GC 在创建 staging/marker 前单独 admission。精确 live-record 数来自刚安装的 Checkpoint；
+Mapping GC 在创建 staging/marker 前单独 admission。精确 entry count 与 Mapping Root 由刚安装的 Checkpoint 原子持久化；
 上界按每条记录最多八层 Dense Node，再按每个输出 Mapping Segment 的完整 `SegmentSize` 计费。
 拒绝时旧 Mapping generation 保持唯一可见，且不留下恢复 artifact。它与 Data GC 共用进程内
 reservation 账本，但不受 `GCBytesPerSecond` 控制。

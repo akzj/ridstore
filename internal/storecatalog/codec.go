@@ -31,6 +31,7 @@ const (
 	tlvCheckpoint
 	tlvOpenBatches
 	tlvSegmentStats
+	tlvMappingEntries
 	tlvCount
 )
 
@@ -69,6 +70,7 @@ func Encode(m Manifest) ([]byte, error) {
 		{tlvCheckpoint, encodeCheckpoint(m)},
 		{tlvOpenBatches, encodeBatchIDs(m.OpenBatchIDsAtCut)},
 		{tlvSegmentStats, encodeStats(m.StatsCoveredCommitSeq, m.SegmentStats)},
+		{tlvMappingEntries, encodeUint64(m.MappingEntryCount)},
 	}
 	payloadSize := 0
 	for _, item := range items {
@@ -101,7 +103,7 @@ func Encode(m Manifest) ([]byte, error) {
 
 func Decode(src []byte) (Manifest, error) {
 	if len(src) >= containerHeaderSize && string(src[:8]) == string(manifestMagic[:]) &&
-		(binary.LittleEndian.Uint16(src[8:10]) != FormatMajor || binary.LittleEndian.Uint16(src[10:12]) > FormatMinor) {
+		(binary.LittleEndian.Uint16(src[8:10]) != FormatMajor || binary.LittleEndian.Uint16(src[10:12]) != FormatMinor) {
 		return Manifest{}, ErrUnsupported
 	}
 	header, err := InspectHeader(src)
@@ -150,6 +152,10 @@ func Decode(src []byte) (Manifest, error) {
 	if m.StatsCoveredCommitSeq, m.SegmentStats, err = decodeStats(items[tlvSegmentStats]); err != nil {
 		return Manifest{}, err
 	}
+	if len(items[tlvMappingEntries]) != 8 {
+		return Manifest{}, fmt.Errorf("mapping entries: %w", ErrCorrupt)
+	}
+	m.MappingEntryCount = binary.LittleEndian.Uint64(items[tlvMappingEntries])
 	if err := Validate(m); err != nil {
 		return Manifest{}, fmt.Errorf("manifest values: %w", ErrCorrupt)
 	}
@@ -198,7 +204,7 @@ func Validate(m Manifest) error {
 	}
 	if m.ReservedIDHigh == 0 || m.ReservedBatchIDHigh == 0 || m.IssuedBatchIDHighAtCut == 0 || m.IssuedBatchIDHighAtCut > m.ReservedBatchIDHigh ||
 		uint64(len(m.OpenBatchIDsAtCut)) > m.HardLimits.MaxOpenBatches || !strictBatchIDs(m.OpenBatchIDsAtCut, m.IssuedBatchIDHighAtCut) ||
-		m.StatsCoveredCommitSeq != m.CoveredCommitSeq {
+		m.StatsCoveredCommitSeq != m.CoveredCommitSeq || (m.MappingRoot == 0) != (m.MappingEntryCount == 0) {
 		return ErrInvalid
 	}
 	sealed := make(map[recordlog.SegmentID]DataSegmentSummary, len(m.SealedDataSegments))

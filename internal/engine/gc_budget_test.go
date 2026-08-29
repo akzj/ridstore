@@ -118,7 +118,7 @@ func TestMappingGCSpaceAdmissionUsesFullSegmentUpperBound(t *testing.T) {
 	free := want + minimum
 	gate := newSpaceGate("test", 100, time.Second, func(string) (uint64, error) { return free, nil })
 	store := &Store{space: gate, gcMinFreeBytes: minimum}
-	reservation, err := store.reserveMappingGC(context.Background(), manifest)
+	reservation, err := store.reserveMappingGC(context.Background(), manifest, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestMappingGCSpaceAdmissionUsesFullSegmentUpperBound(t *testing.T) {
 	}
 	reservation.complete(false)
 	free--
-	if _, err := store.reserveMappingGC(context.Background(), manifest); !errors.Is(err, base.ErrInsufficientSpace) {
+	if _, err := store.reserveMappingGC(context.Background(), manifest, 3); !errors.Is(err, base.ErrInsufficientSpace) {
 		t.Fatalf("reserve err=%v", err)
 	}
 	if got := store.metrics.gcSpaceRejections.Load(); got != 1 {
@@ -146,9 +146,7 @@ func TestGCSpaceAdmissionRejectsOverflow(t *testing.T) {
 	if _, err := store.reserveGCCheckpoint(context.Background(), manifest, ^uint64(0)); !errors.Is(err, base.ErrOverflow) {
 		t.Fatalf("checkpoint reserve err=%v", err)
 	}
-	manifest.CoveredCommitSeq, manifest.StatsCoveredCommitSeq = 1, 1
-	manifest.SegmentStats = []storecatalog.SegmentStats{{SegmentID: 1, LiveBytes: 1, LiveRecords: ^uint64(0)}}
-	if _, err := store.reserveMappingGC(context.Background(), manifest); !errors.Is(err, base.ErrOverflow) {
+	if _, err := store.reserveMappingGC(context.Background(), manifest, ^uint64(0)); !errors.Is(err, base.ErrOverflow) {
 		t.Fatalf("mapping gc reserve err=%v", err)
 	}
 }

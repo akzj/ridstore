@@ -286,6 +286,7 @@ type CheckpointCandidate struct {
 	root       model.MapAddr
 	covered    model.CommitSeq
 	changes    []radix.Mutation
+	entryDelta radix.EntryDelta
 }
 
 func (c CheckpointCandidate) Root() model.MapAddr               { return c.root }
@@ -296,6 +297,26 @@ func (c CheckpointCandidate) BaseCoveredCommitSeq() model.CommitSeq {
 		return 0
 	}
 	return c.checkpoint.base.Covered()
+}
+
+func (c CheckpointCandidate) BaseRoot() model.MapAddr {
+	if c.checkpoint == nil || c.checkpoint.base == nil {
+		return 0
+	}
+	return c.checkpoint.base.Root()
+}
+
+// EntryCount applies this checkpoint's exact leaf-level cardinality delta to
+// the durable count belonging to its base Root.
+func (c CheckpointCandidate) EntryCount(base uint64) (uint64, error) {
+	if c.checkpoint == nil || c.tree == nil || c.entryDelta.Removed > base {
+		return 0, ErrCorrupt
+	}
+	remaining := base - c.entryDelta.Removed
+	if c.entryDelta.Added > math.MaxUint64-remaining {
+		return 0, ErrCorrupt
+	}
+	return remaining + c.entryDelta.Added, nil
 }
 
 func (c CheckpointCandidate) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
@@ -400,7 +421,7 @@ func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCa
 		start = end
 	}
 	mutations = mutations[:unique]
-	tree, err := checkpoint.base.BuildSorted(checkpoint.covered, mutations)
+	tree, entryDelta, err := checkpoint.base.BuildSortedWithEntryDelta(checkpoint.covered, mutations)
 	if err != nil {
 		return CheckpointCandidate{}, err
 	}
@@ -409,7 +430,7 @@ func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCa
 	}
 	return CheckpointCandidate{
 		checkpoint: checkpoint, tree: tree, root: tree.Root(), covered: tree.Covered(),
-		changes: mutations,
+		changes: mutations, entryDelta: entryDelta,
 	}, nil
 }
 
@@ -468,22 +489,53 @@ func (m *Persistent) AbortCheckpoint(checkpoint *FrozenCheckpoint) error {
 	return nil
 }
 
+// CheckpointView pins the immutable checkpoint Root while newer commits may
+// continue accumulating in the active Delta layer. The owner must keep the
+// underlying NodeSyncer open until the view is no longer used.
+type CheckpointView struct {
+	owner *Persistent
+	tree  *radix.Tree
+}
+
+func (m *Persistent) CheckpointView() (CheckpointView, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.inCheckpoint || len(m.frozen) != 0 || m.root == nil {
+		return CheckpointView{}, ErrStalePlan
+	}
+	return CheckpointView{owner: m, tree: m.root}, nil
+}
+
+func (v CheckpointView) Root() model.MapAddr { return v.tree.Root() }
+
+func (v CheckpointView) Covered() model.CommitSeq { return v.tree.Covered() }
+
+func (v CheckpointView) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
+	if v.owner == nil || v.tree == nil {
+		return 0, false, ErrInvalid
+	}
+	return v.tree.Lookup(id)
+}
+
+func (v CheckpointView) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
+	if v.owner == nil || v.tree == nil {
+		return ErrInvalid
+	}
+	return v.tree.Walk(ctx, visit)
+}
+
 // ReplaceCheckpointRoot switches the physical owner of an already installed
-// checkpoint without changing its logical contents. Callers must quiesce all
-// Mapping users before calling it. A rewrite is only valid when checkpointing
-// has drained every delta layer into the current root.
-func (m *Persistent) ReplaceCheckpointRoot(root *radix.Tree, syncer NodeSyncer) error {
-	if root == nil || syncer == nil {
+// checkpoint without changing its logical contents. Newer active Delta entries
+// remain layered above the replacement. Callers must quiesce Mapping users and
+// keep the view's old NodeSyncer open until this method returns.
+func (m *Persistent) ReplaceCheckpointRoot(view CheckpointView, root *radix.Tree, syncer NodeSyncer) error {
+	if view.owner != m || view.tree == nil || root == nil || syncer == nil {
 		return ErrInvalid
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.inCheckpoint || len(m.active.values) != 0 || len(m.frozen) != 0 ||
-		m.active.charge != 0 || root.Covered() != m.covered {
-		return ErrStalePlan
-	}
-	charged, reserved, _, _ := m.budget.usage()
-	if charged != 0 || reserved != 0 {
+	if m.inCheckpoint || len(m.frozen) != 0 || m.root != view.tree ||
+		root.Covered() != view.tree.Covered() {
 		return ErrStalePlan
 	}
 	m.root = root

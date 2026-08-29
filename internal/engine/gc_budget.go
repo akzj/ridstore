@@ -147,26 +147,15 @@ func (s *Store) reserveGCCheckpoint(ctx context.Context, manifest storecatalog.M
 	return reservation, err
 }
 
-// reserveMappingGC covers the complete replacement generation. SegmentStats
-// and the Mapping Root come from the same checkpoint, so their live-record
-// count is an exact entry count. A radix rebuild emits at most one node per
+// reserveMappingGC covers the complete replacement generation. entryCount is
+// the exact cardinality stored atomically with the checkpoint Mapping Root.
+// A radix rebuild emits at most one node per
 // entry at each level. Charging every possible node as dense and every output
 // segment at its full configured size also covers headers, footers, and tail
 // slack without depending on the eventual sparse encoding.
-func (s *Store) reserveMappingGC(ctx context.Context, manifest storecatalog.Manifest) (*spaceReservation, error) {
+func (s *Store) reserveMappingGC(ctx context.Context, manifest storecatalog.Manifest, entries uint64) (*spaceReservation, error) {
 	if s.space == nil || s.gcMinFreeBytes == 0 {
 		return nil, nil
-	}
-	if manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq {
-		return nil, base.ErrCorrupt
-	}
-	var entries uint64
-	for _, stat := range manifest.SegmentStats {
-		var ok bool
-		entries, ok = checkedGCAdd(entries, stat.LiveRecords)
-		if !ok {
-			return nil, base.ErrOverflow
-		}
 	}
 	nodes, ok := checkedGCMul(entries, uint64(mapstore.MaxLevel)+1)
 	if !ok {

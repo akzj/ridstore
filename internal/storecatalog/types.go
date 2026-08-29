@@ -7,7 +7,7 @@ import (
 
 const (
 	FormatMajor = uint16(2)
-	FormatMinor = uint16(0)
+	FormatMinor = uint16(1)
 )
 
 type StoreUUID [16]byte
@@ -51,6 +51,7 @@ type Manifest struct {
 	NextMapSegmentID   model.MapSegmentID
 	SealedMapSegments  []MapSegmentSummary
 	MappingRoot        model.MapAddr
+	MappingEntryCount  uint64
 
 	CoveredCommitSeq       model.CommitSeq
 	ReplayStart            recordlog.LogPos

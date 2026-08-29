@@ -245,7 +245,7 @@ func TestVerifyRejectsCheckpointSegmentStatsMismatch(t *testing.T) {
 	}
 	manifest.SegmentStats[0].LiveBytes--
 	if _, err := manager.InstallCheckpoint(manifest.Generation, storecatalog.Checkpoint{
-		MappingRoot: manifest.MappingRoot, CoveredCommitSeq: manifest.CoveredCommitSeq, ReplayStart: manifest.ReplayStart,
+		MappingRoot: manifest.MappingRoot, MappingEntryCount: manifest.MappingEntryCount, CoveredCommitSeq: manifest.CoveredCommitSeq, ReplayStart: manifest.ReplayStart,
 		ReservedIDHigh: manifest.ReservedIDHigh, ReservedBatchIDHigh: manifest.ReservedBatchIDHigh,
 		IssuedBatchIDHighAtCut: manifest.IssuedBatchIDHighAtCut, OpenBatchIDsAtCut: manifest.OpenBatchIDsAtCut,
 		StatsCoveredCommitSeq: manifest.StatsCoveredCommitSeq, SegmentStats: manifest.SegmentStats,

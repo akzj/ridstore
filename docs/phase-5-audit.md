@@ -69,7 +69,7 @@ Restore artifact publication 现已覆盖 root/`.payload`/子目录 create，RES
 
 该水位是 admission signal 而非文件系统配额：其他进程以及门禁外的 Commit/Checkpoint/GC 可并发消耗空间，真实 write/fsync 仍可能 ENOSPC。部署层仍必须提供独立文件系统/配额、容量告警和基于最大并发 Batch 的余量；代码不把水位误称为绝对空间保证。
 
-Mapping GC 也在创建 staging/marker 前按精确 live-record 数、八层 Dense Mapping Node 和完整输出
+Mapping GC 也在创建 staging/marker 前按 Checkpoint 原子持久化的精确 `MappingEntryCount`、八层 Dense Mapping Node 和完整输出
 Segment 建立保守 admission；拒绝不改变旧 generation。Data GC 的复制速率可通过
 `SetGCBytesPerSecond` 在运行时调整，新值从下一次 Compact 生效。按时段和容量触发维护仍由外部
 scheduler 负责，不进入持久化协议。

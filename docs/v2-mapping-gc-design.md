@@ -35,12 +35,14 @@ current logical Mapping
 maintenanceMu -> checkpointMu -> ops.Lock
 ```
 
-Mapping GC 持有三者直到运行时切换完成。`ops.Lock` 会等待已进入的 Get/Commit/Batch 操作退出，并阻止新操作；
-随后向唯一 Coordinator 插入 barrier，确保此前已接纳 Commit 全部完成。GC 在该 cut 上完成正常 checkpoint，
-使 Persistent Mapping 不再含 active/frozen Delta，再复制 Root。
+Mapping GC 持有 `maintenanceMu` 和 `checkpointMu` 直到运行时切换完成。初始 `ops.Lock` 只建立
+checkpoint cut 并冻结 Delta，随后释放；正常 checkpoint 在允许新 Commit 进入下一层 active Delta 的
+情况下安装 immutable Root。全量 Root 遍历、generation 构建和校验均不持有 `ops.Lock`。
 
-不能简单调用公开 `Checkpoint` 后再抢 `ops.Lock`：两者之间可以进入新 Commit，从而使待重写 Root 立即过期。
-实现应抽取一个“调用者已持有 checkpointMu + ops.Lock”的 checkpoint 内核，而不是增加第二套 checkpoint 协议。
+发布阶段再次短暂取得 `ops.Lock`，并向唯一 Coordinator 插入 barrier，确保此前已接纳 Commit 全部完成；
+这些较新 Commit 仍位于 active Delta。GC 只将物理等价的新 Root 替换旧 checkpoint Root，保留 active
+Delta，再关闭旧 Mapping reader。这样长时间的 O(live IDs) 工作不会形成服务停顿，只有 marker、文件
+promotion、Manifest publish、打开新文件集和 Root/store 切换位于最终短锁窗口。
 
 ## 4. 有界全量重建
 

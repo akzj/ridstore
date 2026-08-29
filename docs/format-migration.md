@@ -6,9 +6,8 @@
 
 磁盘格式版本为 `(major, minor)`：
 
-- decoder 只接受相同 major；
-- 当前实现可以读取 `minor <= current minor`，未知更高 minor 返回
-  `ErrUnsupported`；
+- decoder 只接受当前精确的 `(major, minor)`；更旧或更新的版本均返回
+  `ErrUnsupported`，直到 registry 提供显式迁移路径；
 - major 改变表示必须显式迁移，不能由 Open 猜测；
 - unknown required TLV、flag 或 reserved bit 仍是 unsupported/corruption，不能因
   “尝试兼容”而忽略。
@@ -28,7 +27,8 @@ Header 检查 magic、header/payload CRC、slot generation、StoreUUID、payload
 
 若 registry 中不存在从 source 到当前版本的严格递增连续路径，plan 连同
 `ErrUnsupported` 返回。当前 registry 为空：开发期 v1 没有生产数据，不迁移、不兼容；任何非当前
-v2.0 格式都明确不支持。planner 的存在不等于已经具备跨版本升级能力。
+v2.1 格式都明确不支持。v2.1 增加与 Mapping Root 原子安装的精确
+`MappingEntryCount`；开发期没有生产数据，因此不为 v2.0 提供迁移 step。planner 的存在不等于已经具备跨版本升级能力。
 
 ## 3. 未来 step 契约
 

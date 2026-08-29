@@ -166,6 +166,9 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 	if err != nil {
 		return report, classify(err)
 	}
+	if report.CheckpointLiveIDs != manifest.MappingEntryCount {
+		return report, base.ErrCorrupt
+	}
 	report.Stage = StageReachable
 	baseMapping, err := mapping.New(mapping.Snapshot{CoveredCommitSeq: manifest.CoveredCommitSeq, Entries: entries})
 	if err != nil {

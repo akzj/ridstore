@@ -206,6 +206,7 @@ func (m *Manager) InstallMapRotation(expect uint64, update MapRotation) (Manifes
 
 type Checkpoint struct {
 	MappingRoot            model.MapAddr
+	MappingEntryCount      uint64
 	CoveredCommitSeq       model.CommitSeq
 	ReplayStart            recordlog.LogPos
 	ReservedIDHigh         uint64
@@ -222,6 +223,7 @@ func (m *Manager) InstallCheckpoint(expect uint64, update Checkpoint) (Manifest,
 			return ErrInvalid
 		}
 		next.MappingRoot = update.MappingRoot
+		next.MappingEntryCount = update.MappingEntryCount
 		next.CoveredCommitSeq = update.CoveredCommitSeq
 		next.ReplayStart = update.ReplayStart
 		next.ReservedIDHigh = update.ReservedIDHigh

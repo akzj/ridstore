@@ -32,6 +32,7 @@ func testManifest() Manifest {
 		NextMapSegmentID:       3,
 		SealedMapSegments:      []MapSegmentSummary{{SegmentID: 1, ValidEnd: 128}},
 		MappingRoot:            root,
+		MappingEntryCount:      1,
 		ReplayStart:            replay,
 		ReservedIDHigh:         100,
 		ReservedBatchIDHigh:    100,
@@ -52,7 +53,7 @@ func TestManifestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Generation != want.Generation || got.StoreUUID != want.StoreUUID || got.RecordLogID != want.RecordLogID || got.MappingRoot != want.MappingRoot || got.ReplayStart != want.ReplayStart || len(got.SealedDataSegments) != 1 || len(got.OpenBatchIDsAtCut) != 2 || len(got.SegmentStats) != 1 {
+	if got.Generation != want.Generation || got.StoreUUID != want.StoreUUID || got.RecordLogID != want.RecordLogID || got.MappingRoot != want.MappingRoot || got.MappingEntryCount != want.MappingEntryCount || got.ReplayStart != want.ReplayStart || len(got.SealedDataSegments) != 1 || len(got.OpenBatchIDsAtCut) != 2 || len(got.SegmentStats) != 1 {
 		t.Fatalf("unexpected manifest: %+v", got)
 	}
 	got.OpenBatchIDsAtCut[0] = 99
@@ -77,9 +78,22 @@ func TestInspectHeaderAcceptsChecksummedFutureVersion(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsOlderMinorWithoutMappingEntryCount(t *testing.T) {
+	encoded, err := Encode(testManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(encoded[10:12], FormatMinor-1)
+	binary.LittleEndian.PutUint32(encoded[52:56], crc32.Checksum(encoded[:52], crc32.MakeTable(crc32.Castagnoli)))
+	if _, err := Decode(encoded); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("decode error=%v", err)
+	}
+}
+
 func TestManifestAllowsCanonicalEmptyMappingRoot(t *testing.T) {
 	manifest := testManifest()
 	manifest.MappingRoot = 0
+	manifest.MappingEntryCount = 0
 	manifest.CoveredCommitSeq = 7
 	manifest.StatsCoveredCommitSeq = 7
 	encoded, err := Encode(manifest)
@@ -130,6 +144,7 @@ func TestManifestValidationRejectsUnsafeLimitsAndReferences(t *testing.T) {
 		func(m *Manifest) { m.ReplayStart.SegmentID = 99 },
 		func(m *Manifest) { m.MappingRoot = model.MapAddr(uint64(99)<<32 | 64) },
 		func(m *Manifest) { m.MappingRoot = model.MapAddr(1) },
+		func(m *Manifest) { m.MappingEntryCount = 0 },
 		func(m *Manifest) { m.SegmentStats[0].LiveRecords = 2 },
 		func(m *Manifest) { m.OpenBatchIDsAtCut = []model.BatchID{7, 2} },
 	}
