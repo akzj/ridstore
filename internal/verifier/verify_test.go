@@ -243,8 +243,9 @@ func TestVerifyRejectsCheckpointSegmentStatsMismatch(t *testing.T) {
 	if len(manifest.SegmentStats) == 0 || manifest.SegmentStats[0].LiveBytes == 0 {
 		t.Fatalf("stats=%+v", manifest.SegmentStats)
 	}
+	checkpointBase := manifest.Clone()
 	manifest.SegmentStats[0].LiveBytes--
-	if _, err := manager.InstallCheckpoint(manifest.Generation, storecatalog.Checkpoint{
+	if _, err := manager.InstallCheckpoint(checkpointBase, storecatalog.Checkpoint{
 		MappingRoot: manifest.MappingRoot, MappingEntryCount: manifest.MappingEntryCount, CoveredCommitSeq: manifest.CoveredCommitSeq, ReplayStart: manifest.ReplayStart,
 		ReservedIDHigh: manifest.ReservedIDHigh, ReservedBatchIDHigh: manifest.ReservedBatchIDHigh,
 		IssuedBatchIDHighAtCut: manifest.IssuedBatchIDHighAtCut, OpenBatchIDsAtCut: manifest.OpenBatchIDsAtCut,

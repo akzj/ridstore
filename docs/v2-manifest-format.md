@@ -120,6 +120,10 @@ Root、CoveredCommitSeq 和 ReplayStart 是一个不可拆分的 checkpoint tupl
 
 Catalog 不允许分别安装其中一部分。若 checkpoint 失败，整个 tuple 保持旧值。
 
+Checkpoint 安装允许跨越构建期间发生的纯 Data rotation：base Manifest 的 sealed 列表必须仍是当前
+列表的精确前缀，新增项必须构成从原 Active 开始的连续 rotation，且所有非 Data-topology 字段保持
+不变。Mapping rotation、Data retire 或其他并发安装仍返回冲突，不能用旧快照覆盖新状态。
+
 ## 6. ReplayStart
 
 ReplayStart 是不带 size tag 的 `(SegmentID, Offset)`，指向 CheckpointMarker 之后的第一个字节。
@@ -151,8 +155,9 @@ Catalog 串行化全部安装，但 mutation 权限按操作限定：
 | Data GC publish | 移除已证明安全的 SealedData summary、更新对应 stats |
 | Mapping GC publish | 移除新 Root 不再引用的 Mapping segments |
 
-每个 mutation 必须携带 expected generation。Catalog 在锁内复制当前 Manifest、验证调用者只能改变
-获准字段、完整执行全局 validation，随后安装。不能向调用者暴露任意 `func(*Manifest)`。
+普通 mutation 必须携带 expected generation；Checkpoint 携带用于兼容性校验的完整 base Manifest。
+Catalog 在锁内复制当前 Manifest、验证调用者只能改变获准字段、完整执行全局 validation，随后安装。
+不能向调用者暴露任意 `func(*Manifest)`。
 
 ## 8. 初始化
 

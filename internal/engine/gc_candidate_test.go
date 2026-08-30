@@ -61,6 +61,21 @@ func TestSelectCompactionCandidateHonorsReplayAndPolicy(t *testing.T) {
 	}
 }
 
+func TestSelectCompactionCandidateTreatsReplayBoundarySegmentAsUnknown(t *testing.T) {
+	manifest := candidateManifest(t)
+	segment := candidateSummary(t, 1, 320, 4)
+	manifest.SealedDataSegments = []recordlog.SegmentSummary{segment}
+	manifest.ReplayStart = recordlog.LogPos{SegmentID: 1, Offset: segment.ValidEnd}
+
+	if _, found, err := selectCompactionCandidate(manifest, CompactionPolicy{}, nil); err != nil || found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	manifest.ReplayStart = recordlog.LogPos{SegmentID: 2, Offset: recordlog.SegmentHeaderSize}
+	if candidate, found, err := selectCompactionCandidate(manifest, CompactionPolicy{}, nil); err != nil || !found || candidate.Source.SegmentID != 1 {
+		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+}
+
 func TestSelectCompactionCandidateRejectsInvalidBoundsAndStats(t *testing.T) {
 	manifest := candidateManifest(t)
 	manifest.SealedDataSegments = []recordlog.SegmentSummary{candidateSummary(t, 1, 128, 1)}

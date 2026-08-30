@@ -94,9 +94,10 @@ Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable p
 
 ## 5. Sparse SegmentStats 语义修正
 
-Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺失在同一
-`StatsCoveredCommitSeq == CoveredCommitSeq` 的 Manifest 中明确表示零存活。Catalog retire 门禁已按
-这一格式解释：缺失或显式零值允许继续，任何非零值拒绝。它仍只是必要条件；Engine 的二次 Mapping
+Checkpoint builder 只编码含 live Record 的 sealed Segment。对 `segment.end < ReplayStart` 的 Segment，
+表项缺失明确表示零存活；对 `segment.end >= ReplayStart` 的 Segment，缺失表示 unknown，因为它可能在
+Checkpoint 构建后、安装前才由 Active rotation 成为 sealed。Catalog retire 门禁只接受前一种已覆盖
+Segment 的缺失或显式零值，任何非零值和 unknown 都拒绝。它仍只是必要条件；Engine 的二次 Mapping
 证明与 open-batch gate 仍是物理 retire 的前置条件。
 
 ## 6. M5 剩余范围
@@ -112,7 +113,7 @@ Checkpoint builder 只编码含 live Record 的 sealed Segment，因此表项缺
 
 `CompactNextSegment` 先生成 exact Checkpoint，再以单遍、有界工作空间选择至多一个 Segment。候选必须：
 
-- sealed Segment 的 end 不晚于 ReplayStart；
+- sealed Segment 的 end 严格早于 ReplayStart；
 - 不被任何 open Batch 的最终 Put 引用；
 - 同时满足调用者提供的最小 reclaimable bytes 与最小 reclaimable ratio；
 - 在多个候选中优先 reclaimable bytes 最大、live bytes 更小、SegmentID 更早者。

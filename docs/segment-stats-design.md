@@ -32,7 +32,16 @@ ExactLiveRecordsAtCut
 StatsCoveredCommitSeq
 ```
 
-它必须与同一 Manifest 中的 Mapping Root `CoveredCommitSeq` 相等。表中缺失的 Segment 在该 cut 的 live bytes/count 均为 0；表只保存非零项并按 SegmentID 升序排列。
+它必须与同一 Manifest 中的 Mapping Root `CoveredCommitSeq` 相等。表只保存非零项并按 SegmentID
+升序排列。稀疏表的覆盖水位由 `ReplayStart` 定义：
+
+```text
+segment.end < ReplayStart   => Stats 已覆盖，缺失表示 live bytes/count 均为 0
+segment.end >= ReplayStart  => Stats 可能未覆盖，缺失表示 unknown
+```
+
+严格小于而不是小于等于，是为了覆盖 Checkpoint 构建后、安装前 Active Segment 发生 rotation 的边界。
+unknown Segment 即使缺失 Stats 也不能成为 GC 候选或进入 retire。
 
 运行时另维护：
 
@@ -155,7 +164,7 @@ Stats 可以决定扫描优先级，不能跳过以下删除门禁：
 
 即使 Stats 显示 live=0，也不能直接删除。
 
-v2 的自动候选路径在选择前先做 Checkpoint，并只选择完整落在 ReplayStart 之前的 immutable sealed
+v2 的自动候选路径在选择前先做 Checkpoint，并只选择严格落在 ReplayStart 之前的 immutable sealed
 Segment。由于用户 Put 只能 append 到 active Segment，且 relocation 由全局 maintenance gate 串行，
 Checkpoint 后不会新增指向该候选 source 的 Mapping；该 source 的 exact stats 因而可直接作为选择阶段
 的 live upper bound。这个约束替代了为当前 v2 热路径维护全局 `LiveUpper` 镜像状态，但不改变删除前的

@@ -53,8 +53,7 @@ func selectCompactionCandidate(manifest storecatalog.Manifest, policy Compaction
 		if _, blocked := excluded[source.SegmentID]; blocked {
 			continue
 		}
-		end := recordlog.LogPos{SegmentID: source.SegmentID, Offset: source.ValidEnd}
-		if end.Compare(manifest.ReplayStart) > 0 {
+		if !storecatalog.StatsKnownForSegment(manifest.ReplayStart, source) {
 			continue
 		}
 		if source.ValidEnd < recordlog.SegmentHeaderSize {

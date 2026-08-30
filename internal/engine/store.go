@@ -497,7 +497,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		}
 		return abort(err)
 	}
-	_, err = s.catalog.InstallCheckpoint(manifest.Generation, storecatalog.Checkpoint{
+	_, err = s.catalog.InstallCheckpoint(manifest, storecatalog.Checkpoint{
 		MappingRoot: candidate.Root(), MappingEntryCount: mappingEntries, CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
 		ReservedIDHigh: work.reservedIDHigh, ReservedBatchIDHigh: work.reservedBatchIDHigh, IssuedBatchIDHighAtCut: work.issuedBatchIDHigh,
 		OpenBatchIDsAtCut: work.open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,

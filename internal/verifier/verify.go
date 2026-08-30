@@ -230,7 +230,7 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 	if err != nil {
 		return report, classify(err)
 	}
-	if !equalSegmentStats(stats, manifest.SegmentStats) {
+	if !equalCoveredSegmentStats(stats, manifest.SegmentStats, manifest) {
 		return report, base.ErrCorrupt
 	}
 	report.VerifiedStats = uint64(len(stats))
@@ -303,13 +303,30 @@ func containsDataAddress(manifest storecatalog.Manifest, data recordlog.Physical
 	return false
 }
 
-func equalSegmentStats(left, right []storecatalog.SegmentStats) bool {
-	if len(left) != len(right) {
-		return false
+func equalCoveredSegmentStats(exact, recorded []storecatalog.SegmentStats, manifest storecatalog.Manifest) bool {
+	exactByID := make(map[recordlog.SegmentID]storecatalog.SegmentStats, len(exact))
+	for _, stat := range exact {
+		exactByID[stat.SegmentID] = stat
 	}
-	for i := range left {
-		if left[i] != right[i] {
+	recordedByID := make(map[recordlog.SegmentID]storecatalog.SegmentStats, len(recorded))
+	for _, stat := range recorded {
+		want, ok := exactByID[stat.SegmentID]
+		if ok && want != stat {
 			return false
+		}
+		if !ok && (stat.LiveBytes != 0 || stat.LiveRecords != 0) {
+			return false
+		}
+		recordedByID[stat.SegmentID] = stat
+	}
+	for _, segment := range manifest.SealedDataSegments {
+		if !storecatalog.StatsKnownForSegment(manifest.ReplayStart, segment) {
+			continue
+		}
+		if want, live := exactByID[segment.SegmentID]; live {
+			if got, ok := recordedByID[segment.SegmentID]; !ok || got != want {
+				return false
+			}
 		}
 	}
 	return true

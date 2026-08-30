@@ -32,7 +32,10 @@ Active -> Sealed -> Cleaning -> Retired -> Trash -> Deleted
 
 状态变化由 Maintenance Journal 和 Manifest 共同证明，不能只依赖内存 flag 或文件扩展名。
 
-Data GC、Mapping GC、Mapping Checkpoint 和 Segment rotation 对 Manifest 的修改由同一个安装串行器协调。每次安装都读取最新 generation、合并本操作字段并以 generation CAS 发布；发现 base generation 已过期时重新构造，不能覆盖其他操作刚安装的文件集合或 Root。
+Data GC、Mapping GC、Mapping Checkpoint 和 Segment rotation 对 Manifest 的修改由同一个安装串行器协调。
+Data/Mapping GC 和 rotation 使用 generation CAS；Mapping Checkpoint 携带完整 base Manifest，只有并发变化是
+可证明连续的纯 Data rotation 时才 rebase 到最新 Data 文件集合，其余变化一律冲突。任何操作都不能覆盖
+其他操作刚安装的文件集合或 Root。
 
 ## 3. GC 候选条件
 
@@ -54,7 +57,7 @@ reclaimableLowerBound = max(0, reclaimablePhysicalBytes - LiveUpperBytes)
 
 上界可能因 cut 后多次覆盖而高估 live，只会漏选一时值得清理的 Segment，不会把 live 空间误报为可回收。即使 `LiveUpperBytes == 0`，删除前仍必须完成本协议的精确 Mapping 扫描、Relocation 后复查、Checkpoint、Pin、Manifest 和 Trash 全部门禁；SegmentStats 永不授权删除。
 
-v2 的 `CompactNextSegment` 在选择前主动创建一次 Checkpoint，并且只考虑 `segment.end <= ReplayStart`
+v2 的 `CompactNextSegment` 在选择前主动创建一次 Checkpoint，并且只考虑 `segment.end < ReplayStart`
 的 sealed Segment。这样的 Segment 不再接受新 append；同一时刻又只有一个 maintenance 操作，因此 cut
 后的用户提交只能减少、不能增加指向该 source 的 Mapping。于是该 Checkpoint 的 exact live bytes 对选择
 时刻自然成为 live upper bound，不需要在热路径维护第二套全局计数。
@@ -62,7 +65,8 @@ v2 的 `CompactNextSegment` 在选择前主动创建一次 Checkpoint，并且�
 选择器单遍扫描 Manifest，额外空间只与被 open Batch 引用的 Segment 集合有关，并且一次最多返回一个
 候选。排序依次采用 reclaimable bytes 降序、live bytes 升序、SegmentID 升序。调用方可以同时设置最小
 可回收字节数和最小回收比例（basis points）；两个非零门槛都必须满足。被 open Batch 最终 Put 引用、
-或尚未完全位于 ReplayStart 之前的 Segment 不进入候选集。
+或尚未严格位于 ReplayStart 之前的 Segment 不进入候选集。等于 ReplayStart 的边界 Segment 仍视为
+unknown：它可能在 Stats 构建后、Manifest 安装前才完成 rotation，必须由下一次 Checkpoint 补齐。
 
 ## 4. 存活判定
 

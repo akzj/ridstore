@@ -325,6 +325,9 @@ func (s *Store) proveSegmentRetirementLocked(ctx context.Context, source recordl
 	if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source {
 		return SegmentRetirementProof{}, recordlog.ErrSegmentMissing
 	}
+	if !storecatalog.StatsKnownForSegment(manifest.ReplayStart, manifest.SealedDataSegments[index]) {
+		return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("segment stats are not complete at checkpoint boundary"))
+	}
 	for _, stat := range manifest.SegmentStats {
 		if stat.SegmentID == source && (stat.LiveBytes != 0 || stat.LiveRecords != 0) {
 			return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("checkpoint still maps source segment"))

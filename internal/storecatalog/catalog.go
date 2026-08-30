@@ -3,6 +3,7 @@ package storecatalog
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"sync"
 
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -102,24 +103,7 @@ func (m *Manager) RemoveRecordLogSegment(expect uint64, sealed recordlog.Segment
 	if current.Generation != expect {
 		return recordlog.CatalogSnapshot{}, fmt.Errorf("expected generation %d, current %d: %w", expect, current.Generation, ErrConflict)
 	}
-	replayStart := current.ReplayStart
-	if replayStart.SegmentID == sealed.SegmentID {
-		if replayStart.Offset != sealed.ValidEnd {
-			return recordlog.CatalogSnapshot{}, ErrInvalid
-		}
-		successor := current.ActiveDataSegmentID
-		for _, summary := range current.SealedDataSegments {
-			if summary.SegmentID > sealed.SegmentID && summary.SegmentID < successor {
-				successor = summary.SegmentID
-			}
-		}
-		var err error
-		replayStart, err = recordlog.NewLogPos(successor, recordlog.SegmentHeaderSize)
-		if err != nil {
-			return recordlog.CatalogSnapshot{}, err
-		}
-	}
-	installed, err := m.InstallDataRetire(expect, DataRetire{Source: sealed, CoveredCommitSeq: current.CoveredCommitSeq, ReplayStart: replayStart})
+	installed, err := m.InstallDataRetire(expect, DataRetire{Source: sealed, CoveredCommitSeq: current.CoveredCommitSeq, ReplayStart: current.ReplayStart})
 	if err != nil {
 		return recordlog.CatalogSnapshot{}, err
 	}
@@ -217,23 +201,75 @@ type Checkpoint struct {
 	SegmentStats           []SegmentStats
 }
 
-func (m *Manager) InstallCheckpoint(expect uint64, update Checkpoint) (Manifest, error) {
-	return m.install(expect, func(next *Manifest) error {
-		if update.CoveredCommitSeq < next.CoveredCommitSeq || update.ReplayStart.Compare(next.ReplayStart) < 0 || update.ReservedIDHigh < next.ReservedIDHigh || update.ReservedBatchIDHigh < next.ReservedBatchIDHigh || update.IssuedBatchIDHighAtCut < next.IssuedBatchIDHighAtCut {
-			return ErrInvalid
+func (m *Manager) InstallCheckpoint(base Manifest, update Checkpoint) (Manifest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !checkpointBaseCompatible(base, m.current) {
+		return Manifest{}, fmt.Errorf("checkpoint base generation %d, current %d: %w", base.Generation, m.current.Generation, ErrConflict)
+	}
+	if m.current.Generation == math.MaxUint64 {
+		return Manifest{}, ErrInvalid
+	}
+	next := m.current.Clone()
+	next.Generation++
+	if err := applyCheckpoint(&next, update); err != nil {
+		return Manifest{}, err
+	}
+	if err := Validate(next); err != nil {
+		return Manifest{}, err
+	}
+	if err := Install(m.root, next, m.hook); err != nil {
+		return Manifest{}, err
+	}
+	m.current = next.Clone()
+	return next.Clone(), nil
+}
+
+func applyCheckpoint(next *Manifest, update Checkpoint) error {
+	if update.CoveredCommitSeq < next.CoveredCommitSeq || update.ReplayStart.Compare(next.ReplayStart) < 0 || update.ReservedIDHigh < next.ReservedIDHigh || update.ReservedBatchIDHigh < next.ReservedBatchIDHigh || update.IssuedBatchIDHighAtCut < next.IssuedBatchIDHighAtCut {
+		return ErrInvalid
+	}
+	next.MappingRoot = update.MappingRoot
+	next.MappingEntryCount = update.MappingEntryCount
+	next.CoveredCommitSeq = update.CoveredCommitSeq
+	next.ReplayStart = update.ReplayStart
+	next.ReservedIDHigh = update.ReservedIDHigh
+	next.ReservedBatchIDHigh = update.ReservedBatchIDHigh
+	next.IssuedBatchIDHighAtCut = update.IssuedBatchIDHighAtCut
+	next.OpenBatchIDsAtCut = append([]model.BatchID(nil), update.OpenBatchIDsAtCut...)
+	next.StatsCoveredCommitSeq = update.StatsCoveredCommitSeq
+	next.SegmentStats = append([]SegmentStats(nil), update.SegmentStats...)
+	return nil
+}
+
+// checkpointBaseCompatible permits rebasing only over append-only Data
+// rotations. Every Mapping and checkpoint field, and the existing Data file
+// prefix, must still match the snapshot used to build the candidate.
+func checkpointBaseCompatible(base, current Manifest) bool {
+	if base.Generation == 0 || current.Generation < base.Generation {
+		return false
+	}
+	left, right := base.Clone(), current.Clone()
+	left.Generation, right.Generation = 0, 0
+	left.ActiveDataSegmentID, right.ActiveDataSegmentID = 0, 0
+	left.NextDataSegmentID, right.NextDataSegmentID = 0, 0
+	left.SealedDataSegments, right.SealedDataSegments = nil, nil
+	if !reflect.DeepEqual(left, right) || len(current.SealedDataSegments) < len(base.SealedDataSegments) {
+		return false
+	}
+	for index := range base.SealedDataSegments {
+		if base.SealedDataSegments[index] != current.SealedDataSegments[index] {
+			return false
 		}
-		next.MappingRoot = update.MappingRoot
-		next.MappingEntryCount = update.MappingEntryCount
-		next.CoveredCommitSeq = update.CoveredCommitSeq
-		next.ReplayStart = update.ReplayStart
-		next.ReservedIDHigh = update.ReservedIDHigh
-		next.ReservedBatchIDHigh = update.ReservedBatchIDHigh
-		next.IssuedBatchIDHighAtCut = update.IssuedBatchIDHighAtCut
-		next.OpenBatchIDsAtCut = append([]model.BatchID(nil), update.OpenBatchIDsAtCut...)
-		next.StatsCoveredCommitSeq = update.StatsCoveredCommitSeq
-		next.SegmentStats = append([]SegmentStats(nil), update.SegmentStats...)
-		return nil
-	})
+	}
+	active, next := base.ActiveDataSegmentID, base.NextDataSegmentID
+	for _, sealed := range current.SealedDataSegments[len(base.SealedDataSegments):] {
+		if sealed.SegmentID != active || next != active+1 {
+			return false
+		}
+		active, next = next, next+1
+	}
+	return current.ActiveDataSegmentID == active && current.NextDataSegmentID == next
 }
 
 type DataRetire struct {
@@ -257,10 +293,13 @@ func (m *Manager) InstallDataRetire(expect uint64, update DataRetire) (Manifest,
 		if index < 0 {
 			return ErrInvalid
 		}
-		// SegmentStats is a sparse exact table for the same Mapping cut:
-		// absence means zero live records. A present non-zero entry forbids
-		// retirement; an explicit zero remains valid but is not emitted by the
-		// current checkpoint builder.
+		if !StatsKnownForSegment(next.ReplayStart, update.Source) {
+			return ErrInvalid
+		}
+		// For a Segment strictly behind ReplayStart, SegmentStats is a sparse
+		// exact table for the same Mapping cut: absence means zero live records.
+		// A present non-zero entry forbids retirement; an explicit zero remains
+		// valid but is not emitted by the current checkpoint builder.
 		zeroStats := true
 		for _, stat := range next.SegmentStats {
 			if stat.SegmentID == update.Source.SegmentID {
@@ -271,24 +310,8 @@ func (m *Manager) InstallDataRetire(expect uint64, update DataRetire) (Manifest,
 		if !zeroStats {
 			return ErrInvalid
 		}
-		if next.ReplayStart.SegmentID != update.Source.SegmentID {
-			if update.ReplayStart != next.ReplayStart {
-				return ErrInvalid
-			}
-		} else {
-			if next.ReplayStart.Offset != update.Source.ValidEnd {
-				return ErrInvalid
-			}
-			successor := next.ActiveDataSegmentID
-			for _, summary := range next.SealedDataSegments {
-				if summary.SegmentID > update.Source.SegmentID && summary.SegmentID < successor {
-					successor = summary.SegmentID
-				}
-			}
-			want, err := recordlog.NewLogPos(successor, recordlog.SegmentHeaderSize)
-			if err != nil || update.ReplayStart != want {
-				return ErrInvalid
-			}
+		if update.ReplayStart != next.ReplayStart {
+			return ErrInvalid
 		}
 		next.SealedDataSegments = append(next.SealedDataSegments[:index:index], next.SealedDataSegments[index+1:]...)
 		stats := next.SegmentStats[:0:0]
@@ -301,6 +324,13 @@ func (m *Manager) InstallDataRetire(expect uint64, update DataRetire) (Manifest,
 		next.ReplayStart = update.ReplayStart
 		return nil
 	})
+}
+
+// StatsKnownForSegment reports whether a sealed Segment is strictly behind
+// the checkpoint replay boundary. Equality remains unknown because a Segment
+// may have rotated immediately after the cut that built the Stats table.
+func StatsKnownForSegment(replayStart recordlog.LogPos, segment DataSegmentSummary) bool {
+	return (recordlog.LogPos{SegmentID: segment.SegmentID, Offset: segment.ValidEnd}).Compare(replayStart) < 0
 }
 
 func (m *Manager) install(expect uint64, mutate func(*Manifest) error) (Manifest, error) {

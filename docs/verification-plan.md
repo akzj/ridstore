@@ -183,7 +183,8 @@ Abort 独立覆盖 marker append 前、完整 write 后未 sync、API 已返回�
 - Stats Builder 对同一 ID 多次覆盖只计算 base→cut-final，Abort、条件冲突和 Relocation CAS failure 不计 live；
 - Header 批读错误、Stats underflow 或 Segment 身份错误时新 Root/Stats 均不安装，frozen Delta 不丢失；
 - cut 后并发 Commit、Checkpoint 安装和 Recovery replay 中，`exact Base + active/frozen additions` 始终不低于全量 Mapping 得到的精确 live；
-- Stats 表为 0 或缺失 Segment 时仍不能绕过 GC 精确 Mapping 校验和删除门禁。
+- 已覆盖 Segment 的 Stats 为 0 或缺失时仍不能绕过 GC 精确 Mapping 校验和删除门禁；
+  `segment.end >= ReplayStart` 的缺失 Stats 表示 unknown，必须直接拒绝 GC。
 
 恢复只能选择完整旧 Root 或完整新 Root。
 

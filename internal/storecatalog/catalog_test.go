@@ -85,7 +85,7 @@ func TestManagerInstallsTypedUpdates(t *testing.T) {
 	}
 
 	rootAddr, _ := model.NewMapAddr(2, 128)
-	checkpoint, err := manager.InstallCheckpoint(2, Checkpoint{
+	checkpoint, err := manager.InstallCheckpoint(manager.Snapshot(), Checkpoint{
 		MappingRoot: rootAddr, MappingEntryCount: 1, CoveredCommitSeq: 4, ReplayStart: rotated.ReplayStart,
 		ReservedIDHigh: 200, ReservedBatchIDHigh: 200, IssuedBatchIDHighAtCut: 100,
 		OpenBatchIDsAtCut: []model.BatchID{9}, StatsCoveredCommitSeq: 4,
@@ -102,6 +102,105 @@ func TestManagerInstallsTypedUpdates(t *testing.T) {
 	loaded, err := Load(root)
 	if err != nil || loaded.Generation != 4 {
 		t.Fatalf("loaded generation=%d err=%v", loaded.Generation, err)
+	}
+}
+
+func TestInstallCheckpointRebasesAcrossDataRotation(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	initial := testManifest()
+	if err := Install(root, initial, nil); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(root, initial, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := manager.Snapshot()
+	addr, _ := recordlog.NewVAddr(2, recordlog.SegmentHeaderSize, 64)
+	rotated, err := manager.InstallDataRotation(base.Generation, DataRotation{
+		SealedOld: DataSegmentSummary{SegmentID: 2, ValidEnd: 128, RecordCount: 1, FirstAddr: addr, LastAddr: addr},
+		NewActive: 3, NextID: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, _ = recordlog.NewVAddr(3, recordlog.SegmentHeaderSize, 64)
+	rotated, err = manager.InstallDataRotation(rotated.Generation, DataRotation{
+		SealedOld: DataSegmentSummary{SegmentID: 3, ValidEnd: 128, RecordCount: 1, FirstAddr: addr, LastAddr: addr},
+		NewActive: 4, NextID: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := manager.InstallCheckpoint(base, Checkpoint{
+		MappingRoot: base.MappingRoot, MappingEntryCount: base.MappingEntryCount,
+		CoveredCommitSeq: base.CoveredCommitSeq, ReplayStart: base.ReplayStart,
+		ReservedIDHigh: base.ReservedIDHigh, ReservedBatchIDHigh: base.ReservedBatchIDHigh,
+		IssuedBatchIDHighAtCut: base.IssuedBatchIDHighAtCut, OpenBatchIDsAtCut: base.OpenBatchIDsAtCut,
+		StatsCoveredCommitSeq: base.CoveredCommitSeq, SegmentStats: base.SegmentStats,
+	})
+	if err != nil || installed.Generation != rotated.Generation+1 || installed.ActiveDataSegmentID != 4 || len(installed.SealedDataSegments) != 3 {
+		t.Fatalf("installed=%+v err=%v", installed, err)
+	}
+	for _, segment := range installed.SealedDataSegments[1:] {
+		if StatsKnownForSegment(installed.ReplayStart, segment) {
+			t.Fatalf("segment sealed after the checkpoint snapshot must remain unknown: %+v", segment)
+		}
+	}
+	if _, err := manager.InstallDataRetire(installed.Generation, DataRetire{
+		Source: installed.SealedDataSegments[2], CoveredCommitSeq: installed.CoveredCommitSeq, ReplayStart: installed.ReplayStart,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown segment retire err=%v", err)
+	}
+}
+
+func TestInstallCheckpointRejectsDataRetireRebase(t *testing.T) {
+	t.Parallel()
+	initial := testManifest()
+	initial.SegmentStats = nil
+	manager, err := NewManager(t.TempDir(), initial, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := manager.Snapshot()
+	if _, err := manager.InstallDataRetire(base.Generation, DataRetire{
+		Source: base.SealedDataSegments[0], CoveredCommitSeq: base.CoveredCommitSeq, ReplayStart: base.ReplayStart,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.InstallCheckpoint(base, Checkpoint{
+		MappingRoot: base.MappingRoot, MappingEntryCount: base.MappingEntryCount,
+		CoveredCommitSeq: base.CoveredCommitSeq, ReplayStart: base.ReplayStart,
+		ReservedIDHigh: base.ReservedIDHigh, ReservedBatchIDHigh: base.ReservedBatchIDHigh,
+		IssuedBatchIDHighAtCut: base.IssuedBatchIDHighAtCut, OpenBatchIDsAtCut: base.OpenBatchIDsAtCut,
+		StatsCoveredCommitSeq: base.CoveredCommitSeq, SegmentStats: base.SegmentStats,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("checkpoint err=%v", err)
+	}
+}
+
+func TestInstallCheckpointRejectsNonRotationRebase(t *testing.T) {
+	t.Parallel()
+	initial := testManifest()
+	manager, err := NewManager(t.TempDir(), initial, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := manager.Snapshot()
+	if _, err := manager.InstallMapRotation(base.Generation, MapRotation{
+		SealedOld: MapSegmentSummary{SegmentID: 2, ValidEnd: 128}, NewActive: 3, NextID: 4,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.InstallCheckpoint(base, Checkpoint{
+		MappingRoot: base.MappingRoot, MappingEntryCount: base.MappingEntryCount,
+		CoveredCommitSeq: base.CoveredCommitSeq, ReplayStart: base.ReplayStart,
+		ReservedIDHigh: base.ReservedIDHigh, ReservedBatchIDHigh: base.ReservedBatchIDHigh,
+		IssuedBatchIDHighAtCut: base.IssuedBatchIDHighAtCut, OpenBatchIDsAtCut: base.OpenBatchIDsAtCut,
+		StatsCoveredCommitSeq: base.CoveredCommitSeq, SegmentStats: base.SegmentStats,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("checkpoint err=%v", err)
 	}
 }
 
@@ -224,7 +323,7 @@ func TestManagerImplementsRecordLogCatalogPort(t *testing.T) {
 		t.Fatalf("rotated=%+v err=%v", rotated, err)
 	}
 	rootAddr, _ := model.NewMapAddr(2, 128)
-	checkpoint, err := manager.InstallCheckpoint(2, Checkpoint{
+	checkpoint, err := manager.InstallCheckpoint(manager.Snapshot(), Checkpoint{
 		MappingRoot: rootAddr, MappingEntryCount: 1, CoveredCommitSeq: 1, ReplayStart: initial.ReplayStart,
 		ReservedIDHigh: 100, ReservedBatchIDHigh: 100, IssuedBatchIDHighAtCut: 50,
 		OpenBatchIDsAtCut: []model.BatchID{2, 7}, StatsCoveredCommitSeq: 1,
