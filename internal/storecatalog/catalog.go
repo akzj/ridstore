@@ -98,16 +98,30 @@ func (m *Manager) InstallRecordLogRotation(expect uint64, sealed recordlog.Segme
 	return recordLogSnapshot(installed), nil
 }
 
-func (m *Manager) RemoveRecordLogSegment(expect uint64, sealed recordlog.SegmentSummary) (recordlog.CatalogSnapshot, error) {
-	current := m.Snapshot()
-	if current.Generation != expect {
-		return recordlog.CatalogSnapshot{}, fmt.Errorf("expected generation %d, current %d: %w", expect, current.Generation, ErrConflict)
+// RemoveRecordLogSegment accepts a proof generation as a lower bound. Later
+// generations are safe only after current Manifest state revalidates the same
+// source and its checkpoint-derived zero-live condition.
+func (m *Manager) RemoveRecordLogSegment(minimumGeneration uint64, sealed recordlog.SegmentSummary) (recordlog.CatalogSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.current.Generation < minimumGeneration || m.current.Generation == math.MaxUint64 {
+		return recordlog.CatalogSnapshot{}, fmt.Errorf("minimum generation %d, current %d: %w", minimumGeneration, m.current.Generation, ErrConflict)
 	}
-	installed, err := m.InstallDataRetire(expect, DataRetire{Source: sealed, CoveredCommitSeq: current.CoveredCommitSeq, ReplayStart: current.ReplayStart})
-	if err != nil {
+	next := m.current.Clone()
+	next.Generation++
+	if err := applyDataRetire(&next, DataRetire{
+		Source: sealed, CoveredCommitSeq: m.current.CoveredCommitSeq, ReplayStart: m.current.ReplayStart,
+	}); err != nil {
 		return recordlog.CatalogSnapshot{}, err
 	}
-	return recordLogSnapshot(installed), nil
+	if err := Validate(next); err != nil {
+		return recordlog.CatalogSnapshot{}, err
+	}
+	if err := Install(m.root, next, m.hook); err != nil {
+		return recordlog.CatalogSnapshot{}, err
+	}
+	m.current = next.Clone()
+	return recordLogSnapshot(next), nil
 }
 
 type DataRotation struct {
@@ -145,8 +159,18 @@ type MappingRewrite struct {
 	Covered        model.CommitSeq
 }
 
-func (m *Manager) InstallMappingRewrite(expect uint64, update MappingRewrite) (Manifest, error) {
-	return m.install(expect, func(next *Manifest) error {
+func (m *Manager) InstallMappingRewrite(base Manifest, update MappingRewrite) (Manifest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !checkpointBaseCompatible(base, m.current) {
+		return Manifest{}, fmt.Errorf("mapping rewrite base generation %d, current %d: %w", base.Generation, m.current.Generation, ErrConflict)
+	}
+	if m.current.Generation == math.MaxUint64 {
+		return Manifest{}, ErrInvalid
+	}
+	next := m.current.Clone()
+	next.Generation++
+	if err := func(next *Manifest) error {
 		if update.Covered != next.CoveredCommitSeq || update.ActiveSegment == 0 || update.ActiveSegment == model.MapSegmentID(math.MaxUint32) ||
 			update.NextSegment != update.ActiveSegment+1 {
 			return ErrInvalid
@@ -173,7 +197,17 @@ func (m *Manager) InstallMappingRewrite(expect uint64, update MappingRewrite) (M
 		next.NextMapSegmentID = update.NextSegment
 		next.MappingRoot = update.Root
 		return nil
-	})
+	}(&next); err != nil {
+		return Manifest{}, err
+	}
+	if err := Validate(next); err != nil {
+		return Manifest{}, err
+	}
+	if err := Install(m.root, next, m.hook); err != nil {
+		return Manifest{}, err
+	}
+	m.current = next.Clone()
+	return next.Clone(), nil
 }
 
 func (m *Manager) InstallMapRotation(expect uint64, update MapRotation) (Manifest, error) {
@@ -279,51 +313,53 @@ type DataRetire struct {
 }
 
 func (m *Manager) InstallDataRetire(expect uint64, update DataRetire) (Manifest, error) {
-	return m.install(expect, func(next *Manifest) error {
-		if update.CoveredCommitSeq != next.CoveredCommitSeq || update.Source.SegmentID == next.ActiveDataSegmentID {
-			return ErrInvalid
+	return m.install(expect, func(next *Manifest) error { return applyDataRetire(next, update) })
+}
+
+func applyDataRetire(next *Manifest, update DataRetire) error {
+	if update.CoveredCommitSeq != next.CoveredCommitSeq || update.Source.SegmentID == next.ActiveDataSegmentID {
+		return ErrInvalid
+	}
+	index := -1
+	for i, summary := range next.SealedDataSegments {
+		if summary == update.Source {
+			index = i
+			break
 		}
-		index := -1
-		for i, summary := range next.SealedDataSegments {
-			if summary == update.Source {
-				index = i
-				break
-			}
+	}
+	if index < 0 {
+		return ErrInvalid
+	}
+	if !StatsKnownForSegment(next.ReplayStart, update.Source) {
+		return ErrInvalid
+	}
+	// For a Segment strictly behind ReplayStart, SegmentStats is a sparse
+	// exact table for the same Mapping cut: absence means zero live records.
+	// A present non-zero entry forbids retirement; an explicit zero remains
+	// valid but is not emitted by the current checkpoint builder.
+	zeroStats := true
+	for _, stat := range next.SegmentStats {
+		if stat.SegmentID == update.Source.SegmentID {
+			zeroStats = stat.LiveBytes == 0 && stat.LiveRecords == 0
+			break
 		}
-		if index < 0 {
-			return ErrInvalid
+	}
+	if !zeroStats {
+		return ErrInvalid
+	}
+	if update.ReplayStart != next.ReplayStart {
+		return ErrInvalid
+	}
+	next.SealedDataSegments = append(next.SealedDataSegments[:index:index], next.SealedDataSegments[index+1:]...)
+	stats := next.SegmentStats[:0:0]
+	for _, stat := range next.SegmentStats {
+		if stat.SegmentID != update.Source.SegmentID {
+			stats = append(stats, stat)
 		}
-		if !StatsKnownForSegment(next.ReplayStart, update.Source) {
-			return ErrInvalid
-		}
-		// For a Segment strictly behind ReplayStart, SegmentStats is a sparse
-		// exact table for the same Mapping cut: absence means zero live records.
-		// A present non-zero entry forbids retirement; an explicit zero remains
-		// valid but is not emitted by the current checkpoint builder.
-		zeroStats := true
-		for _, stat := range next.SegmentStats {
-			if stat.SegmentID == update.Source.SegmentID {
-				zeroStats = stat.LiveBytes == 0 && stat.LiveRecords == 0
-				break
-			}
-		}
-		if !zeroStats {
-			return ErrInvalid
-		}
-		if update.ReplayStart != next.ReplayStart {
-			return ErrInvalid
-		}
-		next.SealedDataSegments = append(next.SealedDataSegments[:index:index], next.SealedDataSegments[index+1:]...)
-		stats := next.SegmentStats[:0:0]
-		for _, stat := range next.SegmentStats {
-			if stat.SegmentID != update.Source.SegmentID {
-				stats = append(stats, stat)
-			}
-		}
-		next.SegmentStats = stats
-		next.ReplayStart = update.ReplayStart
-		return nil
-	})
+	}
+	next.SegmentStats = stats
+	next.ReplayStart = update.ReplayStart
+	return nil
 }
 
 // StatsKnownForSegment reports whether a sealed Segment is strictly behind

@@ -51,8 +51,8 @@ func recoverMappingGC(ctx context.Context, root string, catalog *storecatalog.Ma
 	if state.StoreID != [16]byte(manifest.StoreUUID) || uint64(state.SegmentSize) != manifest.HardLimits.SegmentSize || state.Covered != manifest.CoveredCommitSeq {
 		return errors.Join(base.ErrCorrupt, errors.New("mapping gc identity mismatch"))
 	}
-	oldMatches := manifest.Generation == state.BaseGeneration && manifestMatchesMappingSet(manifest, state.Old)
-	newMatches := state.BaseGeneration != math.MaxUint64 && manifest.Generation == state.BaseGeneration+1 && manifestMatchesMappingSet(manifest, state.New)
+	oldMatches := manifest.Generation >= state.BaseGeneration && manifestMatchesMappingSet(manifest, state.Old)
+	newMatches := state.BaseGeneration != math.MaxUint64 && manifest.Generation > state.BaseGeneration && manifestMatchesMappingSet(manifest, state.New)
 	staging := mapgcstate.StagingRoot(root)
 	if oldMatches {
 		if err := mapstore.RollbackGeneration(root, staging, generationFromState(state.New, state.Covered), mapHook); err != nil {

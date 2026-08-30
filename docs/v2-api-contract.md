@@ -201,10 +201,11 @@ physical files、checkpoint Mapping、semantic replay、exact join 的顺序验�
 
 ## 13. Mapping 物理重写
 
-根包公开 `CompactMapping(ctx)` 作为显式维护入口。它在固定
-`maintenanceMu -> checkpointMu -> ops.Lock` 顺序下先推进完整 Checkpoint，再把全部可达
+根包公开 `CompactMapping(ctx)` 作为显式维护入口。它以
+`maintenanceMu -> checkpointMu` 串行同类维护，使用短 Coordinator admission fence 推进完整 Checkpoint，再把全部可达
 `ID -> VAddr` 流式复制到新 Mapping generation。新 Manifest durable 后，Engine 原子替换
-Persistent root 与物理 owner；只有旧 owner 关闭后才允许 retirement。该操作不改变 Value、VAddr、
+Persistent root 与物理 owner；旧 reader 清零、旧 owner 关闭后才允许 retirement。重建、Manifest fsync 和
+reader drain 均不持有 Store 全局数据面锁。该操作不改变 Value、VAddr、
 CoveredCommitSeq、ReplayStart、allocator high、Batch Status 或 SegmentStats。
 
 第一版不自动调度 Mapping GC。显式入口的 syscall fault、process-exit、Offline Verify、重复 GC 与

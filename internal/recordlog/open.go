@@ -153,16 +153,12 @@ func (m *rotationManager) rotate(old *activeSegment) (*activeSegment, error) {
 	if err := installRotationJournal(m.root, journal, m.files, m.hook); err != nil {
 		return nil, err
 	}
-	sealed, sealedSummary, err := old.seal()
+	sealed, sealedSummary, newActive, err := m.prepareRotationFiles(old, snapshot.headerFor(journal.NewActive))
 	if err != nil {
 		return nil, err
 	}
 	if sealedSummary != summary {
-		return nil, fmt.Errorf("sealed summary changed: %w", ErrCorrupt)
-	}
-	newActive, err := createActiveSegment(m.root, snapshot.headerFor(journal.NewActive), m.files, m.hook)
-	if err != nil {
-		return nil, err
+		return nil, errors.Join(fmt.Errorf("sealed summary changed: %w", ErrCorrupt), newActive.close())
 	}
 	installed, err := installCatalogRotation(m.catalog, snapshot, journal)
 	if err != nil {
@@ -178,6 +174,56 @@ func (m *rotationManager) rotate(old *activeSegment) (*activeSegment, error) {
 		return nil, err
 	}
 	return newActive, nil
+}
+
+type rotationSealResult struct {
+	sealed  *sealedSegment
+	summary SegmentSummary
+	err     error
+}
+
+type rotationActiveResult struct {
+	active *activeSegment
+	err    error
+}
+
+// prepareRotationFiles runs only after the rotation journal is durable, so
+// recovery can complete either half independently after a crash. In normal
+// operation footer sealing and next-header creation use different files and
+// may overlap their fsync latency. Fault-injected paths remain serial so the
+// crash matrix retains deterministic boundaries and ordering.
+func (m *rotationManager) prepareRotationFiles(old *activeSegment, header SegmentHeader) (*sealedSegment, SegmentSummary, *activeSegment, error) {
+	if m.hook != nil {
+		sealed, summary, err := old.seal()
+		if err != nil {
+			return nil, SegmentSummary{}, nil, err
+		}
+		active, err := createActiveSegment(m.root, header, m.files, m.hook)
+		if err != nil {
+			return nil, SegmentSummary{}, nil, err
+		}
+		return sealed, summary, active, nil
+	}
+	sealedResult := make(chan rotationSealResult, 1)
+	activeResult := make(chan rotationActiveResult, 1)
+	go func() {
+		sealed, summary, err := old.seal()
+		sealedResult <- rotationSealResult{sealed: sealed, summary: summary, err: err}
+	}()
+	go func() {
+		active, err := createActiveSegment(m.root, header, m.files, nil)
+		activeResult <- rotationActiveResult{active: active, err: err}
+	}()
+	sealed := <-sealedResult
+	active := <-activeResult
+	if sealed.err != nil || active.err != nil {
+		var closeErr error
+		if active.active != nil {
+			closeErr = active.active.close()
+		}
+		return nil, SegmentSummary{}, nil, errors.Join(sealed.err, active.err, closeErr)
+	}
+	return sealed.sealed, sealed.summary, active.active, nil
 }
 
 func installCatalogRotation(catalog CatalogPort, before CatalogSnapshot, journal rotationJournal) (CatalogSnapshot, error) {

@@ -62,7 +62,7 @@ upper = mutation count * DeltaEntryCharge
 
 - 单请求 upper 大于 hard limit，确定返回 `ErrBatchTooLarge`；
 - `used + upper <= hard` 时原子增加 reserved；
-- 达到 soft limit 返回 pressure signal；Commit admission 成功并释放 `ops.RLock` 后，
+- 达到 soft limit 返回 pressure signal；Commit admission 成功并释放 Coordinator admission read lock 后，
   Engine 非阻塞请求后台 Checkpoint；
 - hard limit 暂时不足时不 Prepare Batch、不写 Descriptor、不改变 Mapping；
 - Context 取消、Prepare 失败、条件冲突、编码失败或 pre-durable append 失败必须释放 reservation；
@@ -74,37 +74,39 @@ Recovery 同样受 hard limit：它为 replay group 做立即 reservation。若 
 
 ## 5. Pressure 与 Checkpoint 无死锁时序
 
-当前 Store 的 Checkpoint cut 使用 `ops.Lock`，普通 Batch 方法使用 `ops.RLock`。Commit 若持有 RLock 等待
-Delta 空间，会形成：
+Store 不再使用覆盖数据面的 `ops` 全局锁。Checkpoint 只使用 Coordinator admission fence，把
+`ReserveDelta -> queue` 与 `Freeze` 分在 cut 的两侧。Commit 若持有 admission read lock 等待 Delta
+空间，仍会形成：
 
 ```text
-Commit waits Delta -> Checkpoint waits ops.Lock -> Delta waits Checkpoint
+Commit waits Delta -> Checkpoint waits admission fence -> Delta waits Checkpoint
 ```
 
 v2 禁止该锁环。Commit 的正确流程是：
 
 ```text
-1. 获取 ops.RLock 并检查 Store lifecycle
-2. 在同一个 ops.RLock 区间内 reservation、Prepare 并进入 Coordinator queue
-3. queue 接管请求后立即释放 ops.RLock；不等待 durable result
-4. hard pressure 时先释放 ops.RLock，由该调用者推进一次 Checkpoint
+1. 进入短生命周期计数并检查 Store lifecycle
+2. 在 Coordinator admission read lock 内 reservation、Prepare 并进入 queue
+3. queue 接管请求后立即释放 admission read lock；不等待 durable result
+4. hard pressure 时不持有 admission lock，由该调用者推进一次 Checkpoint
 5. Checkpoint 安装释放 frozen charge
 6. 重试 admission；成功后再等待 durable Publish
 ```
 
-步骤 1–3 的 RLock 不能进一步缩短：否则 reservation 成功后、queue admission 之前可能被 Freeze 穿过，
-reservation 针对旧 active layer 计算，而 Commit 最终写入新 active layer。RLock 只覆盖无 I/O 的 admission；
+步骤 2–3 的 read lock 不能进一步缩短：否则 reservation 成功后、queue admission 之前可能被 Freeze 穿过，
+reservation 针对旧 active layer 计算，而 Commit 最终写入新 active layer。它只覆盖无 I/O 的 admission；
 durable append 和调用者等待都不持有它。
 
 soft pressure 不走 hard-pressure 的同步重试路径。`Receipt` 携带 admission 时的 advisory
-signal；Store 在释放 `ops.RLock` 后向容量为 1 的 channel 投递请求。已排队请求会合并，
+signal；Store 在 admission 完成后向容量为 1 的 channel 投递请求。已排队请求会合并，
 但 worker 执行期间 channel 保持为空，因此 checkpoint cut 之后出现的新 pressure 仍可再排队一次。
 Coordinator barrier 保证 cut 覆盖它之前已 admission 的 Commit。这个调度只来自用户 Commit；
 Relocation 不在其 maintenance 锁域内反向触发后台 worker。
 
 后台 Checkpoint 使用内部 `context.Background()`，不继承已返回 Commit 调用者的取消。任务失败时
 记录 failed counter 并将 Store fail closed，避免 soft-pressure 收敛失败被静默吞掉。`Close`
-先停止并等待 worker，再按 `checkpointMu -> ops.Lock` 关闭 Coordinator 和底层文件。
+先停止并等待 worker，再将 lifecycle 标记为 closing、等待短操作计数归零，然后关闭 Coordinator 和底层文件。
+Close 在 drain 时不占有 `checkpointMu` 或 maintenance 锁，避免与尚未进入 checkpoint 的 active operation 互锁。
 
 Batch 在步骤 2–4 仍是 Open，因此 Checkpoint 可以把它记入 open-batch cut；它后续的 Commit Record 位于
 该 cut 之后。Close 与 Commit 通过 Batch 状态机、Coordinator queue ownership 和 Close drain 协调，不能
@@ -159,7 +161,7 @@ CheckpointSortBytes 只描述可变排序数组；Delta、Radix cache、固定 8
 - Publish 的实际 charge 不超过 reservation upper；
 - hot ID 重复更新不会每次永久增加 active charge；
 - Freeze/Abort 不释放，Install 只释放精确 frozen prefix；
-- hard pressure 可以推进 Checkpoint，不与 `ops.Lock` 形成等待环；
+- hard pressure 可以推进 Checkpoint，不与 admission fence 形成等待环；
 - soft pressure 在 admission 后非阻塞调度且能释放 Delta charge，合并请求不丢失 post-cut pressure；
 - Close 返回前 worker 已退出，后台失败可观测并使 Store fail closed；
 - Checkpoint 连续失败时 Commit 停止在 durable 边界之前，Get/Abort/Close 仍可执行；

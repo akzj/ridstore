@@ -22,7 +22,8 @@ type segmentFile struct {
 }
 
 type Store struct {
-	mu sync.RWMutex
+	writerMu sync.Mutex
+	mu       sync.RWMutex
 
 	root     string
 	catalog  CatalogPort
@@ -178,111 +179,145 @@ func OpenWithFaultHook(root string, catalog CatalogPort, hook FaultHook) (*Store
 }
 
 func (s *Store) Append(level uint8, prefix uint64, covered model.CommitSeq, slots [NodeSlots]uint64) (model.MapAddr, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	s.mu.RLock()
 	if s.closed {
+		s.mu.RUnlock()
 		return 0, ErrClosed
 	}
 	if s.poisoned {
+		s.mu.RUnlock()
 		return 0, ErrPoisoned
 	}
 	if s.nextSeq == math.MaxUint64 {
+		s.mu.RUnlock()
 		return 0, ErrFull
 	}
-	build := NodeBuild{Level: level, NodeSeq: s.nextSeq, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots}
+	nextSeq := s.nextSeq
+	active := s.active
+	segmentSize := s.state.SegmentSize
+	s.mu.RUnlock()
+	build := NodeBuild{Level: level, NodeSeq: nextSeq, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots}
 	encoded, err := EncodeNode(build)
 	if err != nil {
 		return 0, err
 	}
-	if uint64(s.active.summary.ValidEnd)+uint64(len(encoded))+uint64(SegmentFooterSize) > uint64(s.state.SegmentSize) {
-		if s.active.summary.NodeCount == 0 {
+	if uint64(active.summary.ValidEnd)+uint64(len(encoded))+uint64(SegmentFooterSize) > uint64(segmentSize) {
+		if active.summary.NodeCount == 0 {
 			return 0, ErrFull
 		}
-		if err := s.rotateLocked(); err != nil {
-			s.poisoned = true
+		if err := s.rotate(); err != nil {
+			s.markPoisoned()
 			return 0, errors.Join(ErrPoisoned, err)
 		}
-		build.NodeSeq = s.nextSeq
+		s.mu.RLock()
+		nextSeq, active, segmentSize = s.nextSeq, s.active, s.state.SegmentSize
+		s.mu.RUnlock()
+		build.NodeSeq = nextSeq
 		encoded, err = EncodeNode(build)
-		if err != nil || uint64(s.active.summary.ValidEnd)+uint64(len(encoded))+uint64(SegmentFooterSize) > uint64(s.state.SegmentSize) {
+		if err != nil || uint64(active.summary.ValidEnd)+uint64(len(encoded))+uint64(SegmentFooterSize) > uint64(segmentSize) {
 			return 0, errors.Join(ErrFull, err)
 		}
 	}
-	offset := s.active.summary.ValidEnd
+	offset := active.summary.ValidEnd
 	if err := hitFault(s.hook, FaultBeforeAppendWrite); err != nil {
-		s.poisoned = true
+		s.markPoisoned()
 		return 0, errors.Join(ErrPoisoned, err)
 	}
-	if err := writeFullAt(s.active.file, encoded, int64(offset)); err != nil {
-		s.poisoned = true
+	if err := writeFullAt(active.file, encoded, int64(offset)); err != nil {
+		s.markPoisoned()
 		return 0, errors.Join(ErrPoisoned, err)
 	}
-	addr, err := model.NewMapAddr(s.state.ActiveSegment, offset)
+	addr, err := model.NewMapAddr(active.header.SegmentID, offset)
 	if err != nil {
-		s.poisoned = true
+		s.markPoisoned()
 		return 0, errors.Join(ErrPoisoned, err)
 	}
-	if s.active.summary.NodeCount == 0 {
-		s.active.summary.FirstSeq = s.nextSeq
+	s.mu.Lock()
+	if s.active != active || s.nextSeq != nextSeq || s.closed {
+		s.poisoned = true
+		s.mu.Unlock()
+		return 0, errors.Join(ErrPoisoned, ErrCorrupt)
 	}
-	s.active.summary.LastSeq = s.nextSeq
-	s.active.summary.NodeCount++
-	s.active.summary.ValidEnd += uint32(len(encoded))
+	if active.summary.NodeCount == 0 {
+		active.summary.FirstSeq = nextSeq
+	}
+	active.summary.LastSeq = nextSeq
+	active.summary.NodeCount++
+	active.summary.ValidEnd += uint32(len(encoded))
 	s.nextSeq++
+	s.mu.Unlock()
 	return addr, nil
 }
 
-func (s *Store) rotateLocked() error {
+// rotate is serialized by writerMu. The old active descriptor stays open while
+// its immutable prefix is sealed and renamed, so readers remain concurrent;
+// only the final in-memory pointer swap takes mu exclusively.
+func (s *Store) rotate() error {
+	s.mu.RLock()
+	state := s.state.Clone()
+	active := s.active
+	s.mu.RUnlock()
 	fresh := s.catalog.SnapshotMapStore()
 	if err := fresh.validate(); err != nil {
 		return err
 	}
-	if fresh.StoreID != s.state.StoreID || fresh.SegmentSize != s.state.SegmentSize || fresh.ActiveSegment != s.state.ActiveSegment || fresh.NextSegment != s.state.NextSegment {
+	if fresh.StoreID != state.StoreID || fresh.SegmentSize != state.SegmentSize || fresh.ActiveSegment != state.ActiveSegment || fresh.NextSegment != state.NextSegment {
 		return ErrCorrupt
 	}
 	journal := rotationJournal{
 		BaseGeneration: fresh.Generation, StoreID: fresh.StoreID, SegmentSize: fresh.SegmentSize,
-		Old: s.active.summary, NewActive: fresh.NextSegment, NextSegment: fresh.NextSegment + 1,
+		Old: active.summary, NewActive: fresh.NextSegment, NextSegment: fresh.NextSegment + 1,
 	}
 	if err := installRotationJournal(s.root, journal, s.hook); err != nil {
 		return err
 	}
-	sealed, err := sealActive(s.root, s.active, journal.Old, s.hook)
+	sealed, err := sealActive(s.root, active, journal.Old, s.hook)
 	if err != nil {
 		return err
 	}
 	newActive, err := createActive(s.root, fresh.headerFor(journal.NewActive), s.hook)
 	if err != nil {
-		_ = sealed.file.Close()
 		return err
 	}
 	installed, err := installCatalogRotation(s.catalog, fresh, journal)
 	if err != nil {
-		_ = sealed.file.Close()
 		_ = newActive.file.Close()
 		return err
 	}
+	s.mu.Lock()
+	if s.closed || s.active != active || s.state.Generation != state.Generation {
+		_ = newActive.file.Close()
+		s.mu.Unlock()
+		return ErrCorrupt
+	}
 	s.sealed[journal.Old.SegmentID] = sealed
-	s.active = newActive
-	s.state = installed
+	s.active, s.state = newActive, installed
+	s.mu.Unlock()
 	return removeRotationJournal(s.root, s.hook)
 }
 
 func (s *Store) Sync() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	s.mu.RLock()
 	if s.closed {
+		s.mu.RUnlock()
 		return ErrClosed
 	}
 	if s.poisoned {
+		s.mu.RUnlock()
 		return ErrPoisoned
 	}
+	active := s.active
+	s.mu.RUnlock()
 	if err := hitFault(s.hook, FaultBeforeSync); err != nil {
-		s.poisoned = true
+		s.markPoisoned()
 		return errors.Join(ErrPoisoned, err)
 	}
-	if err := s.active.file.Sync(); err != nil {
-		s.poisoned = true
+	if err := active.file.Sync(); err != nil {
+		s.markPoisoned()
 		return errors.Join(ErrPoisoned, err)
 	}
 	return nil
@@ -329,6 +364,8 @@ func readNode(segment *segmentFile, addr model.MapAddr) (Node, error) {
 }
 
 func (s *Store) Close() error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -336,6 +373,12 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 	return s.closeFiles()
+}
+
+func (s *Store) markPoisoned() {
+	s.mu.Lock()
+	s.poisoned = true
+	s.mu.Unlock()
 }
 
 func (s *Store) closeFiles() error {

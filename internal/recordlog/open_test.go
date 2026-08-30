@@ -3,6 +3,7 @@ package recordlog
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -128,6 +129,101 @@ func TestOpenUsesCatalogAndDurablyRotates(t *testing.T) {
 		t.Fatalf("read old len=%d err=%v", len(got), err)
 	}
 	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type syncBarrier struct {
+	mu      sync.Mutex
+	count   int
+	both    chan struct{}
+	release chan struct{}
+}
+
+func (b *syncBarrier) wait() {
+	b.mu.Lock()
+	b.count++
+	if b.count == 2 {
+		close(b.both)
+	}
+	b.mu.Unlock()
+	<-b.release
+}
+
+type barrierSyncFile struct {
+	fileHandle
+	barrier *syncBarrier
+	once    sync.Once
+}
+
+func (f *barrierSyncFile) Sync() error {
+	f.once.Do(f.barrier.wait)
+	return f.fileHandle.Sync()
+}
+
+type barrierCreateBackend struct {
+	fileBackend
+	barrier *syncBarrier
+	want    string
+}
+
+func (b barrierCreateBackend) openFile(name string, flag int, mode fs.FileMode) (fileHandle, error) {
+	file, err := b.fileBackend.openFile(name, flag, mode)
+	if err != nil || filepath.Base(name) != b.want {
+		return file, err
+	}
+	return &barrierSyncFile{fileHandle: file, barrier: b.barrier}, nil
+}
+
+func TestRotationPreparesSealedAndActiveFilesConcurrently(t *testing.T) {
+	root := t.TempDir()
+	state := initialCatalog(16<<10, 8<<10)
+	old, err := createActiveSegment(root, state.headerFor(1), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, old, []byte("before rotation"))
+	barrier := &syncBarrier{both: make(chan struct{}), release: make(chan struct{})}
+	old.mu.Lock()
+	old.file = &barrierSyncFile{fileHandle: old.file, barrier: barrier}
+	old.mu.Unlock()
+	manager := &rotationManager{
+		root: root,
+		files: barrierCreateBackend{
+			fileBackend: osFileBackend{}, barrier: barrier, want: creatingSegmentName(2),
+		},
+	}
+	type result struct {
+		sealed *sealedSegment
+		active *activeSegment
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sealed, _, active, prepareErr := manager.prepareRotationFiles(old, state.headerFor(2))
+		done <- result{sealed: sealed, active: active, err: prepareErr}
+	}()
+	select {
+	case <-barrier.both:
+		close(barrier.release)
+	case <-time.After(time.Second):
+		close(barrier.release)
+		t.Fatal("footer and next-header sync did not overlap")
+	}
+	prepared := <-done
+	if prepared.err != nil {
+		t.Fatal(prepared.err)
+	}
+	if err := old.transferSealedOwnership(prepared.sealed); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.sealed.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.active.close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -360,7 +456,7 @@ func TestRetiredSegmentCleanupFaultsConvergeOnRetry(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(recordsPath(root), sealedSegmentName(1))); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("sealed file remains: %v", err)
 			}
-			trash := filepath.Join(root, "trash", sealedSegmentName(1)+".g9.trash")
+			trash := filepath.Join(root, "trash", sealedSegmentName(1)+".retired")
 			if _, err := os.Stat(trash); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("trash file remains: %v", err)
 			}

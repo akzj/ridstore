@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func testSegmentHeader(id, previous SegmentID) SegmentHeader {
@@ -50,6 +52,248 @@ func appendTestRecords(t *testing.T, segment *activeSegment, payloads ...[]byte)
 		t.Fatalf("append: written=%d err=%v", written, err)
 	}
 	return results
+}
+
+type blockingReadFile struct {
+	fileHandle
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingReadFile) ReadAt(value []byte, offset int64) (int, error) {
+	f.once.Do(func() {
+		close(f.reached)
+		<-f.release
+	})
+	return f.fileHandle.ReadAt(value, offset)
+}
+
+func TestActiveSegmentAppendDoesNotWaitForReadIO(t *testing.T) {
+	root := t.TempDir()
+	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer segment.close()
+	first := appendTestRecords(t, segment, []byte("first"))[0]
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	segment.mu.Lock()
+	segment.file = &blockingReadFile{fileHandle: segment.file, reached: reached, release: release}
+	segment.mu.Unlock()
+
+	readDone := make(chan error, 1)
+	go func() {
+		value, readErr := segment.read(first.Addr)
+		if readErr == nil && string(value) != "first" {
+			readErr = errors.New("wrong payload")
+		}
+		readDone <- readErr
+	}()
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("read did not reach blocked I/O")
+	}
+
+	appendDone := make(chan error, 1)
+	go func() {
+		appendTestRecordsWithoutFatal(segment, []byte("second"), appendDone)
+	}()
+	select {
+	case err := <-appendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("append completion blocked behind existing record read I/O")
+	}
+	close(release)
+	released = true
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendTestRecordsWithoutFatal(segment *activeSegment, payload []byte, done chan<- error) {
+	physical, err := PhysicalRecordSize(uint64(len(payload)))
+	if err != nil {
+		done <- err
+		return
+	}
+	addr, err := NewVAddr(segment.header.SegmentID, segment.summary().ValidEnd, physical)
+	if err != nil {
+		done <- err
+		return
+	}
+	encoded, err := EncodeRecord(addr, payload)
+	if err != nil {
+		done <- err
+		return
+	}
+	result, err := NewAppendResult(addr, physical)
+	if err != nil {
+		done <- err
+		return
+	}
+	_, err = segment.appendEncoded(encoded, []recordExtent{{Result: result, Size: physical}})
+	done <- err
+}
+
+func TestActiveSegmentReadDoesNotWaitForAppendIO(t *testing.T) {
+	root := t.TempDir()
+	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer segment.close()
+	first := appendTestRecords(t, segment, []byte("first"))[0]
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var once sync.Once
+	segment.hook = func(point segmentFaultPoint) error {
+		if point == faultBeforeAppendWrite {
+			once.Do(func() {
+				close(reached)
+				<-release
+			})
+		}
+		return nil
+	}
+	payload := []byte("second")
+	physical, err := PhysicalRecordSize(uint64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAddr, err := NewVAddr(1, segment.summary().ValidEnd, physical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := EncodeRecord(secondAddr, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewAppendResult(secondAddr, physical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := segment.appendEncoded(encoded, []recordExtent{{Result: second, Size: physical}})
+		appendDone <- appendErr
+	}()
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("append did not reach blocked I/O")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		value, readErr := segment.read(first.Addr)
+		if readErr == nil && string(value) != "first" {
+			readErr = errors.New("wrong payload")
+		}
+		readDone <- readErr
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("existing record read blocked behind append I/O")
+	}
+	close(release)
+	released = true
+	if err := <-appendDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestActiveSegmentReadDoesNotWaitForSealIO(t *testing.T) {
+	root := t.TempDir()
+	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := appendTestRecords(t, segment, []byte("first"))[0]
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var once sync.Once
+	segment.hook = func(point segmentFaultPoint) error {
+		if point == faultBeforeFooterSync {
+			once.Do(func() {
+				close(reached)
+				<-release
+			})
+		}
+		return nil
+	}
+	type sealResult struct {
+		sealed *sealedSegment
+		err    error
+	}
+	sealDone := make(chan sealResult, 1)
+	go func() {
+		sealed, _, sealErr := segment.seal()
+		sealDone <- sealResult{sealed: sealed, err: sealErr}
+	}()
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("seal did not reach blocked I/O")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		value, readErr := segment.read(first.Addr)
+		if readErr == nil && string(value) != "first" {
+			readErr = errors.New("wrong payload")
+		}
+		readDone <- readErr
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("existing record read blocked behind seal I/O")
+	}
+	close(release)
+	released = true
+	result := <-sealDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if err := segment.transferSealedOwnership(result.sealed); err != nil {
+		t.Fatal(err)
+	}
+	if err := segment.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := result.sealed.close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestActiveSegmentRecoversOnlyIncompleteTail(t *testing.T) {

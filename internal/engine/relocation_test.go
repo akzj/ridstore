@@ -404,6 +404,148 @@ func TestConcurrentUserUpdateWinsOverSegmentRelocation(t *testing.T) {
 	}
 }
 
+func TestCheckpointDoesNotWaitForRelocationCopy(t *testing.T) {
+	store, source, id, _, _ := relocationFixture(t)
+	underlying := store.log
+	blocked := &blockingCopyLog{
+		Log: underlying, maintenanceLog: store.maintenance, target: id, value: []byte("source-value"),
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.log = blocked
+	store.maintenance = blocked
+	released := false
+	defer func() {
+		if !released {
+			close(blocked.release)
+		}
+	}()
+
+	relocationDone := make(chan error, 1)
+	go func() {
+		_, err := store.RelocateSegment(context.Background(), source)
+		relocationDone <- err
+	}()
+	<-blocked.reached
+
+	checkpointDone := make(chan error, 1)
+	go func() { checkpointDone <- store.Checkpoint(context.Background()) }()
+	select {
+	case err := <-checkpointDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Checkpoint blocked behind Relocation copy")
+	}
+	close(blocked.release)
+	released = true
+	if err := <-relocationDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetirementProofDoesNotBlockUserCommit(t *testing.T) {
+	store, source, id, _, _ := relocationFixture(t)
+	relocated, err := store.RelocateSegment(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.checkpoint(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingProofLog{
+		maintenanceLog: store.maintenance, source: source,
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.maintenance = blocked
+	released := false
+	defer func() {
+		if !released {
+			close(blocked.release)
+		}
+	}()
+	proofDone := make(chan error, 1)
+	go func() {
+		_, err := store.proveSegmentRetirement(context.Background(), source, relocated.LastCommitSeq)
+		proofDone <- err
+	}()
+	<-blocked.reached
+
+	commitDone := make(chan error, 1)
+	go func() {
+		batch, err := store.Begin(context.Background())
+		if err == nil {
+			err = batch.Put(context.Background(), id, []byte("during-proof"))
+		}
+		if err == nil {
+			_, err = batch.Commit(context.Background())
+		}
+		commitDone <- err
+	}()
+	select {
+	case err := <-commitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("user Commit blocked behind retirement proof scan")
+	}
+	close(blocked.release)
+	released = true
+	if err := <-proofDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetirementProofDrainsInFlightBatchMutationBeforeScanning(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	relocated, err := store.RelocateSegment(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.checkpoint(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingProofLog{
+		maintenanceLog: store.maintenance, source: source,
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.maintenance = blocked
+	released := false
+	defer func() {
+		if !released {
+			close(blocked.release)
+		}
+	}()
+
+	// This models the interval after a Put Record append and before its final
+	// Batch mutation becomes visible. Retirement must drain that interval before
+	// it may inspect open-Batch references or scan the source.
+	store.mutationFence.RLock()
+	proofDone := make(chan error, 1)
+	go func() {
+		_, err := store.proveSegmentRetirement(context.Background(), source, relocated.LastCommitSeq)
+		proofDone <- err
+	}()
+	select {
+	case <-blocked.reached:
+		store.mutationFence.RUnlock()
+		t.Fatal("retirement scan crossed an in-flight Batch mutation")
+	case <-time.After(20 * time.Millisecond):
+	}
+	store.mutationFence.RUnlock()
+	select {
+	case <-blocked.reached:
+	case <-time.After(time.Second):
+		t.Fatal("retirement did not resume after Batch mutation drained")
+	}
+	close(blocked.release)
+	released = true
+	if err := <-proofDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type blockingCopyLog struct {
 	Log
 	maintenanceLog
@@ -412,6 +554,24 @@ type blockingCopyLog struct {
 	reached chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type blockingProofLog struct {
+	maintenanceLog
+	source  recordlog.SegmentID
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (l *blockingProofLog) ScanSegment(ctx context.Context, source recordlog.SegmentID, visit func(recordlog.AppendResult, []byte) error) error {
+	if source == l.source {
+		l.once.Do(func() {
+			close(l.reached)
+			<-l.release
+		})
+	}
+	return l.maintenanceLog.ScanSegment(ctx, source, visit)
 }
 
 func (l *blockingCopyLog) Append(ctx context.Context, payload []byte, syncWrite bool) (recordlog.AppendResult, error) {

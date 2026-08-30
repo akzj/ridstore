@@ -77,10 +77,13 @@ type statusOrderEntry struct {
 }
 
 type Store struct {
-	ops           sync.RWMutex
-	mu            sync.Mutex
-	checkpointMu  sync.Mutex
-	maintenanceMu sync.Mutex
+	mu              sync.Mutex
+	batchSnapshotMu sync.Mutex
+	mutationFence   sync.RWMutex
+	checkpointMu    sync.Mutex
+	maintenanceMu   sync.Mutex
+	activeOps       uint64
+	closing         bool
 
 	log                         Log
 	maintenance                 maintenanceLog
@@ -151,11 +154,10 @@ func (s *Store) SetGCBytesPerSecond(rate uint64) error {
 	if rate == 0 {
 		return base.ErrInvalidConfig
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return base.ErrClosed
+	if err := s.beginOperation(); err != nil {
+		return err
 	}
+	defer s.endOperation()
 	s.gcBytesPerSecond.Store(rate)
 	return nil
 }
@@ -188,8 +190,10 @@ func (s *Store) Status(ctx context.Context, id model.BatchID) (BatchStatus, erro
 	if err := ctx.Err(); err != nil {
 		return BatchStatus{}, err
 	}
-	s.ops.RLock()
-	defer s.ops.RUnlock()
+	if err := s.beginOperation(); err != nil {
+		return BatchStatus{}, err
+	}
+	defer s.endOperation()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -213,6 +217,10 @@ func (s *Store) Status(ctx context.Context, id model.BatchID) (BatchStatus, erro
 }
 
 func (s *Store) Begin(ctx context.Context) (*Batch, error) {
+	if err := s.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer s.endOperation()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -220,27 +228,47 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		s.ops.RLock()
 		s.mu.Lock()
-		if s.closed {
+		if s.closed || s.closing {
 			s.mu.Unlock()
-			s.ops.RUnlock()
 			return nil, base.ErrClosed
 		}
 		if fault := s.operationFaultLocked(); fault != nil {
 			s.mu.Unlock()
-			s.ops.RUnlock()
 			return nil, errors.Join(base.ErrReadOnly, fault)
 		}
 		capacityBlocked := !s.statusCapacityAvailableLocked()
 		if s.openCount < s.maxOpen && !capacityBlocked {
 			s.openCount++
 			s.mu.Unlock()
-			break
+			s.batchSnapshotMu.Lock()
+			raw, err := s.batches.Allocate(ctx)
+			if err != nil {
+				s.batchSnapshotMu.Unlock()
+				s.mu.Lock()
+				s.openCount--
+				s.signalLocked()
+				s.mu.Unlock()
+				return nil, err
+			}
+			inner, err := transaction.New(model.BatchID(raw), s.limits, s.userAppender, s.ids)
+			if err != nil {
+				s.batchSnapshotMu.Unlock()
+				s.mu.Lock()
+				s.openCount--
+				s.signalLocked()
+				s.mu.Unlock()
+				return nil, err
+			}
+			batch := &Batch{store: s, inner: inner}
+			s.mu.Lock()
+			s.open[batch.ID()] = batch
+			s.mu.Unlock()
+			s.batchSnapshotMu.Unlock()
+			return batch, nil
 		}
 		notify := s.notify
 		s.mu.Unlock()
-		s.ops.RUnlock()
 		if capacityBlocked {
 			if err := s.Checkpoint(ctx); err != nil {
 				return nil, err
@@ -253,24 +281,6 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		case <-notify:
 		}
 	}
-	raw, err := s.batches.Allocate(ctx)
-	if err != nil {
-		s.releaseSlot()
-		s.ops.RUnlock()
-		return nil, err
-	}
-	inner, err := transaction.New(model.BatchID(raw), s.limits, s.userAppender, s.ids)
-	if err != nil {
-		s.releaseSlot()
-		s.ops.RUnlock()
-		return nil, err
-	}
-	b := &Batch{store: s, inner: inner}
-	s.mu.Lock()
-	s.open[b.ID()] = b
-	s.mu.Unlock()
-	s.ops.RUnlock()
-	return b, nil
 }
 
 func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
@@ -280,8 +290,10 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.ops.RLock()
-	defer s.ops.RUnlock()
+	if err := s.beginOperation(); err != nil {
+		return Record{}, err
+	}
+	defer s.endOperation()
 	for {
 		if err := ctx.Err(); err != nil {
 			return Record{}, err
@@ -333,15 +345,21 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 }
 
 func (s *Store) Close() error {
-	s.stopBackgroundCheckpoint()
-	s.checkpointMu.Lock()
-	defer s.checkpointMu.Unlock()
-	s.ops.Lock()
-	defer s.ops.Unlock()
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.closing {
 		s.mu.Unlock()
 		return base.ErrClosed
+	}
+	s.closing = true
+	s.signalLocked()
+	s.mu.Unlock()
+	s.stopBackgroundCheckpoint()
+	s.mu.Lock()
+	for s.activeOps != 0 {
+		notify := s.notify
+		s.mu.Unlock()
+		<-notify
+		s.mu.Lock()
 	}
 	s.closed = true
 	open := make([]*Batch, 0, len(s.open))
@@ -372,6 +390,10 @@ func (s *Store) Close() error {
 // Checkpoint installs one atomic Mapping, replay-cut, allocator, open-batch,
 // and exact sealed-segment statistics generation.
 func (s *Store) Checkpoint(ctx context.Context) error {
+	if err := s.beginOperation(); err != nil {
+		return err
+	}
+	defer s.endOperation()
 	return s.checkpoint(ctx, false)
 }
 
@@ -382,9 +404,7 @@ func (s *Store) checkpoint(ctx context.Context, gcAdmission bool) error {
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
 
-	s.ops.Lock()
-	work, err := s.prepareCheckpointLocked(ctx)
-	s.ops.Unlock()
+	work, err := s.prepareCheckpoint(ctx)
 	if err != nil {
 		return err
 	}
@@ -417,10 +437,10 @@ type checkpointWork struct {
 	issuedBatchIDHigh   uint64
 }
 
-// prepareCheckpointLocked captures one cut while the caller holds ops.Lock.
-// finishCheckpoint may run with that lock held (Mapping GC) or released (the
-// ordinary Checkpoint path).
-func (s *Store) prepareCheckpointLocked(ctx context.Context) (checkpointWork, error) {
+// prepareCheckpoint captures a durable commit cut, recovery metadata, and the
+// corresponding frozen Mapping generation while commit admission is fenced.
+// Reads, record appends, and unrelated Batch construction remain concurrent.
+func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -435,24 +455,36 @@ func (s *Store) prepareCheckpointLocked(ctx context.Context) (checkpointWork, er
 		return checkpointWork{}, base.ErrInvalidConfig
 	}
 	s.mu.Unlock()
-	cut, err := s.commits.CheckpointCut(ctx)
+	// Drain potentially slow Begin/Abort metadata work before stopping Commit
+	// admission. Once held, this mutex keeps the open-Batch/allocator snapshot
+	// stable through the short durable cut and Mapping freeze.
+	s.batchSnapshotMu.Lock()
+	defer s.batchSnapshotMu.Unlock()
+	fence, err := s.commits.AcquireCheckpointFence(ctx)
 	if err != nil {
 		return checkpointWork{}, err
 	}
+	defer fence.Release()
+	cut := fence.Cut
+	s.mu.Lock()
 	open, statusCut, err := s.openBatchIDsAtCut()
 	if err != nil {
+		s.mu.Unlock()
 		s.setFault(err)
 		return checkpointWork{}, err
 	}
 	sort.Slice(open, func(i, j int) bool { return open[i] < open[j] })
+	reservedIDHigh, reservedBatchIDHigh := s.ids.DurableHigh(), s.batches.DurableHigh()
+	issuedBatchIDHigh := s.batches.IssuedHigh()
+	s.mu.Unlock()
 	frozen, err := s.mapping.Freeze(cut.CoveredCommitSeq)
 	if err != nil {
 		return checkpointWork{}, err
 	}
 	return checkpointWork{
 		frozen: frozen, cut: cut, open: open, statusCut: statusCut,
-		reservedIDHigh: s.ids.DurableHigh(), reservedBatchIDHigh: s.batches.DurableHigh(),
-		issuedBatchIDHigh: s.batches.IssuedHigh(),
+		reservedIDHigh: reservedIDHigh, reservedBatchIDHigh: reservedBatchIDHigh,
+		issuedBatchIDHigh: issuedBatchIDHigh,
 	}, nil
 }
 
@@ -541,8 +573,6 @@ func containsDataSegment(manifest storecatalog.Manifest, id recordlog.SegmentID)
 // Store.open. Only genuinely non-terminal, non-committing batches belong in
 // the recovery snapshot.
 func (s *Store) openBatchIDsAtCut() ([]model.BatchID, uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	open := make([]model.BatchID, 0, len(s.open))
 	for id, batch := range s.open {
 		state, _ := batch.inner.State()
@@ -558,6 +588,27 @@ func (s *Store) openBatchIDsAtCut() ([]model.BatchID, uint64, error) {
 		}
 	}
 	return open, s.terminalTotal, nil
+}
+
+func (s *Store) beginOperation() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.closing {
+		return base.ErrClosed
+	}
+	s.activeOps++
+	return nil
+}
+
+func (s *Store) endOperation() {
+	s.mu.Lock()
+	if s.activeOps == 0 {
+		s.fault = errors.Join(base.ErrReadOnly, base.ErrCorrupt)
+	} else {
+		s.activeOps--
+	}
+	s.signalLocked()
+	s.mu.Unlock()
 }
 
 func (s *Store) setFault(err error) {
@@ -605,16 +656,16 @@ func (b *Batch) Allocate(ctx context.Context) (model.ID, error) {
 }
 
 func (b *Batch) Create(ctx context.Context, value []byte) (model.ID, error) {
-	return withBatch(b, func() (model.ID, error) { return b.inner.Create(ctx, value) })
+	return withBatchMutation(b, func() (model.ID, error) { return b.inner.Create(ctx, value) })
 }
 
 func (b *Batch) Put(ctx context.Context, id model.ID, value []byte) error {
-	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.Put(ctx, id, value) })
+	_, err := withBatchMutation(b, func() (struct{}, error) { return struct{}{}, b.inner.Put(ctx, id, value) })
 	return err
 }
 
 func (b *Batch) CompareAndPut(ctx context.Context, id model.ID, expected recordlog.VAddr, value []byte) error {
-	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.CompareAndPut(ctx, id, expected, value) })
+	_, err := withBatchMutation(b, func() (struct{}, error) { return struct{}{}, b.inner.CompareAndPut(ctx, id, expected, value) })
 	return err
 }
 
@@ -642,12 +693,16 @@ func (b *Batch) Commit(ctx context.Context) (coordinator.Result, error) {
 	if b == nil || b.store == nil || b.inner == nil {
 		return coordinator.Result{}, base.ErrBatchClosed
 	}
+	if err := b.store.beginOperation(); err != nil {
+		return coordinator.Result{}, err
+	}
+	defer b.store.endOperation()
 	for {
 		receipt, err := b.store.submitCommit(ctx, b.inner)
 		if errors.Is(err, mapping.ErrBudget) {
-			// Reservation failed before Prepare or durable append. Do not hold
-			// ops.RLock here: Checkpoint must be able to install a Root and
-			// release frozen Delta charge before this Commit retries admission.
+			// Reservation failed before Prepare or durable append. The failed
+			// admission owns no Coordinator fence, so Checkpoint can
+			// install a Root and release frozen Delta charge before retry.
 			if err := b.store.Checkpoint(ctx); err != nil {
 				return coordinator.Result{}, err
 			}
@@ -671,10 +726,8 @@ func (b *Batch) Commit(ctx context.Context) (coordinator.Result, error) {
 }
 
 func (s *Store) submitCommit(ctx context.Context, batch *transaction.Batch) (coordinator.Receipt, error) {
-	s.ops.RLock()
-	defer s.ops.RUnlock()
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.closing {
 		s.mu.Unlock()
 		return coordinator.Receipt{}, base.ErrClosed
 	}
@@ -687,7 +740,25 @@ func (s *Store) submitCommit(ctx context.Context, batch *transaction.Batch) (coo
 }
 
 func (b *Batch) Abort(ctx context.Context) error {
-	_, err := withBatch(b, func() (struct{}, error) { return struct{}{}, b.inner.Abort(ctx, 1) })
+	if b == nil || b.store == nil || b.inner == nil {
+		return base.ErrBatchClosed
+	}
+	if err := b.store.beginOperation(); err != nil {
+		return err
+	}
+	defer b.store.endOperation()
+	b.store.batchSnapshotMu.Lock()
+	defer b.store.batchSnapshotMu.Unlock()
+	b.store.mu.Lock()
+	closed, fault := b.store.closed || b.store.closing, b.store.operationFaultLocked()
+	b.store.mu.Unlock()
+	if closed {
+		return base.ErrClosed
+	}
+	if fault != nil {
+		return errors.Join(base.ErrReadOnly, fault)
+	}
+	err := b.inner.Abort(ctx, 1)
 	if terminal(b.inner) {
 		b.finish()
 	}
@@ -699,8 +770,10 @@ func withBatch[T any](b *Batch, run func() (T, error)) (T, error) {
 	if b == nil || b.store == nil || b.inner == nil {
 		return zero, base.ErrBatchClosed
 	}
-	b.store.ops.RLock()
-	defer b.store.ops.RUnlock()
+	if err := b.store.beginOperation(); err != nil {
+		return zero, err
+	}
+	defer b.store.endOperation()
 	b.store.mu.Lock()
 	closed, fault := b.store.closed, b.store.operationFaultLocked()
 	b.store.mu.Unlock()
@@ -711,6 +784,17 @@ func withBatch[T any](b *Batch, run func() (T, error)) (T, error) {
 		return zero, errors.Join(base.ErrReadOnly, fault)
 	}
 	return run()
+}
+
+func withBatchMutation[T any](b *Batch, run func() (T, error)) (T, error) {
+	return withBatch(b, func() (T, error) {
+		// Put-like operations append a Record before publishing the final
+		// mutation into the Batch. Retirement briefly takes the write side to
+		// drain this interval before snapshotting source references.
+		b.store.mutationFence.RLock()
+		defer b.store.mutationFence.RUnlock()
+		return run()
+	})
 }
 
 func terminal(batch *transaction.Batch) bool {

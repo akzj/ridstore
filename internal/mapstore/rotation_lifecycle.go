@@ -257,9 +257,6 @@ func sealActive(root string, active *segmentFile, expected SegmentSummary, hook 
 	if err := active.file.Sync(); err != nil {
 		return nil, err
 	}
-	if err := active.file.Close(); err != nil {
-		return nil, err
-	}
 	dir := filepath.Join(root, mappingDirectory)
 	if err := hitFault(hook, FaultBeforeSealRename); err != nil {
 		return nil, err
@@ -273,5 +270,9 @@ func sealActive(root string, active *segmentFile, expected SegmentSummary, hook 
 	if err := syncDirectory(dir); err != nil {
 		return nil, err
 	}
-	return openSealed(root, active.header, SegmentRef{SegmentID: expected.SegmentID, ValidEnd: expected.ValidEnd})
+	// Keep the existing descriptor alive. ReadAt on the immutable prefix is
+	// safe while the footer is appended and while the path is renamed, and
+	// retaining the descriptor lets runtime readers cross rotation without a
+	// global read stop. Fresh Open still validates the sealed file normally.
+	return active, nil
 }

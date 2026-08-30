@@ -29,20 +29,20 @@ current logical Mapping
 
 ## 3. 并发切面
 
-锁顺序固定为：
+维护串行顺序为：
 
 ```text
-maintenanceMu -> checkpointMu -> ops.Lock
+maintenanceMu -> checkpointMu
 ```
 
-Mapping GC 持有 `maintenanceMu` 和 `checkpointMu` 直到运行时切换完成。初始 `ops.Lock` 只建立
-checkpoint cut 并冻结 Delta，随后释放；正常 checkpoint 在允许新 Commit 进入下一层 active Delta 的
-情况下安装 immutable Root。全量 Root 遍历、generation 构建和校验均不持有 `ops.Lock`。
+Mapping GC 持有 `maintenanceMu` 和 `checkpointMu` 直到运行时切换完成，这两把锁只排斥其他维护与
+Checkpoint，不阻塞数据面。初始 Coordinator admission fence 建立 durable cut、捕获 Batch/allocator
+元数据并冻结 Delta，随后立即释放；正常 checkpoint 在允许新 Commit 进入下一层 active Delta 的情况下
+安装 immutable Root。全量 Root 遍历、generation 构建和校验均不持有 admission fence。
 
-发布阶段再次短暂取得 `ops.Lock`，并向唯一 Coordinator 插入 barrier，确保此前已接纳 Commit 全部完成；
-这些较新 Commit 仍位于 active Delta。GC 只将物理等价的新 Root 替换旧 checkpoint Root，保留 active
-Delta，再关闭旧 Mapping reader。这样长时间的 O(live IDs) 工作不会形成服务停顿，只有 marker、文件
-promotion、Manifest publish、打开新文件集和 Root/store 切换位于最终短锁窗口。
+重建期间的新 Commit 留在 active Delta。GC 发布物理等价的新 Root 时不再暂停 Commit；Mapping epoch
+使跨切换的 resolve 重试，Root owner reader ref 使旧文件延迟到旧 reader 清零后关闭。这样
+O(live IDs) 遍历、promotion、Manifest fsync 和旧文件 retirement 都不会形成 Store 级服务停顿。
 
 ## 4. 有界全量重建
 
@@ -89,17 +89,17 @@ Open 可幂等继续。
 
 ## 6. Catalog 与运行时切换
 
-Catalog 增加单一 `InstallMappingRewrite` mutation：要求 generation 精确匹配、CoveredCommitSeq 不变、
+Catalog 增加单一 `InstallMappingRewrite` mutation：要求 base 除 append-only Data rotation 外仍完全匹配、CoveredCommitSeq 不变、
 新 SegmentID 区间从旧 `NextMapSegmentID` 开始，并一次替换 `SealedMapSegments`、`ActiveMapSegmentID`、
 `NextMapSegmentID` 和 `MappingRoot`。它不得改写其他 Manifest 字段。
 
-Manifest durable 后，在 `ops.Lock` 内：
+Manifest durable 后：
 
 1. 以新 Catalog 打开新的 MapStore；
 2. 打开并验证新 Radix Root；
-3. `Persistent.ReplaceCheckpointRoot` 原子替换 root 与 syncer，要求无 active/frozen Delta 且 covered 相同；
+3. `Persistent.ReplaceCheckpointRoot` 原子替换 root 与 owner，要求无 frozen Delta 且 covered 相同，并保留 active Delta；
 4. Engine 替换 `mapStore` owner；
-5. 关闭旧 MapStore，随后执行旧文件 retirement。
+5. 等待旧 Root reader ref 清零，关闭旧 MapStore，随后执行旧文件 retirement。
 
 若 Manifest 已发布但进程内切换失败，Store 立即 fail closed；不得继续使用旧 Root 接受 Commit。
 

@@ -559,6 +559,32 @@ func TestConcurrentCommitCheckpointAndClose(t *testing.T) {
 	}
 }
 
+func TestCloseDoesNotWaitForCheckpointMutex(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	store, err := Create(context.Background(), root, testCreateConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A running operation may be about to enter checkpoint after Close marks
+	// the Store closing. Close must drain active operations without owning the
+	// same mutex they may still need, otherwise the lifecycle protocol can
+	// deadlock permanently.
+	store.checkpointMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- store.Close() }()
+	select {
+	case err := <-done:
+		store.checkpointMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		store.checkpointMu.Unlock()
+		t.Fatal("Close waited for checkpoint mutex")
+	}
+}
+
 func TestStatusCapacityAdvancesCheckpointBeforeNextBatch(t *testing.T) {
 	ctx := context.Background()
 	config := testCreateConfig()

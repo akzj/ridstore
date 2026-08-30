@@ -15,10 +15,9 @@ Catalog Manifest
   -> Engine
 
 Engine.Checkpoint
-  -> quiesce API operations
-  -> Coordinator durable CheckpointMarker
+  -> Coordinator admission fence + durable CheckpointMarker
   -> capture allocator/open-batch state + freeze Delta
-  -> resume API operations
+  -> release admission fence
   -> build and fsync candidate Root
   -> incrementally apply folded changes
   -> sequentially scan the former active Segment after Data rotation
@@ -34,7 +33,8 @@ Engine fail closed，重启以 durable Manifest 为准。
 ## 2. 关键所有权
 
 - Coordinator 独占 CommitSeq 顺序，并把 checkpoint marker 排在此前已 admission 的 Commit 后；
-- Engine 的 `ops` barrier 只保护 cut、open Batch 和 allocator 快照，不覆盖后台 Root/Stats I/O；
+- Engine 没有 Store 级 `ops` 锁；Coordinator admission fence 只保护 cut、open Batch/allocator 快照和 Freeze，
+  不覆盖后台 Root/Stats I/O，也不阻塞 Get、Record append 或 GC copy；
 - Persistent Mapping 独占 active/frozen/root 发布；
 - Persistent Mapping 同时独占 Delta charged/reserved 预算；Coordinator 只持 reservation，Engine 只负责
   在 hard pressure 时推进 Checkpoint；
@@ -89,9 +89,9 @@ former-active segment 并与 candidate Mapping join，不回到全量 live-ID wa
   自身失败可再次 Open，且成功恢复后 Catalog 与目录文件集合精确一致；
 - Delta reservation 位于 Prepare/durable Descriptor 之前，冲突、取消和 pre-durable 失败会归还；重复更新
   active hot ID 不重复计费，Freeze/Abort 不释放，Install 只释放精确 frozen prefix；
-- Delta hard pressure 会在不持有 `ops.RLock` 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
+- Delta hard pressure 会在不持有 admission read lock 等待的情况下推进 Checkpoint 并重试；Commit、Checkpoint、
   Close 的并发路径已纳入 race 测试；
-- Delta soft pressure 会在 Commit admission 后、`ops.RLock` 释放后非阻塞调度合并的
+- Delta soft pressure 会在 Commit admission 后非阻塞调度合并的
   后台 Checkpoint；worker 执行期间允许再排队一次 post-cut pressure，Close 会先等待 worker 退出；
 - Open replay 超过本次 Delta hard limit 时确定返回配置错误，不部分发布、不等待运行期 Checkpoint；
 - 配置拒绝 `floor(DeltaHardLimitBytes / 64) > floor(CheckpointSortBytes / 16)`，保证 Builder 至少能处理

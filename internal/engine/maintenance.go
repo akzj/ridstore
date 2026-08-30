@@ -32,13 +32,14 @@ func recoverMaintenance(root string, catalog *storecatalog.Manager, maintenanceH
 	})
 	present := index < len(manifest.SealedDataSegments) && manifest.SealedDataSegments[index].SegmentID == state.Source.SegmentID
 	if present {
-		if manifest.Generation != state.BaseGeneration || manifest.SealedDataSegments[index] != state.Source ||
-			manifest.CoveredCommitSeq != state.CoveredCommitSeq || manifest.ReplayStart != state.ReplayStart {
+		if manifest.Generation < state.BaseGeneration || manifest.SealedDataSegments[index] != state.Source ||
+			manifest.CoveredCommitSeq < state.CoveredCommitSeq || manifest.ReplayStart.Compare(state.ReplayStart) < 0 {
 			return errors.Join(base.ErrCorrupt, errors.New("maintenance rollback evidence mismatch"))
 		}
 		return maintstate.RemoveWithFaultHook(root, maintenanceHook)
 	}
-	if state.BaseGeneration == math.MaxUint64 || manifest.Generation != state.BaseGeneration+1 {
+	if state.BaseGeneration == math.MaxUint64 || manifest.Generation <= state.BaseGeneration ||
+		manifest.CoveredCommitSeq < state.CoveredCommitSeq || manifest.ReplayStart.Compare(state.ReplayStart) < 0 {
 		return errors.Join(base.ErrCorrupt, errors.New("maintenance completion generation mismatch"))
 	}
 	if err := recordlog.CleanupRetiredSegmentWithFaultHook(root, state.Source.SegmentID, manifest.Generation, recordLogHook); err != nil {

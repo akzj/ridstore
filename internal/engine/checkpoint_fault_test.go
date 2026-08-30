@@ -467,9 +467,7 @@ func TestCheckpointSupportsDataRotationAfterCut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store.ops.Lock()
-	work, err := store.prepareCheckpointLocked(context.Background())
-	store.ops.Unlock()
+	work, err := store.prepareCheckpoint(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

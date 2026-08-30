@@ -215,8 +215,9 @@ Open 在 RecordLog 打开文件前恢复：
 | durable evidence | Open 行为 |
 |---|---|
 | source 仍在 BaseGeneration Catalog，字段与 marker 一致 | Catalog remove 未发生；删除 marker，保留 source |
-| source 不在 BaseGeneration+1 Catalog | Catalog remove 已 durable；幂等完成 canonical/trash 清理，再删除 marker |
-| 其他 generation、identity、summary 组合 | corruption，拒绝打开 |
+| source 仍以相同 summary 位于 generation >= BaseGeneration 的 Catalog | retire 尚未发布；删除 marker |
+| source 不在 generation > BaseGeneration 的 Catalog | Catalog remove 已 durable；幂等完成 canonical/trash 清理，再删除 marker |
+| identity、summary 或 checkpoint 单调边界不匹配 | corruption，拒绝打开 |
 
 Catalog 是方向判定的唯一状态源；marker 只标识本次允许清理的确定文件，避免把未知 orphan 当作 GC
 产物自动删除。普通 Checkpoint 不写 marker，Data Segment rotation 继续使用自己的短物理 journal。
@@ -228,7 +229,7 @@ Catalog 是方向判定的唯一状态源；marker 只标识本次允许清理�
 ```text
 write new Manifest without source
 -> fsync Manifest/CURRENT/root dirs
--> rename data/source -> trash/source.catalogGeneration
+-> rename data/source -> trash/source.retired
 -> fsync data dir
 -> fsync trash dir
 -> unlink trash file

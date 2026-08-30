@@ -17,7 +17,7 @@ import (
 
 // CompactMapping rewrites the current logical Mapping into a fresh physical
 // generation. The immutable checkpoint Root is rebuilt without blocking data
-// operations; ops.Lock is held only to capture the cut and to publish/switch.
+// operations; commit admission is fenced only for capture and publication.
 func (s *Store) CompactMapping(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -25,13 +25,15 @@ func (s *Store) CompactMapping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := s.beginOperation(); err != nil {
+		return err
+	}
+	defer s.endOperation()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
-	s.ops.Lock()
-	work, err := s.prepareCheckpointLocked(ctx)
-	s.ops.Unlock()
+	work, err := s.prepareCheckpoint(ctx)
 	if err != nil {
 		return err
 	}
@@ -135,19 +137,6 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
 	}
 
-	// Stop new submissions and drain every commit admitted before the lock.
-	// Newer commits remain in the active Mapping Delta and are preserved when
-	// the physically equivalent checkpoint Root is switched below.
-	s.ops.Lock()
-	opsLocked := true
-	defer func() {
-		if opsLocked {
-			s.ops.Unlock()
-		}
-	}()
-	if _, err := s.commits.CheckpointCut(ctx); err != nil {
-		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
-	}
 	latest := s.catalog.Snapshot()
 	oldSet := mappingGCFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot)
 	if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
@@ -177,7 +166,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	if err := mapstore.PromoteGeneration(s.root, staging, generation, s.mapStoreHook); err != nil {
 		return rollback(err)
 	}
-	installed, err := s.catalog.InstallMappingRewrite(latest.Generation, storecatalog.MappingRewrite{
+	installed, err := s.catalog.InstallMappingRewrite(latest, storecatalog.MappingRewrite{
 		SealedSegments: mappingGCSummaries(generation.SealedSegments), ActiveSegment: generation.ActiveSegment,
 		NextSegment: generation.NextSegment, Root: generation.Root, Covered: generation.Covered,
 	})
@@ -197,19 +186,19 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	if err := s.mapping.ReplaceCheckpointRoot(view, newRoot, newStore); err != nil {
+	drained, err := s.mapping.ReplaceCheckpointRoot(view, newRoot, newStore)
+	if err != nil {
 		_ = newStore.Close()
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
 	oldStore := s.mapStore
 	s.mapStore = newStore
+	<-drained
 	if err := oldStore.Close(); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	s.ops.Unlock()
-	opsLocked = false
 	if err := mapstore.RetireGeneration(s.root, generationFromState(state.Old, state.Covered), installed.Generation, s.mapStoreHook); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)

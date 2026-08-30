@@ -36,7 +36,7 @@ type SegmentRelocationResult struct {
 // SegmentRetirementProof captures the durable checkpoint at which source was
 // proven to have no current Mapping or open-Batch references. It is not an
 // authorization to unlink by itself: the eventual retire operation must
-// consume and revalidate it while holding the maintenance/operation gates.
+// consume and revalidate it while holding the maintenance gate.
 type SegmentRetirementProof struct {
 	Source            recordlog.SegmentSummary
 	CatalogGeneration uint64
@@ -77,6 +77,10 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 	if source == 0 {
 		return SegmentRelocationResult{}, base.ErrInvalidConfig
 	}
+	if err := s.beginOperation(); err != nil {
+		return SegmentRelocationResult{}, err
+	}
+	defer s.endOperation()
 
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
@@ -85,8 +89,8 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 }
 
 // PrepareSegmentRetirement relocates current live records, checkpoints every
-// resulting relocation, then proves under the exclusive operation gate that
-// the source cannot be reintroduced by an already-open Batch.
+// resulting relocation, then proves that the source cannot be reintroduced by
+// an already-open Batch. Data operations remain concurrent with the proof.
 func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.SegmentID) (SegmentRetirementProof, SegmentRelocationResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -97,6 +101,10 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	if source == 0 {
 		return SegmentRetirementProof{}, SegmentRelocationResult{}, base.ErrInvalidConfig
 	}
+	if err := s.beginOperation(); err != nil {
+		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
+	}
+	defer s.endOperation()
 
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
@@ -109,9 +117,7 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 		return SegmentRetirementProof{}, relocated, err
 	}
 
-	s.ops.Lock()
-	defer s.ops.Unlock()
-	proof, err := s.proveSegmentRetirementLocked(ctx, source, relocated.LastCommitSeq)
+	proof, err := s.proveSegmentRetirement(ctx, source, relocated.LastCommitSeq)
 	return proof, relocated, err
 }
 
@@ -129,6 +135,10 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	if source == 0 {
 		return SegmentCompactionResult{}, base.ErrInvalidConfig
 	}
+	if err := s.beginOperation(); err != nil {
+		return SegmentCompactionResult{}, err
+	}
+	defer s.endOperation()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	rate := s.gcBytesPerSecond.Load()
@@ -152,6 +162,10 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	if policy.MinReclaimableRatioBasis > compactionRatioScale {
 		return NextSegmentCompactionResult{}, false, base.ErrInvalidConfig
 	}
+	if err := s.beginOperation(); err != nil {
+		return NextSegmentCompactionResult{}, false, err
+	}
+	defer s.endOperation()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	rate := s.gcBytesPerSecond.Load()
@@ -215,21 +229,21 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		return result, fmt.Errorf("checkpoint relocated segment %d: %w", source, err)
 	}
 
-	s.ops.Lock()
-	defer s.ops.Unlock()
-	proof, err := s.proveSegmentRetirementLocked(ctx, source, relocated.LastCommitSeq)
+	proof, err := s.proveSegmentRetirement(ctx, source, relocated.LastCommitSeq)
 	result.Proof = proof
 	if err != nil {
 		return result, fmt.Errorf("prove retirement of segment %d: %w", source, err)
 	}
 	manifest := s.catalog.Snapshot()
-	if s.root == "" || manifest.Generation != proof.CatalogGeneration || manifest.RecordLogID == (recordlog.LogID{}) {
+	if s.root == "" || manifest.Generation < proof.CatalogGeneration || manifest.RecordLogID == (recordlog.LogID{}) ||
+		manifest.CoveredCommitSeq < proof.CoveredCommitSeq || manifest.ReplayStart.Compare(proof.ReplayStart) < 0 ||
+		!containsSealedSegment(manifest, proof.Source) {
 		return result, fmt.Errorf("retirement proof generation=%d current=%d: %w", proof.CatalogGeneration, manifest.Generation, base.ErrInvalidConfig)
 	}
 	state := maintstate.State{
 		Operation: maintstate.DataRetire, StoreUUID: manifest.StoreUUID, LogID: manifest.RecordLogID,
-		BaseGeneration: proof.CatalogGeneration, CoveredCommitSeq: proof.CoveredCommitSeq,
-		ReplayStart: proof.ReplayStart, Source: proof.Source,
+		BaseGeneration: manifest.Generation, CoveredCommitSeq: manifest.CoveredCommitSeq,
+		ReplayStart: manifest.ReplayStart, Source: proof.Source,
 	}
 	if err := maintstate.InstallWithFaultHook(s.root, state, s.maintenanceHook); err != nil {
 		_, markerVisible, loadErr := maintstate.Load(s.root)
@@ -240,9 +254,9 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		}
 		return result, err
 	}
-	if err := s.maintenance.RetireSegment(ctx, source, proof.CatalogGeneration); err != nil {
+	if err := s.maintenance.RetireSegment(ctx, source, manifest.Generation); err != nil {
 		current := s.catalog.Snapshot()
-		if current.Generation == proof.CatalogGeneration && containsSealedSegment(current, proof.Source) {
+		if current.Generation >= manifest.Generation && containsSealedSegment(current, proof.Source) {
 			cleanupErr := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook)
 			if cleanupErr == nil {
 				return result, err
@@ -264,17 +278,27 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 }
 
 func (s *Store) openBatchSegmentReferences(sealed []recordlog.SegmentSummary) (map[recordlog.SegmentID]struct{}, error) {
+	s.mutationFence.Lock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
+		s.mutationFence.Unlock()
 		return nil, base.ErrClosed
 	}
 	if s.fault != nil {
+		s.mu.Unlock()
+		s.mutationFence.Unlock()
 		return nil, errors.Join(base.ErrReadOnly, s.fault)
 	}
+	open := make([]*Batch, 0, len(s.open))
+	for _, batch := range s.open {
+		open = append(open, batch)
+	}
+	s.mu.Unlock()
+	s.mutationFence.Unlock()
 	result := make(map[recordlog.SegmentID]struct{})
 	for _, source := range sealed {
-		for _, batch := range s.open {
+		for _, batch := range open {
 			if batch.inner.ReferencesSegment(source.SegmentID) {
 				result[source.SegmentID] = struct{}{}
 				break
@@ -291,24 +315,31 @@ func containsSealedSegment(manifest storecatalog.Manifest, source recordlog.Segm
 	return index < len(manifest.SealedDataSegments) && manifest.SealedDataSegments[index] == source
 }
 
-func (s *Store) proveSegmentRetirementLocked(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq) (SegmentRetirementProof, error) {
+func (s *Store) proveSegmentRetirement(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq) (SegmentRetirementProof, error) {
+	s.mutationFence.Lock()
 	s.mu.Lock()
 	closed, fault := s.closed, s.fault
 	if closed {
 		s.mu.Unlock()
+		s.mutationFence.Unlock()
 		return SegmentRetirementProof{}, base.ErrClosed
 	}
 	if fault != nil {
 		s.mu.Unlock()
+		s.mutationFence.Unlock()
 		return SegmentRetirementProof{}, errors.Join(base.ErrReadOnly, fault)
 	}
+	open := make([]*Batch, 0, len(s.open))
 	for _, batch := range s.open {
+		open = append(open, batch)
+	}
+	s.mu.Unlock()
+	s.mutationFence.Unlock()
+	for _, batch := range open {
 		if batch.inner.ReferencesSegment(source) {
-			s.mu.Unlock()
 			return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("open batch references source segment"))
 		}
 	}
-	s.mu.Unlock()
 	if commitFault := s.commits.Fault(); commitFault != nil {
 		return SegmentRetirementProof{}, errors.Join(base.ErrReadOnly, commitFault)
 	}
@@ -371,9 +402,6 @@ func (s *Store) proveSegmentRetirementLocked(ctx context.Context, source recordl
 // Store lets a later complete GC operation compose relocation, checkpoint and
 // retirement without recursively acquiring the maintenance lock.
 func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentRelocationResult, error) {
-	s.ops.RLock()
-	defer s.ops.RUnlock()
-
 	s.mu.Lock()
 	closed, fault := s.closed, s.fault
 	s.mu.Unlock()

@@ -212,6 +212,67 @@ func TestSubmitPropagatesDeltaSoftPressure(t *testing.T) {
 	}
 }
 
+func TestCheckpointFenceStopsAdmissionOnlyUntilRelease(t *testing.T) {
+	log := &fakeLog{firstSync: make(chan struct{}), releaseSync: make(chan struct{})}
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+
+	fenceResult := make(chan struct {
+		fence *CheckpointFence
+		err   error
+	}, 1)
+	go func() {
+		fence, err := c.AcquireCheckpointFence(context.Background())
+		fenceResult <- struct {
+			fence *CheckpointFence
+			err   error
+		}{fence: fence, err: err}
+	}()
+	select {
+	case <-log.firstSync:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint marker did not reach durable append")
+	}
+
+	batch := newBatch(t, 7, log)
+	if err := batch.Put(context.Background(), 3, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	submitDone := make(chan error, 1)
+	go func() {
+		receipt, err := c.Submit(context.Background(), batch)
+		if err == nil {
+			_, err = receipt.Wait()
+		}
+		submitDone <- err
+	}()
+	select {
+	case err := <-submitDone:
+		t.Fatalf("submit crossed checkpoint admission fence: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(log.releaseSync)
+	answer := <-fenceResult
+	if answer.err != nil {
+		t.Fatal(answer.err)
+	}
+	select {
+	case err := <-submitDone:
+		t.Fatalf("submit crossed held checkpoint fence: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	answer.fence.Release()
+	select {
+	case err := <-submitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("submit did not resume after checkpoint fence release")
+	}
+}
+
 func TestRelocationSharesCommitOrderAndUsesAddressCAS(t *testing.T) {
 	log := &fakeLog{}
 	current := mapping.NewEmpty()

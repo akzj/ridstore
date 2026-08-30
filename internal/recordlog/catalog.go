@@ -61,7 +61,7 @@ func (s CatalogSnapshot) sealedSummary(id SegmentID) (SegmentSummary, bool) {
 type CatalogPort interface {
 	SnapshotRecordLog() CatalogSnapshot
 	InstallRecordLogRotation(expectGeneration uint64, sealed SegmentSummary, newActive, next SegmentID) (CatalogSnapshot, error)
-	RemoveRecordLogSegment(expectGeneration uint64, sealed SegmentSummary) (CatalogSnapshot, error)
+	RemoveRecordLogSegment(minimumGeneration uint64, sealed SegmentSummary) (CatalogSnapshot, error)
 }
 
 func validateRotationResult(before, after CatalogSnapshot, sealed SegmentSummary, newActive, next SegmentID) error {

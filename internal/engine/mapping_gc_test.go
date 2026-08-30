@@ -269,7 +269,7 @@ func TestCompactMappingPostPublishFailureRecoversOnOpen(t *testing.T) {
 	}
 }
 
-func TestCompactMappingKeepsOperationsQuiescedThroughRuntimeSwitch(t *testing.T) {
+func TestCompactMappingDoesNotBlockDataOperationsDuringGenerationPromotion(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
@@ -308,15 +308,39 @@ func TestCompactMappingKeepsOperationsQuiescedThroughRuntimeSwitch(t *testing.T)
 	}()
 	select {
 	case err := <-getDone:
-		t.Fatalf("Get crossed the Mapping switch gate: %v", err)
+		if err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(50 * time.Millisecond):
+		t.Fatal("Get blocked behind Mapping generation promotion")
+	}
+	batch, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(ctx, id, []byte("updated")); err != nil {
+		t.Fatal(err)
+	}
+	commitDone := make(chan error, 1)
+	go func() {
+		_, err := batch.Commit(ctx)
+		commitDone <- err
+	}()
+	select {
+	case err := <-commitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Commit blocked behind Mapping generation promotion")
 	}
 	close(release)
 	if err := <-compactDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-getDone; err != nil {
-		t.Fatal(err)
+	record, err := store.Get(ctx, id)
+	if err != nil || string(record.Value) != "updated" {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }
 

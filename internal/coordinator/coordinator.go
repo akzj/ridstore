@@ -76,6 +76,23 @@ type CheckpointCut struct {
 	ReplayStart      recordlog.LogPos
 }
 
+// CheckpointFence is a durable commit-order cut that prevents new Commit and
+// Relocation admission until Release. It lets checkpoint and Mapping-GC
+// callers perform short cross-component state transitions without stopping
+// reads, record appends, or GC copying.
+type CheckpointFence struct {
+	Cut  CheckpointCut
+	once sync.Once
+	c    *Coordinator
+}
+
+func (f *CheckpointFence) Release() {
+	if f == nil || f.c == nil {
+		return
+	}
+	f.once.Do(func() { f.c.admissionMu.Unlock() })
+}
+
 type checkpointResponse struct {
 	cut CheckpointCut
 	err error
@@ -102,14 +119,17 @@ type Coordinator struct {
 	mapping mapping.Index
 	config  Config
 
-	stateMu  sync.Mutex
-	next     model.CommitSeq
-	fault    error
-	submitMu sync.Mutex
-	closed   bool
-	requests chan request
-	done     chan struct{}
-	metrics  runtimeMetrics
+	stateMu sync.Mutex
+	next    model.CommitSeq
+	fault   error
+	// admissionMu makes ReserveDelta -> queue admission atomic with a
+	// checkpoint fence. It never covers durable append or result waiting.
+	admissionMu sync.RWMutex
+	submitMu    sync.Mutex
+	closed      bool
+	requests    chan request
+	done        chan struct{}
+	metrics     runtimeMetrics
 }
 
 func New(next model.CommitSeq, log Appender, current mapping.Index, config Config) (*Coordinator, error) {
@@ -155,6 +175,13 @@ func (c *Coordinator) Relocate(ctx context.Context, relocation Relocation) (Relo
 	if err := c.Fault(); err != nil {
 		return RelocationResult{}, errors.Join(base.ErrReadOnly, err)
 	}
+	c.admissionMu.RLock()
+	admissionHeld := true
+	defer func() {
+		if admissionHeld {
+			c.admissionMu.RUnlock()
+		}
+	}()
 	proposal := relocationProposal(relocation)
 	if relocation.BatchID == 0 || mapping.ValidateProposal(proposal) != nil {
 		return RelocationResult{}, base.ErrInvalidConfig
@@ -184,6 +211,8 @@ func (c *Coordinator) Relocate(ctx context.Context, relocation Relocation) (Relo
 		reservation.Release()
 		return RelocationResult{}, ctx.Err()
 	}
+	c.admissionMu.RUnlock()
+	admissionHeld = false
 	answer := <-req.relocated
 	return answer.result, answer.err
 }
@@ -204,6 +233,8 @@ func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Rec
 	if err := c.Fault(); err != nil {
 		return Receipt{}, errors.Join(base.ErrReadOnly, err)
 	}
+	c.admissionMu.RLock()
+	defer c.admissionMu.RUnlock()
 	mutationIDs, err := batch.MutationIDs()
 	if err != nil {
 		return Receipt{}, err
@@ -250,30 +281,53 @@ func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Rec
 // must separately quiesce non-commit RecordLog producers while capturing the
 // rest of the checkpoint state.
 func (c *Coordinator) CheckpointCut(ctx context.Context) (CheckpointCut, error) {
+	fence, err := c.AcquireCheckpointFence(ctx)
+	if err != nil {
+		return CheckpointCut{}, err
+	}
+	defer fence.Release()
+	return fence.Cut, nil
+}
+
+// AcquireCheckpointFence drains and durably marks every commit admitted before
+// the call. New Commit and Relocation admission remains stopped until Release;
+// callers must keep the fenced section short and must always release it.
+func (c *Coordinator) AcquireCheckpointFence(ctx context.Context) (*CheckpointFence, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return CheckpointCut{}, err
+		return nil, err
 	}
 	if err := c.Fault(); err != nil {
-		return CheckpointCut{}, errors.Join(base.ErrReadOnly, err)
+		return nil, errors.Join(base.ErrReadOnly, err)
 	}
+	c.admissionMu.Lock()
+	release := true
+	defer func() {
+		if release {
+			c.admissionMu.Unlock()
+		}
+	}()
 	req := request{barrier: make(chan checkpointResponse, 1)}
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()
-		return CheckpointCut{}, base.ErrClosed
+		return nil, base.ErrClosed
 	}
 	select {
 	case c.requests <- req:
 		c.submitMu.Unlock()
 	case <-ctx.Done():
 		c.submitMu.Unlock()
-		return CheckpointCut{}, ctx.Err()
+		return nil, ctx.Err()
 	}
 	answer := <-req.barrier
-	return answer.cut, answer.err
+	if answer.err != nil {
+		return nil, answer.err
+	}
+	release = false
+	return &CheckpointFence{Cut: answer.cut, c: c}, nil
 }
 
 func (c *Coordinator) Fault() error {
@@ -289,6 +343,8 @@ func (c *Coordinator) NextCommitSeq() model.CommitSeq {
 }
 
 func (c *Coordinator) Close() error {
+	c.admissionMu.Lock()
+	defer c.admissionMu.Unlock()
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()

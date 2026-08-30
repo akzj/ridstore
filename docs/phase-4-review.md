@@ -51,7 +51,7 @@ SegmentStats、dead ratio、Metrics 和文件年龄均不授权删除。任何�
 
 - 已排队用户 Commit 优先于下一批 GC Relocation；已选中的单个有限 Relocation Batch 保持原子，不被中途拆分；
 - Relocation 与用户 Put 的两种 CommitSeq 顺序都由 expected-old CAS 决定，GC 不覆盖较新的用户值；
-- GC-held `ops.RLock` 允许正常读写，Close 等待 GC 到可恢复完成点；
+- GC 不持有 Store 全局 operation lock；Close 通过 lifecycle admission + active-operation drain 等待 GC 到可恢复完成点；
 - Context/ENOSPC 在 MappingCheckpointDurable 前撤销 Cleaning、移除 Journal 并保留 source；之后 fault closed；
 - Journal 前的 copy admission 与 checkpoint barrier 后按 frozen Delta entry 数计算的 COW admission 分离，避免漏算 GC 期间进入 cut 的用户 Commit；
 - `GCBytesPerSecond` 在每个 durable Relocation Batch 后做 Context-aware pacing，累计 throttled nanos 可观测；

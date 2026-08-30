@@ -57,23 +57,26 @@ Mapping[ID] != scanned VAddr
 
 1. 搬迁当前 live Put；
 2. 创建覆盖 `LastCommitSeq` 的 durable Checkpoint；
-3. 取得 Engine exclusive operation gate；
-4. 拒绝仍以最终 Put mutation 引用 source 的 Open/Committing Batch；
+3. 快照并检查仍以最终 Put mutation 引用 source 的 Open/Committing Batch；
 5. 验证 checkpoint sparse stats 对 source 为零；
 6. 再扫描 source，并逐条确认当前 `Mapping[ID] != scanned VAddr`；
 7. 返回绑定 source summary、Catalog generation、CoveredCommitSeq 和 ReplayStart 的 proof。
 
 历史 Put 若已被同 Batch 的 Put/Delete 覆盖，不会进入 Mapping，因此不属于 open-batch 引用。proof 不是
-独立删除令牌；未来 retire 操作必须在 maintenance/operation gate 内消费并重新验证。
+独立删除令牌；retire 操作必须在 maintenance gate 内消费并重新验证。引用检查和 source 精确扫描不持有
+Store 生命周期锁，Get/Put/Commit 可继续运行；sealed source 不会被新 Put 重新引用。
 
 `CompactSegment` 在 proof 之后安装唯一 durable `MAINTENANCE.v2` marker，再调用 RecordLog retire gate、
 Catalog remove、Registry detach、close、trash 和 delete。marker 删除是最后一步。
 
 恢复不持久化内存阶段，而只比较 marker 与 Catalog：
 
-- source 仍在 BaseGeneration Catalog：不可逆操作尚未发生，删除 marker；
-- source 已从 BaseGeneration+1 Catalog 移除：继续幂等物理清理，再删除 marker；
-- 其他 generation、identity 或 summary 组合：corruption，拒绝猜测。
+- source 仍以相同 summary 位于不早于 BaseGeneration 的 Catalog：不可逆操作尚未发生，删除 marker；
+- source 已从晚于 BaseGeneration 的 Catalog 移除：继续幂等物理清理，再删除 marker；
+- identity、summary 或单调 checkpoint 边界不匹配：corruption，拒绝猜测。
+
+这里允许 marker 之后发生任意次 append-only Data rotation。Catalog remove 在最新 generation 上重新验证
+source、ReplayStart 和零存活 stats；trash 名称只绑定永不复用的 SegmentID，不依赖可能继续前进的 generation。
 
 fault hook 已覆盖 marker 的 temp cleanup/create、write、file sync、close、rename、directory sync 和 remove，
 以及 source-to-trash rename、records/trash directory sync、trash unlink 和最终 directory sync。marker 已
@@ -90,7 +93,9 @@ canonical source 重新出现。
 
 Transaction 可以从最终 mutation 集合报告 Segment 引用。被后续 Put/Delete 覆盖的历史 Put 不会进入
 Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable publication 或终止清理前持续
-构成引用。退休前证明在阻止新 Batch 操作后检查该引用集合。
+构成引用。Put-like 操作在 `Record append -> Batch mutation visible` 区间持有 batch-mutation read fence；
+退休证明只短暂取得 write fence 来排空该区间并快照 open Batch。fence 随即释放，后续 Put 只能追加到
+当前 active Segment，不可能重新引用 sealed source；长时间的 source scan 不持有该 fence。
 
 ## 5. Sparse SegmentStats 语义修正
 

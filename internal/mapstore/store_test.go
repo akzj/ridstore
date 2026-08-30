@@ -4,7 +4,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -86,6 +88,137 @@ func TestStoreAppendSyncReadAndOpen(t *testing.T) {
 	rootNode, err := reopened.Read(rootAddr)
 	if err != nil || rootNode.Level != MaxLevel {
 		t.Fatalf("node=%+v err=%v", rootNode, err)
+	}
+}
+
+func TestStoreReadDoesNotWaitForNodeAppendIO(t *testing.T) {
+	root := t.TempDir()
+	state := initialState()
+	if err := CreateInitialSegment(root, state.StoreID, state.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root, &staticCatalog{state: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var slots [NodeSlots]uint64
+	addr, _ := recordlog.NewVAddr(1, 64, 64)
+	slots[1] = uint64(addr)
+	first, err := store.Append(0, 0, 1, slots)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var once sync.Once
+	store.hook = func(point FaultPoint) error {
+		if point == FaultBeforeAppendWrite {
+			once.Do(func() {
+				close(reached)
+				<-release
+			})
+		}
+		return nil
+	}
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := store.Append(0, 1, 2, slots)
+		appendDone <- appendErr
+	}()
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("append did not reach blocked I/O")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := store.Read(first)
+		readDone <- readErr
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("existing node read blocked behind append I/O")
+	}
+	close(release)
+	released = true
+	if err := <-appendDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStoreReadDoesNotWaitForRotationIO(t *testing.T) {
+	root := t.TempDir()
+	state := initialState()
+	if err := CreateInitialSegment(root, state.StoreID, state.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root, &staticCatalog{state: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, err := store.Append(1, 0, 1, denseSlots(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var once sync.Once
+	store.hook = func(point FaultPoint) error {
+		if point == FaultBeforeFooterSync {
+			once.Do(func() {
+				close(reached)
+				<-release
+			})
+		}
+		return nil
+	}
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := store.Append(1, 1, 2, denseSlots(t))
+		appendDone <- appendErr
+	}()
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("rotation did not reach blocked I/O")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := store.Read(first)
+		readDone <- readErr
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("existing node read blocked behind rotation I/O")
+	}
+	close(release)
+	released = true
+	if err := <-appendDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -95,6 +95,7 @@ type recordExtent struct {
 }
 
 type activeSegment struct {
+	writerMu    sync.Mutex
 	mu          sync.RWMutex
 	file        fileHandle
 	path        string
@@ -323,38 +324,52 @@ func (s *activeSegment) remainingLocked() uint32 {
 }
 
 func (s *activeSegment) appendEncoded(encoded []byte, records []recordExtent) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	s.mu.RLock()
 	if s.file == nil || s.sealed {
+		s.mu.RUnlock()
 		return 0, ErrClosed
 	}
 	if len(records) == 0 || len(encoded) == 0 {
+		s.mu.RUnlock()
 		if len(records) == 0 && len(encoded) == 0 {
 			return 0, nil
 		}
 		return 0, ErrInvalidConfig
 	}
+	file, startOffset := s.file, s.end
+	segmentID := s.header.SegmentID
 	var total uint32
 	for _, record := range records {
 		if total > s.remainingLocked() || record.Size == 0 || record.Size > s.remainingLocked()-total {
+			s.mu.RUnlock()
 			return 0, fmt.Errorf("append plan: %w", ErrCorrupt)
 		}
-		offset := s.end + total
+		offset := startOffset + total
 		end := offset + record.Size
-		if record.Result.Addr.SegmentID() != s.header.SegmentID || record.Result.Addr.Offset() != offset || record.Result.End != (LogPos{SegmentID: s.header.SegmentID, Offset: end}) {
+		if record.Result.Addr.SegmentID() != segmentID || record.Result.Addr.Offset() != offset || record.Result.End != (LogPos{SegmentID: segmentID, Offset: end}) {
+			s.mu.RUnlock()
 			return 0, fmt.Errorf("append plan: %w", ErrCorrupt)
 		}
 		total += record.Size
 	}
 	if uint32(len(encoded)) != total {
+		s.mu.RUnlock()
 		return 0, fmt.Errorf("encoded append size: %w", ErrCorrupt)
 	}
+	s.mu.RUnlock()
 	if err := hitSegmentFault(s.hook, faultBeforeAppendWrite); err != nil {
 		return 0, err
 	}
-	written, err := writeFullAt(s.file, encoded, int64(s.end))
+	written, err := writeFullAt(file, encoded, int64(startOffset))
 	if err != nil {
 		return written, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file != file || s.end != startOffset || s.sealed {
+		return written, ErrCorrupt
 	}
 	for _, record := range records {
 		if s.records == 0 {
@@ -368,15 +383,19 @@ func (s *activeSegment) appendEncoded(encoded []byte, records []recordExtent) (i
 }
 
 func (s *activeSegment) sync() error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if s.file == nil || s.sealed {
+		s.mu.RUnlock()
 		return ErrClosed
 	}
+	file := s.file
+	s.mu.RUnlock()
 	if err := hitSegmentFault(s.hook, faultBeforeDataSync); err != nil {
 		return err
 	}
-	return s.file.Sync()
+	return file.Sync()
 }
 
 func (s *activeSegment) summary() SegmentSummary {
@@ -390,12 +409,16 @@ func (s *activeSegment) summaryLocked() SegmentSummary {
 }
 
 func (s *activeSegment) seal() (*sealedSegment, SegmentSummary, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	s.mu.RLock()
 	if s.file == nil || s.sealed {
+		s.mu.RUnlock()
 		return nil, SegmentSummary{}, ErrClosed
 	}
 	summary := s.summaryLocked()
+	file, path, header := s.file, s.path, s.header
+	s.mu.RUnlock()
 	footer, err := EncodeSegmentFooter(SegmentFooter{SegmentID: summary.SegmentID, DataEnd: summary.ValidEnd, FirstAddr: summary.FirstAddr, LastAddr: summary.LastAddr, RecordCount: summary.RecordCount})
 	if err != nil {
 		return nil, SegmentSummary{}, err
@@ -403,21 +426,21 @@ func (s *activeSegment) seal() (*sealedSegment, SegmentSummary, error) {
 	if err := hitSegmentFault(s.hook, faultBeforeFooterWrite); err != nil {
 		return nil, SegmentSummary{}, err
 	}
-	if _, err := writeFullAt(s.file, footer[:], int64(s.end)); err != nil {
+	if _, err := writeFullAt(file, footer[:], int64(summary.ValidEnd)); err != nil {
 		return nil, SegmentSummary{}, err
 	}
 	if err := hitSegmentFault(s.hook, faultBeforeFooterSync); err != nil {
 		return nil, SegmentSummary{}, err
 	}
-	if err := s.file.Sync(); err != nil {
+	if err := file.Sync(); err != nil {
 		return nil, SegmentSummary{}, err
 	}
-	dir := filepath.Dir(s.path)
-	destination := filepath.Join(dir, sealedSegmentName(s.header.SegmentID))
+	dir := filepath.Dir(path)
+	destination := filepath.Join(dir, sealedSegmentName(header.SegmentID))
 	if err := hitSegmentFault(s.hook, faultBeforeSealRename); err != nil {
 		return nil, SegmentSummary{}, err
 	}
-	if err := s.files.rename(s.path, destination); err != nil {
+	if err := s.files.rename(path, destination); err != nil {
 		return nil, SegmentSummary{}, err
 	}
 	if err := hitSegmentFault(s.hook, faultBeforeSealDirSync); err != nil {
@@ -426,12 +449,18 @@ func (s *activeSegment) seal() (*sealedSegment, SegmentSummary, error) {
 	if err := s.files.syncDir(dir); err != nil {
 		return nil, SegmentSummary{}, err
 	}
-	sealed := &sealedSegment{file: s.file, path: destination, header: s.header, summary: summary}
+	sealed := &sealedSegment{file: file, path: destination, header: header, summary: summary}
 	// Existing reader pins may still hold the active wrapper until Registry
 	// publication. Both wrappers therefore share this immutable descriptor;
 	// ownership transfers to sealedSegment and activeSegment.close becomes a
 	// no-op after this point.
+	s.mu.Lock()
+	if s.file != file || s.end != summary.ValidEnd || s.sealed {
+		s.mu.Unlock()
+		return nil, SegmentSummary{}, ErrCorrupt
+	}
 	s.sealed = true
+	s.mu.Unlock()
 	return sealed, summary, nil
 }
 
@@ -589,19 +618,23 @@ func scanRecordRange(file fileHandle, summary SegmentSummary, from uint32, visit
 
 func (s *activeSegment) read(addr VAddr) ([]byte, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if s.file == nil {
+		s.mu.RUnlock()
 		return nil, ErrClosed
 	}
-	return readRecordAt(s.file, s.summaryLocked(), addr)
+	file, summary := s.file, s.summaryLocked()
+	s.mu.RUnlock()
+	return readRecordAt(file, summary, addr)
 }
 func (s *activeSegment) inspect(addr VAddr, prefixBytes uint32) (RecordHeader, []byte, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if s.file == nil {
+		s.mu.RUnlock()
 		return RecordHeader{}, nil, ErrClosed
 	}
-	return inspectRecordAt(s.file, s.summaryLocked(), addr, prefixBytes)
+	file, summary := s.file, s.summaryLocked()
+	s.mu.RUnlock()
+	return inspectRecordAt(file, summary, addr, prefixBytes)
 }
 func (s *activeSegment) scan(from uint32, visit func(AppendResult, []byte) error) error {
 	return s.scanTo(from, s.summary().ValidEnd, visit)
@@ -640,6 +673,8 @@ func (s *sealedSegment) scan(from uint32, visit func(AppendResult, []byte) error
 	return scanRecordRange(s.file, s.summary, from, visit)
 }
 func (s *activeSegment) close() error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.file == nil {

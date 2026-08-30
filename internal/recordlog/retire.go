@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 )
 
-func (l *Log) RetireSegment(ctx context.Context, id SegmentID, expectGeneration uint64) error {
+func (l *Log) RetireSegment(ctx context.Context, id SegmentID, minimumGeneration uint64) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -19,7 +19,7 @@ func (l *Log) RetireSegment(ctx context.Context, id SegmentID, expectGeneration 
 		return ErrInvalidConfig
 	}
 	snapshot := l.catalog.SnapshotRecordLog()
-	if snapshot.Generation != expectGeneration || snapshot.ActiveSegmentID == id {
+	if snapshot.Generation < minimumGeneration || snapshot.ActiveSegmentID == id {
 		return ErrInvalidConfig
 	}
 	summary, ok := snapshot.sealedSummary(id)
@@ -38,7 +38,7 @@ func (l *Log) RetireSegment(ctx context.Context, id SegmentID, expectGeneration 
 	if err := l.registry.waitNoReaders(ctx, id); err != nil {
 		return err
 	}
-	installed, err := l.catalog.RemoveRecordLogSegment(expectGeneration, summary)
+	installed, err := l.catalog.RemoveRecordLogSegment(minimumGeneration, summary)
 	if err != nil {
 		return err
 	}
@@ -87,7 +87,7 @@ func cleanupRetiredSegment(root string, id SegmentID, catalogGeneration uint64, 
 		return err
 	}
 	source := filepath.Join(recordsPath(root), sealedSegmentName(id))
-	destination := filepath.Join(trash, fmt.Sprintf("%s.g%d.trash", sealedSegmentName(id), catalogGeneration))
+	destination := filepath.Join(trash, fmt.Sprintf("%s.retired", sealedSegmentName(id)))
 	_, sourceErr := files.stat(source)
 	_, destinationErr := files.stat(destination)
 	sourceExists, destinationExists := sourceErr == nil, destinationErr == nil

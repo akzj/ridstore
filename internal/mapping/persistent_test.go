@@ -6,6 +6,7 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -441,3 +442,108 @@ func (emptyNodeStoreForPersistentTest) Append(uint8, uint64, model.CommitSeq, [m
 }
 
 func (emptyNodeStoreForPersistentTest) Sync() error { return nil }
+
+type blockingNodeStore struct {
+	inner   *mapstore.Store
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	block   bool
+}
+
+func (s *blockingNodeStore) Read(addr model.MapAddr) (mapstore.Node, error) {
+	if s.block {
+		s.once.Do(func() { close(s.started) })
+		<-s.release
+	}
+	return s.inner.Read(addr)
+}
+
+func (s *blockingNodeStore) Append(level uint8, prefix uint64, covered model.CommitSeq, slots [mapstore.NodeSlots]uint64) (model.MapAddr, error) {
+	return s.inner.Append(level, prefix, covered, slots)
+}
+
+func (s *blockingNodeStore) Sync() error { return s.inner.Sync() }
+
+func TestReplaceCheckpointRootWaitsOnlyForOldReaders(t *testing.T) {
+	seed, physical := newPersistentForTest(t)
+	defer physical.Close()
+	addr := testAddr(t, 1, 64)
+	plan, err := seed.ResolveGroup([]Proposal{{
+		Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: addr, Operation: OperationPut}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.PublishGroup(1, plan, reservePlan(t, seed, plan)); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := seed.Freeze(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := seed.BuildCheckpoint(frozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.InstallCheckpoint(candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	oldStore := &blockingNodeStore{inner: physical, started: make(chan struct{}), release: make(chan struct{})}
+	oldTree, err := radix.Open(oldStore, candidate.Root(), candidate.CoveredCommitSeq(), uint64(mapstore.DenseNodeSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := OpenPersistent(oldTree, oldStore, PersistentConfig{
+		CheckpointSortBytes: 16 << 10, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := current.CheckpointView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTree, err := radix.Open(physical, candidate.Root(), candidate.CoveredCommitSeq(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldStore.block = true
+	lookupDone := make(chan error, 1)
+	go func() {
+		got, exists, lookupErr := current.Lookup(1)
+		if lookupErr == nil && (!exists || got != addr) {
+			lookupErr = errors.New("old-root lookup returned the wrong value")
+		}
+		lookupDone <- lookupErr
+	}()
+	select {
+	case <-oldStore.started:
+	case <-time.After(time.Second):
+		t.Fatal("old-root lookup did not reach storage")
+	}
+
+	drained, err := current.ReplaceCheckpointRoot(view, newTree, physical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-drained:
+		t.Fatal("old root drained while a reader was still active")
+	default:
+	}
+	if got, exists, err := current.Lookup(1); err != nil || !exists || got != addr {
+		t.Fatalf("new-root lookup got=%v exists=%v err=%v", got, exists, err)
+	}
+	close(oldStore.release)
+	if err := <-lookupDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("old root did not drain after its reader completed")
+	}
+}

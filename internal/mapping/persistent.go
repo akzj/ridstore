@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/model"
@@ -26,6 +27,14 @@ type deltaLayer struct {
 	charge uint64
 }
 
+type rootOwner struct {
+	syncer    NodeSyncer
+	readers   atomic.Int64
+	retired   atomic.Bool
+	closeOnce sync.Once
+	drained   chan struct{}
+}
+
 // Persistent is the v2 production Mapping runtime. The complete Mapping is
 // never materialized: only committed deltas and a bounded radix cache live in
 // memory.
@@ -33,7 +42,7 @@ type Persistent struct {
 	mu sync.RWMutex
 
 	root    *radix.Tree
-	syncer  NodeSyncer
+	owner   *rootOwner
 	covered model.CommitSeq
 	epoch   uint64
 	active  *deltaLayer
@@ -70,7 +79,7 @@ func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig
 	}
 	budget, _ := newDeltaBudget(config.DeltaSoftLimitBytes, config.DeltaHardLimitBytes)
 	return &Persistent{
-		root: root, syncer: syncer, covered: root.Covered(),
+		root: root, owner: &rootOwner{syncer: syncer, drained: make(chan struct{})}, covered: root.Covered(),
 		active:              &deltaLayer{values: make(map[model.ID]persistentDelta)},
 		checkpointSortBytes: config.CheckpointSortBytes,
 		budget:              budget,
@@ -117,8 +126,10 @@ func (m *Persistent) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 		m.mu.RUnlock()
 		return value.addr, value.exists, nil
 	}
-	root := m.root
+	root, owner := m.root, m.owner
+	owner.readers.Add(1)
 	m.mu.RUnlock()
+	defer m.releaseRoot(owner)
 	addr, exists, err := root.Lookup(id)
 	return addr, exists, err
 }
@@ -135,7 +146,8 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	ids := proposalReadSet(proposals)
 	for {
 		m.mu.RLock()
-		epoch, base, root := m.epoch, m.covered, m.root
+		epoch, base, root, owner := m.epoch, m.covered, m.root, m.owner
+		owner.readers.Add(1)
 		active := make(map[model.ID]struct{})
 		for _, proposal := range proposals {
 			for _, change := range proposal.Changes {
@@ -157,6 +169,7 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 		for _, id := range misses {
 			addr, exists, err := root.Lookup(id)
 			if err != nil {
+				m.releaseRoot(owner)
 				return GroupPlan{}, err
 			}
 			value := persistentDelta{exists: exists}
@@ -165,8 +178,9 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 			}
 			values[id] = value
 		}
+		m.releaseRoot(owner)
 		m.mu.RLock()
-		stable := epoch == m.epoch && base == m.covered && root == m.root
+		stable := epoch == m.epoch && base == m.covered && root == m.root && owner == m.owner
 		m.mu.RUnlock()
 		if !stable {
 			continue
@@ -449,7 +463,7 @@ func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCa
 	if err != nil {
 		return CheckpointCandidate{}, err
 	}
-	if err := m.syncer.Sync(); err != nil {
+	if err := m.owner.syncer.Sync(); err != nil {
 		return CheckpointCandidate{}, err
 	}
 	return CheckpointCandidate{
@@ -517,8 +531,9 @@ func (m *Persistent) AbortCheckpoint(checkpoint *FrozenCheckpoint) error {
 // continue accumulating in the active Delta layer. The owner must keep the
 // underlying NodeSyncer open until the view is no longer used.
 type CheckpointView struct {
-	owner *Persistent
-	tree  *radix.Tree
+	owner     *Persistent
+	rootOwner *rootOwner
+	tree      *radix.Tree
 }
 
 func (m *Persistent) CheckpointView() (CheckpointView, error) {
@@ -527,7 +542,7 @@ func (m *Persistent) CheckpointView() (CheckpointView, error) {
 	if m.inCheckpoint || len(m.frozen) != 0 || m.root == nil {
 		return CheckpointView{}, ErrStalePlan
 	}
-	return CheckpointView{owner: m, tree: m.root}, nil
+	return CheckpointView{owner: m, rootOwner: m.owner, tree: m.root}, nil
 }
 
 func (v CheckpointView) Root() model.MapAddr { return v.tree.Root() }
@@ -535,37 +550,73 @@ func (v CheckpointView) Root() model.MapAddr { return v.tree.Root() }
 func (v CheckpointView) Covered() model.CommitSeq { return v.tree.Covered() }
 
 func (v CheckpointView) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
-	if v.owner == nil || v.tree == nil {
+	if v.owner == nil || v.rootOwner == nil || v.tree == nil {
 		return 0, false, ErrInvalid
 	}
+	if !v.pin() {
+		return 0, false, ErrStalePlan
+	}
+	defer v.owner.releaseRoot(v.rootOwner)
 	return v.tree.Lookup(id)
 }
 
 func (v CheckpointView) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
-	if v.owner == nil || v.tree == nil {
+	if v.owner == nil || v.rootOwner == nil || v.tree == nil {
 		return ErrInvalid
 	}
+	if !v.pin() {
+		return ErrStalePlan
+	}
+	defer v.owner.releaseRoot(v.rootOwner)
 	return v.tree.Walk(ctx, visit)
+}
+
+func (v CheckpointView) pin() bool {
+	v.owner.mu.RLock()
+	defer v.owner.mu.RUnlock()
+	if v.owner.root != v.tree || v.owner.owner != v.rootOwner {
+		return false
+	}
+	v.rootOwner.readers.Add(1)
+	return true
 }
 
 // ReplaceCheckpointRoot switches the physical owner of an already installed
 // checkpoint without changing its logical contents. Newer active Delta entries
-// remain layered above the replacement. Callers must quiesce Mapping users and
-// keep the view's old NodeSyncer open until this method returns.
-func (m *Persistent) ReplaceCheckpointRoot(view CheckpointView, root *radix.Tree, syncer NodeSyncer) error {
-	if view.owner != m || view.tree == nil || root == nil || syncer == nil {
-		return ErrInvalid
+// remain layered above the replacement. The returned channel closes after all
+// readers of the old root drain; callers keep its NodeSyncer open until then.
+func (m *Persistent) ReplaceCheckpointRoot(view CheckpointView, root *radix.Tree, syncer NodeSyncer) (<-chan struct{}, error) {
+	if view.owner != m || view.rootOwner == nil || view.tree == nil || root == nil || syncer == nil {
+		return nil, ErrInvalid
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.inCheckpoint || len(m.frozen) != 0 || m.root != view.tree ||
+	if m.inCheckpoint || len(m.frozen) != 0 || m.root != view.tree || m.owner != view.rootOwner ||
 		root.Covered() != view.tree.Covered() {
-		return ErrStalePlan
+		return nil, ErrStalePlan
 	}
+	oldOwner := m.owner
 	m.root = root
-	m.syncer = syncer
+	m.owner = &rootOwner{syncer: syncer, drained: make(chan struct{})}
 	m.epoch++
-	return nil
+	oldOwner.retired.Store(true)
+	if oldOwner.readers.Load() == 0 {
+		oldOwner.closeOnce.Do(func() { close(oldOwner.drained) })
+	}
+	return oldOwner.drained, nil
+}
+
+func (m *Persistent) releaseRoot(owner *rootOwner) {
+	if owner == nil {
+		return
+	}
+	remaining := owner.readers.Add(-1)
+	if remaining < 0 {
+		panic("mapping: root reader reference underflow")
+	}
+	if remaining == 0 && owner.retired.Load() {
+		owner.closeOnce.Do(func() { close(owner.drained) })
+	}
 }
 
 // WalkCheckpoint visits the fully checkpointed root. It rejects a Mapping
@@ -575,11 +626,15 @@ func (m *Persistent) WalkCheckpoint(ctx context.Context, visit func(model.ID, re
 		return ErrInvalid
 	}
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	if m.inCheckpoint || len(m.active.values) != 0 || len(m.frozen) != 0 || m.active.charge != 0 {
+		m.mu.RUnlock()
 		return ErrStalePlan
 	}
-	return m.root.Walk(ctx, visit)
+	root, owner := m.root, m.owner
+	owner.readers.Add(1)
+	m.mu.RUnlock()
+	defer m.releaseRoot(owner)
+	return root.Walk(ctx, visit)
 }
 
 func lookupLayers(active *deltaLayer, frozen []*deltaLayer, id model.ID) (persistentDelta, bool) {

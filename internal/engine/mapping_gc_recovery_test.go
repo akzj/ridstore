@@ -12,6 +12,8 @@ import (
 	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
+	"github.com/akzj/ridstore/internal/recordcodec"
+	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
@@ -37,6 +39,23 @@ func TestOpenFinishesPublishedMappingGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertMappingGCRecovered(t, root, state, true)
+}
+
+func TestMappingGCRecoveryAllowsInterveningDataRotations(t *testing.T) {
+	for _, published := range []bool{false, true} {
+		t.Run(map[bool]string{false: "rollback", true: "finish"}[published], func(t *testing.T) {
+			root, config, state := prepareMappingGCRecovery(t, published)
+			rotateDataOutsideEngine(t, root, config)
+			store, err := Open(context.Background(), root, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			assertMappingGCRecovered(t, root, state, published)
+		})
+	}
 }
 
 func TestMappingGCRecoveryFaultsConvergeOnRetry(t *testing.T) {
@@ -219,7 +238,7 @@ func prepareMappingGCRecovery(t *testing.T, publish bool) (string, OpenConfig, m
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := manager.InstallMappingRewrite(manifest.Generation, storecatalog.MappingRewrite{
+		if _, err := manager.InstallMappingRewrite(manifest, storecatalog.MappingRewrite{
 			SealedSegments: mapSummaries(generation.SealedSegments), ActiveSegment: generation.ActiveSegment,
 			NextSegment: generation.NextSegment, Root: generation.Root, Covered: generation.Covered,
 		}); err != nil {
@@ -227,6 +246,28 @@ func prepareMappingGCRecovery(t *testing.T, publish bool) (string, OpenConfig, m
 		}
 	}
 	return root, config.Runtime, state
+}
+
+func rotateDataOutsideEngine(t *testing.T, root string, config OpenConfig) {
+	t.Helper()
+	manager, err := storecatalog.OpenManager(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := recordlog.Open(root, config.RecordLog, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := manager.Snapshot().ActiveDataSegmentID
+	payload := recordcodec.EncodeCheckpoint(recordcodec.CheckpointMarker{CoveredCommitSeq: manager.Snapshot().CoveredCommitSeq})
+	for manager.Snapshot().ActiveDataSegmentID == start {
+		if _, err := log.Append(context.Background(), payload, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertMappingGCRecovered(t *testing.T, root string, state mapgcstate.State, published bool) {

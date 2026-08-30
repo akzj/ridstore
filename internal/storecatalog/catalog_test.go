@@ -219,7 +219,7 @@ func TestInstallMappingRewriteChangesOnlyMappingFileSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated, err := manager.InstallMappingRewrite(initial.Generation, MappingRewrite{
+	updated, err := manager.InstallMappingRewrite(initial, MappingRewrite{
 		ActiveSegment: initial.NextMapSegmentID, NextSegment: initial.NextMapSegmentID + 1,
 		Root: rootAddr, Covered: initial.CoveredCommitSeq,
 	})
@@ -236,6 +236,51 @@ func TestInstallMappingRewriteChangesOnlyMappingFileSet(t *testing.T) {
 	updated.SealedMapSegments = initial.SealedMapSegments
 	if !reflect.DeepEqual(updated, initial) {
 		t.Fatalf("non-mapping fields changed\nupdated=%+v\ninitial=%+v", updated, initial)
+	}
+}
+
+func TestInstallMappingRewriteRebasesAcrossDataRotation(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	initial := testManifest()
+	if err := Install(root, initial, nil); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(root, initial, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := manager.Snapshot()
+	addr, err := recordlog.NewVAddr(base.ActiveDataSegmentID, recordlog.SegmentHeaderSize, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := manager.InstallDataRotation(base.Generation, DataRotation{
+		SealedOld: DataSegmentSummary{SegmentID: base.ActiveDataSegmentID, ValidEnd: 128, RecordCount: 1, FirstAddr: addr, LastAddr: addr},
+		NewActive: base.NextDataSegmentID, NextID: base.NextDataSegmentID + 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootAddr, err := model.NewMapAddr(base.NextMapSegmentID, mapstore.SegmentHeaderSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := manager.InstallMappingRewrite(base, MappingRewrite{
+		ActiveSegment: base.NextMapSegmentID, NextSegment: base.NextMapSegmentID + 1,
+		Root: rootAddr, Covered: base.CoveredCommitSeq,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.Generation != rotated.Generation+1 ||
+		installed.ActiveDataSegmentID != rotated.ActiveDataSegmentID ||
+		installed.NextDataSegmentID != rotated.NextDataSegmentID ||
+		!reflect.DeepEqual(installed.SealedDataSegments, rotated.SealedDataSegments) {
+		t.Fatalf("data topology was not preserved: installed=%+v rotated=%+v", installed, rotated)
+	}
+	if installed.MappingRoot != rootAddr || installed.ActiveMapSegmentID != base.NextMapSegmentID {
+		t.Fatalf("mapping rewrite was not installed: %+v", installed)
 	}
 }
 
@@ -264,7 +309,7 @@ func TestInstallMappingRewriteRejectsStaleCutAndNonContiguousGeneration(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := manager.InstallMappingRewrite(initial.Generation, test.update(initial)); !errors.Is(err, ErrInvalid) {
+			if _, err := manager.InstallMappingRewrite(initial, test.update(initial)); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("err=%v", err)
 			}
 		})
@@ -335,5 +380,33 @@ func TestManagerImplementsRecordLogCatalogPort(t *testing.T) {
 	retired, err := manager.RemoveRecordLogSegment(checkpoint.Generation, checkpoint.SealedDataSegments[0])
 	if err != nil || retired.Generation != 4 || len(retired.SealedSegments) != 1 || retired.SealedSegments[0].SegmentID != 2 {
 		t.Fatalf("retired=%+v err=%v", retired, err)
+	}
+}
+
+func TestRemoveRecordLogSegmentRebasesAcrossDataRotation(t *testing.T) {
+	t.Parallel()
+	initial := testManifest()
+	initial.SegmentStats = nil
+	manager, err := NewManager(t.TempDir(), initial, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := recordlog.NewVAddr(initial.ActiveDataSegmentID, recordlog.SegmentHeaderSize, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := manager.InstallDataRotation(initial.Generation, DataRotation{
+		SealedOld: DataSegmentSummary{SegmentID: initial.ActiveDataSegmentID, ValidEnd: 128, RecordCount: 1, FirstAddr: addr, LastAddr: addr},
+		NewActive: initial.NextDataSegmentID, NextID: initial.NextDataSegmentID + 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := manager.RemoveRecordLogSegment(initial.Generation, initial.SealedDataSegments[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired.Generation != rotated.Generation+1 || retired.ActiveSegmentID != rotated.ActiveDataSegmentID || len(retired.SealedSegments) != 1 || retired.SealedSegments[0].SegmentID != 2 {
+		t.Fatalf("retired=%+v rotated=%+v", retired, rotated)
 	}
 }
