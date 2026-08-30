@@ -58,9 +58,9 @@ MapStore close and retirement wait on the returned reader-drain channel outside 
 
 RecordLog has one append writer and per-Segment reader pins. The active Segment separates writer ordering from its short
 state lock, so existing Record `ReadAt` calls remain concurrent with append, fsync and rotation I/O. Sealed Segment scans and
-reads do not stop appends or reads of other Segments. After the durable rotation journal is installed, sealing the old
-Segment and creating the next Active Segment overlap their independent footer/header fsync work; Catalog publication and
-Registry pointer switching still occur only after both files are durable.
+reads do not stop appends or reads of other Segments. The old footer fsync also makes its preceding Records durable before
+the rotation journal is published. After that journal is durable, publishing the old sealed pathname overlaps creation of
+the next Active Segment; Catalog publication and Registry pointer switching still occur only after both files are durable.
 
 MapStore has one `writerMu` for append/rotation/sync ordering. Ordinary immutable Node `ReadAt` runs concurrently with Node
 append and fsync. Rotation keeps the old descriptor open across footer write and rename, then takes the state lock only for

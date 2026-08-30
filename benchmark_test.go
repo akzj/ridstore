@@ -87,8 +87,8 @@ func BenchmarkDurableHotOverwrite(b *testing.B) {
 func BenchmarkDurableMaintenanceInterference(b *testing.B) {
 	for _, maintenance := range []string{"none", "checkpoint", "mapping-compact"} {
 		b.Run(maintenance, func(b *testing.B) {
-			store := openMaintenanceBenchmarkStore(b)
-			ids := seedMaintenanceBenchmark(b, store, 2048, 256)
+			store, dir := openMaintenanceBenchmarkStore(b)
+			ids := seedMaintenanceBenchmark(b, store, 2800, 256)
 			value := make([]byte, 256)
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -157,6 +157,11 @@ func BenchmarkDurableMaintenanceInterference(b *testing.B) {
 			reportLatencyDistribution(b, "put", putLatency[:completed])
 			reportLatencyDistribution(b, "commit", commitLatency[:completed])
 			b.ReportMetric(float64(maintenanceCount.Load()), "maintenance-ops")
+			sealed, err := filepath.Glob(filepath.Join(dir, "records", "record-*.sealed"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportMetric(float64(len(sealed)), "data-rotations")
 		})
 	}
 }
@@ -237,10 +242,11 @@ func reportLatencyDistribution(b *testing.B, operation string, samples []int64) 
 	b.ReportMetric(float64(samples[len(samples)-1]), operation+"-max-ns")
 }
 
-func openMaintenanceBenchmarkStore(b *testing.B) *Store {
+func openMaintenanceBenchmarkStore(b *testing.B) (*Store, string) {
 	b.Helper()
+	dir := filepath.Join(b.TempDir(), "store")
 	config := CreateConfig{
-		Dir: filepath.Join(b.TempDir(), "store"),
+		Dir: dir,
 		HardLimits: HardLimits{
 			SegmentSize: 1 << 20, MaxValueSize: 256, MaxBatchBytes: 1 << 20,
 			MaxBatchMutations: 4096, MaxBatchConditions: 4096, MaxOpenBatches: 1024,
@@ -265,7 +271,7 @@ func openMaintenanceBenchmarkStore(b *testing.B) *Store {
 			b.Error(err)
 		}
 	})
-	return store
+	return store, dir
 }
 
 func seedMaintenanceBenchmark(b *testing.B, store *Store, records, valueSize int) []ID {

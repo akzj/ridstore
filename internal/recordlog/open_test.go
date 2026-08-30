@@ -3,7 +3,6 @@ package recordlog
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -150,29 +149,18 @@ func (b *syncBarrier) wait() {
 	<-b.release
 }
 
-type barrierSyncFile struct {
-	fileHandle
-	barrier *syncBarrier
-	once    sync.Once
-}
-
-func (f *barrierSyncFile) Sync() error {
-	f.once.Do(f.barrier.wait)
-	return f.fileHandle.Sync()
-}
-
-type barrierCreateBackend struct {
+type barrierRenameBackend struct {
 	fileBackend
 	barrier *syncBarrier
-	want    string
 }
 
-func (b barrierCreateBackend) openFile(name string, flag int, mode fs.FileMode) (fileHandle, error) {
-	file, err := b.fileBackend.openFile(name, flag, mode)
-	if err != nil || filepath.Base(name) != b.want {
-		return file, err
+func (b barrierRenameBackend) rename(oldPath, newPath string) error {
+	oldName, newName := filepath.Base(oldPath), filepath.Base(newPath)
+	if oldName == activeSegmentName(1) && newName == sealedSegmentName(1) ||
+		oldName == creatingSegmentName(2) && newName == activeSegmentName(2) {
+		b.barrier.wait()
 	}
-	return &barrierSyncFile{fileHandle: file, barrier: b.barrier}, nil
+	return b.fileBackend.rename(oldPath, newPath)
 }
 
 func TestRotationPreparesSealedAndActiveFilesConcurrently(t *testing.T) {
@@ -183,15 +171,15 @@ func TestRotationPreparesSealedAndActiveFilesConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 	appendTestRecords(t, old, []byte("before rotation"))
+	preparedSummary, err := old.prepareSeal()
+	if err != nil {
+		t.Fatal(err)
+	}
 	barrier := &syncBarrier{both: make(chan struct{}), release: make(chan struct{})}
-	old.mu.Lock()
-	old.file = &barrierSyncFile{fileHandle: old.file, barrier: barrier}
-	old.mu.Unlock()
+	backend := barrierRenameBackend{fileBackend: osFileBackend{}, barrier: barrier}
+	old.files = backend
 	manager := &rotationManager{
-		root: root,
-		files: barrierCreateBackend{
-			fileBackend: osFileBackend{}, barrier: barrier, want: creatingSegmentName(2),
-		},
+		root: root, files: backend,
 	}
 	type result struct {
 		sealed *sealedSegment
@@ -200,7 +188,7 @@ func TestRotationPreparesSealedAndActiveFilesConcurrently(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		sealed, _, active, prepareErr := manager.prepareRotationFiles(old, state.headerFor(2))
+		sealed, _, active, prepareErr := manager.prepareRotationFiles(old, preparedSummary, state.headerFor(2))
 		done <- result{sealed: sealed, active: active, err: prepareErr}
 	}()
 	select {
@@ -208,22 +196,22 @@ func TestRotationPreparesSealedAndActiveFilesConcurrently(t *testing.T) {
 		close(barrier.release)
 	case <-time.After(time.Second):
 		close(barrier.release)
-		t.Fatal("footer and next-header sync did not overlap")
+		t.Fatal("sealed and active file publication did not overlap")
 	}
-	prepared := <-done
-	if prepared.err != nil {
-		t.Fatal(prepared.err)
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
 	}
-	if err := old.transferSealedOwnership(prepared.sealed); err != nil {
+	if err := old.transferSealedOwnership(got.sealed); err != nil {
 		t.Fatal(err)
 	}
 	if err := old.close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := prepared.sealed.close(); err != nil {
+	if err := got.sealed.close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := prepared.active.close(); err != nil {
+	if err := got.active.close(); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -351,6 +351,45 @@ func TestActiveSegmentRecoversOnlyIncompleteTail(t *testing.T) {
 	}
 }
 
+func TestActiveSegmentRepairsUnpublishedPreparedFooter(t *testing.T) {
+	root := t.TempDir()
+	header := testSegmentHeader(1, 0)
+	segment, err := createActiveSegment(root, header, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, segment, []byte("durable prefix"))
+	want := segment.summary()
+	footer, err := EncodeSegmentFooter(SegmentFooter{
+		SegmentID: want.SegmentID, DataEnd: want.ValidEnd, FirstAddr: want.FirstAddr,
+		LastAddr: want.LastAddr, RecordCount: want.RecordCount,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeFullAt(segment.file, footer[:40], int64(want.ValidEnd)); err != nil {
+		t.Fatal(err)
+	}
+	if err := segment.close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, repaired, err := openActiveSegment(root, header, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.close()
+	if !repaired || reopened.summary() != want {
+		t.Fatalf("repaired=%v summary=%+v want=%+v", repaired, reopened.summary(), want)
+	}
+	info, err := reopened.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != int64(want.ValidEnd) {
+		t.Fatalf("size=%d want=%d", info.Size(), want.ValidEnd)
+	}
+}
+
 func TestActiveSegmentRejectsCompleteCorruptRecord(t *testing.T) {
 	root := t.TempDir()
 	header := testSegmentHeader(1, 0)

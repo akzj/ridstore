@@ -18,8 +18,8 @@ func TestRuntimeRotationFaultsConvergeFromDurableEvidence(t *testing.T) {
 		{FaultBeforeJournalSync, false},
 		{FaultBeforeJournalRename, false},
 		{FaultBeforeJournalDirSync, true},
-		{FaultBeforeFooterWrite, true},
-		{FaultBeforeFooterSync, true},
+		{FaultBeforeFooterWrite, false},
+		{FaultBeforeFooterSync, false},
 		{FaultBeforeSealRename, true},
 		{FaultBeforeSealDirSync, true},
 		{FaultBeforeHeaderWrite, true},
@@ -77,7 +77,7 @@ func TestRuntimeRotationFaultsConvergeFromDurableEvidence(t *testing.T) {
 	}
 }
 
-func TestRotationSyncsOldPrefixBeforePublishingJournal(t *testing.T) {
+func TestRotationSyncsPreparedFooterBeforePublishingJournal(t *testing.T) {
 	root := t.TempDir()
 	state := initialCatalog(512, 256)
 	if err := CreateInitialSegment(root, state.LogID, state.SegmentSize); err != nil {
@@ -86,7 +86,7 @@ func TestRotationSyncsOldPrefixBeforePublishingJournal(t *testing.T) {
 	injected := errors.New("stop before journal write")
 	var order []FaultPoint
 	log, err := OpenWithFaultHook(root, testLogConfig(), &memoryCatalog{state: state}, func(point FaultPoint) error {
-		if point == FaultBeforeDataSync || point == FaultBeforeJournalWrite {
+		if point == FaultBeforeDataSync || point == FaultBeforeFooterSync || point == FaultBeforeJournalWrite {
 			order = append(order, point)
 		}
 		if point == FaultBeforeJournalWrite {
@@ -104,7 +104,7 @@ func TestRotationSyncsOldPrefixBeforePublishingJournal(t *testing.T) {
 		t.Fatalf("rotation err=%v", err)
 	}
 	_ = log.Close()
-	want := []FaultPoint{FaultBeforeDataSync, FaultBeforeJournalWrite}
+	want := []FaultPoint{FaultBeforeFooterSync, FaultBeforeJournalWrite}
 	if !slices.Equal(order, want) {
 		t.Fatalf("fault order=%v want=%v", order, want)
 	}

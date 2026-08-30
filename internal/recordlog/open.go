@@ -145,15 +145,19 @@ func (m *rotationManager) rotate(old *activeSegment) (*activeSegment, error) {
 		BaseGeneration: snapshot.Generation, LogID: snapshot.LogID, SegmentSize: snapshot.SegmentSize,
 		Old: summary, NewActive: snapshot.NextSegmentID, NextSegmentID: snapshot.NextSegmentID + 1,
 	}
-	// The durable journal names Old.ValidEnd as recovery truth. Make the
-	// corresponding record bytes durable before publishing that promise.
-	if err := old.sync(); err != nil {
+	// Footer fsync also makes every preceding Record byte durable. Publishing
+	// the journal afterward therefore needs no separate old-data fsync.
+	prepared, err := old.prepareSeal()
+	if err != nil {
 		return nil, err
+	}
+	if prepared != summary {
+		return nil, fmt.Errorf("prepared summary changed: %w", ErrCorrupt)
 	}
 	if err := installRotationJournal(m.root, journal, m.files, m.hook); err != nil {
 		return nil, err
 	}
-	sealed, sealedSummary, newActive, err := m.prepareRotationFiles(old, snapshot.headerFor(journal.NewActive))
+	sealed, sealedSummary, newActive, err := m.prepareRotationFiles(old, prepared, snapshot.headerFor(journal.NewActive))
 	if err != nil {
 		return nil, err
 	}
@@ -189,12 +193,12 @@ type rotationActiveResult struct {
 
 // prepareRotationFiles runs only after the rotation journal is durable, so
 // recovery can complete either half independently after a crash. In normal
-// operation footer sealing and next-header creation use different files and
-// may overlap their fsync latency. Fault-injected paths remain serial so the
-// crash matrix retains deterministic boundaries and ordering.
-func (m *rotationManager) prepareRotationFiles(old *activeSegment, header SegmentHeader) (*sealedSegment, SegmentSummary, *activeSegment, error) {
+// operation old-path publication and next-header creation use different files
+// and may overlap. Fault-injected paths remain serial so the crash matrix
+// retains deterministic boundaries and ordering.
+func (m *rotationManager) prepareRotationFiles(old *activeSegment, prepared SegmentSummary, header SegmentHeader) (*sealedSegment, SegmentSummary, *activeSegment, error) {
 	if m.hook != nil {
-		sealed, summary, err := old.seal()
+		sealed, summary, err := old.publishPreparedSeal(prepared)
 		if err != nil {
 			return nil, SegmentSummary{}, nil, err
 		}
@@ -207,7 +211,7 @@ func (m *rotationManager) prepareRotationFiles(old *activeSegment, header Segmen
 	sealedResult := make(chan rotationSealResult, 1)
 	activeResult := make(chan rotationActiveResult, 1)
 	go func() {
-		sealed, summary, err := old.seal()
+		sealed, summary, err := old.publishPreparedSeal(prepared)
 		sealedResult <- rotationSealResult{sealed: sealed, summary: summary, err: err}
 	}()
 	go func() {

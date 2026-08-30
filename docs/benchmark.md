@@ -10,8 +10,9 @@
 - `BenchmarkDurableHotOverwrite`：并发 blind overwrite 同一 Stable ID；
 - `BenchmarkDurableMaintenanceInterference`：对同一份预热 Mapping 比较无维护、连续
   Checkpoint、连续 Mapping Compact 三种场景；每个前台操作执行 Get、Put、Commit，
-  分别报告 p50/p99/p999/max 和已完成维护次数；该 workload 使用 1MiB Segment，令持续
-  overwrite 在测量期间自然触发 Data rotation，同时覆盖 Catalog generation rebase；
+  分别报告 p50/p99/p999/max、已完成维护次数和实际 Data rotation 数；该 workload 使用
+  1MiB Segment，令持续 overwrite 在测量期间自然触发 Data rotation，同时覆盖 Catalog
+  generation rebase；
 - `BenchmarkDurableAppendBaseline`：向同一 regular file append 一个 value 并每次 `fsync`。
 
 raw append 只是设备和文件系统的 durable lower bound。它没有 framing、recovery、Mapping、
@@ -25,9 +26,9 @@ Stable ID 或原子 Batch，因此不能被描述为与 ridstore 功能等价。
 “不存在 Store 全局锁”误读为“维护没有共享 I/O”。生产调度仍应在高峰降低调用频率，并为
 连续维护设置间隔或 I/O 预算。
 
-RecordLog rotation 的同步窗口仍会暂停单 append writer，但 journal durable 之后，旧 Segment
-footer seal 与新 Active header 创建会并行执行；Catalog 只在两侧都 durable 后发布。这个优化
-缩短 rotation 窗口，不改变 crash recovery 的完成顺序。
+RecordLog rotation 的同步窗口仍会暂停单 append writer。旧 Segment footer 的一次 fsync 同时
+覆盖此前 Record bytes；journal durable 后，旧 sealed pathname 发布与新 Active header 创建并行，
+Catalog 只在两侧都 durable 后发布。这个优化缩短 rotation 窗口，不改变 crash recovery 的完成顺序。
 
 ## 2. 可重复产物
 

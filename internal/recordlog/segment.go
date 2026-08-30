@@ -262,6 +262,18 @@ func scanActiveSegmentWithVisitor(file fileHandle, expected SegmentHeader, visit
 	contentLimit := expected.SegmentSize - SegmentFooterSize
 	for result.ValidEnd < fileEnd {
 		remaining := fileEnd - result.ValidEnd
+		if remaining <= SegmentFooterSize && remaining >= uint32(len(segmentFooterMagic)) {
+			magic := make([]byte, len(segmentFooterMagic))
+			if err := readFullAt(file, magic, int64(result.ValidEnd)); err != nil {
+				return SegmentSummary{}, false, err
+			}
+			if string(magic) == string(segmentFooterMagic[:]) {
+				// A footer prepared before the rotation journal became durable
+				// is not yet a sealed-file publication. Remove it as an
+				// unpublished active tail and keep the logical record prefix.
+				return result, true, nil
+			}
+		}
 		if remaining < RecordHeaderSize {
 			return result, true, nil
 		}
@@ -409,32 +421,58 @@ func (s *activeSegment) summaryLocked() SegmentSummary {
 }
 
 func (s *activeSegment) seal() (*sealedSegment, SegmentSummary, error) {
+	summary, err := s.prepareSeal()
+	if err != nil {
+		return nil, SegmentSummary{}, err
+	}
+	return s.publishPreparedSeal(summary)
+}
+
+// prepareSeal writes and syncs the footer without publishing the pathname or
+// changing runtime state. Its fsync also makes every preceding Record byte
+// durable, so a rotation journal may safely name the returned summary without
+// a separate data sync. Without a durable journal, Open treats this footer as
+// an unpublished active tail and truncates it back to summary.ValidEnd.
+func (s *activeSegment) prepareSeal() (SegmentSummary, error) {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
 	s.mu.RLock()
 	if s.file == nil || s.sealed {
 		s.mu.RUnlock()
-		return nil, SegmentSummary{}, ErrClosed
+		return SegmentSummary{}, ErrClosed
 	}
 	summary := s.summaryLocked()
-	file, path, header := s.file, s.path, s.header
+	file := s.file
 	s.mu.RUnlock()
 	footer, err := EncodeSegmentFooter(SegmentFooter{SegmentID: summary.SegmentID, DataEnd: summary.ValidEnd, FirstAddr: summary.FirstAddr, LastAddr: summary.LastAddr, RecordCount: summary.RecordCount})
 	if err != nil {
-		return nil, SegmentSummary{}, err
+		return SegmentSummary{}, err
 	}
 	if err := hitSegmentFault(s.hook, faultBeforeFooterWrite); err != nil {
-		return nil, SegmentSummary{}, err
+		return SegmentSummary{}, err
 	}
 	if _, err := writeFullAt(file, footer[:], int64(summary.ValidEnd)); err != nil {
-		return nil, SegmentSummary{}, err
+		return SegmentSummary{}, err
 	}
 	if err := hitSegmentFault(s.hook, faultBeforeFooterSync); err != nil {
-		return nil, SegmentSummary{}, err
+		return SegmentSummary{}, err
 	}
 	if err := file.Sync(); err != nil {
-		return nil, SegmentSummary{}, err
+		return SegmentSummary{}, err
 	}
+	return summary, nil
+}
+
+func (s *activeSegment) publishPreparedSeal(expected SegmentSummary) (*sealedSegment, SegmentSummary, error) {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	s.mu.RLock()
+	if s.file == nil || s.sealed || s.summaryLocked() != expected {
+		s.mu.RUnlock()
+		return nil, SegmentSummary{}, ErrClosed
+	}
+	file, path, header := s.file, s.path, s.header
+	s.mu.RUnlock()
 	dir := filepath.Dir(path)
 	destination := filepath.Join(dir, sealedSegmentName(header.SegmentID))
 	if err := hitSegmentFault(s.hook, faultBeforeSealRename); err != nil {
@@ -449,19 +487,19 @@ func (s *activeSegment) seal() (*sealedSegment, SegmentSummary, error) {
 	if err := s.files.syncDir(dir); err != nil {
 		return nil, SegmentSummary{}, err
 	}
-	sealed := &sealedSegment{file: file, path: destination, header: header, summary: summary}
+	sealed := &sealedSegment{file: file, path: destination, header: header, summary: expected}
 	// Existing reader pins may still hold the active wrapper until Registry
 	// publication. Both wrappers therefore share this immutable descriptor;
 	// ownership transfers to sealedSegment and activeSegment.close becomes a
 	// no-op after this point.
 	s.mu.Lock()
-	if s.file != file || s.end != summary.ValidEnd || s.sealed {
+	if s.file != file || s.summaryLocked() != expected || s.sealed {
 		s.mu.Unlock()
 		return nil, SegmentSummary{}, ErrCorrupt
 	}
 	s.sealed = true
 	s.mu.Unlock()
-	return sealed, summary, nil
+	return sealed, expected, nil
 }
 
 func openSealedSegment(root string, expected SegmentHeader, summary SegmentSummary, files fileBackend) (*sealedSegment, error) {
