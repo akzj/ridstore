@@ -62,9 +62,11 @@ reads do not stop appends or reads of other Segments. The old footer fsync also 
 the rotation journal is published. After that journal is durable, publishing the old sealed pathname overlaps creation of
 the next Active Segment; Catalog publication and Registry pointer switching still occur only after both files are durable.
 
-MapStore has one `writerMu` for append/rotation/sync ordering. Ordinary immutable Node `ReadAt` runs concurrently with Node
-append and fsync. Rotation keeps the old descriptor open across footer write and rename, then takes the state lock only for
-the in-memory active/sealed pointer swap.
+MapStore has one `writerMu` for append/rotation/sync ordering. A read resolves its file and immutable valid-end bound under
+the short state lock, acquires a reader pin, then performs Node `ReadAt` without that lock. It therefore remains concurrent
+with Node append, fsync and rotation. Rotation keeps the old descriptor open across footer write and rename, then takes the
+state lock only for the in-memory active/sealed pointer swap. Close rejects new reads and drains reader pins before closing
+descriptors.
 
 Catalog serializes Manifest generations across durable install. This can delay another metadata transition such as a rare
 Segment rotation, but it does not lock Mapping lookup or RecordLog reads.

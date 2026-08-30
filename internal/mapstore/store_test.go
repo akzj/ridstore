@@ -222,6 +222,152 @@ func TestStoreReadDoesNotWaitForRotationIO(t *testing.T) {
 	}
 }
 
+func TestStoreAppendDoesNotWaitForReadIO(t *testing.T) {
+	root := t.TempDir()
+	state := initialState()
+	if err := CreateInitialSegment(root, state.StoreID, state.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root, &staticCatalog{state: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var slots [NodeSlots]uint64
+	addr, _ := recordlog.NewVAddr(1, 64, 64)
+	slots[1] = uint64(addr)
+	first, err := store.Append(0, 0, 1, slots)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var once sync.Once
+	store.hook = func(point FaultPoint) error {
+		if point == FaultBeforeRead {
+			once.Do(func() {
+				close(reached)
+				<-release
+			})
+		}
+		return nil
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := store.Read(first)
+		readDone <- readErr
+	}()
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("read did not reach blocked I/O")
+	}
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := store.Append(0, 1, 2, slots)
+		appendDone <- appendErr
+	}()
+	select {
+	case err := <-appendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("append blocked behind read I/O")
+	}
+	close(release)
+	released = true
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStoreCloseWaitsForReadIO(t *testing.T) {
+	root := t.TempDir()
+	state := initialState()
+	if err := CreateInitialSegment(root, state.StoreID, state.SegmentSize); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root, &staticCatalog{state: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var slots [NodeSlots]uint64
+	addr, _ := recordlog.NewVAddr(1, 64, 64)
+	slots[1] = uint64(addr)
+	first, err := store.Append(0, 0, 1, slots)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var once sync.Once
+	store.hook = func(point FaultPoint) error {
+		if point == FaultBeforeRead {
+			once.Do(func() {
+				close(reached)
+				<-release
+			})
+		}
+		return nil
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := store.Read(first)
+		readDone <- readErr
+	}()
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("read did not reach blocked I/O")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- store.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		store.mu.Lock()
+		closed := store.closed
+		store.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("close did not enter reader drain")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close completed before reader release: %v", err)
+	default:
+	}
+	if _, err := store.Read(first); !errors.Is(err, ErrClosed) {
+		t.Fatalf("read after close admission: %v", err)
+	}
+	close(release)
+	released = true
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStoreRepairsOnlyIncompleteUnpublishedTail(t *testing.T) {
 	root := t.TempDir()
 	state := initialState()

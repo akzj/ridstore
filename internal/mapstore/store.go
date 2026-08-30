@@ -33,6 +33,8 @@ type Store struct {
 	nextSeq  uint64
 	closed   bool
 	poisoned bool
+	readers  uint64
+	readDone chan struct{}
 	hook     FaultHook
 }
 
@@ -126,7 +128,10 @@ func OpenWithFaultHook(root string, catalog CatalogPort, hook FaultHook) (*Store
 	if err := state.validate(); err != nil {
 		return nil, err
 	}
-	store := &Store{root: root, catalog: catalog, state: state.Clone(), sealed: make(map[model.MapSegmentID]*segmentFile), nextSeq: 1, hook: hook}
+	store := &Store{
+		root: root, catalog: catalog, state: state.Clone(), sealed: make(map[model.MapSegmentID]*segmentFile),
+		nextSeq: 1, readDone: make(chan struct{}), hook: hook,
+	}
 	fail := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, store.closeFiles())
 	}
@@ -324,42 +329,66 @@ func (s *Store) Sync() error {
 }
 
 func (s *Store) Read(addr model.MapAddr) (Node, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
 	if s.closed {
+		s.mu.Unlock()
 		return Node{}, ErrClosed
 	}
-	return s.readLocked(addr)
+	segment, err := s.segmentForReadLocked(addr)
+	if err != nil {
+		s.mu.Unlock()
+		return Node{}, err
+	}
+	file, validEnd := segment.file, segment.summary.ValidEnd
+	s.readers++
+	s.mu.Unlock()
+	defer s.releaseReader()
+	if err := hitFault(s.hook, FaultBeforeRead); err != nil {
+		return Node{}, err
+	}
+	return readNodeAt(file, validEnd, addr)
 }
 
 func (s *Store) readLocked(addr model.MapAddr) (Node, error) {
+	segment, err := s.segmentForReadLocked(addr)
+	if err != nil {
+		return Node{}, err
+	}
+	return readNode(segment, addr)
+}
+
+func (s *Store) segmentForReadLocked(addr model.MapAddr) (*segmentFile, error) {
 	if !addr.Valid() {
-		return Node{}, ErrInvalid
+		return nil, ErrInvalid
 	}
 	segment := s.sealed[addr.SegmentID()]
 	if addr.SegmentID() == s.state.ActiveSegment {
 		segment = s.active
 	}
 	if segment == nil || addr.Offset() > segment.summary.ValidEnd || segment.summary.ValidEnd-addr.Offset() < NodeHeaderSize {
-		return Node{}, ErrInvalid
+		return nil, ErrInvalid
 	}
-	return readNode(segment, addr)
+	return segment, nil
 }
 
 func readNode(segment *segmentFile, addr model.MapAddr) (Node, error) {
+	return readNodeAt(segment.file, segment.summary.ValidEnd, addr)
+}
+
+func readNodeAt(file *os.File, validEnd uint32, addr model.MapAddr) (Node, error) {
 	header := make([]byte, NodeHeaderSize)
-	if _, err := segment.file.ReadAt(header, int64(addr.Offset())); err != nil {
+	if _, err := file.ReadAt(header, int64(addr.Offset())); err != nil {
 		return Node{}, err
 	}
-	_, size, err := decodeNodeHeader(header, segment.summary.ValidEnd-addr.Offset())
+	_, size, err := decodeNodeHeader(header, validEnd-addr.Offset())
 	if err != nil {
 		return Node{}, err
 	}
 	encoded := make([]byte, size)
-	if _, err := segment.file.ReadAt(encoded, int64(addr.Offset())); err != nil {
+	if _, err := file.ReadAt(encoded, int64(addr.Offset())); err != nil {
 		return Node{}, err
 	}
-	node, _, err := DecodeNode(encoded, segment.summary.ValidEnd-addr.Offset())
+	node, _, err := DecodeNode(encoded, validEnd-addr.Offset())
 	return node, err
 }
 
@@ -372,7 +401,27 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
+	for s.readers != 0 {
+		done := s.readDone
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
 	return s.closeFiles()
+}
+
+func (s *Store) releaseReader() {
+	s.mu.Lock()
+	if s.readers == 0 {
+		s.poisoned = true
+	} else {
+		s.readers--
+		if s.readers == 0 {
+			close(s.readDone)
+			s.readDone = make(chan struct{})
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *Store) markPoisoned() {

@@ -3,6 +3,7 @@ package mapstore
 type FaultPoint string
 
 const (
+	FaultBeforeRead             FaultPoint = "mapstore.before-read"
 	FaultBeforeAppendWrite      FaultPoint = "mapstore.before-append-write"
 	FaultBeforeSync             FaultPoint = "mapstore.before-sync"
 	FaultBeforeTailTruncate     FaultPoint = "mapstore.before-tail-truncate"
