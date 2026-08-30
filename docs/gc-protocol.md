@@ -101,6 +101,8 @@ GC 不能改变逻辑内容。
 
 Relocation 可以分多个有限 Batch，避免单次占用过多内存或阻塞 group commit。
 
+同一 CommitGroup 内，Coordinator 稳定地让 UserCommit 先于 Relocation；两类请求内部仍保持 FIFO。该语义优先级只减少同组中由 VAddr 变化引起的用户条件伪冲突，不跨 group，也不替代 Relocation copy I/O 的限速和外部时段调度。
+
 Relocation 不增加顶层 Record 类型。它是 `CommitGroupRecord` 中的 Descriptor kind，与 UserCommit 进入
 同一个 Coordinator queue，共享分组、RecordLog append/fsync、CommitSeq 和 Mapping publish 顺序。
 Coordinator 在 durable append 前的 virtual Mapping 顺序中对每条 mutation 解析 CAS：

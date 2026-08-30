@@ -270,6 +270,135 @@ func TestRelocationSharesCommitOrderAndUsesAddressCAS(t *testing.T) {
 	}
 }
 
+func TestUserCommitPrecedesRelocationWithinCommitGroup(t *testing.T) {
+	log := &fakeLog{}
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+
+	initial := newBatch(t, 1, log)
+	if err := initial.Put(context.Background(), 3, []byte("initial")); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := c.Commit(context.Background(), initial); err != nil || result.CommitSeq != 1 {
+		t.Fatalf("initial commit=%+v err=%v", result, err)
+	}
+	oldAddr, exists, err := current.Lookup(3)
+	if err != nil || !exists {
+		t.Fatalf("old addr=%v exists=%v err=%v", oldAddr, exists, err)
+	}
+
+	copiedPayload, err := recordcodec.EncodePut(recordcodec.PutRecord{OriginBatchID: 1, RecordID: 3, Value: []byte("initial")}, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied, err := log.Append(context.Background(), copiedPayload, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	log.firstSync = make(chan struct{})
+	log.releaseSync = make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(log.releaseSync)
+		}
+	}()
+	blocker := newBatch(t, 2, log)
+	if err := blocker.Put(context.Background(), 99, []byte("blocker")); err != nil {
+		t.Fatal(err)
+	}
+	blockerDone := make(chan error, 1)
+	go func() {
+		_, commitErr := c.Commit(context.Background(), blocker)
+		blockerDone <- commitErr
+	}()
+	select {
+	case <-log.firstSync:
+	case <-time.After(time.Second):
+		t.Fatal("blocking commit did not reach durable append")
+	}
+
+	relocationDone := make(chan relocationResponse, 1)
+	go func() {
+		result, relocateErr := c.Relocate(context.Background(), Relocation{
+			BatchID: 3, LogicalPayloadBytes: 7,
+			Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewAddr: copied.Addr, Operation: mapping.OperationRelocate}},
+		})
+		relocationDone <- relocationResponse{result: result, err: relocateErr}
+	}()
+	waitForQueuedRequests(t, c, 1)
+
+	user := newBatch(t, 4, log)
+	if err := user.CompareAndPut(context.Background(), 3, oldAddr, []byte("user")); err != nil {
+		t.Fatal(err)
+	}
+	userAddr := log.latestPutAddr()
+	userDone := make(chan response, 1)
+	go func() {
+		result, commitErr := c.Commit(context.Background(), user)
+		userDone <- response{result: result, err: commitErr}
+	}()
+	waitForQueuedRequests(t, c, 2)
+	close(log.releaseSync)
+	released = true
+
+	if err := <-blockerDone; err != nil {
+		t.Fatal(err)
+	}
+	userResult := <-userDone
+	if userResult.err != nil || userResult.result.CommitSeq != 3 {
+		t.Fatalf("user commit=%+v err=%v", userResult.result, userResult.err)
+	}
+	relocationResult := <-relocationDone
+	if relocationResult.err != nil || relocationResult.result.CommitSeq != 4 || relocationResult.result.Applied != 0 || relocationResult.result.Skipped != 1 {
+		t.Fatalf("relocation=%+v err=%v", relocationResult.result, relocationResult.err)
+	}
+	if got, exists, lookupErr := current.Lookup(3); lookupErr != nil || !exists || got != userAddr {
+		t.Fatalf("final addr=%v want=%v exists=%v err=%v", got, userAddr, exists, lookupErr)
+	}
+	groups := log.snapshotGroups()
+	if len(groups) != 3 || len(groups[2].Descriptors) != 2 ||
+		groups[2].Descriptors[0].Kind != recordcodec.DescriptorUserCommit ||
+		groups[2].Descriptors[0].BatchID != 4 ||
+		groups[2].Descriptors[0].CommitSeq != 3 ||
+		groups[2].Descriptors[1].Kind != recordcodec.DescriptorRelocation ||
+		groups[2].Descriptors[1].BatchID != 3 ||
+		groups[2].Descriptors[1].CommitSeq != 4 {
+		t.Fatalf("groups=%+v", groups)
+	}
+	if c.NextCommitSeq() != 5 {
+		t.Fatalf("next commit seq=%d", c.NextCommitSeq())
+	}
+}
+
+func TestOrderUserBeforeRelocationIsStable(t *testing.T) {
+	relocation1 := Relocation{BatchID: 1}
+	relocation2 := Relocation{BatchID: 2}
+	group := []request{
+		{relocation: &relocation1},
+		{prepared: transaction.Prepared{BatchID: 3}},
+		{prepared: transaction.Prepared{BatchID: 4}},
+		{relocation: &relocation2},
+	}
+	ordered := orderUserBeforeRelocation(group)
+	if len(ordered) != 4 || ordered[0].prepared.BatchID != 3 || ordered[1].prepared.BatchID != 4 ||
+		ordered[2].relocation.BatchID != 1 || ordered[3].relocation.BatchID != 2 {
+		t.Fatalf("ordered=%+v", ordered)
+	}
+}
+
+func waitForQueuedRequests(t *testing.T, c *Coordinator, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for len(c.requests) != want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(c.requests); got != want {
+		t.Fatalf("queued=%d want=%d", got, want)
+	}
+}
+
 func TestRelocationDurabilityFailureIsCommitUnknown(t *testing.T) {
 	wantErr := errors.New("sync failed")
 	log := &fakeLog{syncErr: wantErr, poisoned: true}

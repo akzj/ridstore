@@ -118,9 +118,11 @@ Batch 从 Open CAS 到 Committing 后：
 
 Commit Coordinator 是条件验证的唯一串行化点。它按准备提交的确定顺序维护只在当前 group 内存在的 virtual Mapping：
 
+Coordinator 在已经形成的 group 内先做稳定分区：UserCommit 在 Relocation 之前；UserCommit 之间和 Relocation 之间各自保持入队 FIFO。该优先级不跨 group，也不越过 Checkpoint barrier，并且不改变 group 容量、durability/fsync 边界。它使同组用户条件提交先观察旧 VAddr，随后过期的 Relocation 通过 expected-old-VAddr CAS skip，减少 GC 引起的可避免冲突。
+
 ```text
 virtual = current committed Mapping
-for request in group order:
+for request in stable(UserCommit first, Relocation second) group order:
     read every condition from virtual
     if any condition fails:
         mark Batch Aborted with ErrConflict

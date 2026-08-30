@@ -395,10 +395,9 @@ func (c *Coordinator) process(group []request) {
 		}
 		return
 	}
-	active := make([]request, 0, len(group))
+	active := orderUserBeforeRelocation(group)
 	proposals := make([]mapping.Proposal, 0, len(group))
-	for _, req := range group {
-		active = append(active, req)
+	for _, req := range active {
 		proposals = append(proposals, requestProposal(req))
 	}
 	if len(active) == 0 {
@@ -540,6 +539,24 @@ func (c *Coordinator) process(group []request) {
 			c.fail(err)
 		}
 	}
+}
+
+// orderUserBeforeRelocation gives foreground commits semantic priority within
+// an already formed durability group. Both classes remain FIFO, and run()
+// keeps checkpoint barriers outside the group.
+func orderUserBeforeRelocation(group []request) []request {
+	ordered := make([]request, 0, len(group))
+	for _, req := range group {
+		if req.relocation == nil {
+			ordered = append(ordered, req)
+		}
+	}
+	for _, req := range group {
+		if req.relocation != nil {
+			ordered = append(ordered, req)
+		}
+	}
+	return ordered
 }
 
 func requestDescriptorSize(req request) (uint64, error) {
