@@ -110,9 +110,11 @@ Batch 在步骤 2–4 仍是 Open，因此 Checkpoint 可以把它记入 open-ba
 该 cut 之后。Close 与 Commit 通过 Batch 状态机、Coordinator queue ownership 和 Close drain 协调，不能
 依赖 Commit 长时间持有 Store lifecycle RLock。
 
-多个 pressure caller 可以同时请求 Checkpoint；`checkpointMu` 保证实际构建串行。当前实现允许已经进入
-等待队列的 caller 在前一轮释放空间后再构建一代空 checkpoint；这是吞吐优化缺口，不破坏容量或持久性
-不变量，后续可用 pressure generation 去重。
+多个 pressure caller 可以同时请求 Checkpoint；`checkpointMu` 保证实际构建串行。每个 pressure receipt
+携带它被 admission 时所属的 Active Delta generation；Freeze 后的新 Active 使用下一 generation。Store
+分别维护 pending 与 completed generation，channel 只负责唤醒：已被显式、hard-pressure 或后台
+Checkpoint 覆盖的迟到请求会直接丢弃，只有 cut 后新 Active 上的 pressure 才继续触发下一轮。因此不会
+为了已经释放的 Delta 再构建一代空 checkpoint，也不会误丢 cut 后的新压力。
 
 ## 6. Checkpoint 释放
 

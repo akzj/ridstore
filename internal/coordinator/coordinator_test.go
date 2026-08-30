@@ -204,8 +204,8 @@ func TestSubmitPropagatesDeltaSoftPressure(t *testing.T) {
 		}
 	}
 	receipt, err := c.Submit(context.Background(), batch)
-	if err != nil || !receipt.DeltaPressure() {
-		t.Fatalf("pressure=%v err=%v", receipt.DeltaPressure(), err)
+	if err != nil || !receipt.DeltaPressure() || receipt.DeltaPressureGeneration() == 0 {
+		t.Fatalf("pressure=%v generation=%d err=%v", receipt.DeltaPressure(), receipt.DeltaPressureGeneration(), err)
 	}
 	if _, err := receipt.Wait(); err != nil {
 		t.Fatal(err)

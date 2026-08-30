@@ -82,53 +82,55 @@ type Store struct {
 	checkpointMu  sync.Mutex
 	maintenanceMu sync.Mutex
 
-	log                    Log
-	maintenance            maintenanceLog
-	maintenanceHook        maintstate.FaultHook
-	mapStoreHook           mapstore.FaultHook
-	mappingGCHook          mapgcstate.FaultHook
-	root                   string
-	mapping                *mapping.Persistent
-	mapStore               *mapstore.Store
-	catalog                *storecatalog.Manager
-	ids                    *idalloc.Allocator
-	batches                *idalloc.Allocator
-	commits                *coordinator.Coordinator
-	limits                 transaction.Limits
-	userAppender           transaction.Appender
-	maxOpen                int
-	open                   map[model.BatchID]*Batch
-	statuses               map[model.BatchID]statusEntry
-	statusOrder            []statusOrderEntry
-	statusOrderHead        int
-	statusSerial           uint64
-	statusRetention        uint64
-	terminalTotal          uint64
-	terminalBase           uint64
-	openCount              int
-	recoveryAbortedStart   uint64
-	recoveryAbortedEnd     uint64
-	recoveryAbortedValid   bool
-	notify                 chan struct{}
-	closed                 bool
-	fault                  error
-	maxStats               uint64
-	mappingCacheBytes      uint64
-	maxRelocationBytes     uint64
-	maxRelocationMutations uint64
-	gcMinFreeBytes         uint64
-	gcBytesPerSecond       atomic.Uint64
-	gcNow                  func() time.Time
-	gcWait                 func(context.Context, time.Duration) error
-	dirLock                *filelock.Lock
-	identity               [16]byte
-	space                  *spaceGate
-	metrics                runtimeMetrics
-	recordMeta             *recordmeta.Cache
-	checkpointRequests     chan struct{}
-	checkpointStop         chan struct{}
-	checkpointDone         chan struct{}
-	checkpointStopOnce     sync.Once
+	log                         Log
+	maintenance                 maintenanceLog
+	maintenanceHook             maintstate.FaultHook
+	mapStoreHook                mapstore.FaultHook
+	mappingGCHook               mapgcstate.FaultHook
+	root                        string
+	mapping                     *mapping.Persistent
+	mapStore                    *mapstore.Store
+	catalog                     *storecatalog.Manager
+	ids                         *idalloc.Allocator
+	batches                     *idalloc.Allocator
+	commits                     *coordinator.Coordinator
+	limits                      transaction.Limits
+	userAppender                transaction.Appender
+	maxOpen                     int
+	open                        map[model.BatchID]*Batch
+	statuses                    map[model.BatchID]statusEntry
+	statusOrder                 []statusOrderEntry
+	statusOrderHead             int
+	statusSerial                uint64
+	statusRetention             uint64
+	terminalTotal               uint64
+	terminalBase                uint64
+	openCount                   int
+	recoveryAbortedStart        uint64
+	recoveryAbortedEnd          uint64
+	recoveryAbortedValid        bool
+	notify                      chan struct{}
+	closed                      bool
+	fault                       error
+	maxStats                    uint64
+	mappingCacheBytes           uint64
+	maxRelocationBytes          uint64
+	maxRelocationMutations      uint64
+	gcMinFreeBytes              uint64
+	gcBytesPerSecond            atomic.Uint64
+	gcNow                       func() time.Time
+	gcWait                      func(context.Context, time.Duration) error
+	dirLock                     *filelock.Lock
+	identity                    [16]byte
+	space                       *spaceGate
+	metrics                     runtimeMetrics
+	recordMeta                  *recordmeta.Cache
+	checkpointRequests          chan struct{}
+	checkpointStop              chan struct{}
+	checkpointDone              chan struct{}
+	checkpointStopOnce          sync.Once
+	checkpointPressurePending   atomic.Uint64
+	checkpointPressureCompleted atomic.Uint64
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -512,6 +514,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
+	s.completeCheckpointPressure(frozen.PressureGeneration())
 	s.mu.Lock()
 	if work.statusCut > s.terminalBase {
 		s.terminalBase = work.statusCut
@@ -657,7 +660,7 @@ func (b *Batch) Commit(ctx context.Context) (coordinator.Result, error) {
 			return coordinator.Result{}, err
 		}
 		if receipt.DeltaPressure() {
-			b.store.requestBackgroundCheckpoint()
+			b.store.requestBackgroundCheckpoint(receipt.DeltaPressureGeneration())
 		}
 		result, err := receipt.Wait()
 		if err == nil || terminal(b.inner) {

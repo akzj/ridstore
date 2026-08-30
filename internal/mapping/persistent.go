@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -76,14 +77,14 @@ func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig
 	}, nil
 }
 
-func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, bool, error) {
+func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, uint64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var entries uint64
 	seen := make(map[model.ID]struct{}, len(ids))
 	for _, id := range ids {
 		if id == 0 {
-			return nil, false, ErrInvalid
+			return nil, 0, ErrInvalid
 		}
 		if _, duplicate := seen[id]; duplicate {
 			continue
@@ -93,7 +94,18 @@ func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, bool, error
 			entries++
 		}
 	}
-	return m.budget.reserve(entries)
+	reservation, pressure, err := m.budget.reserve(entries)
+	if err != nil || !pressure {
+		return reservation, 0, err
+	}
+	if m.checkpointID == math.MaxUint64 {
+		reservation.Release()
+		return nil, 0, base.ErrGenerationExhausted
+	}
+	// The current active Delta will be frozen by the next checkpoint ID.
+	// Returning that ID lets the Engine discard a late pressure notification
+	// after another checkpoint has already covered this layer.
+	return reservation, m.checkpointID + 1, nil
 }
 
 func (m *Persistent) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
@@ -257,6 +269,15 @@ type FrozenCheckpoint struct {
 	layers  []*deltaLayer
 }
 
+// PressureGeneration identifies the active Delta generation covered by this
+// checkpoint. It is runtime scheduling state and is never persisted.
+func (c *FrozenCheckpoint) PressureGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.id
+}
+
 func (c *FrozenCheckpoint) CoveredCommitSeq() model.CommitSeq {
 	if c == nil {
 		return 0
@@ -367,6 +388,9 @@ func (m *Persistent) Freeze(expected model.CommitSeq) (*FrozenCheckpoint, error)
 	defer m.mu.Unlock()
 	if m.inCheckpoint || expected != m.covered {
 		return nil, ErrStalePlan
+	}
+	if m.checkpointID == math.MaxUint64 {
+		return nil, base.ErrGenerationExhausted
 	}
 	m.frozen = append(m.frozen, m.active)
 	m.active = &deltaLayer{values: make(map[model.ID]persistentDelta)}

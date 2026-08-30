@@ -282,6 +282,135 @@ func TestDeltaSoftPressureSchedulesBackgroundCheckpoint(t *testing.T) {
 	}
 }
 
+func TestCheckpointPressureGenerationDeduplicatesLateRequest(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.DeltaSoftLimitBytes = 64
+	config.Runtime.DeltaHardLimitBytes = 256
+	store, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.stopBackgroundCheckpoint()
+	defer func() {
+		if err := store.Close(); err != nil && !errors.Is(err, base.ErrClosed) {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	commit := func(value string) uint64 {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Create(context.Background(), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		receipt, err := store.submitCommit(context.Background(), batch.inner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		generation := receipt.DeltaPressureGeneration()
+		if generation == 0 {
+			t.Fatal("soft pressure did not carry a generation")
+		}
+		if _, err := receipt.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		batch.finish()
+		return generation
+	}
+
+	first := commit("first")
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if completed := store.checkpointPressureCompleted.Load(); completed < first {
+		t.Fatalf("completed generation=%d first=%d", completed, first)
+	}
+	store.requestBackgroundCheckpoint(first)
+	if pending, completed := store.checkpointPressurePending.Load(), store.checkpointPressureCompleted.Load(); pending > completed {
+		t.Fatalf("late request was not deduplicated: pending=%d completed=%d", pending, completed)
+	}
+	if requested := store.Metrics().BackgroundCheckpointRequested; requested != 0 {
+		t.Fatalf("covered late request changed requested counter: %d", requested)
+	}
+
+	second := commit("second")
+	if second <= first {
+		t.Fatalf("new active Delta generation=%d first=%d", second, first)
+	}
+	store.requestBackgroundCheckpoint(second)
+	if pending, completed := store.checkpointPressurePending.Load(), store.checkpointPressureCompleted.Load(); pending != second || pending <= completed {
+		t.Fatalf("new pressure was lost: pending=%d completed=%d second=%d", pending, completed, second)
+	}
+}
+
+func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.DeltaSoftLimitBytes = 64
+	config.Runtime.DeltaHardLimitBytes = 256
+	store, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil && !errors.Is(err, base.ErrClosed) {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	store.checkpointMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			store.checkpointMu.Unlock()
+		}
+	}()
+	commit := func(value string) {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Create(context.Background(), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit("first")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(store.checkpointRequests) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("background worker did not consume the first wake")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	commit("second")
+	if requested := store.Metrics().BackgroundCheckpointRequested; requested != 1 {
+		t.Fatalf("same Delta generation queued %d checkpoint requests", requested)
+	}
+
+	store.checkpointMu.Unlock()
+	locked = false
+	deadline = time.Now().Add(2 * time.Second)
+	for store.Metrics().BackgroundCheckpointCompleted == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background checkpoint did not complete: %+v", store.Metrics())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	metrics := store.Metrics()
+	if metrics.BackgroundCheckpointRequested != 1 || metrics.BackgroundCheckpointCompleted != 1 || metrics.DeltaChargedBytes != 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
 func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()

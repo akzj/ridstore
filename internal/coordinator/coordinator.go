@@ -51,8 +51,8 @@ type response struct {
 }
 
 type Receipt struct {
-	result        <-chan response
-	deltaPressure bool
+	result                  <-chan response
+	deltaPressureGeneration uint64
 }
 
 func (r Receipt) Wait() (Result, error) {
@@ -65,7 +65,11 @@ func (r Receipt) Wait() (Result, error) {
 
 // DeltaPressure reports that admission reached the Mapping soft limit. It is
 // advisory: the admitted request still owns its normal durable completion.
-func (r Receipt) DeltaPressure() bool { return r.deltaPressure }
+func (r Receipt) DeltaPressure() bool { return r.deltaPressureGeneration != 0 }
+
+// DeltaPressureGeneration identifies the active Mapping Delta admitted by
+// this request. Equal generations may be coalesced into one Checkpoint.
+func (r Receipt) DeltaPressureGeneration() uint64 { return r.deltaPressureGeneration }
 
 type CheckpointCut struct {
 	CoveredCommitSeq model.CommitSeq
@@ -204,7 +208,7 @@ func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Rec
 	if err != nil {
 		return Receipt{}, err
 	}
-	reservation, pressure, err := c.mapping.ReserveDelta(mutationIDs)
+	reservation, pressureGeneration, err := c.mapping.ReserveDelta(mutationIDs)
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -238,7 +242,7 @@ func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Rec
 	}
 	// Admission transfers completion ownership to the coordinator. Wait joins
 	// the result even if ctx is cancelled while durability is in flight.
-	return Receipt{result: req.result, deltaPressure: pressure}, nil
+	return Receipt{result: req.result, deltaPressureGeneration: pressureGeneration}, nil
 }
 
 // CheckpointCut appends a durable marker after every commit admitted before

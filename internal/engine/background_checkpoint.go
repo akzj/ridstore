@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 
 	"github.com/akzj/ridstore/internal/base"
 )
@@ -14,15 +15,40 @@ func (s *Store) startBackgroundCheckpoint() {
 	go s.runBackgroundCheckpoint()
 }
 
-func (s *Store) requestBackgroundCheckpoint() {
-	if s == nil || s.checkpointRequests == nil {
+func (s *Store) requestBackgroundCheckpoint(generation uint64) {
+	if s == nil || s.checkpointRequests == nil || generation == 0 {
 		return
 	}
+	if generation <= s.checkpointPressureCompleted.Load() {
+		return
+	}
+	if !advanceAtomic(&s.checkpointPressurePending, generation) {
+		return
+	}
+	if generation <= s.checkpointPressureCompleted.Load() {
+		return
+	}
+	s.metrics.backgroundCheckpointRequested.Add(1)
 	select {
 	case s.checkpointRequests <- struct{}{}:
-		s.metrics.backgroundCheckpointRequested.Add(1)
 	default:
 	}
+}
+
+func (s *Store) completeCheckpointPressure(generation uint64) {
+	if s == nil || generation == 0 {
+		return
+	}
+	advanceAtomic(&s.checkpointPressureCompleted, generation)
+}
+
+func advanceAtomic(value *atomic.Uint64, candidate uint64) bool {
+	for current := value.Load(); candidate > current; current = value.Load() {
+		if value.CompareAndSwap(current, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) runBackgroundCheckpoint() {
@@ -43,14 +69,21 @@ func (s *Store) runBackgroundCheckpoint() {
 			return
 		default:
 		}
-		if err := s.Checkpoint(context.Background()); err != nil {
-			if !errors.Is(err, base.ErrClosed) {
-				s.setFault(err)
+		for s.checkpointPressurePending.Load() > s.checkpointPressureCompleted.Load() {
+			select {
+			case <-s.checkpointStop:
+				return
+			default:
 			}
-			s.metrics.backgroundCheckpointFailed.Add(1)
-			continue
+			if err := s.Checkpoint(context.Background()); err != nil {
+				if !errors.Is(err, base.ErrClosed) {
+					s.setFault(err)
+				}
+				s.metrics.backgroundCheckpointFailed.Add(1)
+				break
+			}
+			s.metrics.backgroundCheckpointCompleted.Add(1)
 		}
-		s.metrics.backgroundCheckpointCompleted.Add(1)
 	}
 }
 

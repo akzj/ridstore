@@ -47,6 +47,8 @@ Prometheus SDK 引入 ridstore 内核。OpenTelemetry 或自有 exporter 可直�
   `gc_min_free_bytes` 和当前 `gc_bytes_per_second`。
 - 后台 Checkpoint counters：`ridstore_background_checkpoint_requested_total`、
   `ridstore_background_checkpoint_completed_total`、`ridstore_background_checkpoint_failed_total`。
+  requested 统计被调度器接受的不同 Delta pressure generation；同代重复通知以及已被其他成功
+  Checkpoint 覆盖的迟到通知不会重复计数。
 - Record metadata cache：`ridstore_record_meta_cache_hits_total`、
   `ridstore_record_meta_cache_misses_total`、`ridstore_record_meta_cache_entries`、
   `ridstore_record_meta_cache_evictions_total`。

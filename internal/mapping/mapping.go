@@ -83,7 +83,7 @@ type Snapshot struct {
 // temporary in-memory model for tests until the v2 Open path is complete.
 type Index interface {
 	Lookup(model.ID) (recordlog.VAddr, bool, error)
-	ReserveDelta([]model.ID) (DeltaReservation, bool, error)
+	ReserveDelta([]model.ID) (DeltaReservation, uint64, error)
 	ResolveGroup([]Proposal) (GroupPlan, error)
 	PublishGroup(model.CommitSeq, GroupPlan, []DeltaReservation) (PublishResult, error)
 	CoveredCommitSeq() model.CommitSeq
@@ -124,8 +124,8 @@ func (m *Mapping) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 	return entry, exists, nil
 }
 
-func (m *Mapping) ReserveDelta([]model.ID) (DeltaReservation, bool, error) {
-	return &unlimitedReservation{}, false, nil
+func (m *Mapping) ReserveDelta([]model.ID) (DeltaReservation, uint64, error) {
+	return &unlimitedReservation{}, 0, nil
 }
 
 func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {

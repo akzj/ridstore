@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/radix"
@@ -105,6 +106,54 @@ func TestPersistentCheckpointKeepsNewCommitsVisible(t *testing.T) {
 	}
 	if candidate.Root() == 0 || candidate.CoveredCommitSeq() != 1 || current.CoveredCommitSeq() != 2 {
 		t.Fatalf("candidate root=%v covered=%d runtime=%d", candidate.Root(), candidate.CoveredCommitSeq(), current.CoveredCommitSeq())
+	}
+}
+
+func TestPersistentPressureGenerationFollowsActiveDelta(t *testing.T) {
+	current, physical := newPersistentForTest(t)
+	defer physical.Close()
+	ids := make([]model.ID, 512)
+	for index := range ids {
+		ids[index] = model.ID(index + 1)
+	}
+
+	reservation, first, err := current.ReserveDelta(ids)
+	if err != nil || first == 0 {
+		t.Fatalf("first generation=%d err=%v", first, err)
+	}
+	reservation.Release()
+	frozen, err := current.Freeze(0)
+	if err != nil || frozen.PressureGeneration() != first {
+		t.Fatalf("frozen generation=%d first=%d err=%v", frozen.PressureGeneration(), first, err)
+	}
+	if err := current.AbortCheckpoint(frozen); err != nil {
+		t.Fatal(err)
+	}
+
+	reservation, second, err := current.ReserveDelta(ids)
+	if err != nil || second != first+1 {
+		t.Fatalf("second generation=%d first=%d err=%v", second, first, err)
+	}
+	reservation.Release()
+}
+
+func TestPersistentPressureGenerationExhaustionReleasesReservation(t *testing.T) {
+	current, physical := newPersistentForTest(t)
+	defer physical.Close()
+	current.checkpointID = math.MaxUint64
+	ids := make([]model.ID, 512)
+	for index := range ids {
+		ids[index] = model.ID(index + 1)
+	}
+
+	if _, _, err := current.ReserveDelta(ids); !errors.Is(err, base.ErrGenerationExhausted) {
+		t.Fatalf("reserve err=%v", err)
+	}
+	if charged, reserved, _, _ := current.DeltaUsage(); charged != 0 || reserved != 0 {
+		t.Fatalf("charged=%d reserved=%d", charged, reserved)
+	}
+	if _, err := current.Freeze(0); !errors.Is(err, base.ErrGenerationExhausted) {
+		t.Fatalf("freeze err=%v", err)
 	}
 }
 

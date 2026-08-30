@@ -193,6 +193,81 @@ func TestBackgroundCheckpointFailureFailsStoreClosed(t *testing.T) {
 	}
 }
 
+func TestBackgroundCheckpointPreservesPressureAfterFreeze(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.DeltaSoftLimitBytes = 64
+	config.Runtime.DeltaHardLimitBytes = 256
+	created, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var armed, blocked atomic.Bool
+	store, err := open(context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+		if armed.Load() && point == mapstore.FaultBeforeAppendWrite && blocked.CompareAndSwap(false, true) {
+			close(started)
+			<-release
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil && !errors.Is(err, base.ErrClosed) {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	commit := func(value string) {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Create(context.Background(), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	armed.Store(true)
+	commit("before-freeze")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background checkpoint did not reach Mapping build")
+	}
+	commit("after-freeze")
+	close(release)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for store.Metrics().BackgroundCheckpointCompleted < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("cut-after pressure did not trigger a second checkpoint: %+v", store.Metrics())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	metrics := store.Metrics()
+	if metrics.BackgroundCheckpointRequested != 2 || metrics.BackgroundCheckpointCompleted != 2 || metrics.DeltaChargedBytes != 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
 func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	root, config := prepareCheckpointStore(t)
 	injected := errors.New("injected recordlog sync failure")
