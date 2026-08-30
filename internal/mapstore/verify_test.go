@@ -24,7 +24,7 @@ func TestVerifyFilesAcceptsCompleteMappingSet(t *testing.T) {
 	var slots [NodeSlots]uint64
 	addr, _ := recordlog.NewVAddr(1, 64, 64)
 	slots[1] = uint64(addr)
-	if _, err := store.Append(0, 0, 1, slots); err != nil {
+	if _, err := store.AppendLeaf(0, 1, testLeafRefs(slots)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Sync(); err != nil {

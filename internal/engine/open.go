@@ -153,6 +153,10 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err := recoverMaintenance(root, catalog, hooks.maintenance, hooks.recordLog); err != nil {
 		return nil, err
 	}
+	pendingCompaction, err := recoverCompactionBeforeOpen(root, catalog)
+	if err != nil {
+		return nil, err
+	}
 	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, catalog, hooks.recordLog)
 	if err != nil {
 		return nil, err
@@ -174,6 +178,9 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	}
 	current, err := mapping.OpenPersistent(tree, physicalMapping, persistentConfig(config))
 	if err != nil {
+		return fail(err)
+	}
+	if err := current.InitializeLiveStats(ctx); err != nil {
 		return fail(err)
 	}
 	recovered, err := replay.Recover(ctx, log, replay.Checkpoint{
@@ -258,7 +265,13 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.dirLock = dirLock
 	store.identity = [16]byte(manifest.StoreUUID)
 	store.recordMeta = recordmeta.New(config.RecordMetaCacheEntries)
+	store.gcStability.sample(catalog.Snapshot(), store.gcNow())
 	store.userAppender = &metadataAppender{next: store.userAppender, cache: store.recordMeta, maxValueSize: store.limits.MaxValueSize}
+	if pendingCompaction != nil {
+		if err := store.resumeCompaction(ctx, *pendingCompaction); err != nil {
+			return fail(errors.Join(base.ErrRecoveryRequired, err))
+		}
+	}
 	store.startBackgroundCheckpoint()
 	return store, nil
 }

@@ -11,13 +11,17 @@ import (
 )
 
 const (
-	NodeHeaderSize      = uint32(64)
-	NodeSlots           = uint16(512)
-	SparseBitmapBytes   = uint32(64)
-	DenseNodeSize       = NodeHeaderSize + uint32(NodeSlots)*8
+	NodeHeaderSize        = uint32(64)
+	NodeSlots             = uint16(512)
+	SparseBitmapBytes     = uint32(64)
+	DenseInternalNodeSize = NodeHeaderSize + uint32(NodeSlots)*8
+	DenseLeafNodeSize     = NodeHeaderSize + uint32(NodeSlots)*12
+	// DenseNodeSize is the maximum encoded node size and remains the capacity
+	// planning bound used by MapStore and GC admission.
+	DenseNodeSize       = DenseLeafNodeSize
 	SparseDenseBoundary = uint16(504)
 	MaxLevel            = uint8(7)
-	FormatVersion       = uint16(2)
+	FormatVersion       = uint16(3)
 )
 
 var (
@@ -43,6 +47,7 @@ type Node struct {
 	EntryCount       uint16
 	Bitmap           [8]uint64
 	Values           []uint64
+	Sizes            []uint32
 }
 
 type NodeBuild struct {
@@ -51,6 +56,7 @@ type NodeBuild struct {
 	Prefix           uint64
 	CoveredCommitSeq model.CommitSeq
 	Slots            [NodeSlots]uint64
+	Sizes            [NodeSlots]uint32
 }
 
 func EncodeNode(build NodeBuild) ([]byte, error) {
@@ -61,15 +67,22 @@ func EncodeNode(build NodeBuild) ([]byte, error) {
 	if count == 0 || (build.Level == MaxLevel && !topSlotsEmpty(build.Slots[:])) {
 		return nil, ErrInvalid
 	}
-	if err := validateValues(build.Level, build.Slots[:]); err != nil {
+	if err := validateValues(build.Level, build.Slots[:], build.Sizes[:]); err != nil {
 		return nil, err
 	}
 
 	encoding := EncodingSparse
-	size := NodeHeaderSize + SparseBitmapBytes + uint32(count)*8
+	width := uint32(8)
+	if build.Level == 0 {
+		width = 12
+	}
+	size := alignNodeSize(NodeHeaderSize + SparseBitmapBytes + uint32(count)*width)
 	if count >= int(SparseDenseBoundary) {
 		encoding = EncodingDense
-		size = DenseNodeSize
+		size = DenseInternalNodeSize
+		if build.Level == 0 {
+			size = DenseLeafNodeSize
+		}
 	}
 	dst := make([]byte, size)
 	copy(dst[0:8], nodeMagic[:])
@@ -94,10 +107,20 @@ func EncodeNode(build NodeBuild) ([]byte, error) {
 			binary.LittleEndian.PutUint64(payload[word*8:word*8+8], current|uint64(1)<<uint(slot%64))
 			binary.LittleEndian.PutUint64(payload[valueOffset:valueOffset+8], value)
 			valueOffset += 8
+			if build.Level == 0 {
+				binary.LittleEndian.PutUint32(payload[valueOffset:valueOffset+4], build.Sizes[slot])
+				valueOffset += 4
+			}
 		}
 	} else {
 		for slot, value := range build.Slots {
-			binary.LittleEndian.PutUint64(payload[slot*8:slot*8+8], value)
+			if build.Level == 0 {
+				offset := uint32(slot) * 12
+				binary.LittleEndian.PutUint64(payload[offset:offset+8], value)
+				binary.LittleEndian.PutUint32(payload[offset+8:offset+12], build.Sizes[slot])
+			} else {
+				binary.LittleEndian.PutUint64(payload[slot*8:slot*8+8], value)
+			}
 		}
 	}
 	binary.LittleEndian.PutUint32(dst[44:48], crc32.Checksum(payload, crcTable))
@@ -130,20 +153,37 @@ func DecodeNode(src []byte, segmentRemaining uint32) (Node, uint32, error) {
 			return Node{}, 0, ErrCorrupt
 		}
 		node.Values = make([]uint64, node.EntryCount)
+		if node.Level == 0 {
+			node.Sizes = make([]uint32, node.EntryCount)
+		}
+		valueOffset := SparseBitmapBytes
 		for index := range node.Values {
-			offset := SparseBitmapBytes + uint32(index)*8
-			node.Values[index] = binary.LittleEndian.Uint64(payload[offset : offset+8])
+			node.Values[index] = binary.LittleEndian.Uint64(payload[valueOffset : valueOffset+8])
+			valueOffset += 8
+			if node.Level == 0 {
+				node.Sizes[index] = binary.LittleEndian.Uint32(payload[valueOffset : valueOffset+4])
+				valueOffset += 4
+			}
 		}
 	case EncodingDense:
 		node.Values = make([]uint64, NodeSlots)
+		if node.Level == 0 {
+			node.Sizes = make([]uint32, NodeSlots)
+		}
 		for index := range node.Values {
-			node.Values[index] = binary.LittleEndian.Uint64(payload[index*8 : index*8+8])
+			if node.Level == 0 {
+				offset := uint32(index) * 12
+				node.Values[index] = binary.LittleEndian.Uint64(payload[offset : offset+8])
+				node.Sizes[index] = binary.LittleEndian.Uint32(payload[offset+8 : offset+12])
+			} else {
+				node.Values[index] = binary.LittleEndian.Uint64(payload[index*8 : index*8+8])
+			}
 		}
 		if countValues(node.Values) != int(node.EntryCount) || (node.Level == MaxLevel && !topSlotsEmpty(node.Values)) {
 			return Node{}, 0, ErrCorrupt
 		}
 	}
-	if err := validateValues(node.Level, node.Values); err != nil {
+	if err := validateValues(node.Level, node.Values, node.Sizes); err != nil {
 		return Node{}, 0, errors.Join(ErrCorrupt, err)
 	}
 	return node, size, nil
@@ -180,12 +220,20 @@ func decodeNodeHeader(src []byte, segmentRemaining uint32) (Node, uint32, error)
 	}
 	switch node.Encoding {
 	case EncodingSparse:
-		want := NodeHeaderSize + SparseBitmapBytes + uint32(node.EntryCount)*8
+		width := uint32(8)
+		if node.Level == 0 {
+			width = 12
+		}
+		want := alignNodeSize(NodeHeaderSize + SparseBitmapBytes + uint32(node.EntryCount)*width)
 		if size != want {
 			return Node{}, 0, ErrCorrupt
 		}
 	case EncodingDense:
-		if size != DenseNodeSize {
+		want := DenseInternalNodeSize
+		if node.Level == 0 {
+			want = DenseLeafNodeSize
+		}
+		if size != want {
 			return Node{}, 0, ErrCorrupt
 		}
 	default:
@@ -214,6 +262,28 @@ func (n Node) Lookup(slot uint16) (uint64, bool) {
 	return n.Values[index], true
 }
 
+func (n Node) LookupRef(slot uint16) (recordlog.RecordRef, bool) {
+	if n.Level != 0 || slot >= NodeSlots {
+		return recordlog.RecordRef{}, false
+	}
+	if n.Encoding == EncodingDense {
+		if n.Values[slot] == 0 {
+			return recordlog.RecordRef{}, false
+		}
+		return recordlog.RecordRef{Addr: recordlog.VAddr(n.Values[slot]), PhysicalSize: n.Sizes[slot]}, true
+	}
+	word, bit := slot/64, slot%64
+	if n.Bitmap[word]&(uint64(1)<<bit) == 0 {
+		return recordlog.RecordRef{}, false
+	}
+	index := 0
+	for i := uint16(0); i < word; i++ {
+		index += bits.OnesCount64(n.Bitmap[i])
+	}
+	index += bits.OnesCount64(n.Bitmap[word] & ((uint64(1) << bit) - 1))
+	return recordlog.RecordRef{Addr: recordlog.VAddr(n.Values[index]), PhysicalSize: n.Sizes[index]}, true
+}
+
 // Slots expands a decoded node for copy-on-write construction. Point lookups
 // should use Lookup so sparse nodes stay compact in cache.
 func (n Node) Slots() [NodeSlots]uint64 {
@@ -234,6 +304,31 @@ func (n Node) Slots() [NodeSlots]uint64 {
 	return slots
 }
 
+func (n Node) Refs() [NodeSlots]recordlog.RecordRef {
+	var refs [NodeSlots]recordlog.RecordRef
+	if n.Level != 0 {
+		return refs
+	}
+	if n.Encoding == EncodingDense {
+		for index, value := range n.Values {
+			if value != 0 {
+				refs[index] = recordlog.RecordRef{Addr: recordlog.VAddr(value), PhysicalSize: n.Sizes[index]}
+			}
+		}
+		return refs
+	}
+	valueIndex := 0
+	for wordIndex, word := range n.Bitmap {
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			refs[wordIndex*64+bit] = recordlog.RecordRef{Addr: recordlog.VAddr(n.Values[valueIndex]), PhysicalSize: n.Sizes[valueIndex]}
+			valueIndex++
+			word &^= uint64(1) << bit
+		}
+	}
+	return refs
+}
+
 func validPrefix(level uint8, prefix uint64) bool {
 	if level > MaxLevel {
 		return false
@@ -245,20 +340,32 @@ func validPrefix(level uint8, prefix uint64) bool {
 	return prefix < uint64(1)<<used
 }
 
-func validateValues(level uint8, values []uint64) error {
-	for _, value := range values {
+func validateValues(level uint8, values []uint64, sizes []uint32) error {
+	if level == 0 && len(sizes) != len(values) || level != 0 && len(sizes) != 0 && len(sizes) != len(values) {
+		return ErrInvalid
+	}
+	for index, value := range values {
 		if value == 0 {
+			if level == 0 && sizes[index] != 0 {
+				return ErrInvalid
+			}
 			continue
 		}
 		if level == 0 {
-			if _, err := recordlog.ParseVAddr(value); err != nil {
+			if !(recordlog.RecordRef{Addr: recordlog.VAddr(value), PhysicalSize: sizes[index]}).Valid() {
 				return ErrInvalid
 			}
+		} else if len(sizes) != 0 && sizes[index] != 0 {
+			return ErrInvalid
 		} else if _, err := model.ParseMapAddr(value); err != nil {
 			return ErrInvalid
 		}
 	}
 	return nil
+}
+
+func alignNodeSize(size uint32) uint32 {
+	return (size + 7) &^ 7
 }
 
 func headerChecksum(header []byte) uint32 {

@@ -31,7 +31,11 @@ func TestGenerationWriterBuildsIndependentVerifiedFileSet(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := builder.Add(id, addr); err != nil {
+		ref, err := recordlog.NewRecordRef(addr, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := builder.Add(id, ref); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -116,7 +120,11 @@ func TestOpenVerifiedGenerationAllowsRetiringFilesToCoexist(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr, _ := recordlog.NewVAddr(1, 64, 64)
-	if err := builder.Add(1, addr); err != nil {
+	ref, err := recordlog.NewRecordRef(addr, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Add(1, ref); err != nil {
 		t.Fatal(err)
 	}
 	tree, err := builder.Finish()
@@ -175,7 +183,11 @@ func TestPromoteGenerationFaultsConvergeOnRetry(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := builder.Add(model.ID(uint64(index)*512+1), addr); err != nil {
+				ref, err := recordlog.NewRecordRef(addr, 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := builder.Add(model.ID(uint64(index)*512+1), ref); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -17,6 +17,15 @@ func testAddr(t *testing.T, segment recordlog.SegmentID, offset uint32) recordlo
 	return addr
 }
 
+func testRef(t *testing.T, addr recordlog.VAddr) recordlog.RecordRef {
+	t.Helper()
+	ref, err := recordlog.NewRecordRef(addr, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
+}
+
 func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 	mapping := NewEmpty()
 	firstAddr := testAddr(t, 1, 64)
@@ -25,12 +34,12 @@ func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 		{
 			Kind:       ProposalUserCommit,
 			Conditions: []Condition{{RecordID: 7}},
-			Changes:    []Change{{RecordID: 7, NewAddr: firstAddr, Operation: OperationPut}},
+			Changes:    []Change{{RecordID: 7, NewRef: testRef(t, firstAddr), Operation: OperationPut}},
 		},
 		{
 			Kind:       ProposalUserCommit,
 			Conditions: []Condition{{RecordID: 7, ExpectedAddr: firstAddr}},
-			Changes:    []Change{{RecordID: 7, NewAddr: secondAddr, Operation: OperationPut}},
+			Changes:    []Change{{RecordID: 7, NewRef: testRef(t, secondAddr), Operation: OperationPut}},
 		},
 	})
 	if err != nil {
@@ -55,11 +64,34 @@ func TestResolveGroupUsesVirtualStateAndPublishesAtomically(t *testing.T) {
 	}
 }
 
+func TestPublishGroupMaintainsExactLiveStats(t *testing.T) {
+	oldRef := testRef(t, testAddr(t, 1, 64))
+	newRef := testRef(t, testAddr(t, 2, 64))
+	current, err := New(Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.RecordRef{7: oldRef}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := current.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 7, NewRef: newRef, Operation: OperationPut}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := current.PublishGroup(5, plan, reservePlan(t, current, plan)); err != nil {
+		t.Fatal(err)
+	}
+	stats := current.LiveStats()
+	if _, exists := stats[1]; exists {
+		t.Fatalf("old segment remains live: %+v", stats)
+	}
+	if got := stats[2]; got.LiveBytes != 64 || got.LiveRecords != 1 || got.LastChangedCommitSeq != 5 {
+		t.Fatalf("new segment stats=%+v", got)
+	}
+}
+
 func TestPublishGroupReservationFailureDoesNotExposePartialGroup(t *testing.T) {
 	current := NewEmpty()
 	plan, err := current.ResolveGroup([]Proposal{
-		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: testAddr(t, 1, 64), Operation: OperationPut}}},
-		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewAddr: testAddr(t, 1, 128), Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewRef: testRef(t, testAddr(t, 1, 64)), Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewRef: testRef(t, testAddr(t, 1, 128)), Operation: OperationPut}}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,14 +113,14 @@ func TestPublishGroupReservationFailureDoesNotExposePartialGroup(t *testing.T) {
 
 func TestResolveGroupRejectsConflictWithoutAffectingLaterProposal(t *testing.T) {
 	old := testAddr(t, 1, 64)
-	mapping, err := New(Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.VAddr{1: old}})
+	mapping, err := New(Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.RecordRef{1: testRef(t, old)}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	newAddr := testAddr(t, 1, 128)
 	plan, err := mapping.ResolveGroup([]Proposal{
 		{Kind: ProposalUserCommit, Conditions: []Condition{{RecordID: 1, ExpectedAddr: testAddr(t, 9, 64)}}, Changes: []Change{{RecordID: 1, Operation: OperationDelete}}},
-		{Kind: ProposalUserCommit, Conditions: []Condition{{RecordID: 1, ExpectedAddr: old}}, Changes: []Change{{RecordID: 1, NewAddr: newAddr, Operation: OperationPut}}},
+		{Kind: ProposalUserCommit, Conditions: []Condition{{RecordID: 1, ExpectedAddr: old}}, Changes: []Change{{RecordID: 1, NewRef: testRef(t, newAddr), Operation: OperationPut}}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -109,12 +141,12 @@ func TestResolveGroupRejectsConflictWithoutAffectingLaterProposal(t *testing.T) 
 func TestRelocationUsesAddressCAS(t *testing.T) {
 	old := testAddr(t, 2, 64)
 	newAddr := testAddr(t, 3, 64)
-	mapping, _ := New(Snapshot{CoveredCommitSeq: 2, Entries: map[model.ID]recordlog.VAddr{5: old}})
+	mapping, _ := New(Snapshot{CoveredCommitSeq: 2, Entries: map[model.ID]recordlog.RecordRef{5: testRef(t, old)}})
 	plan, err := mapping.ResolveGroup([]Proposal{{
 		Kind: ProposalRelocation,
 		Changes: []Change{
-			{RecordID: 5, ExpectedOldAddr: old, NewAddr: newAddr, Operation: OperationRelocate},
-			{RecordID: 6, ExpectedOldAddr: old, NewAddr: testAddr(t, 3, 128), Operation: OperationRelocate},
+			{RecordID: 5, ExpectedOldAddr: old, NewRef: testRef(t, newAddr), Operation: OperationRelocate},
+			{RecordID: 6, ExpectedOldAddr: old, NewRef: testRef(t, testAddr(t, 3, 128)), Operation: OperationRelocate},
 		},
 	}})
 	if err != nil {
@@ -133,7 +165,7 @@ func TestRelocationUsesAddressCAS(t *testing.T) {
 func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 	mapping := NewEmpty()
 	addr := testAddr(t, 1, 64)
-	proposal := Proposal{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewAddr: addr, Operation: OperationPut}}}
+	proposal := Proposal{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 1, NewRef: testRef(t, addr), Operation: OperationPut}}}
 	first, err := mapping.ResolveGroup([]Proposal{proposal})
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +180,7 @@ func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 	if _, err := mapping.PublishGroup(2, second, reservePlan(t, mapping, second)); !errors.Is(err, ErrStalePlan) {
 		t.Fatalf("stale error=%v", err)
 	}
-	third, err := mapping.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewAddr: testAddr(t, 1, 128), Operation: OperationPut}}}})
+	third, err := mapping.ResolveGroup([]Proposal{{Kind: ProposalUserCommit, Changes: []Change{{RecordID: 2, NewRef: testRef(t, testAddr(t, 1, 128)), Operation: OperationPut}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +192,7 @@ func TestPublishRejectsStaleOrMutatedPlan(t *testing.T) {
 
 func TestSnapshotOwnsEntries(t *testing.T) {
 	addr := testAddr(t, 1, 64)
-	mapping, err := New(Snapshot{Entries: map[model.ID]recordlog.VAddr{1: addr}})
+	mapping, err := New(Snapshot{Entries: map[model.ID]recordlog.RecordRef{1: testRef(t, addr)}})
 	if err != nil {
 		t.Fatal(err)
 	}

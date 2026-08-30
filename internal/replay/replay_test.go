@@ -84,9 +84,10 @@ func TestRecoverRebuildsMappingAllocatorsAndStatuses(t *testing.T) {
 	log.add(t, orphan)
 	put, _ := recordcodec.EncodePut(recordcodec.PutRecord{OriginBatchID: 2, RecordID: 2, Value: []byte("value")}, 1024)
 	putAddr := log.add(t, put)
+	putPhysical, _ := recordlog.PhysicalRecordSize(uint64(len(put)))
 	commit, _ := recordcodec.EncodeCommitGroup(recordcodec.CommitGroup{Descriptors: []recordcodec.Descriptor{{
 		Kind: recordcodec.DescriptorUserCommit, BatchID: 2, CommitSeq: 1, LogicalPayloadBytes: 5,
-		Mutations: []recordcodec.Mutation{{RecordID: 2, NewAddr: putAddr, Operation: recordcodec.OperationPut}},
+		Mutations: []recordcodec.Mutation{{RecordID: 2, NewAddr: putAddr, PhysicalSize: putPhysical, Operation: recordcodec.OperationPut}},
 	}}}, 4096)
 	log.add(t, commit)
 	abort, _ := recordcodec.EncodeAbort(recordcodec.AbortRecord{BatchID: 3, Reason: 1})
@@ -129,9 +130,10 @@ func TestRecoverRejectsCommitSequenceGapAndWrongPutIdentity(t *testing.T) {
 			log.add(t, batchReserve)
 			put, _ := recordcodec.EncodePut(recordcodec.PutRecord{OriginBatchID: 1, RecordID: 1, Value: []byte("x")}, 1024)
 			addr := log.add(t, put)
+			physical, _ := recordlog.PhysicalRecordSize(uint64(len(put)))
 			commit, _ := recordcodec.EncodeCommitGroup(recordcodec.CommitGroup{Descriptors: []recordcodec.Descriptor{{
 				Kind: recordcodec.DescriptorUserCommit, BatchID: 1, CommitSeq: tc.seq, LogicalPayloadBytes: 1,
-				Mutations: []recordcodec.Mutation{{RecordID: tc.id, NewAddr: addr, Operation: recordcodec.OperationPut}},
+				Mutations: []recordcodec.Mutation{{RecordID: tc.id, NewAddr: addr, PhysicalSize: physical, Operation: recordcodec.OperationPut}},
 			}}}, 4096)
 			log.add(t, commit)
 			start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
@@ -158,15 +160,15 @@ func TestRecoverRelocationUsesAddressCAS(t *testing.T) {
 	group, _ := recordcodec.EncodeCommitGroup(recordcodec.CommitGroup{Descriptors: []recordcodec.Descriptor{{
 		Kind: recordcodec.DescriptorRelocation, BatchID: 3, CommitSeq: 5, LogicalPayloadBytes: 10,
 		Mutations: []recordcodec.Mutation{
-			{RecordID: 1, NewAddr: newAddr, ExpectedOldAddr: oldAddr, Operation: recordcodec.OperationRelocate},
-			{RecordID: 2, NewAddr: staleAddr, ExpectedOldAddr: staleOldAddr, Operation: recordcodec.OperationRelocate},
+			{RecordID: 1, NewAddr: newAddr, ExpectedOldAddr: oldAddr, PhysicalSize: oldPhysical, Operation: recordcodec.OperationRelocate},
+			{RecordID: 2, NewAddr: staleAddr, ExpectedOldAddr: staleOldAddr, PhysicalSize: oldPhysical, Operation: recordcodec.OperationRelocate},
 		},
 	}}}, 4096)
 	log.add(t, group)
 	start, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
 	initial, err := mapping.New(mapping.Snapshot{
 		CoveredCommitSeq: 4,
-		Entries:          map[model.ID]recordlog.VAddr{1: oldAddr},
+		Entries:          map[model.ID]recordlog.RecordRef{1: {Addr: oldAddr, PhysicalSize: oldPhysical}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -212,17 +214,19 @@ func TestRecoverRejectsUserStatusTailBeyondCapacity(t *testing.T) {
 func TestRecoverRejectsDurableTailLargerThanDeltaBudget(t *testing.T) {
 	log := &fakeLog{byAddr: make(map[recordlog.VAddr][]byte)}
 	addresses := make([]recordlog.VAddr, 2)
+	physicalSizes := make([]uint32, 2)
 	for index := range addresses {
 		payload, _ := recordcodec.EncodePut(recordcodec.PutRecord{
 			OriginBatchID: 1, RecordID: model.ID(index + 1), Value: []byte("value"),
 		}, 1024)
 		addresses[index] = log.add(t, payload)
+		physicalSizes[index], _ = recordlog.PhysicalRecordSize(uint64(len(payload)))
 	}
 	commit, _ := recordcodec.EncodeCommitGroup(recordcodec.CommitGroup{Descriptors: []recordcodec.Descriptor{{
 		Kind: recordcodec.DescriptorUserCommit, BatchID: 1, CommitSeq: 1, LogicalPayloadBytes: 10,
 		Mutations: []recordcodec.Mutation{
-			{RecordID: 1, NewAddr: addresses[0], Operation: recordcodec.OperationPut},
-			{RecordID: 2, NewAddr: addresses[1], Operation: recordcodec.OperationPut},
+			{RecordID: 1, NewAddr: addresses[0], PhysicalSize: physicalSizes[0], Operation: recordcodec.OperationPut},
+			{RecordID: 2, NewAddr: addresses[1], PhysicalSize: physicalSizes[1], Operation: recordcodec.OperationPut},
 		},
 	}}}, 4096)
 	log.add(t, commit)
@@ -233,7 +237,7 @@ func TestRecoverRejectsDurableTailLargerThanDeltaBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
-		CheckpointSortBytes: 16, DeltaSoftLimitBytes: 32, DeltaHardLimitBytes: 64,
+		CheckpointSortBytes: 24, DeltaSoftLimitBytes: 32, DeltaHardLimitBytes: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -260,6 +264,10 @@ func (replayNodeStore) Read(model.MapAddr) (mapstore.Node, error) {
 }
 
 func (replayNodeStore) Append(uint8, uint64, model.CommitSeq, [mapstore.NodeSlots]uint64) (model.MapAddr, error) {
+	return 0, mapping.ErrCorrupt
+}
+
+func (replayNodeStore) AppendLeaf(uint64, model.CommitSeq, [mapstore.NodeSlots]recordlog.RecordRef) (model.MapAddr, error) {
 	return 0, mapping.ErrCorrupt
 }
 

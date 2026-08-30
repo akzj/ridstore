@@ -62,6 +62,40 @@ func (l *Log) RetireSegment(ctx context.Context, id SegmentID, minimumGeneration
 	return nil
 }
 
+func (l *Log) FinalizeCompactionRetirement(ctx context.Context, inputs []SegmentSummary, catalogGeneration uint64) error {
+	if l == nil || len(inputs) == 0 || catalogGeneration == 0 {
+		return ErrInvalidConfig
+	}
+	snapshot := l.catalog.SnapshotRecordLog()
+	if snapshot.Generation < catalogGeneration {
+		return ErrInvalidConfig
+	}
+	for _, input := range inputs {
+		if _, exists := snapshot.sealedSummary(input.SegmentID); exists {
+			return ErrInvalidConfig
+		}
+		if err := l.registry.beginRetire(input.SegmentID); err != nil {
+			return err
+		}
+	}
+	for _, input := range inputs {
+		if err := l.registry.waitNoReaders(ctx, input.SegmentID); err != nil {
+			return err
+		}
+		segment, err := l.registry.detachRetired(input.SegmentID)
+		if err != nil {
+			return l.setTerminal(err)
+		}
+		if err := segment.close(); err != nil {
+			return err
+		}
+		if err := cleanupRetiredSegment(l.root, input.SegmentID, catalogGeneration, l.files, l.hook); err != nil {
+			return l.setTerminal(err)
+		}
+	}
+	return nil
+}
+
 // CleanupRetiredSegment completes the physical half of a retirement whose
 // Catalog removal is already durable. The caller must prove that id is absent
 // from the authoritative Catalog before calling it.

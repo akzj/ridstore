@@ -490,10 +490,11 @@ func startRecord(opts Options, started time.Time) (Start, error) {
 		device = int64(stat.Dev)
 	}
 	kernel, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	if err != nil {
-		return Start{}, err
+	kernelRelease := runtime.GOOS
+	if err == nil {
+		kernelRelease = strings.TrimSpace(string(kernel))
 	}
-	return Start{Type: "start", StartedAt: started, GitCommit: opts.GitCommit, GitDirty: opts.GitDirty, GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, KernelRelease: strings.TrimSpace(string(kernel)), FilesystemType: int64(fs.Type), FilesystemBlockSize: fs.Bsize, Device: device, DurationNanos: int64(opts.Duration), SampleIntervalNanos: int64(opts.SampleInterval), MaintenanceIntervalNanos: int64(opts.MaintenanceInterval), MaintenanceBatches: opts.MaintenanceBatches, LiveRecords: opts.LiveRecords, BatchMutations: opts.BatchMutations, ValueBytes: opts.ValueBytes, Seed: opts.Seed, SegmentSize: opts.SegmentSize}, nil
+	return Start{Type: "start", StartedAt: started, GitCommit: opts.GitCommit, GitDirty: opts.GitDirty, GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, KernelRelease: kernelRelease, FilesystemType: int64(fs.Type), FilesystemBlockSize: int64(fs.Bsize), Device: device, DurationNanos: int64(opts.Duration), SampleIntervalNanos: int64(opts.SampleInterval), MaintenanceIntervalNanos: int64(opts.MaintenanceInterval), MaintenanceBatches: opts.MaintenanceBatches, LiveRecords: opts.LiveRecords, BatchMutations: opts.BatchMutations, ValueBytes: opts.ValueBytes, Seed: opts.Seed, SegmentSize: opts.SegmentSize}, nil
 }
 
 func diskUsage(root string) (logical, allocated uint64, resultErr error) {

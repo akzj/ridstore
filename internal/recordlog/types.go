@@ -17,11 +17,39 @@ const (
 )
 
 type SegmentID uint32
+
+const CompactionSegmentBase SegmentID = 1 << 31
+
+func IsCompactionSegment(id SegmentID) bool { return id >= CompactionSegmentBase }
+
 type LogID [16]byte
 
 // VAddr identifies the first byte of one physical Record. The lower three bits
 // are a read-size hint; Offset returns the aligned byte offset without the tag.
 type VAddr uint64
+
+// RecordRef is the complete physical identity stored by Mapping. Addr remains
+// the version/CAS identity; PhysicalSize permits exact accounting without a
+// Record Header read.
+type RecordRef struct {
+	Addr         VAddr
+	PhysicalSize uint32
+}
+
+func NewRecordRef(addr VAddr, physicalSize uint32) (RecordRef, error) {
+	ref := RecordRef{Addr: addr, PhysicalSize: physicalSize}
+	if !ref.Valid() {
+		return RecordRef{}, ErrInvalidVAddr
+	}
+	return ref, nil
+}
+
+func (r RecordRef) Valid() bool {
+	return r.Addr.Valid() && r.PhysicalSize >= RecordHeaderSize &&
+		r.PhysicalSize&uint32(RecordAlignment-1) == 0 && r.Addr.MatchesPhysicalSize(r.PhysicalSize)
+}
+
+func (r RecordRef) IsZero() bool { return r == (RecordRef{}) }
 
 func NewVAddr(segmentID SegmentID, offset, physicalSize uint32) (VAddr, error) {
 	tag, err := sizeTag(physicalSize)
@@ -122,6 +150,25 @@ func (p LogPos) Compare(other LogPos) int {
 type AppendResult struct {
 	Addr VAddr
 	End  LogPos
+}
+
+func (r AppendResult) PhysicalSize() (uint32, error) {
+	if !r.Addr.Valid() || !r.End.Valid() || r.Addr.SegmentID() != r.End.SegmentID || r.End.Offset < r.Addr.Offset() {
+		return 0, ErrInvalidVAddr
+	}
+	size := r.End.Offset - r.Addr.Offset()
+	if !r.Addr.MatchesPhysicalSize(size) {
+		return 0, ErrInvalidVAddr
+	}
+	return size, nil
+}
+
+func (r AppendResult) Ref() (RecordRef, error) {
+	size, err := r.PhysicalSize()
+	if err != nil {
+		return RecordRef{}, err
+	}
+	return NewRecordRef(r.Addr, size)
 }
 
 // RecordMetadata is the structural information available for both buffered

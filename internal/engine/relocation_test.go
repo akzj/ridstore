@@ -231,11 +231,14 @@ func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
 	if err != nil || string(record.Value) != "source-value" || record.Addr == oldAddr {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
+	if !recordlog.IsCompactionSegment(record.Addr.SegmentID()) || record.Addr.SegmentID() == store.catalog.Snapshot().ActiveDataSegmentID {
+		t.Fatalf("GC copy was not isolated from user active segment: addr=%v active=%d", record.Addr, store.catalog.Snapshot().ActiveDataSegmentID)
+	}
 }
 
 func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
-	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{})
+	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true})
 	if err != nil || !found {
 		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
@@ -254,10 +257,68 @@ func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	}
 }
 
+func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.T) {
+	store := newRelocationStore(t)
+	bySegment := make(map[recordlog.SegmentID][]model.ID)
+	for store.catalog.Snapshot().ActiveDataSegmentID < 4 {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := batch.Create(context.Background(), bytes.Repeat([]byte{'a'}, 512))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		record, err := store.Get(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bySegment[record.Addr.SegmentID()] = append(bySegment[record.Addr.SegmentID()], id)
+	}
+	for _, segment := range []recordlog.SegmentID{1, 2} {
+		ids := bySegment[segment]
+		if len(ids) < 2 {
+			t.Fatalf("segment %d has only %d puts", segment, len(ids))
+		}
+		for _, id := range ids[1:] {
+			batch, err := store.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := batch.Put(context.Background(), id, []byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := batch.Commit(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true, MaxInputSegments: 2, MinReclaimableRatioBasis: 5_000})
+	if err != nil || !found {
+		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
+	}
+	if len(result.Candidate.Sources) != 2 || result.Candidate.Sources[0].SegmentID != 1 || result.Candidate.Sources[1].SegmentID != 2 {
+		t.Fatalf("candidate=%+v", result.Candidate)
+	}
+	manifest := store.catalog.Snapshot()
+	if containsSegmentID(manifest.SealedDataSegments, 1) || containsSegmentID(manifest.SealedDataSegments, 2) {
+		t.Fatal("adjacent inputs were not retired atomically")
+	}
+	for _, segment := range []recordlog.SegmentID{1, 2} {
+		record, err := store.Get(context.Background(), bySegment[segment][0])
+		if err != nil || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
+			t.Fatalf("segment=%d record=%+v err=%v", segment, record, err)
+		}
+	}
+}
+
 func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{MinReclaimableBytes: ^uint64(0)})
-	if err != nil || found || result != (NextSegmentCompactionResult{}) {
+	if err != nil || found || result.Candidate.Source.SegmentID != 0 || result.Compaction.Relocation.ScannedRecords != 0 {
 		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
 	if !containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
@@ -306,7 +367,7 @@ func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T
 		uint64(summary.RecordCount)*(uint64(commitPhysical)+uint64(reservePhysical)) + 2*manifest.HardLimits.SegmentSize
 	store.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return copyEstimate + 1, nil })
 	store.gcMinFreeBytes = 1
-	result, err := store.CompactSegment(context.Background(), source)
+	result, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load())
 	if !errors.Is(err, base.ErrInsufficientSpace) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -317,7 +378,7 @@ func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T
 	if getErr != nil || record.Addr == oldAddr || string(record.Value) != "source-value" {
 		t.Fatalf("record=%+v err=%v", record, getErr)
 	}
-	if metrics := store.Metrics(); metrics.GCSpaceRejections != 1 || metrics.GCFailed != 1 {
+	if metrics := store.Metrics(); metrics.GCSpaceRejections != 1 {
 		t.Fatalf("metrics=%+v", metrics)
 	}
 	if err := store.Checkpoint(context.Background()); err != nil {
@@ -353,7 +414,7 @@ func TestCompactNextSegmentSkipsOpenBatchReferences(t *testing.T) {
 	if err := pending.Abort(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{}); err != nil || !found || result.Candidate.Source.SegmentID != source {
+	if result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true}); err != nil || !found || result.Candidate.Source.SegmentID != source {
 		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
 }

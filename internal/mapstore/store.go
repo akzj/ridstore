@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/akzj/ridstore/internal/model"
+	"github.com/akzj/ridstore/internal/recordlog"
 )
 
 const mappingDirectory = "mapping-v2"
@@ -184,6 +185,20 @@ func OpenWithFaultHook(root string, catalog CatalogPort, hook FaultHook) (*Store
 }
 
 func (s *Store) Append(level uint8, prefix uint64, covered model.CommitSeq, slots [NodeSlots]uint64) (model.MapAddr, error) {
+	return s.appendBuild(NodeBuild{Level: level, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots})
+}
+
+func (s *Store) AppendLeaf(prefix uint64, covered model.CommitSeq, refs [NodeSlots]recordlog.RecordRef) (model.MapAddr, error) {
+	var build NodeBuild
+	build.Level, build.Prefix, build.CoveredCommitSeq = 0, prefix, covered
+	for index, ref := range refs {
+		build.Slots[index] = uint64(ref.Addr)
+		build.Sizes[index] = ref.PhysicalSize
+	}
+	return s.appendBuild(build)
+}
+
+func (s *Store) appendBuild(build NodeBuild) (model.MapAddr, error) {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
 	s.mu.RLock()
@@ -203,7 +218,7 @@ func (s *Store) Append(level uint8, prefix uint64, covered model.CommitSeq, slot
 	active := s.active
 	segmentSize := s.state.SegmentSize
 	s.mu.RUnlock()
-	build := NodeBuild{Level: level, NodeSeq: nextSeq, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots}
+	build.NodeSeq = nextSeq
 	encoded, err := EncodeNode(build)
 	if err != nil {
 		return 0, err

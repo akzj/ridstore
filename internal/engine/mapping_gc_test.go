@@ -728,7 +728,7 @@ func createMultiFileMappingFixture(t *testing.T, ctx context.Context) (string, C
 	config.HardLimits.MaxBatchConditions = 128
 	config.HardLimits.MaxRecordLogPayload = 7000
 	config.Runtime.Commit.MaxGroupPayload = 7000
-	config.Runtime.CheckpointSortBytes = 64 << 10
+	config.Runtime.CheckpointSortBytes = 96 << 10
 	config.Runtime.DeltaSoftLimitBytes = 128 << 10
 	config.Runtime.DeltaHardLimitBytes = 256 << 10
 	config.Runtime.StatusRetention = 4096

@@ -165,6 +165,7 @@ func EncodeCommitGroup(group CommitGroup, maxPayloadSize uint64) ([]byte, error)
 			binary.LittleEndian.PutUint64(dst[offset+8:offset+16], uint64(mutation.NewAddr))
 			binary.LittleEndian.PutUint64(dst[offset+16:offset+24], uint64(mutation.ExpectedOldAddr))
 			dst[offset+24] = byte(mutation.Operation)
+			binary.LittleEndian.PutUint32(dst[offset+25:offset+29], mutation.PhysicalSize)
 			offset += MutationSize
 		}
 	}
@@ -212,7 +213,7 @@ func DecodeCommitGroup(src []byte, maxPayloadSize, maxDescriptors, maxMutations 
 		entryOffset := offset + uint64(DescriptorHeadSize)
 		for index := range descriptor.Mutations {
 			entry := src[entryOffset : entryOffset+uint64(MutationSize)]
-			if !zero(entry[25:32]) {
+			if !zero(entry[29:32]) {
 				return CommitGroup{}, fmt.Errorf("mutation reserved bytes: %w", ErrCorrupt)
 			}
 			descriptor.Mutations[index] = Mutation{
@@ -220,6 +221,7 @@ func DecodeCommitGroup(src []byte, maxPayloadSize, maxDescriptors, maxMutations 
 				NewAddr:         recordlog.VAddr(binary.LittleEndian.Uint64(entry[8:16])),
 				ExpectedOldAddr: recordlog.VAddr(binary.LittleEndian.Uint64(entry[16:24])),
 				Operation:       Operation(entry[24]),
+				PhysicalSize:    binary.LittleEndian.Uint32(entry[25:29]),
 			}
 			entryOffset += uint64(MutationSize)
 		}
@@ -352,18 +354,18 @@ func validateDescriptors(descriptors []Descriptor) error {
 			switch descriptor.Kind {
 			case DescriptorUserCommit:
 				if mutation.Operation == OperationPut {
-					if !mutation.NewAddr.Valid() || mutation.ExpectedOldAddr != 0 {
+					if !(recordlog.RecordRef{Addr: mutation.NewAddr, PhysicalSize: mutation.PhysicalSize}).Valid() || mutation.ExpectedOldAddr != 0 {
 						return ErrInvalid
 					}
 				} else if mutation.Operation == OperationDelete {
-					if mutation.NewAddr != 0 || mutation.ExpectedOldAddr != 0 {
+					if mutation.NewAddr != 0 || mutation.ExpectedOldAddr != 0 || mutation.PhysicalSize != 0 {
 						return ErrInvalid
 					}
 				} else {
 					return ErrInvalid
 				}
 			case DescriptorRelocation:
-				if mutation.Operation != OperationRelocate || !mutation.NewAddr.Valid() || !mutation.ExpectedOldAddr.Valid() || mutation.NewAddr == mutation.ExpectedOldAddr {
+				if mutation.Operation != OperationRelocate || !(recordlog.RecordRef{Addr: mutation.NewAddr, PhysicalSize: mutation.PhysicalSize}).Valid() || !mutation.ExpectedOldAddr.Valid() || mutation.NewAddr == mutation.ExpectedOldAddr {
 					return ErrInvalid
 				}
 			default:

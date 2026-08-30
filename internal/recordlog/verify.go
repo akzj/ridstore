@@ -27,6 +27,7 @@ type ReadOnly struct {
 	files   map[SegmentID]*sealedSegment
 	refs    uint64
 	closed  bool
+	active  SegmentID
 }
 
 // VerifyFiles validates the authoritative RecordLog file set without starting
@@ -62,7 +63,7 @@ func OpenVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapsh
 	}
 
 	report := PhysicalReport{Segments: uint64(len(snapshot.SealedSegments)) + 1, SealedSegments: uint64(len(snapshot.SealedSegments))}
-	reader := &ReadOnly{files: make(map[SegmentID]*sealedSegment, len(snapshot.SealedSegments)+1)}
+	reader := &ReadOnly{files: make(map[SegmentID]*sealedSegment, len(snapshot.SealedSegments)+1), active: snapshot.ActiveSegmentID}
 	reader.changed = sync.NewCond(&reader.mu)
 	fail := func(cause error) (*ReadOnly, PhysicalReport, error) {
 		return nil, report, errors.Join(cause, reader.Close())
@@ -194,7 +195,7 @@ func (r *ReadOnly) Scan(ctx context.Context, from LogPos, visit func(AppendResul
 		return ErrInvalidLogPos
 	}
 	for _, id := range ids {
-		if id < from.SegmentID {
+		if id < from.SegmentID || id > r.active {
 			continue
 		}
 		segment := r.files[id]

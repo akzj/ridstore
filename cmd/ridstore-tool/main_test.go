@@ -103,5 +103,5 @@ func TestUsage(t *testing.T) {
 func toolTestConfig(dir string) ridstore.CreateConfig {
 	return ridstore.CreateConfig{Dir: dir,
 		HardLimits: ridstore.HardLimits{SegmentSize: 1 << 20, MaxValueSize: 1024, MaxBatchBytes: 4096, MaxBatchMutations: 16, MaxBatchConditions: 16, MaxOpenBatches: 4, MaxRecordLogPayload: 64 << 10, IDReserveSize: 16, BatchIDReserveSize: 16},
-		Runtime:    ridstore.RuntimeConfig{MaxQueuedBytes: 1 << 20, AppendQueueCapacity: 32, AppendBufferBytes: 64 << 10, AppendBufferRecords: 32, CommitQueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10, MappingCacheBytes: 1 << 20, CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10, StatusRetention: 16, WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second}}
+		Runtime:    ridstore.RuntimeConfig{MaxQueuedBytes: 1 << 20, AppendQueueCapacity: 32, AppendBufferBytes: 64 << 10, AppendBufferRecords: 32, CommitQueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10, MappingCacheBytes: 1 << 20, CheckpointSortBytes: 24 << 10, MaxSegmentStats: 1024, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10, StatusRetention: 16, WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second}}
 }

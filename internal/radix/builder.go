@@ -9,8 +9,8 @@ import (
 )
 
 type Mutation struct {
-	ID   model.ID
-	Addr recordlog.VAddr // zero deletes the ID
+	ID  model.ID
+	Ref recordlog.RecordRef // zero deletes the ID
 }
 
 // EntryDelta describes the logical cardinality change produced by a build.
@@ -49,7 +49,7 @@ func (t *Tree) BuildSortedWithEntryDelta(covered model.CommitSeq, ordered []Muta
 		return nil, EntryDelta{}, ErrInvalid
 	}
 	for index, mutation := range ordered {
-		if mutation.ID == 0 || (mutation.Addr != 0 && !mutation.Addr.Valid()) || (index != 0 && mutation.ID <= ordered[index-1].ID) {
+		if mutation.ID == 0 || (!mutation.Ref.IsZero() && !mutation.Ref.Valid()) || (index != 0 && mutation.ID <= ordered[index-1].ID) {
 			return nil, EntryDelta{}, ErrInvalid
 		}
 	}
@@ -70,22 +70,22 @@ func (t *Tree) BuildSortedWithEntryDelta(covered model.CommitSeq, ordered []Muta
 		if err != nil {
 			return nil, EntryDelta{}, err
 		}
-		slots, err := t.oldSlots(oldAddr, 0, prefix)
+		refs, err := t.oldRefs(oldAddr, prefix)
 		if err != nil {
 			return nil, EntryDelta{}, err
 		}
-		before := slots
+		before := refs
 		for _, mutation := range ordered[start:end] {
 			slot := nodeSlot(mutation.ID, 0)
-			oldExists, newExists := slots[slot] != 0, mutation.Addr != 0
+			oldExists, newExists := !refs[slot].IsZero(), !mutation.Ref.IsZero()
 			if !oldExists && newExists {
 				delta.Added++
 			} else if oldExists && !newExists {
 				delta.Removed++
 			}
-			slots[slot] = uint64(mutation.Addr)
+			refs[slot] = mutation.Ref
 		}
-		newAddr, err := t.writeChangedNode(0, prefix, covered, before, slots, oldAddr)
+		newAddr, err := t.writeChangedLeaf(prefix, covered, before, refs, oldAddr)
 		if err != nil {
 			return nil, EntryDelta{}, err
 		}
@@ -103,6 +103,37 @@ func (t *Tree) BuildSortedWithEntryDelta(covered model.CommitSeq, ordered []Muta
 	}
 	tree, err := Open(t.writer, builder.root, covered, t.cache.capacity)
 	return tree, delta, err
+}
+
+func (t *Tree) writeChangedLeaf(prefix uint64, covered model.CommitSeq, before, after [mapstore.NodeSlots]recordlog.RecordRef, old model.MapAddr) (model.MapAddr, error) {
+	if before == after {
+		return old, nil
+	}
+	allZero := true
+	for _, ref := range after {
+		if !ref.IsZero() {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return 0, nil
+	}
+	if t.writer == nil {
+		return 0, ErrInvalid
+	}
+	return t.writer.AppendLeaf(prefix, covered, after)
+}
+
+func (t *Tree) oldRefs(addr model.MapAddr, prefix uint64) ([mapstore.NodeSlots]recordlog.RecordRef, error) {
+	if addr == 0 {
+		return [mapstore.NodeSlots]recordlog.RecordRef{}, nil
+	}
+	node, err := t.load(addr, 0, prefix, false)
+	if err != nil {
+		return [mapstore.NodeSlots]recordlog.RecordRef{}, err
+	}
+	return node.Refs(), nil
 }
 
 type nodeAccumulator struct {

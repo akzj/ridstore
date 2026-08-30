@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"sync"
 
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -84,7 +85,8 @@ func recordLogSnapshot(current Manifest) recordlog.CatalogSnapshot {
 		Generation: current.Generation, LogID: current.RecordLogID,
 		SegmentSize: uint32(current.HardLimits.SegmentSize), MaxPayloadBytes: uint32(current.HardLimits.MaxRecordLogPayload),
 		ActiveSegmentID: current.ActiveDataSegmentID, NextSegmentID: current.NextDataSegmentID,
-		SealedSegments: append([]recordlog.SegmentSummary(nil), current.SealedDataSegments...),
+		CompactionSegmentFloor: current.CompactionSegmentFloor,
+		SealedSegments:         append([]recordlog.SegmentSummary(nil), current.SealedDataSegments...),
 	}
 }
 
@@ -139,6 +141,61 @@ func (m *Manager) InstallDataRotation(expect uint64, update DataRotation) (Manif
 		sortDataSegments(next.SealedDataSegments)
 		next.ActiveDataSegmentID = update.NewActive
 		next.NextDataSegmentID = update.NextID
+		return nil
+	})
+}
+
+func (m *Manager) ReserveCompactionSegments(expect uint64, count uint32) (Manifest, []recordlog.SegmentID, error) {
+	if count == 0 {
+		return Manifest{}, nil, ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if expect != m.current.Generation {
+		return Manifest{}, nil, ErrConflict
+	}
+	top := m.current.CompactionSegmentFloor
+	if top == 0 {
+		top = recordlog.SegmentID(math.MaxUint32)
+	}
+	if top < recordlog.CompactionSegmentBase || uint64(count) > uint64(top-recordlog.CompactionSegmentBase)+1 || m.current.Generation == math.MaxUint64 {
+		return Manifest{}, nil, ErrInvalid
+	}
+	first := top - recordlog.SegmentID(count) + 1
+	ids := make([]recordlog.SegmentID, count)
+	for index := range ids {
+		ids[index] = first + recordlog.SegmentID(index)
+	}
+	next := m.current.Clone()
+	next.Generation++
+	next.CompactionSegmentFloor = first - 1
+	if err := Validate(next); err != nil {
+		return Manifest{}, nil, err
+	}
+	if err := Install(m.root, next, m.hook); err != nil {
+		return Manifest{}, nil, err
+	}
+	m.current = next.Clone()
+	return next.Clone(), ids, nil
+}
+
+func (m *Manager) InstallCompactionOutputs(expect uint64, outputs []recordlog.SegmentSummary) (Manifest, error) {
+	return m.install(expect, func(next *Manifest) error {
+		if len(outputs) == 0 || next.CompactionSegmentFloor == 0 {
+			return ErrInvalid
+		}
+		for _, output := range outputs {
+			if !recordlog.IsCompactionSegment(output.SegmentID) || output.SegmentID <= next.CompactionSegmentFloor {
+				return ErrInvalid
+			}
+			for _, existing := range next.SealedDataSegments {
+				if existing.SegmentID == output.SegmentID {
+					return ErrInvalid
+				}
+			}
+			next.SealedDataSegments = append(next.SealedDataSegments, output)
+		}
+		sortDataSegments(next.SealedDataSegments)
 		return nil
 	})
 }
@@ -288,16 +345,21 @@ func checkpointBaseCompatible(base, current Manifest) bool {
 	left.ActiveDataSegmentID, right.ActiveDataSegmentID = 0, 0
 	left.NextDataSegmentID, right.NextDataSegmentID = 0, 0
 	left.SealedDataSegments, right.SealedDataSegments = nil, nil
-	if !reflect.DeepEqual(left, right) || len(current.SealedDataSegments) < len(base.SealedDataSegments) {
+	if !reflect.DeepEqual(left, right) {
 		return false
 	}
-	for index := range base.SealedDataSegments {
-		if base.SealedDataSegments[index] != current.SealedDataSegments[index] {
+	baseNormal, baseOutputs := splitDataSegments(base.SealedDataSegments)
+	currentNormal, currentOutputs := splitDataSegments(current.SealedDataSegments)
+	if !reflect.DeepEqual(baseOutputs, currentOutputs) || len(currentNormal) < len(baseNormal) {
+		return false
+	}
+	for index := range baseNormal {
+		if baseNormal[index] != currentNormal[index] {
 			return false
 		}
 	}
 	active, next := base.ActiveDataSegmentID, base.NextDataSegmentID
-	for _, sealed := range current.SealedDataSegments[len(base.SealedDataSegments):] {
+	for _, sealed := range currentNormal[len(baseNormal):] {
 		if sealed.SegmentID != active || next != active+1 {
 			return false
 		}
@@ -306,10 +368,65 @@ func checkpointBaseCompatible(base, current Manifest) bool {
 	return current.ActiveDataSegmentID == active && current.NextDataSegmentID == next
 }
 
+func splitDataSegments(segments []recordlog.SegmentSummary) (normal, outputs []recordlog.SegmentSummary) {
+	index := sort.Search(len(segments), func(i int) bool { return recordlog.IsCompactionSegment(segments[i].SegmentID) })
+	return segments[:index], segments[index:]
+}
+
 type DataRetire struct {
 	Source           DataSegmentSummary
 	CoveredCommitSeq model.CommitSeq
 	ReplayStart      recordlog.LogPos
+}
+
+func (m *Manager) InstallDataCompaction(expect uint64, inputs []DataSegmentSummary, covered model.CommitSeq, replayStart recordlog.LogPos) (Manifest, error) {
+	return m.install(expect, func(next *Manifest) error {
+		if len(inputs) == 0 || covered != next.CoveredCommitSeq || replayStart != next.ReplayStart {
+			return ErrInvalid
+		}
+		remove := make(map[recordlog.SegmentID]DataSegmentSummary, len(inputs))
+		for _, input := range inputs {
+			if input.SegmentID == next.ActiveDataSegmentID || !StatsKnownForSegment(next.ReplayStart, input) {
+				return ErrInvalid
+			}
+			remove[input.SegmentID] = input
+			for _, stat := range next.SegmentStats {
+				if stat.SegmentID == input.SegmentID && (stat.LiveBytes != 0 || stat.LiveRecords != 0) {
+					return ErrInvalid
+				}
+			}
+		}
+		kept := next.SealedDataSegments[:0:0]
+		for _, segment := range next.SealedDataSegments {
+			if want, ok := remove[segment.SegmentID]; ok {
+				if want != segment {
+					return ErrInvalid
+				}
+				delete(remove, segment.SegmentID)
+				continue
+			}
+			kept = append(kept, segment)
+		}
+		if len(remove) != 0 {
+			return ErrInvalid
+		}
+		next.SealedDataSegments = kept
+		stats := next.SegmentStats[:0:0]
+		for _, stat := range next.SegmentStats {
+			found := false
+			for _, input := range inputs {
+				if stat.SegmentID == input.SegmentID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				stats = append(stats, stat)
+			}
+		}
+		next.SegmentStats = stats
+		return nil
+	})
 }
 
 func (m *Manager) InstallDataRetire(expect uint64, update DataRetire) (Manifest, error) {
@@ -366,6 +483,9 @@ func applyDataRetire(next *Manifest, update DataRetire) error {
 // the checkpoint replay boundary. Equality remains unknown because a Segment
 // may have rotated immediately after the cut that built the Stats table.
 func StatsKnownForSegment(replayStart recordlog.LogPos, segment DataSegmentSummary) bool {
+	if recordlog.IsCompactionSegment(segment.SegmentID) {
+		return true
+	}
 	return (recordlog.LogPos{SegmentID: segment.SegmentID, Offset: segment.ValidEnd}).Compare(replayStart) < 0
 }
 

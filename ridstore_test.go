@@ -332,7 +332,7 @@ func testCreateConfig(dir string) CreateConfig {
 			MaxQueuedBytes: 1 << 20, AppendQueueCapacity: 32, AppendBufferBytes: 64 << 10,
 			AppendBufferRecords: 32, CommitQueueCapacity: 16, MaxGroupBatches: 8,
 			MaxGroupPayload: 64 << 10, MappingCacheBytes: 1 << 20,
-			CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
+			CheckpointSortBytes: 24 << 10, MaxSegmentStats: 1024,
 			DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
 			WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second, GCBytesPerSecond: ^uint64(0),
 		},

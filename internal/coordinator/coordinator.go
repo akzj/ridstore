@@ -645,7 +645,7 @@ func requestDescriptor(req request, seq model.CommitSeq) recordcodec.Descriptor 
 	mutations := make([]recordcodec.Mutation, len(req.relocation.Changes))
 	for i, change := range req.relocation.Changes {
 		mutations[i] = recordcodec.Mutation{
-			RecordID: change.RecordID, NewAddr: change.NewAddr,
+			RecordID: change.RecordID, NewAddr: change.NewRef.Addr, PhysicalSize: change.NewRef.PhysicalSize,
 			ExpectedOldAddr: change.ExpectedOldAddr, Operation: recordcodec.OperationRelocate,
 		}
 	}
@@ -702,7 +702,7 @@ func descriptor(prepared transaction.Prepared, seq model.CommitSeq) recordcodec.
 		if mutation.Operation == mapping.OperationPut {
 			operation = recordcodec.OperationPut
 		}
-		mutations[i] = recordcodec.Mutation{RecordID: mutation.RecordID, NewAddr: mutation.Addr, Operation: operation}
+		mutations[i] = recordcodec.Mutation{RecordID: mutation.RecordID, NewAddr: mutation.Ref.Addr, PhysicalSize: mutation.Ref.PhysicalSize, Operation: operation}
 	}
 	return recordcodec.Descriptor{
 		Kind: recordcodec.DescriptorUserCommit, BatchID: prepared.BatchID, CommitSeq: seq,

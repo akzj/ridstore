@@ -9,6 +9,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/bootstrap"
+	"github.com/akzj/ridstore/internal/compactionstate"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapgcstate"
@@ -106,6 +107,11 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 	} else if found {
 		return report, base.ErrRecoveryRequired
 	}
+	if found, err := compactionstate.RecoveryArtifacts(root); err != nil {
+		return report, err
+	} else if found {
+		return report, base.ErrRecoveryRequired
+	}
 	if found, err := mapgcstate.RecoveryArtifacts(root); err != nil {
 		return report, err
 	} else if found {
@@ -145,12 +151,13 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 		return report, classify(err)
 	}
 	addresses := make(map[recordlog.VAddr]model.ID)
-	entries := make(map[model.ID]recordlog.VAddr)
+	entries := make(map[model.ID]recordlog.RecordRef)
 	var previous model.ID
-	err = tree.Walk(ctx, func(id model.ID, addr recordlog.VAddr) error {
+	err = tree.WalkRefs(ctx, func(id model.ID, ref recordlog.RecordRef) error {
 		if report.CheckpointLiveIDs == config.MaxLiveIDs {
 			return ErrLimit
 		}
+		addr := ref.Addr
 		if id <= previous || !containsDataAddress(manifest, report.Data, addr) {
 			return base.ErrCorrupt
 		}
@@ -158,7 +165,7 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 			return errors.Join(base.ErrCorrupt, fmt.Errorf("data address %v aliases IDs %d and %d", addr, owner, id))
 		}
 		addresses[addr] = id
-		entries[id] = addr
+		entries[id] = ref
 		previous = id
 		report.CheckpointLiveIDs++
 		return nil
@@ -199,10 +206,11 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 	report.BatchStatuses = uint64(len(recovered.Statuses))
 	report.Stage = StageSemantic
 	finalAddresses := make(map[recordlog.VAddr]model.ID, len(final.Entries))
-	for id, addr := range final.Entries {
+	for id, ref := range final.Entries {
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
+		addr := ref.Addr
 		if !containsDataAddress(manifest, report.Data, addr) {
 			return report, base.ErrCorrupt
 		}
@@ -214,7 +222,8 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 			return report, classify(err)
 		}
 		put, err := recordcodec.DecodePut(payload, manifest.HardLimits.MaxValueSize)
-		if err != nil || put.RecordID != id {
+		physical, sizeErr := recordlog.PhysicalRecordSize(uint64(len(payload)))
+		if err != nil || sizeErr != nil || put.RecordID != id || physical != ref.PhysicalSize {
 			return report, errors.Join(base.ErrCorrupt, err)
 		}
 		finalAddresses[addr] = id

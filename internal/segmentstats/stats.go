@@ -15,12 +15,12 @@ import (
 )
 
 type Mapping interface {
-	Walk(context.Context, func(model.ID, recordlog.VAddr) error) error
+	WalkRefs(context.Context, func(model.ID, recordlog.RecordRef) error) error
 }
 
 type IncrementalMapping interface {
-	Lookup(model.ID) (recordlog.VAddr, bool, error)
-	WalkChanges(context.Context, func(model.ID, recordlog.VAddr, bool, recordlog.VAddr, bool) error) error
+	LookupRef(model.ID) (recordlog.RecordRef, bool, error)
+	WalkChanges(context.Context, func(model.ID, recordlog.RecordRef, bool, recordlog.RecordRef, bool) error) error
 }
 
 type Inspector interface {
@@ -55,18 +55,21 @@ func Build(ctx context.Context, current Mapping, records Inspector, cache Metada
 		return nil, err
 	}
 	stats := make(map[recordlog.SegmentID]storecatalog.SegmentStats)
-	err = current.Walk(ctx, func(id model.ID, addr recordlog.VAddr) error {
+	err = current.WalkRefs(ctx, func(id model.ID, ref recordlog.RecordRef) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		physicalSize, summary, isSealed, err := inspectMetadata(ctx, id, addr, records, cache, files.Active, sealed, maxValueSize)
+		summary, isSealed, err := locate(ref.Addr, files.Active, sealed)
 		if err != nil {
 			return err
+		}
+		if !ref.Valid() || isSealed && (ref.Addr.Offset() > summary.ValidEnd || ref.PhysicalSize > summary.ValidEnd-ref.Addr.Offset()) {
+			return base.ErrCorrupt
 		}
 		if !isSealed {
 			return nil
 		}
-		if err := add(stats, summary.SegmentID, physicalSize); err != nil {
+		if err := add(stats, summary.SegmentID, ref.PhysicalSize); err != nil {
 			return err
 		}
 		if uint64(len(stats)) > maxEntries {
@@ -116,33 +119,31 @@ func BuildIncremental(ctx context.Context, current IncrementalMapping, records I
 			return nil, base.ErrInvalidConfig
 		}
 	}
-	err = current.WalkChanges(ctx, func(id model.ID, oldAddr recordlog.VAddr, oldExists bool, newAddr recordlog.VAddr, newExists bool) error {
+	err = current.WalkChanges(ctx, func(id model.ID, oldRef recordlog.RecordRef, oldExists bool, newRef recordlog.RecordRef, newExists bool) error {
 		if oldExists {
-			summary, isSealed, err := locate(oldAddr, files.Active, sealed)
+			summary, isSealed, err := locate(oldRef.Addr, files.Active, sealed)
 			if err != nil {
 				return err
 			}
-			if isSealed && oldAddr.SegmentID() != baseActive {
-				physicalSize, _, _, err := inspectMetadata(ctx, id, oldAddr, records, cache, files.Active, sealed, maxValueSize)
-				if err != nil {
-					return err
-				}
-				if err := subtract(stats, summary.SegmentID, physicalSize); err != nil {
+			if !oldRef.Valid() {
+				return base.ErrCorrupt
+			}
+			if isSealed && oldRef.Addr.SegmentID() != baseActive {
+				if err := subtract(stats, summary.SegmentID, oldRef.PhysicalSize); err != nil {
 					return err
 				}
 			}
 		}
 		if newExists {
-			summary, isSealed, err := locate(newAddr, files.Active, sealed)
+			summary, isSealed, err := locate(newRef.Addr, files.Active, sealed)
 			if err != nil {
 				return err
 			}
-			if isSealed && newAddr.SegmentID() != baseActive {
-				physicalSize, _, _, err := inspectMetadata(ctx, id, newAddr, records, cache, files.Active, sealed, maxValueSize)
-				if err != nil {
-					return err
-				}
-				return add(stats, summary.SegmentID, physicalSize)
+			if !newRef.Valid() {
+				return base.ErrCorrupt
+			}
+			if isSealed && newRef.Addr.SegmentID() != baseActive {
+				return add(stats, summary.SegmentID, newRef.PhysicalSize)
 			}
 		}
 		return nil
@@ -164,15 +165,15 @@ func BuildIncremental(ctx context.Context, current IncrementalMapping, records I
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
 			}
-			addr, exists, err := current.Lookup(put.RecordID)
+			ref, exists, err := current.LookupRef(put.RecordID)
 			if err != nil {
 				return err
 			}
-			if !exists || addr != scanned.Addr {
+			if !exists || ref.Addr != scanned.Addr {
 				return nil
 			}
 			physicalSize := scanned.End.Offset - scanned.Addr.Offset()
-			if !scanned.Addr.MatchesPhysicalSize(physicalSize) {
+			if !scanned.Addr.MatchesPhysicalSize(physicalSize) || ref.PhysicalSize != physicalSize {
 				return base.ErrCorrupt
 			}
 			return add(stats, baseActive, physicalSize)
@@ -191,7 +192,9 @@ func sealedFiles(files FileSet) (map[recordlog.SegmentID]recordlog.SegmentSummar
 	sealed := make(map[recordlog.SegmentID]recordlog.SegmentSummary, len(files.Sealed))
 	var previous recordlog.SegmentID
 	for _, summary := range files.Sealed {
-		if summary.SegmentID == 0 || summary.SegmentID >= files.Active || summary.SegmentID <= previous {
+		regular := summary.SegmentID < files.Active
+		compacted := recordlog.IsCompactionSegment(summary.SegmentID)
+		if summary.SegmentID == 0 || (!regular && !compacted) || summary.SegmentID <= previous {
 			return nil, base.ErrInvalidConfig
 		}
 		sealed[summary.SegmentID] = summary

@@ -20,7 +20,7 @@ func TestRebuildBuilderStreamsCompleteTree(t *testing.T) {
 	for index, id := range ids {
 		addr := testDataAddr(t, recordlog.SegmentID(index+1), 64)
 		want[id] = addr
-		if err := builder.Add(id, addr); err != nil {
+		if err := builder.Add(id, testDataRef(t, addr)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -58,16 +58,16 @@ func TestRebuildBuilderRejectsInvalidOrderAndReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := testDataAddr(t, 1, 64)
-	if err := builder.Add(2, addr); err != nil {
+	if err := builder.Add(2, testDataRef(t, addr)); err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.Add(1, addr); err != ErrInvalid {
+	if err := builder.Add(1, testDataRef(t, addr)); err != ErrInvalid {
 		t.Fatalf("out-of-order err=%v", err)
 	}
 	if _, err := builder.Finish(); err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.Add(3, addr); err != ErrInvalid {
+	if err := builder.Add(3, testDataRef(t, addr)); err != ErrInvalid {
 		t.Fatalf("add after finish err=%v", err)
 	}
 	if _, err := builder.Finish(); err != ErrInvalid {

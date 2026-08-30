@@ -253,6 +253,27 @@ func (r *segmentRegistry) publishRotation(oldID SegmentID, sealed *sealedSegment
 	return nil
 }
 
+func (r *segmentRegistry) publishSealed(segments []*sealedSegment) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || len(segments) == 0 {
+		return ErrInvalidConfig
+	}
+	for _, segment := range segments {
+		if segment == nil || segment.file == nil || !IsCompactionSegment(segment.header.SegmentID) {
+			return ErrInvalidConfig
+		}
+		if _, exists := r.entries[segment.header.SegmentID]; exists {
+			return ErrInvalidConfig
+		}
+	}
+	for _, segment := range segments {
+		r.entries[segment.header.SegmentID] = &registryEntry{state: segmentSealed, sealed: segment}
+	}
+	r.signalLocked()
+	return nil
+}
+
 func (r *segmentRegistry) beginRetire(id SegmentID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

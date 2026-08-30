@@ -44,7 +44,11 @@ func TestIncrementalBuildMatchesMapModel(t *testing.T) {
 		}
 		mutations := make([]Mutation, 0, len(batch))
 		for id, addr := range batch {
-			mutations = append(mutations, Mutation{ID: id, Addr: addr})
+			mutation := Mutation{ID: id}
+			if addr != 0 {
+				mutation.Ref = testDataRef(t, addr)
+			}
+			mutations = append(mutations, mutation)
 			if addr == 0 {
 				delete(want, id)
 			} else {
@@ -70,9 +74,23 @@ func newMemoryNodeStore() *memoryNodeStore {
 }
 
 func (s *memoryNodeStore) Append(level uint8, prefix uint64, covered model.CommitSeq, slots [mapstore.NodeSlots]uint64) (model.MapAddr, error) {
+	return s.appendBuild(mapstore.NodeBuild{Level: level, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots})
+}
+
+func (s *memoryNodeStore) AppendLeaf(prefix uint64, covered model.CommitSeq, refs [mapstore.NodeSlots]recordlog.RecordRef) (model.MapAddr, error) {
+	var build mapstore.NodeBuild
+	build.Level, build.Prefix, build.CoveredCommitSeq = 0, prefix, covered
+	for index, ref := range refs {
+		build.Slots[index], build.Sizes[index] = uint64(ref.Addr), ref.PhysicalSize
+	}
+	return s.appendBuild(build)
+}
+
+func (s *memoryNodeStore) appendBuild(build mapstore.NodeBuild) (model.MapAddr, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	encoded, err := mapstore.EncodeNode(mapstore.NodeBuild{Level: level, NodeSeq: s.seq, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots})
+	build.NodeSeq = s.seq
+	encoded, err := mapstore.EncodeNode(build)
 	if err != nil {
 		return 0, err
 	}
@@ -84,7 +102,7 @@ func (s *memoryNodeStore) Append(level uint8, prefix uint64, covered model.Commi
 	s.nodes[addr] = node
 	s.next += size
 	s.seq++
-	s.appends[level]++
+	s.appends[build.Level]++
 	return addr, nil
 }
 
@@ -108,6 +126,15 @@ func testDataAddr(t *testing.T, segment recordlog.SegmentID, offset uint32) reco
 	return addr
 }
 
+func testDataRef(t *testing.T, addr recordlog.VAddr) recordlog.RecordRef {
+	t.Helper()
+	ref, err := recordlog.NewRecordRef(addr, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
+}
+
 func TestBuildLookupUpdateAndPrune(t *testing.T) {
 	store := newMemoryNodeStore()
 	tree, err := Open(store, 0, 0, 1<<20)
@@ -117,7 +144,7 @@ func TestBuildLookupUpdateAndPrune(t *testing.T) {
 	a := testDataAddr(t, 1, 64)
 	b := testDataAddr(t, 1, 128)
 	c := testDataAddr(t, 2, 64)
-	tree, err = tree.Build(3, []Mutation{{ID: 1, Addr: a}, {ID: 2, Addr: b}, {ID: model.ID(uint64(1) << 63), Addr: c}})
+	tree, err = tree.Build(3, []Mutation{{ID: 1, Ref: testDataRef(t, a)}, {ID: 2, Ref: testDataRef(t, b)}, {ID: model.ID(uint64(1) << 63), Ref: testDataRef(t, c)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +156,7 @@ func TestBuildLookupUpdateAndPrune(t *testing.T) {
 	}
 	before := store.appends
 	d := testDataAddr(t, 3, 64)
-	tree, err = tree.Build(4, []Mutation{{ID: 1, Addr: d}, {ID: 2}})
+	tree, err = tree.Build(4, []Mutation{{ID: 1, Ref: testDataRef(t, d)}, {ID: 2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +188,7 @@ func TestWalkVisitsLeavesInIDOrder(t *testing.T) {
 	addresses := make(map[model.ID]recordlog.VAddr, len(want))
 	for index, id := range want {
 		addr := testDataAddr(t, recordlog.SegmentID(index+1), 64)
-		mutations[index] = Mutation{ID: id, Addr: addr}
+		mutations[index] = Mutation{ID: id, Ref: testDataRef(t, addr)}
 		addresses[id] = addr
 	}
 	var err error
@@ -196,7 +223,7 @@ func TestOpenReadOnlyWalksButCannotBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := testDataAddr(t, 1, 64)
-	writable, err = writable.Build(1, []Mutation{{ID: 7, Addr: addr}})
+	writable, err = writable.Build(1, []Mutation{{ID: 7, Ref: testDataRef(t, addr)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +244,7 @@ func TestOpenReadOnlyWalksButCannotBuild(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("count=%d", count)
 	}
-	if _, err := readOnly.Build(2, []Mutation{{ID: 8, Addr: addr}}); err != ErrInvalid {
+	if _, err := readOnly.Build(2, []Mutation{{ID: 8, Ref: testDataRef(t, addr)}}); err != ErrInvalid {
 		t.Fatalf("read-only build err=%v", err)
 	}
 }
@@ -226,14 +253,14 @@ func TestBuildRejectsDuplicateIDAndSequenceRegression(t *testing.T) {
 	store := newMemoryNodeStore()
 	tree, _ := Open(store, 0, 0, 1<<20)
 	addr := testDataAddr(t, 1, 64)
-	if _, err := tree.Build(1, []Mutation{{ID: 1, Addr: addr}, {ID: 1, Addr: addr}}); err == nil {
+	if _, err := tree.Build(1, []Mutation{{ID: 1, Ref: testDataRef(t, addr)}, {ID: 1, Ref: testDataRef(t, addr)}}); err == nil {
 		t.Fatal("duplicate ID accepted")
 	}
-	tree, err := tree.Build(1, []Mutation{{ID: 1, Addr: addr}})
+	tree, err := tree.Build(1, []Mutation{{ID: 1, Ref: testDataRef(t, addr)}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tree.Build(1, []Mutation{{ID: 2, Addr: addr}}); err == nil {
+	if _, err := tree.Build(1, []Mutation{{ID: 2, Ref: testDataRef(t, addr)}}); err == nil {
 		t.Fatal("same covered sequence accepted changes")
 	}
 }
@@ -243,7 +270,7 @@ func TestBuildSortedRejectsInvalidOrderBeforeWriting(t *testing.T) {
 	tree, _ := Open(store, 0, 0, 1<<20)
 	addr := testDataAddr(t, 1, 64)
 	before := store.appends
-	if _, err := tree.BuildSorted(1, []Mutation{{ID: 2, Addr: addr}, {ID: 1, Addr: addr}}); err == nil {
+	if _, err := tree.BuildSorted(1, []Mutation{{ID: 2, Ref: testDataRef(t, addr)}, {ID: 1, Ref: testDataRef(t, addr)}}); err == nil {
 		t.Fatal("unsorted mutations accepted")
 	}
 	if store.appends != before {
@@ -257,7 +284,7 @@ func TestBuildSortedStreamsAcrossDistantPrefixes(t *testing.T) {
 	ids := []model.ID{1, 512, 1 << 24, 1 << 48, model.ID(uint64(1) << 63), model.ID(math.MaxUint64)}
 	mutations := make([]Mutation, len(ids))
 	for index, id := range ids {
-		mutations[index] = Mutation{ID: id, Addr: testDataAddr(t, recordlog.SegmentID(index+1), 64)}
+		mutations[index] = Mutation{ID: id, Ref: testDataRef(t, testDataAddr(t, recordlog.SegmentID(index+1), 64))}
 	}
 	built, err := tree.BuildSorted(1, mutations)
 	if err != nil {
@@ -265,7 +292,7 @@ func TestBuildSortedStreamsAcrossDistantPrefixes(t *testing.T) {
 	}
 	for _, mutation := range mutations {
 		addr, exists, err := built.Lookup(mutation.ID)
-		if err != nil || !exists || addr != mutation.Addr {
+		if err != nil || !exists || addr != mutation.Ref.Addr {
 			t.Fatalf("id=%d addr=%v exists=%v err=%v", mutation.ID, addr, exists, err)
 		}
 	}
@@ -279,15 +306,15 @@ func TestBuildSortedReportsExactEntryDeltaWithoutExtraWalk(t *testing.T) {
 	c := testDataAddr(t, 2, 64)
 	var delta EntryDelta
 	var err error
-	tree, delta, err = tree.BuildSortedWithEntryDelta(1, []Mutation{{ID: 1, Addr: a}, {ID: 2, Addr: b}})
+	tree, delta, err = tree.BuildSortedWithEntryDelta(1, []Mutation{{ID: 1, Ref: testDataRef(t, a)}, {ID: 2, Ref: testDataRef(t, b)}})
 	if err != nil || delta != (EntryDelta{Added: 2}) {
 		t.Fatalf("first delta=%+v err=%v", delta, err)
 	}
 	tree, delta, err = tree.BuildSortedWithEntryDelta(2, []Mutation{
-		{ID: 1, Addr: c}, // replacement
-		{ID: 2},          // deletion
-		{ID: 3, Addr: a}, // creation
-		{ID: 4},          // absent deletion
+		{ID: 1, Ref: testDataRef(t, c)}, // replacement
+		{ID: 2},                         // deletion
+		{ID: 3, Ref: testDataRef(t, a)}, // creation
+		{ID: 4},                         // absent deletion
 	})
 	if err != nil || delta != (EntryDelta{Added: 1, Removed: 1}) {
 		t.Fatalf("second delta=%+v err=%v", delta, err)
@@ -305,7 +332,7 @@ func TestOpenRequiresCacheCapacityForPinnedRoot(t *testing.T) {
 	store := newMemoryNodeStore()
 	tree, _ := Open(store, 0, 0, 1<<20)
 	addr := testDataAddr(t, 1, 64)
-	built, err := tree.Build(1, []Mutation{{ID: 1, Addr: addr}})
+	built, err := tree.Build(1, []Mutation{{ID: 1, Ref: testDataRef(t, addr)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +345,7 @@ func TestConcurrentLookupLoadsEachPathNodeOnce(t *testing.T) {
 	store := newMemoryNodeStore()
 	tree, _ := Open(store, 0, 0, 1<<20)
 	addr := testDataAddr(t, 1, 64)
-	tree, err := tree.Build(1, []Mutation{{ID: 42, Addr: addr}})
+	tree, err := tree.Build(1, []Mutation{{ID: 42, Ref: testDataRef(t, addr)}})
 	if err != nil {
 		t.Fatal(err)
 	}

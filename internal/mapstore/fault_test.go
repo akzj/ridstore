@@ -34,16 +34,16 @@ func TestCheckpointWriterFaultsPoisonRuntimeAndFreshOpenRecovers(t *testing.T) {
 				var slots [NodeSlots]uint64
 				slots[1] = mustRecordValue(t, 1)
 				if point == FaultBeforeAppendWrite {
-					_, err = store.Append(0, 0, 1, slots)
+					_, err = store.AppendLeaf(0, 1, testLeafRefs(slots))
 				} else {
-					if _, err = store.Append(0, 0, 1, slots); err == nil {
+					if _, err = store.AppendLeaf(0, 1, testLeafRefs(slots)); err == nil {
 						err = store.Sync()
 					}
 				}
 				if !errors.Is(err, ErrPoisoned) || !errors.Is(err, cause) {
 					t.Fatalf("fault err=%v", err)
 				}
-				if _, err := store.Append(0, 0, 2, slots); !errors.Is(err, ErrPoisoned) {
+				if _, err := store.AppendLeaf(0, 2, testLeafRefs(slots)); !errors.Is(err, ErrPoisoned) {
 					t.Fatalf("append after fault err=%v", err)
 				}
 				if err := store.Close(); err != nil {
@@ -53,7 +53,7 @@ func TestCheckpointWriterFaultsPoisonRuntimeAndFreshOpenRecovers(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := reopened.Append(0, 0, 2, slots); err != nil {
+				if _, err := reopened.AppendLeaf(0, 2, testLeafRefs(slots)); err != nil {
 					t.Fatal(err)
 				}
 				if err := reopened.Close(); err != nil {
@@ -79,7 +79,7 @@ func TestActiveTailRepairFaultsRemainRetryable(t *testing.T) {
 			}
 			var slots [NodeSlots]uint64
 			slots[1] = mustRecordValue(t, 1)
-			if _, err := store.Append(0, 0, 1, slots); err != nil {
+			if _, err := store.AppendLeaf(0, 1, testLeafRefs(slots)); err != nil {
 				t.Fatal(err)
 			}
 			if err := store.Sync(); err != nil {

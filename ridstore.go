@@ -4,6 +4,7 @@ package ridstore
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/engine"
@@ -54,15 +55,23 @@ type CommitResult struct {
 	CommitSeq CommitSeq
 }
 
-// CompactionPolicy sets lower bounds for selecting one sealed segment. Ratio
-// uses basis points (10_000 == 100%). Zero disables a bound.
+// CompactionPolicy controls selection of an adjacent sealed-segment run.
+// Ratio uses basis points (10_000 == 100%).
 type CompactionPolicy struct {
 	MinReclaimableBytes      uint64
 	MinReclaimableRatioBasis uint32
+	MinStableRounds          uint32
+	MaxDeathBytesPerCommit   uint64
+	MaxDeathBytesPerSecond   uint64
+	MinSegmentAge            time.Duration
+	MaxInputSegments         uint32
+	BypassCooldown           bool
 }
 
 type CompactionResult struct {
 	SourceSegmentID       uint32
+	SourceSegmentIDs      []uint32
+	OutputSegmentIDs      []uint32
 	ReclaimableBytes      uint64
 	ReclaimableRatioBasis uint32
 	ScannedRecords        uint64
@@ -198,7 +207,7 @@ func (s *Store) CompactMapping(ctx context.Context) error {
 	return s.inner.CompactMapping(ctx)
 }
 
-// CompactNextSegment selects and fully retires at most one eligible segment.
+// CompactNextSegment selects and atomically retires one eligible adjacent run.
 func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy) (CompactionResult, bool, error) {
 	if s == nil || s.inner == nil {
 		return CompactionResult{}, false, base.ErrClosed
@@ -206,12 +215,25 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	result, found, err := s.inner.CompactNextSegment(ctx, engine.CompactionPolicy{
 		MinReclaimableBytes:      policy.MinReclaimableBytes,
 		MinReclaimableRatioBasis: policy.MinReclaimableRatioBasis,
+		MinStableRounds:          policy.MinStableRounds, MaxDeathBytesPerCommit: policy.MaxDeathBytesPerCommit,
+		MaxDeathBytesPerSecond: policy.MaxDeathBytesPerSecond, MinSegmentAge: policy.MinSegmentAge,
+		MaxInputSegments: policy.MaxInputSegments, BypassCooldown: policy.BypassCooldown,
 	})
 	if err != nil || !found {
 		return CompactionResult{}, found, err
 	}
+	sources := make([]uint32, len(result.Candidate.Sources))
+	for i, source := range result.Candidate.Sources {
+		sources[i] = uint32(source.SegmentID)
+	}
+	outputs := make([]uint32, len(result.Compaction.Outputs))
+	for i, output := range result.Compaction.Outputs {
+		outputs[i] = uint32(output.SegmentID)
+	}
 	return CompactionResult{
 		SourceSegmentID:       uint32(result.Candidate.Source.SegmentID),
+		SourceSegmentIDs:      sources,
+		OutputSegmentIDs:      outputs,
 		ReclaimableBytes:      result.Candidate.ReclaimableBytesLower,
 		ReclaimableRatioBasis: result.Candidate.ReclaimableRatioBasis,
 		ScannedRecords:        result.Compaction.Relocation.ScannedRecords,

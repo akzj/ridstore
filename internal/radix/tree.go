@@ -16,11 +16,19 @@ type NodeReader interface {
 type NodeStore interface {
 	NodeReader
 	Append(level uint8, prefix uint64, covered model.CommitSeq, slots [mapstore.NodeSlots]uint64) (model.MapAddr, error)
+	AppendLeaf(prefix uint64, covered model.CommitSeq, refs [mapstore.NodeSlots]recordlog.RecordRef) (model.MapAddr, error)
 }
 
 // Walk visits every leaf in ID order. The tree is immutable, so callers see
 // one complete checkpoint root without holding Mapping publication locks.
 func (t *Tree) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
+	if visit == nil {
+		return ErrInvalid
+	}
+	return t.WalkRefs(ctx, func(id model.ID, ref recordlog.RecordRef) error { return visit(id, ref.Addr) })
+}
+
+func (t *Tree) WalkRefs(ctx context.Context, visit func(model.ID, recordlog.RecordRef) error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -36,7 +44,7 @@ func (t *Tree) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) e
 	return t.walkNode(ctx, t.root, mapstore.MaxLevel, 0, visit)
 }
 
-func (t *Tree) walkNode(ctx context.Context, addr model.MapAddr, level uint8, prefix uint64, visit func(model.ID, recordlog.VAddr) error) error {
+func (t *Tree) walkNode(ctx context.Context, addr model.MapAddr, level uint8, prefix uint64, visit func(model.ID, recordlog.RecordRef) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -45,19 +53,22 @@ func (t *Tree) walkNode(ctx context.Context, addr model.MapAddr, level uint8, pr
 		return err
 	}
 	for slot := uint16(0); slot < mapstore.NodeSlots; slot++ {
-		value, exists := node.Lookup(slot)
-		if !exists {
-			continue
-		}
 		if level == 0 {
-			id := model.ID(prefix<<9 | uint64(slot))
-			data, err := recordlog.ParseVAddr(value)
-			if err != nil || id == 0 {
-				return errors.Join(ErrCorrupt, err)
+			ref, exists := node.LookupRef(slot)
+			if !exists {
+				continue
 			}
-			if err := visit(id, data); err != nil {
+			id := model.ID(prefix<<9 | uint64(slot))
+			if !ref.Valid() || id == 0 {
+				return ErrCorrupt
+			}
+			if err := visit(id, ref); err != nil {
 				return err
 			}
+			continue
+		}
+		value, exists := node.Lookup(slot)
+		if !exists {
 			continue
 		}
 		child, err := model.ParseMapAddr(value)
@@ -111,33 +122,41 @@ func (t *Tree) Covered() model.CommitSeq { return t.covered }
 func (t *Tree) CacheBytes() uint64       { return t.cache.bytes() }
 
 func (t *Tree) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
+	ref, exists, err := t.LookupRef(id)
+	return ref.Addr, exists, err
+}
+
+func (t *Tree) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
 	if id == 0 {
-		return 0, false, ErrInvalid
+		return recordlog.RecordRef{}, false, ErrInvalid
 	}
 	addr := t.root
 	if addr == 0 {
-		return 0, false, nil
+		return recordlog.RecordRef{}, false, nil
 	}
 	for level := mapstore.MaxLevel; ; level-- {
 		prefix := nodePrefix(id, level)
 		node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel)
 		if err != nil {
-			return 0, false, err
+			return recordlog.RecordRef{}, false, err
+		}
+		if level == 0 {
+			ref, exists := node.LookupRef(nodeSlot(id, level))
+			if !exists {
+				return recordlog.RecordRef{}, false, nil
+			}
+			if !ref.Valid() {
+				return recordlog.RecordRef{}, false, ErrCorrupt
+			}
+			return ref, true, nil
 		}
 		value, exists := node.Lookup(nodeSlot(id, level))
 		if !exists {
-			return 0, false, nil
-		}
-		if level == 0 {
-			result, err := recordlog.ParseVAddr(value)
-			if err != nil {
-				return 0, false, errors.Join(ErrCorrupt, err)
-			}
-			return result, true, nil
+			return recordlog.RecordRef{}, false, nil
 		}
 		childAddr, err := model.ParseMapAddr(value)
 		if err != nil {
-			return 0, false, errors.Join(ErrCorrupt, err)
+			return recordlog.RecordRef{}, false, errors.Join(ErrCorrupt, err)
 		}
 		addr = childAddr
 	}

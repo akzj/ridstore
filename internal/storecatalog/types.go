@@ -7,7 +7,7 @@ import (
 
 const (
 	FormatMajor = uint16(2)
-	FormatMinor = uint16(1)
+	FormatMinor = uint16(3)
 )
 
 type StoreUUID [16]byte
@@ -45,7 +45,10 @@ type Manifest struct {
 	RecordLogID         recordlog.LogID
 	ActiveDataSegmentID recordlog.SegmentID
 	NextDataSegmentID   recordlog.SegmentID
-	SealedDataSegments  []DataSegmentSummary
+	// CompactionSegmentFloor is the greatest high-namespace SegmentID that
+	// remains unallocated. Zero is the initial state and denotes MaxUint32.
+	CompactionSegmentFloor recordlog.SegmentID
+	SealedDataSegments     []DataSegmentSummary
 
 	ActiveMapSegmentID model.MapSegmentID
 	NextMapSegmentID   model.MapSegmentID

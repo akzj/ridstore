@@ -32,7 +32,7 @@ const (
 
 type Change struct {
 	RecordID        model.ID
-	NewAddr         recordlog.VAddr
+	NewRef          recordlog.RecordRef
 	ExpectedOldAddr recordlog.VAddr
 	Operation       Operation
 }
@@ -51,8 +51,10 @@ type Proposal struct {
 }
 
 type ResolvedChange struct {
-	Change Change
-	Apply  bool
+	Change    Change
+	Apply     bool
+	OldRef    recordlog.RecordRef
+	OldExists bool
 }
 
 type ResolvedProposal struct {
@@ -73,9 +75,15 @@ type PublishResult struct {
 	Skipped   uint32
 }
 
+type SegmentLiveStats struct {
+	LiveBytes            uint64
+	LiveRecords          uint64
+	LastChangedCommitSeq model.CommitSeq
+}
+
 type Snapshot struct {
 	CoveredCommitSeq model.CommitSeq
-	Entries          map[model.ID]recordlog.VAddr
+	Entries          map[model.ID]recordlog.RecordRef
 }
 
 // Index is the single runtime Mapping contract used by commit, replay and
@@ -83,6 +91,7 @@ type Snapshot struct {
 // temporary in-memory model for tests until the v2 Open path is complete.
 type Index interface {
 	Lookup(model.ID) (recordlog.VAddr, bool, error)
+	LookupRef(model.ID) (recordlog.RecordRef, bool, error)
 	ReserveDelta([]model.ID) (DeltaReservation, uint64, error)
 	ResolveGroup([]Proposal) (GroupPlan, error)
 	PublishGroup(model.CommitSeq, GroupPlan, []DeltaReservation) (PublishResult, error)
@@ -95,18 +104,23 @@ var _ Index = (*Persistent)(nil)
 type Mapping struct {
 	mu      sync.RWMutex
 	covered model.CommitSeq
-	entries map[model.ID]recordlog.VAddr
+	entries map[model.ID]recordlog.RecordRef
+	live    map[recordlog.SegmentID]SegmentLiveStats
 }
 
 func New(snapshot Snapshot) (*Mapping, error) {
-	entries := make(map[model.ID]recordlog.VAddr, len(snapshot.Entries))
-	for id, addr := range snapshot.Entries {
-		if id == 0 || !addr.Valid() {
+	entries := make(map[model.ID]recordlog.RecordRef, len(snapshot.Entries))
+	live := make(map[recordlog.SegmentID]SegmentLiveStats)
+	for id, ref := range snapshot.Entries {
+		if id == 0 || !ref.Valid() {
 			return nil, ErrInvalid
 		}
-		entries[id] = addr
+		entries[id] = ref
+		if err := addLiveRef(live, ref, snapshot.CoveredCommitSeq); err != nil {
+			return nil, err
+		}
 	}
-	return &Mapping{covered: snapshot.CoveredCommitSeq, entries: entries}, nil
+	return &Mapping{covered: snapshot.CoveredCommitSeq, entries: entries, live: live}, nil
 }
 
 func NewEmpty() *Mapping {
@@ -115,8 +129,13 @@ func NewEmpty() *Mapping {
 }
 
 func (m *Mapping) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
+	ref, exists, err := m.LookupRef(id)
+	return ref.Addr, exists, err
+}
+
+func (m *Mapping) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
 	if id == 0 {
-		return 0, false, ErrInvalid
+		return recordlog.RecordRef{}, false, ErrInvalid
 	}
 	m.mu.RLock()
 	entry, exists := m.entries[id]
@@ -139,7 +158,7 @@ func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	plan, err := resolveGroupAt(m.covered, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
+	plan, err := resolveGroupAt(m.covered, proposals, func(id model.ID) (recordlog.RecordRef, bool, error) {
 		value, ok := m.entries[id]
 		return value, ok, nil
 	})
@@ -149,27 +168,27 @@ func (m *Mapping) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 	return plan, err
 }
 
-func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(model.ID) (recordlog.VAddr, bool, error)) (GroupPlan, error) {
+func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(model.ID) (recordlog.RecordRef, bool, error)) (GroupPlan, error) {
 	plan := GroupPlan{BaseCommitSeq: base, Proposals: make([]ResolvedProposal, len(proposals))}
 	type virtualEntry struct {
-		addr   recordlog.VAddr
+		ref    recordlog.RecordRef
 		exists bool
 	}
 	virtual := make(map[model.ID]virtualEntry)
-	lookup := func(id model.ID) (recordlog.VAddr, bool, error) {
+	lookup := func(id model.ID) (recordlog.RecordRef, bool, error) {
 		if value, ok := virtual[id]; ok {
-			return value.addr, value.exists, nil
+			return value.ref, value.exists, nil
 		}
 		return baseLookup(id)
 	}
 	for index, proposal := range proposals {
 		resolved := ResolvedProposal{Kind: proposal.Kind, Accepted: true}
 		for _, condition := range proposal.Conditions {
-			addr, exists, err := lookup(condition.RecordID)
+			ref, exists, err := lookup(condition.RecordID)
 			if err != nil {
 				return GroupPlan{}, err
 			}
-			if condition.ExpectedAddr == 0 && exists || condition.ExpectedAddr != 0 && (!exists || addr != condition.ExpectedAddr) {
+			if condition.ExpectedAddr == 0 && exists || condition.ExpectedAddr != 0 && (!exists || ref.Addr != condition.ExpectedAddr) {
 				resolved.Accepted = false
 				break
 			}
@@ -180,22 +199,22 @@ func resolveGroupAt(base model.CommitSeq, proposals []Proposal, baseLookup func(
 		}
 		resolved.Changes = make([]ResolvedChange, len(proposal.Changes))
 		for changeIndex, change := range proposal.Changes {
-			result := ResolvedChange{Change: change, Apply: true}
+			current, exists, err := lookup(change.RecordID)
+			if err != nil {
+				return GroupPlan{}, err
+			}
+			result := ResolvedChange{Change: change, Apply: true, OldRef: current, OldExists: exists}
 			switch proposal.Kind {
 			case ProposalUserCommit:
 				if change.Operation == OperationDelete {
 					virtual[change.RecordID] = virtualEntry{}
 				} else {
-					virtual[change.RecordID] = virtualEntry{addr: change.NewAddr, exists: true}
+					virtual[change.RecordID] = virtualEntry{ref: change.NewRef, exists: true}
 				}
 			case ProposalRelocation:
-				current, exists, err := lookup(change.RecordID)
-				if err != nil {
-					return GroupPlan{}, err
-				}
-				result.Apply = exists && current == change.ExpectedOldAddr
+				result.Apply = exists && current.Addr == change.ExpectedOldAddr
 				if result.Apply {
-					virtual[change.RecordID] = virtualEntry{addr: change.NewAddr, exists: true}
+					virtual[change.RecordID] = virtualEntry{ref: change.NewRef, exists: true}
 				}
 			}
 			resolved.Changes[changeIndex] = result
@@ -245,6 +264,9 @@ func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan, r
 			return PublishResult{}, err
 		}
 	}
+	if err := applyPlanLiveStats(m.live, firstCommitSeq, plan); err != nil {
+		return PublishResult{}, err
+	}
 	// Validate/consume the complete reservation set before changing visible
 	// entries, so an invariant failure cannot expose a partial group.
 	for _, proposal := range plan.Proposals {
@@ -259,7 +281,7 @@ func (m *Mapping) PublishGroup(firstCommitSeq model.CommitSeq, plan GroupPlan, r
 			if resolved.Change.Operation == OperationDelete {
 				delete(m.entries, resolved.Change.RecordID)
 			} else {
-				m.entries[resolved.Change.RecordID] = resolved.Change.NewAddr
+				m.entries[resolved.Change.RecordID] = resolved.Change.NewRef
 			}
 			result.Applied++
 		}
@@ -324,7 +346,7 @@ func consumeReservation(reservation DeltaReservation, entries uint64) (uint64, e
 func (m *Mapping) Snapshot() Snapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	entries := make(map[model.ID]recordlog.VAddr, len(m.entries))
+	entries := make(map[model.ID]recordlog.RecordRef, len(m.entries))
 	for id, entry := range m.entries {
 		entries[id] = entry
 	}
@@ -335,6 +357,12 @@ func (m *Mapping) CoveredCommitSeq() model.CommitSeq {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.covered
+}
+
+func (m *Mapping) LiveStats() map[recordlog.SegmentID]SegmentLiveStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return cloneLiveStats(m.live)
 }
 
 func validateProposal(proposal Proposal) error {
@@ -364,11 +392,11 @@ func validateProposal(proposal Proposal) error {
 		}
 		switch proposal.Kind {
 		case ProposalUserCommit:
-			if change.ExpectedOldAddr != 0 || (change.Operation == OperationPut && !change.NewAddr.Valid()) || (change.Operation == OperationDelete && change.NewAddr != 0) || (change.Operation != OperationPut && change.Operation != OperationDelete) {
+			if change.ExpectedOldAddr != 0 || (change.Operation == OperationPut && !change.NewRef.Valid()) || (change.Operation == OperationDelete && !change.NewRef.IsZero()) || (change.Operation != OperationPut && change.Operation != OperationDelete) {
 				return ErrInvalid
 			}
 		case ProposalRelocation:
-			if change.Operation != OperationRelocate || !change.NewAddr.Valid() || !change.ExpectedOldAddr.Valid() || change.NewAddr == change.ExpectedOldAddr {
+			if change.Operation != OperationRelocate || !change.NewRef.Valid() || !change.ExpectedOldAddr.Valid() || change.NewRef.Addr == change.ExpectedOldAddr {
 				return ErrInvalid
 			}
 		}
@@ -392,6 +420,9 @@ func validateResolvedPlan(plan GroupPlan) error {
 		changes := make([]Change, len(proposal.Changes))
 		for i, resolved := range proposal.Changes {
 			changes[i] = resolved.Change
+			if resolved.OldExists != !resolved.OldRef.IsZero() || resolved.OldExists && !resolved.OldRef.Valid() {
+				return ErrInvalid
+			}
 			if proposal.Kind == ProposalUserCommit && !resolved.Apply {
 				return ErrInvalid
 			}
@@ -401,4 +432,121 @@ func validateResolvedPlan(plan GroupPlan) error {
 		}
 	}
 	return nil
+}
+
+type segmentLiveDelta struct {
+	removeBytes, addBytes     uint64
+	removeRecords, addRecords uint64
+	lastChanged               model.CommitSeq
+}
+
+func applyPlanLiveStats(stats map[recordlog.SegmentID]SegmentLiveStats, first model.CommitSeq, plan GroupPlan) error {
+	deltas := make(map[recordlog.SegmentID]segmentLiveDelta)
+	seq := first
+	for _, proposal := range plan.Proposals {
+		if !proposal.Accepted {
+			continue
+		}
+		for _, resolved := range proposal.Changes {
+			if !resolved.Apply {
+				continue
+			}
+			if resolved.OldExists {
+				if !resolved.OldRef.Valid() {
+					return ErrCorrupt
+				}
+				segment := resolved.OldRef.Addr.SegmentID()
+				delta := deltas[segment]
+				if delta.removeBytes > math.MaxUint64-uint64(resolved.OldRef.PhysicalSize) || delta.removeRecords == math.MaxUint64 {
+					return ErrCorrupt
+				}
+				delta.removeBytes += uint64(resolved.OldRef.PhysicalSize)
+				delta.removeRecords++
+				delta.lastChanged = seq
+				deltas[segment] = delta
+			}
+			if resolved.Change.Operation != OperationDelete {
+				ref := resolved.Change.NewRef
+				if !ref.Valid() {
+					return ErrCorrupt
+				}
+				segment := ref.Addr.SegmentID()
+				delta := deltas[segment]
+				if delta.addBytes > math.MaxUint64-uint64(ref.PhysicalSize) || delta.addRecords == math.MaxUint64 {
+					return ErrCorrupt
+				}
+				delta.addBytes += uint64(ref.PhysicalSize)
+				delta.addRecords++
+				delta.lastChanged = seq
+				deltas[segment] = delta
+			}
+		}
+		seq++
+	}
+	for segment, delta := range deltas {
+		current := stats[segment]
+		removeBytes, addBytes := delta.removeBytes, delta.addBytes
+		if removeBytes >= addBytes {
+			removeBytes -= addBytes
+			addBytes = 0
+		} else {
+			addBytes -= removeBytes
+			removeBytes = 0
+		}
+		removeRecords, addRecords := delta.removeRecords, delta.addRecords
+		if removeRecords >= addRecords {
+			removeRecords -= addRecords
+			addRecords = 0
+		} else {
+			addRecords -= removeRecords
+			removeRecords = 0
+		}
+		if current.LiveBytes < removeBytes || current.LiveRecords < removeRecords ||
+			current.LiveBytes-removeBytes > math.MaxUint64-addBytes ||
+			current.LiveRecords-removeRecords > math.MaxUint64-addRecords {
+			return ErrCorrupt
+		}
+		delta.removeBytes, delta.addBytes = removeBytes, addBytes
+		delta.removeRecords, delta.addRecords = removeRecords, addRecords
+		deltas[segment] = delta
+	}
+	for segment, delta := range deltas {
+		current := stats[segment]
+		current.LiveBytes = current.LiveBytes - delta.removeBytes + delta.addBytes
+		current.LiveRecords = current.LiveRecords - delta.removeRecords + delta.addRecords
+		if current.LiveRecords == 0 {
+			if current.LiveBytes != 0 {
+				return ErrCorrupt
+			}
+			delete(stats, segment)
+			continue
+		}
+		current.LastChangedCommitSeq = delta.lastChanged
+		stats[segment] = current
+	}
+	return nil
+}
+
+func addLiveRef(stats map[recordlog.SegmentID]SegmentLiveStats, ref recordlog.RecordRef, seq model.CommitSeq) error {
+	if !ref.Valid() {
+		return ErrCorrupt
+	}
+	segment := ref.Addr.SegmentID()
+	current := stats[segment]
+	if current.LiveBytes > math.MaxUint64-uint64(ref.PhysicalSize) || current.LiveRecords == math.MaxUint64 {
+		return ErrCorrupt
+	}
+	current.LiveBytes += uint64(ref.PhysicalSize)
+	current.LiveRecords++
+	current.LastChangedCommitSeq = seq
+	stats[segment] = current
+	return nil
+}
+
+func cloneLiveStats(stats map[recordlog.SegmentID]SegmentLiveStats) map[recordlog.SegmentID]SegmentLiveStats {
+	result := make(map[recordlog.SegmentID]SegmentLiveStats, len(stats))
+	for segment, value := range stats {
+		result[segment] = value
+	}
+	return result
 }

@@ -22,6 +22,28 @@ type fakeAllocator struct{}
 func (fakeAllocator) Allocate(context.Context) (uint64, error) { return 1, nil }
 func (fakeAllocator) CanUse(uint64) bool                       { return true }
 
+func resultRef(t *testing.T, result recordlog.AppendResult) recordlog.RecordRef {
+	t.Helper()
+	ref, err := result.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
+}
+
+func addrRef(t *testing.T, addr recordlog.VAddr) recordlog.RecordRef {
+	t.Helper()
+	size, err := addr.ReadHint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := recordlog.NewRecordRef(addr, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
+}
+
 type fakeLog struct {
 	mu          sync.Mutex
 	nextOffset  uint32
@@ -153,6 +175,10 @@ func (coordinatorNodeStore) Append(uint8, uint64, model.CommitSeq, [mapstore.Nod
 	return 0, mapping.ErrCorrupt
 }
 
+func (coordinatorNodeStore) AppendLeaf(uint64, model.CommitSeq, [mapstore.NodeSlots]recordlog.RecordRef) (model.MapAddr, error) {
+	return 0, mapping.ErrCorrupt
+}
+
 func (coordinatorNodeStore) Sync() error { return nil }
 
 func newPersistentMapping(t *testing.T) *mapping.Persistent {
@@ -163,7 +189,7 @@ func newPersistentMapping(t *testing.T) *mapping.Persistent {
 		t.Fatal(err)
 	}
 	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
-		CheckpointSortBytes: 256, DeltaSoftLimitBytes: 512, DeltaHardLimitBytes: 1024,
+		CheckpointSortBytes: 384, DeltaSoftLimitBytes: 512, DeltaHardLimitBytes: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -300,7 +326,7 @@ func TestRelocationSharesCommitOrderAndUsesAddressCAS(t *testing.T) {
 	}
 	relocated, err := c.Relocate(context.Background(), Relocation{
 		BatchID: 8, LogicalPayloadBytes: 5,
-		Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewAddr: copied.Addr, Operation: mapping.OperationRelocate}},
+		Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewRef: resultRef(t, copied), Operation: mapping.OperationRelocate}},
 	})
 	if err != nil || relocated.CommitSeq != 2 || relocated.Applied != 1 || relocated.Skipped != 0 {
 		t.Fatalf("relocation=%+v err=%v", relocated, err)
@@ -315,7 +341,7 @@ func TestRelocationSharesCommitOrderAndUsesAddressCAS(t *testing.T) {
 	}
 	stale, err := c.Relocate(context.Background(), Relocation{
 		BatchID: 9, LogicalPayloadBytes: 5,
-		Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewAddr: staleCopy.Addr, Operation: mapping.OperationRelocate}},
+		Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewRef: resultRef(t, staleCopy), Operation: mapping.OperationRelocate}},
 	})
 	if err != nil || stale.CommitSeq != 3 || stale.Applied != 0 || stale.Skipped != 1 {
 		t.Fatalf("stale relocation=%+v err=%v", stale, err)
@@ -384,7 +410,7 @@ func TestUserCommitPrecedesRelocationWithinCommitGroup(t *testing.T) {
 	go func() {
 		result, relocateErr := c.Relocate(context.Background(), Relocation{
 			BatchID: 3, LogicalPayloadBytes: 7,
-			Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewAddr: copied.Addr, Operation: mapping.OperationRelocate}},
+			Changes: []mapping.Change{{RecordID: 3, ExpectedOldAddr: oldAddr, NewRef: resultRef(t, copied), Operation: mapping.OperationRelocate}},
 		})
 		relocationDone <- relocationResponse{result: result, err: relocateErr}
 	}()
@@ -469,7 +495,7 @@ func TestRelocationDurabilityFailureIsCommitUnknown(t *testing.T) {
 	newAddr, _ := recordlog.NewVAddr(1, 128, 64)
 	result, err := c.Relocate(context.Background(), Relocation{
 		BatchID: 1, LogicalPayloadBytes: 1,
-		Changes: []mapping.Change{{RecordID: 1, ExpectedOldAddr: oldAddr, NewAddr: newAddr, Operation: mapping.OperationRelocate}},
+		Changes: []mapping.Change{{RecordID: 1, ExpectedOldAddr: oldAddr, NewRef: addrRef(t, newAddr), Operation: mapping.OperationRelocate}},
 	})
 	if result != (RelocationResult{}) || !errors.Is(err, base.ErrCommitUnknown) || !errors.Is(err, wantErr) || c.Fault() == nil {
 		t.Fatalf("result=%+v err=%v fault=%v", result, err, c.Fault())
@@ -553,7 +579,7 @@ func TestConflictDoesNotConsumeCommitSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := mapping.New(mapping.Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.VAddr{1: addr}})
+	current, err := mapping.New(mapping.Snapshot{CoveredCommitSeq: 4, Entries: map[model.ID]recordlog.RecordRef{1: addrRef(t, addr)}})
 	if err != nil {
 		t.Fatal(err)
 	}

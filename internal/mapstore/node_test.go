@@ -33,6 +33,7 @@ func TestSparseNodeRoundTrip(t *testing.T) {
 	build := NodeBuild{Level: 0, NodeSeq: 9, Prefix: 3, CoveredCommitSeq: 7}
 	build.Slots[0] = dataAddr(t, 1, 64)
 	build.Slots[511] = dataAddr(t, 2, 128)
+	build.Sizes[0], build.Sizes[511] = 64, 64
 	encoded, err := EncodeNode(build)
 	if err != nil {
 		t.Fatal(err)
@@ -61,11 +62,12 @@ func TestNodeEncodingGolden(t *testing.T) {
 	build := NodeBuild{Level: 0, NodeSeq: 9, Prefix: 3, CoveredCommitSeq: 7}
 	build.Slots[0] = dataAddr(t, 1, 64)
 	build.Slots[511] = dataAddr(t, 2, 128)
+	build.Sizes[0], build.Sizes[511] = 64, 64
 	encoded, err := EncodeNode(build)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "c7ea9bc7d748e29bc3044c3b6bb7f5801bed8719757308fa23246289ea0f46f1"
+	const want = "e1d280cfcf24f0be39eb3e27c616703f8770d5d2699007fcaaa1d77594eb488a"
 	if got := fmt.Sprintf("%x", sha256.Sum256(encoded)); got != want {
 		t.Fatalf("golden digest=%s", got)
 	}
@@ -107,6 +109,7 @@ func TestNodeRejectsInvalidIdentityAndAddresses(t *testing.T) {
 func TestNodeDecodeRejectsCorruptionAndBoundaryCrossing(t *testing.T) {
 	build := NodeBuild{Level: 0, NodeSeq: 1, CoveredCommitSeq: 1}
 	build.Slots[4] = dataAddr(t, 1, 64)
+	build.Sizes[4] = 64
 	encoded, err := EncodeNode(build)
 	if err != nil {
 		t.Fatal(err)
@@ -131,6 +134,7 @@ func FuzzDecodeNode(f *testing.F) {
 	build := NodeBuild{Level: 0, NodeSeq: 1, CoveredCommitSeq: 1}
 	addr, _ := recordlog.NewVAddr(1, 64, 64)
 	build.Slots[1] = uint64(addr)
+	build.Sizes[1] = 64
 	seed, _ := EncodeNode(build)
 	f.Add(seed, uint32(len(seed)))
 	f.Fuzz(func(t *testing.T, value []byte, remaining uint32) {

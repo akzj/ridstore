@@ -14,18 +14,18 @@ import (
 )
 
 type mappingEntry struct {
-	id   model.ID
-	addr recordlog.VAddr
+	id  model.ID
+	ref recordlog.RecordRef
 }
 
 type fakeMapping []mappingEntry
 
-func (m fakeMapping) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
+func (m fakeMapping) WalkRefs(ctx context.Context, visit func(model.ID, recordlog.RecordRef) error) error {
 	for _, entry := range m {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := visit(entry.id, entry.addr); err != nil {
+		if err := visit(entry.id, entry.ref); err != nil {
 			return err
 		}
 	}
@@ -34,30 +34,30 @@ func (m fakeMapping) Walk(ctx context.Context, visit func(model.ID, recordlog.VA
 
 type mappingChange struct {
 	id                   model.ID
-	oldAddr, newAddr     recordlog.VAddr
+	oldRef, newRef       recordlog.RecordRef
 	oldExists, newExists bool
 }
 
 type fakeIncremental struct {
 	changes []mappingChange
-	entries map[model.ID]recordlog.VAddr
+	entries map[model.ID]recordlog.RecordRef
 }
 
-func (m fakeIncremental) WalkChanges(ctx context.Context, visit func(model.ID, recordlog.VAddr, bool, recordlog.VAddr, bool) error) error {
+func (m fakeIncremental) WalkChanges(ctx context.Context, visit func(model.ID, recordlog.RecordRef, bool, recordlog.RecordRef, bool) error) error {
 	for _, change := range m.changes {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := visit(change.id, change.oldAddr, change.oldExists, change.newAddr, change.newExists); err != nil {
+		if err := visit(change.id, change.oldRef, change.oldExists, change.newRef, change.newExists); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (m fakeIncremental) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
-	addr, ok := m.entries[id]
-	return addr, ok, nil
+func (m fakeIncremental) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
+	ref, ok := m.entries[id]
+	return ref, ok, nil
 }
 
 type inspectedRecord struct {
@@ -114,13 +114,17 @@ func addPut(t *testing.T, records fakeInspector, segment recordlog.SegmentID, of
 	return addr
 }
 
+func recordRef(records fakeInspector, addr recordlog.VAddr) recordlog.RecordRef {
+	return recordlog.RecordRef{Addr: addr, PhysicalSize: records[addr].header.PhysicalSize}
+}
+
 func TestBuildExactSealedStats(t *testing.T) {
 	records := make(fakeInspector)
 	a := addPut(t, records, 1, 64, 1, 7)
 	b := addPut(t, records, 1, 128, 2, 80)
 	c := addPut(t, records, 2, 64, 3, 1)
 	active := addPut(t, records, 3, 64, 4, 900)
-	stats, err := Build(context.Background(), fakeMapping{{1, a}, {2, b}, {3, c}, {4, active}}, records, nil, FileSet{
+	stats, err := Build(context.Background(), fakeMapping{{1, recordRef(records, a)}, {2, recordRef(records, b)}, {3, recordRef(records, c)}, {4, recordRef(records, active)}}, records, nil, FileSet{
 		Active: 3,
 		Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}, {SegmentID: 2, ValidEnd: 512}},
 	}, 1024, 2)
@@ -143,7 +147,7 @@ func TestBuildRejectsWrongIdentityUnknownSegmentAndBudget(t *testing.T) {
 		files      FileSet
 		maxEntries uint64
 	}{
-		{name: "wrong identity", maxEntries: 1},
+		{name: "invalid ref", maxEntries: 1},
 		{name: "unknown segment", maxEntries: 1},
 		{name: "budget", maxEntries: 1},
 	} {
@@ -152,15 +156,15 @@ func TestBuildRejectsWrongIdentityUnknownSegmentAndBudget(t *testing.T) {
 			a := addPut(t, records, 1, 64, 1, 1)
 			b := addPut(t, records, 2, 64, 2, 1)
 			files := FileSet{Active: 3, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}, {SegmentID: 2, ValidEnd: 512}}}
-			mapping := fakeMapping{{1, a}}
+			mapping := fakeMapping{{1, recordRef(records, a)}}
 			switch test.name {
-			case "wrong identity":
-				mapping[0].id = 9
+			case "invalid ref":
+				mapping[0].ref.PhysicalSize = 65
 			case "unknown segment":
 				unknown := addPut(t, records, 4, 64, 1, 1)
-				mapping[0].addr = unknown
+				mapping[0].ref = recordRef(records, unknown)
 			case "budget":
-				mapping = append(mapping, mappingEntry{2, b})
+				mapping = append(mapping, mappingEntry{2, recordRef(records, b)})
 			}
 			_, err := Build(context.Background(), mapping, records, nil, files, 1024, test.maxEntries)
 			if test.name == "budget" {
@@ -180,22 +184,20 @@ func TestBuildUsesValidatedCachedMetadataWithoutInspect(t *testing.T) {
 	physical, _ := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize + 80))
 	cache := recordmeta.New(64)
 	cache.Remember(addr, 7, physical)
-	stats, err := Build(context.Background(), fakeMapping{{7, addr}}, fakeInspector{}, cache, FileSet{
+	stats, err := Build(context.Background(), fakeMapping{{7, recordRef(records, addr)}}, fakeInspector{}, cache, FileSet{
 		Active: 2, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}},
 	}, 1024, 1)
-	if err != nil || len(stats) != 1 || stats[0].LiveBytes != uint64(physical) || cache.Stats().Hits != 1 {
+	if err != nil || len(stats) != 1 || stats[0].LiveBytes != uint64(physical) || cache.Stats().Hits != 0 {
 		t.Fatalf("stats=%+v cache=%+v err=%v", stats, cache.Stats(), err)
 	}
 }
 
-func TestBuildRejectsCachedIdentityMismatch(t *testing.T) {
+func TestBuildRejectsInvalidRecordRef(t *testing.T) {
 	addr, err := recordlog.NewVAddr(1, 64, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache := recordmeta.New(64)
-	cache.Remember(addr, 8, 64)
-	_, err = Build(context.Background(), fakeMapping{{7, addr}}, fakeInspector{}, cache, FileSet{
+	_, err = Build(context.Background(), fakeMapping{{7, recordlog.RecordRef{Addr: addr, PhysicalSize: 128}}}, fakeInspector{}, nil, FileSet{
 		Active: 2, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}},
 	}, 1024, 1)
 	if !errors.Is(err, base.ErrCorrupt) {
@@ -220,10 +222,10 @@ func TestBuildIncrementalAppliesOnlyFoldedChanges(t *testing.T) {
 	}
 	cache.Remember(moved, 1, movedSize)
 	current := fakeIncremental{changes: []mappingChange{
-		{id: 1, oldAddr: old, oldExists: true, newAddr: moved, newExists: true},
-		{id: 3, newAddr: created, newExists: true},
-		{id: 4, newAddr: active, newExists: true},
-	}, entries: map[model.ID]recordlog.VAddr{1: moved, 2: unchanged, 3: created, 4: active}}
+		{id: 1, oldRef: recordRef(records, old), oldExists: true, newRef: recordRef(records, moved), newExists: true},
+		{id: 3, newRef: recordRef(records, created), newExists: true},
+		{id: 4, newRef: recordRef(records, active), newExists: true},
+	}, entries: map[model.ID]recordlog.RecordRef{1: recordRef(records, moved), 2: recordRef(records, unchanged), 3: recordRef(records, created), 4: recordRef(records, active)}}
 	stats, err := BuildIncremental(context.Background(), current, fakeInspector{}, fakeInspector{}, cache,
 		[]storecatalog.SegmentStats{{SegmentID: 1, LiveBytes: uint64(oldSize + unchangedSize), LiveRecords: 2}}, 3, FileSet{
 			Active: 3, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}, {SegmentID: 2, ValidEnd: 512}},
@@ -235,7 +237,7 @@ func TestBuildIncrementalAppliesOnlyFoldedChanges(t *testing.T) {
 		stats[1] != (storecatalog.SegmentStats{SegmentID: 2, LiveBytes: uint64(movedSize + createdSize), LiveRecords: 2}) {
 		t.Fatalf("stats=%+v", stats)
 	}
-	if got := cache.Stats().Hits; got != 3 {
+	if got := cache.Stats().Hits; got != 0 {
 		t.Fatalf("cache hits=%d", got)
 	}
 }
@@ -243,7 +245,7 @@ func TestBuildIncrementalAppliesOnlyFoldedChanges(t *testing.T) {
 func TestBuildIncrementalRejectsBaseUnderflow(t *testing.T) {
 	records := make(fakeInspector)
 	old := addPut(t, records, 1, 64, 1, 80)
-	current := fakeIncremental{changes: []mappingChange{{id: 1, oldAddr: old, oldExists: true}}}
+	current := fakeIncremental{changes: []mappingChange{{id: 1, oldRef: recordRef(records, old), oldExists: true}}}
 	_, err := BuildIncremental(context.Background(), current, records, records, nil,
 		[]storecatalog.SegmentStats{{SegmentID: 1, LiveBytes: 64, LiveRecords: 1}},
 		2, FileSet{Active: 2, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}}}, 1024, 1)
@@ -260,10 +262,10 @@ func TestBuildIncrementalScansOnlyFormerActiveAfterRotation(t *testing.T) {
 	created := addPut(t, records, 2, 192, 3, 7)
 	current := fakeIncremental{
 		changes: []mappingChange{
-			{id: 2, oldAddr: old, oldExists: true, newAddr: moved, newExists: true},
-			{id: 3, newAddr: created, newExists: true},
+			{id: 2, oldRef: recordRef(records, old), oldExists: true, newRef: recordRef(records, moved), newExists: true},
+			{id: 3, newRef: recordRef(records, created), newExists: true},
 		},
-		entries: map[model.ID]recordlog.VAddr{1: unchanged, 2: moved, 3: created},
+		entries: map[model.ID]recordlog.RecordRef{1: recordRef(records, unchanged), 2: recordRef(records, moved), 3: recordRef(records, created)},
 	}
 	stats, err := BuildIncremental(context.Background(), current, records, records, nil, nil, 1, FileSet{
 		Active: 3, Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}, {SegmentID: 2, ValidEnd: 512}},

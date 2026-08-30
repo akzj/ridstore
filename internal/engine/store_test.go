@@ -36,6 +36,10 @@ func (emptyNodeStore) Append(uint8, uint64, model.CommitSeq, [mapstore.NodeSlots
 	return 0, errors.New("unexpected persistent node append")
 }
 
+func (emptyNodeStore) AppendLeaf(uint64, model.CommitSeq, [mapstore.NodeSlots]recordlog.RecordRef) (model.MapAddr, error) {
+	return 0, errors.New("unexpected persistent leaf append")
+}
+
 func (emptyNodeStore) Sync() error { return nil }
 
 func newPersistent(t *testing.T) *mapping.Persistent {
@@ -46,7 +50,7 @@ func newPersistent(t *testing.T) *mapping.Persistent {
 		t.Fatal(err)
 	}
 	current, err := mapping.OpenPersistent(tree, nodes, mapping.PersistentConfig{
-		CheckpointSortBytes: 16 << 10, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
+		CheckpointSortBytes: 24 << 10, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -398,7 +402,7 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 	config := OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: 1 << 20, QueueCapacity: 32, BufferBytes: 64 << 10, BufferRecords: 32},
 		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 4096},
-		MappingCacheBytes: 1 << 20, CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
+		MappingCacheBytes: 1 << 20, CheckpointSortBytes: 24 << 10, MaxSegmentStats: 1024,
 		DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
 		StatusRetention: 64,
 	}

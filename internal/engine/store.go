@@ -21,7 +21,6 @@ import (
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/recordmeta"
-	"github.com/akzj/ridstore/internal/segmentstats"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
 )
@@ -36,6 +35,10 @@ type Log interface {
 type maintenanceLog interface {
 	ScanSegment(context.Context, recordlog.SegmentID, func(recordlog.AppendResult, []byte) error) error
 	RetireSegment(context.Context, recordlog.SegmentID, uint64) error
+	NewCompactionWriter([]recordlog.SegmentID) (*recordlog.CompactionWriter, error)
+	RegisterCompactionOutputs([]recordlog.SegmentSummary) error
+	RemoveUnpublishedCompactionFiles([]recordlog.SegmentID) error
+	FinalizeCompactionRetirement(context.Context, []recordlog.SegmentSummary, uint64) error
 }
 
 type Config struct {
@@ -128,6 +131,7 @@ type Store struct {
 	space                       *spaceGate
 	metrics                     runtimeMetrics
 	recordMeta                  *recordmeta.Cache
+	gcStability                 gcStability
 	checkpointRequests          chan struct{}
 	checkpointStop              chan struct{}
 	checkpointDone              chan struct{}
@@ -511,27 +515,14 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		s.setFault(err)
 		return abort(err)
 	}
-	files := segmentstats.FileSet{
-		Active: manifest.ActiveDataSegmentID, Sealed: manifest.SealedDataSegments,
-	}
-	var stats []storecatalog.SegmentStats
-	if manifest.CoveredCommitSeq == candidate.BaseCoveredCommitSeq() &&
-		manifest.StatsCoveredCommitSeq == manifest.CoveredCommitSeq &&
-		containsDataSegment(manifest, manifest.ReplayStart.SegmentID) {
-		stats, err = segmentstats.BuildIncremental(ctx, candidate, s.log, s.maintenance, s.recordMeta, manifest.SegmentStats,
-			manifest.ReplayStart.SegmentID, files, manifest.HardLimits.MaxValueSize, s.maxStats)
-	} else {
-		// Retain a full-root recovery path for a baseline whose Mapping or Data
-		// topology cannot be proven to match the candidate.
-		stats, err = segmentstats.Build(ctx, candidate, s.log, s.recordMeta, files, manifest.HardLimits.MaxValueSize, s.maxStats)
-	}
+	stats, err := checkpointSegmentStats(candidate.LiveStats(), manifest, s.maxStats)
 	if err != nil {
 		if errors.Is(err, base.ErrCorrupt) {
 			s.setFault(err)
 		}
 		return abort(err)
 	}
-	_, err = s.catalog.InstallCheckpoint(manifest, storecatalog.Checkpoint{
+	installed, err := s.catalog.InstallCheckpoint(manifest, storecatalog.Checkpoint{
 		MappingRoot: candidate.Root(), MappingEntryCount: mappingEntries, CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
 		ReservedIDHigh: work.reservedIDHigh, ReservedBatchIDHigh: work.reservedBatchIDHigh, IssuedBatchIDHighAtCut: work.issuedBatchIDHigh,
 		OpenBatchIDsAtCut: work.open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,
@@ -546,6 +537,11 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
+	now := time.Now()
+	if s.gcNow != nil {
+		now = s.gcNow()
+	}
+	s.gcStability.sample(installed, now)
 	s.completeCheckpointPressure(frozen.PressureGeneration())
 	s.mu.Lock()
 	if work.statusCut > s.terminalBase {
@@ -555,6 +551,32 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 	s.signalLocked()
 	s.mu.Unlock()
 	return nil
+}
+
+func checkpointSegmentStats(live map[recordlog.SegmentID]mapping.SegmentLiveStats, manifest storecatalog.Manifest, maxEntries uint64) ([]storecatalog.SegmentStats, error) {
+	known := make(map[recordlog.SegmentID]struct{}, len(manifest.SealedDataSegments)+1)
+	known[manifest.ActiveDataSegmentID] = struct{}{}
+	result := make([]storecatalog.SegmentStats, 0, min(len(live), len(manifest.SealedDataSegments)))
+	for _, segment := range manifest.SealedDataSegments {
+		known[segment.SegmentID] = struct{}{}
+		stat, ok := live[segment.SegmentID]
+		if !ok {
+			continue
+		}
+		if segment.ValidEnd < recordlog.SegmentHeaderSize || stat.LiveBytes > uint64(segment.ValidEnd-recordlog.SegmentHeaderSize) || stat.LiveRecords > segment.RecordCount {
+			return nil, base.ErrCorrupt
+		}
+		if uint64(len(result)) == maxEntries {
+			return nil, base.ErrOverflow
+		}
+		result = append(result, storecatalog.SegmentStats{SegmentID: segment.SegmentID, LiveBytes: stat.LiveBytes, LiveRecords: stat.LiveRecords})
+	}
+	for segment := range live {
+		if _, ok := known[segment]; !ok {
+			return nil, base.ErrCorrupt
+		}
+	}
+	return result, nil
 }
 
 func containsDataSegment(manifest storecatalog.Manifest, id recordlog.SegmentID) bool {

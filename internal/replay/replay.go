@@ -250,7 +250,7 @@ func descriptorProposal(ctx context.Context, log Log, descriptor recordcodec.Des
 		if uint64(mutation.RecordID) >= reservedIDHigh {
 			return mapping.Proposal{}, corrupt(errors.New("mutation outside reserved ID range"))
 		}
-		change := mapping.Change{RecordID: mutation.RecordID, NewAddr: mutation.NewAddr, ExpectedOldAddr: mutation.ExpectedOldAddr}
+		change := mapping.Change{RecordID: mutation.RecordID, NewRef: recordlog.RecordRef{Addr: mutation.NewAddr, PhysicalSize: mutation.PhysicalSize}, ExpectedOldAddr: mutation.ExpectedOldAddr}
 		switch mutation.Operation {
 		case recordcodec.OperationDelete:
 			change.Operation = mapping.OperationDelete
@@ -259,8 +259,9 @@ func descriptorProposal(ctx context.Context, log Log, descriptor recordcodec.Des
 				return mapping.Proposal{}, corrupt(errors.New("mutation address does not precede commit"))
 			}
 			put, err := readPut(ctx, log, mutation.NewAddr, maxValue)
-			if err != nil || put.RecordID != mutation.RecordID {
-				return mapping.Proposal{}, corruptAt("new put identity", err)
+			physicalSize, sizeErr := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize) + uint64(len(put.Value)))
+			if err != nil || sizeErr != nil || put.RecordID != mutation.RecordID || physicalSize != mutation.PhysicalSize {
+				return mapping.Proposal{}, corruptAt("new put identity", errors.Join(err, sizeErr))
 			}
 			if logical > math.MaxUint64-uint64(len(put.Value)) {
 				return mapping.Proposal{}, corrupt(errors.New("logical payload overflow"))

@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	FormatVersion       = uint16(2)
+	FormatVersion       = uint16(3)
 	CommonHeaderSize    = uint32(16)
 	PutHeaderSize       = uint32(32)
 	CommitGroupHeadSize = uint32(32)
@@ -58,6 +58,7 @@ type Mutation struct {
 	NewAddr         recordlog.VAddr
 	ExpectedOldAddr recordlog.VAddr
 	Operation       Operation
+	PhysicalSize    uint32
 }
 
 type Descriptor struct {

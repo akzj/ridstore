@@ -18,7 +18,7 @@ type NodeSyncer interface {
 }
 
 type persistentDelta struct {
-	addr   recordlog.VAddr
+	ref    recordlog.RecordRef
 	exists bool
 }
 
@@ -52,6 +52,8 @@ type Persistent struct {
 	inCheckpoint        bool
 	checkpointSortBytes uint64
 	budget              *deltaBudget
+	live                map[recordlog.SegmentID]SegmentLiveStats
+	liveReady           bool
 }
 
 type PersistentConfig struct {
@@ -60,7 +62,7 @@ type PersistentConfig struct {
 	DeltaHardLimitBytes uint64
 }
 
-const checkpointMutationBytes = uint64(16)
+const checkpointMutationBytes = uint64(24)
 
 func ValidatePersistentConfig(config PersistentConfig) error {
 	if config.CheckpointSortBytes < checkpointMutationBytes ||
@@ -83,7 +85,39 @@ func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig
 		active:              &deltaLayer{values: make(map[model.ID]persistentDelta)},
 		checkpointSortBytes: config.CheckpointSortBytes,
 		budget:              budget,
+		live:                make(map[recordlog.SegmentID]SegmentLiveStats),
+		liveReady:           root.Root() == 0,
 	}, nil
+}
+
+func (m *Persistent) InitializeLiveStats(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.RLock()
+	if m.liveReady {
+		m.mu.RUnlock()
+		return nil
+	}
+	root, owner, epoch := m.root, m.owner, m.epoch
+	owner.readers.Add(1)
+	m.mu.RUnlock()
+	live := make(map[recordlog.SegmentID]SegmentLiveStats)
+	err := root.WalkRefs(ctx, func(_ model.ID, ref recordlog.RecordRef) error {
+		return addLiveRef(live, ref, root.Covered())
+	})
+	m.releaseRoot(owner)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.epoch != epoch || m.root != root || m.owner != owner || m.covered != root.Covered() {
+		return ErrStalePlan
+	}
+	m.live = live
+	m.liveReady = true
+	return nil
 }
 
 func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, uint64, error) {
@@ -118,20 +152,24 @@ func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, uint64, err
 }
 
 func (m *Persistent) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
+	ref, exists, err := m.LookupRef(id)
+	return ref.Addr, exists, err
+}
+
+func (m *Persistent) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
 	if id == 0 {
-		return 0, false, ErrInvalid
+		return recordlog.RecordRef{}, false, ErrInvalid
 	}
 	m.mu.RLock()
 	if value, found := lookupLayers(m.active, m.frozen, id); found {
 		m.mu.RUnlock()
-		return value.addr, value.exists, nil
+		return value.ref, value.exists, nil
 	}
 	root, owner := m.root, m.owner
 	owner.readers.Add(1)
 	m.mu.RUnlock()
 	defer m.releaseRoot(owner)
-	addr, exists, err := root.Lookup(id)
-	return addr, exists, err
+	return root.LookupRef(id)
 }
 
 func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
@@ -167,14 +205,14 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 		}
 		m.mu.RUnlock()
 		for _, id := range misses {
-			addr, exists, err := root.Lookup(id)
+			ref, exists, err := root.LookupRef(id)
 			if err != nil {
 				m.releaseRoot(owner)
 				return GroupPlan{}, err
 			}
 			value := persistentDelta{exists: exists}
 			if exists {
-				value.addr = addr
+				value.ref = ref
 			}
 			values[id] = value
 		}
@@ -185,9 +223,9 @@ func (m *Persistent) ResolveGroup(proposals []Proposal) (GroupPlan, error) {
 		if !stable {
 			continue
 		}
-		plan, err := resolveGroupAt(base, proposals, func(id model.ID) (recordlog.VAddr, bool, error) {
+		plan, err := resolveGroupAt(base, proposals, func(id model.ID) (recordlog.RecordRef, bool, error) {
 			value := values[id]
-			return value.addr, value.exists, nil
+			return value.ref, value.exists, nil
 		})
 		if err == nil {
 			assignDeltaEntries(&plan, active)
@@ -205,6 +243,9 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan, reserva
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.liveReady {
+		return PublishResult{}, ErrCorrupt
+	}
 	if plan.BaseCommitSeq != m.covered {
 		return PublishResult{}, ErrStalePlan
 	}
@@ -244,6 +285,9 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan, reserva
 	if m.active.charge > math.MaxUint64-charged {
 		return PublishResult{}, ErrCorrupt
 	}
+	if err := applyPlanLiveStats(m.live, first, plan); err != nil {
+		return PublishResult{}, err
+	}
 	// Consume every reservation before changing the visible Delta. An invariant
 	// failure must not leave a partially published durable commit group.
 	for _, proposal := range plan.Proposals {
@@ -258,7 +302,7 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan, reserva
 			if resolved.Change.Operation == OperationDelete {
 				m.active.values[resolved.Change.RecordID] = persistentDelta{}
 			} else {
-				m.active.values[resolved.Change.RecordID] = persistentDelta{addr: resolved.Change.NewAddr, exists: true}
+				m.active.values[resolved.Change.RecordID] = persistentDelta{ref: resolved.Change.NewRef, exists: true}
 			}
 			result.Applied++
 		}
@@ -275,12 +319,19 @@ func (m *Persistent) CoveredCommitSeq() model.CommitSeq {
 	return m.covered
 }
 
+func (m *Persistent) LiveStats() map[recordlog.SegmentID]SegmentLiveStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return cloneLiveStats(m.live)
+}
+
 type FrozenCheckpoint struct {
 	owner   *Persistent
 	id      uint64
 	base    *radix.Tree
 	covered model.CommitSeq
 	layers  []*deltaLayer
+	live    map[recordlog.SegmentID]SegmentLiveStats
 }
 
 // PressureGeneration identifies the active Delta generation covered by this
@@ -324,6 +375,13 @@ type CheckpointCandidate struct {
 	entryDelta radix.EntryDelta
 }
 
+func (c CheckpointCandidate) LiveStats() map[recordlog.SegmentID]SegmentLiveStats {
+	if c.checkpoint == nil {
+		return nil
+	}
+	return cloneLiveStats(c.checkpoint.live)
+}
+
 func (c CheckpointCandidate) Root() model.MapAddr               { return c.root }
 func (c CheckpointCandidate) CoveredCommitSeq() model.CommitSeq { return c.covered }
 
@@ -355,16 +413,21 @@ func (c CheckpointCandidate) EntryCount(base uint64) (uint64, error) {
 }
 
 func (c CheckpointCandidate) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
+	ref, exists, err := c.LookupRef(id)
+	return ref.Addr, exists, err
+}
+
+func (c CheckpointCandidate) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
 	if c.tree == nil {
-		return 0, false, ErrInvalid
+		return recordlog.RecordRef{}, false, ErrInvalid
 	}
-	return c.tree.Lookup(id)
+	return c.tree.LookupRef(id)
 }
 
 // WalkChanges visits the folded base-to-candidate transition once per changed
 // ID. It reads old values only from the immutable base root and never observes
 // commits published after the checkpoint cut.
-func (c CheckpointCandidate) WalkChanges(ctx context.Context, visit func(model.ID, recordlog.VAddr, bool, recordlog.VAddr, bool) error) error {
+func (c CheckpointCandidate) WalkChanges(ctx context.Context, visit func(model.ID, recordlog.RecordRef, bool, recordlog.RecordRef, bool) error) error {
 	if c.checkpoint == nil || c.checkpoint.base == nil || c.tree == nil || visit == nil {
 		return ErrInvalid
 	}
@@ -375,15 +438,15 @@ func (c CheckpointCandidate) WalkChanges(ctx context.Context, visit func(model.I
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		oldAddr, oldExists, err := c.checkpoint.base.Lookup(change.ID)
+		oldRef, oldExists, err := c.checkpoint.base.LookupRef(change.ID)
 		if err != nil {
 			return err
 		}
-		newExists := change.Addr != 0
-		if oldExists == newExists && (!oldExists || oldAddr == change.Addr) {
+		newExists := !change.Ref.IsZero()
+		if oldExists == newExists && (!oldExists || oldRef == change.Ref) {
 			continue
 		}
-		if err := visit(change.ID, oldAddr, oldExists, change.Addr, newExists); err != nil {
+		if err := visit(change.ID, oldRef, oldExists, change.Ref, newExists); err != nil {
 			return err
 		}
 	}
@@ -395,6 +458,13 @@ func (c CheckpointCandidate) Walk(ctx context.Context, visit func(model.ID, reco
 		return ErrInvalid
 	}
 	return c.tree.Walk(ctx, visit)
+}
+
+func (c CheckpointCandidate) WalkRefs(ctx context.Context, visit func(model.ID, recordlog.RecordRef) error) error {
+	if c.tree == nil {
+		return ErrInvalid
+	}
+	return c.tree.WalkRefs(ctx, visit)
 }
 
 func (m *Persistent) Freeze(expected model.CommitSeq) (*FrozenCheckpoint, error) {
@@ -412,7 +482,7 @@ func (m *Persistent) Freeze(expected model.CommitSeq) (*FrozenCheckpoint, error)
 	m.inCheckpoint = true
 	m.epoch++
 	layers := append([]*deltaLayer(nil), m.frozen...)
-	return &FrozenCheckpoint{owner: m, id: m.checkpointID, base: m.root, covered: expected, layers: layers}, nil
+	return &FrozenCheckpoint{owner: m, id: m.checkpointID, base: m.root, covered: expected, layers: layers, live: cloneLiveStats(m.live)}, nil
 }
 
 func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCandidate, error) {
@@ -444,7 +514,7 @@ func (m *Persistent) BuildCheckpoint(checkpoint *FrozenCheckpoint) (CheckpointCa
 	mutations := make([]radix.Mutation, 0, total)
 	for _, layer := range checkpoint.layers {
 		for id, value := range layer.values {
-			mutations = append(mutations, radix.Mutation{ID: id, Addr: value.addr})
+			mutations = append(mutations, radix.Mutation{ID: id, Ref: value.ref})
 		}
 	}
 	sort.SliceStable(mutations, func(i, j int) bool { return mutations[i].ID < mutations[j].ID })
@@ -560,6 +630,17 @@ func (v CheckpointView) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 	return v.tree.Lookup(id)
 }
 
+func (v CheckpointView) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
+	if v.owner == nil || v.rootOwner == nil || v.tree == nil {
+		return recordlog.RecordRef{}, false, ErrInvalid
+	}
+	if !v.pin() {
+		return recordlog.RecordRef{}, false, ErrStalePlan
+	}
+	defer v.owner.releaseRoot(v.rootOwner)
+	return v.tree.LookupRef(id)
+}
+
 func (v CheckpointView) Walk(ctx context.Context, visit func(model.ID, recordlog.VAddr) error) error {
 	if v.owner == nil || v.rootOwner == nil || v.tree == nil {
 		return ErrInvalid
@@ -569,6 +650,17 @@ func (v CheckpointView) Walk(ctx context.Context, visit func(model.ID, recordlog
 	}
 	defer v.owner.releaseRoot(v.rootOwner)
 	return v.tree.Walk(ctx, visit)
+}
+
+func (v CheckpointView) WalkRefs(ctx context.Context, visit func(model.ID, recordlog.RecordRef) error) error {
+	if v.owner == nil || v.rootOwner == nil || v.tree == nil {
+		return ErrInvalid
+	}
+	if !v.pin() {
+		return ErrStalePlan
+	}
+	defer v.owner.releaseRoot(v.rootOwner)
+	return v.tree.WalkRefs(ctx, visit)
 }
 
 func (v CheckpointView) pin() bool {
@@ -655,10 +747,8 @@ func proposalReadSet(proposals []Proposal) []model.ID {
 		for _, condition := range proposal.Conditions {
 			set[condition.RecordID] = struct{}{}
 		}
-		if proposal.Kind == ProposalRelocation {
-			for _, change := range proposal.Changes {
-				set[change.RecordID] = struct{}{}
-			}
+		for _, change := range proposal.Changes {
+			set[change.RecordID] = struct{}{}
 		}
 	}
 	ids := make([]model.ID, 0, len(set))
