@@ -216,57 +216,6 @@ func (l *Log) Read(ctx context.Context, addr VAddr) ([]byte, error) {
 	return payload, errors.Join(readErr, releaseErr)
 }
 
-// Inspect returns structural metadata and only the requested payload prefix.
-// Persisted records have their physical header validated; the full payload CRC
-// is deliberately not read or validated.
-func (l *Log) Inspect(ctx context.Context, addr VAddr, prefixBytes uint32) (RecordMetadata, []byte, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return RecordMetadata{}, nil, err
-	}
-	if !addr.Valid() {
-		return RecordMetadata{}, nil, ErrInvalidVAddr
-	}
-	l.submitMu.RLock()
-	closed := l.closing
-	l.submitMu.RUnlock()
-	l.stateMu.RLock()
-	terminal := l.terminal
-	if terminal != nil {
-		l.stateMu.RUnlock()
-		return RecordMetadata{}, nil, terminal
-	}
-	if closed {
-		l.stateMu.RUnlock()
-		return RecordMetadata{}, nil, ErrClosed
-	}
-	if payload, exists := l.pending[addr]; exists {
-		if prefixBytes > uint32(len(payload)) {
-			l.stateMu.RUnlock()
-			return RecordMetadata{}, nil, ErrCorrupt
-		}
-		physical, err := PhysicalRecordSize(uint64(len(payload)))
-		if err != nil || !addr.MatchesPhysicalSize(physical) {
-			l.stateMu.RUnlock()
-			return RecordMetadata{}, nil, errors.Join(ErrCorrupt, err)
-		}
-		metadata := RecordMetadata{PhysicalSize: physical, PayloadSize: uint32(len(payload)), Addr: addr}
-		prefix := append([]byte(nil), payload[:prefixBytes]...)
-		l.stateMu.RUnlock()
-		return metadata, prefix, nil
-	}
-	l.stateMu.RUnlock()
-	pin, err := l.registry.pin(addr.SegmentID())
-	if err != nil {
-		return RecordMetadata{}, nil, err
-	}
-	header, prefix, inspectErr := pin.inspect(addr, prefixBytes)
-	releaseErr := pin.release()
-	return RecordMetadata{PhysicalSize: header.PhysicalSize, PayloadSize: header.PayloadSize, Addr: header.Addr}, prefix, errors.Join(inspectErr, releaseErr)
-}
-
 func (l *Log) Scan(ctx context.Context, from LogPos, visit func(AppendResult, []byte) error) error {
 	if ctx == nil {
 		ctx = context.Background()

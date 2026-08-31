@@ -140,18 +140,40 @@ func RecoveryArtifacts(root string) (bool, error) {
 }
 
 func valid(state State) bool {
-	if state.Phase < PhaseReserved || state.Phase > PhaseInputsRetired || state.StoreUUID == (storecatalog.StoreUUID{}) || state.LogID == (recordlog.LogID{}) || state.BaseGeneration == 0 || len(state.Inputs) == 0 {
+	if state.Phase < PhaseReserved || state.Phase > PhaseInputsRetired || state.StoreUUID == (storecatalog.StoreUUID{}) || state.LogID == (recordlog.LogID{}) || state.BaseGeneration == 0 ||
+		len(state.Inputs) == 0 || len(state.OutputIDs) != len(state.Inputs) || state.Phase == PhaseReserved && len(state.Outputs) != 0 || len(state.Outputs) > len(state.OutputIDs) {
 		return false
+	}
+	var previousInput recordlog.SegmentID
+	for _, input := range state.Inputs {
+		if !validSummary(input) || input.SegmentID <= previousInput {
+			return false
+		}
+		previousInput = input.SegmentID
 	}
 	for index, id := range state.OutputIDs {
 		if !recordlog.IsCompactionSegment(id) || index != 0 && id != state.OutputIDs[index-1]+1 {
 			return false
 		}
 	}
-	if len(state.OutputIDs) == 0 && len(state.Outputs) != 0 {
-		return false
+	for index, output := range state.Outputs {
+		if !validSummary(output) || output.SegmentID != state.OutputIDs[index] {
+			return false
+		}
 	}
 	return true
+}
+
+func validSummary(summary recordlog.SegmentSummary) bool {
+	if summary.SegmentID == 0 || summary.ValidEnd < recordlog.SegmentHeaderSize || summary.ValidEnd&uint32(recordlog.RecordAlignment-1) != 0 {
+		return false
+	}
+	if summary.RecordCount == 0 {
+		return summary.ValidEnd == recordlog.SegmentHeaderSize && summary.FirstAddr == 0 && summary.LastAddr == 0
+	}
+	return summary.FirstAddr.Valid() && summary.LastAddr.Valid() &&
+		summary.FirstAddr.SegmentID() == summary.SegmentID && summary.LastAddr.SegmentID() == summary.SegmentID &&
+		summary.FirstAddr <= summary.LastAddr && summary.LastAddr.Offset() < summary.ValidEnd
 }
 
 func syncDir(path string) error {

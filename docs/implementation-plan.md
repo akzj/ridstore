@@ -155,9 +155,9 @@ Checkpoint 最终流程是 `Manifest durable -> release manifest installer -> pu
 7. atomic Mapping State/Publish；
 8. checkpoint overlay cut；
 9. bottom-up COW builder 与 occupancy 编码选择；
-10. base→cut-final SegmentStats builder、批量 Header validation 和 exact Stats codec；
+10. RecordRef exact live accounting、Checkpoint stats snapshot 和 exact Stats codec；
 11. Mapping Segment rotation journal + files fsync + Manifest Root/Stats 同代安装；
-12. Recovery from Root/Stats Base + replay Delta additions；
+12. Recovery 从 Root 重建 live stats，再应用 replay ref transitions；
 13. active+all frozen Delta limits/backpressure；
 14. Mapping GC。
 
@@ -167,7 +167,7 @@ Checkpoint 最终流程是 `Manifest durable -> release manifest installer -> pu
 
 模块/提交顺序：
 
-1. 基于 `LiveUpperBytes` 的候选选择和统计可观测性；
+1. 基于 checkpoint exact live bytes 的候选选择和统计可观测性；
 2. Reader pin/Retire state machine；
 3. GC candidate selection（Stats 不得授权删除）；
 4. live Record copy；

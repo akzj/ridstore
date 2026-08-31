@@ -118,6 +118,22 @@ func (w *CompactionWriter) Finish() ([]SegmentSummary, error) {
 	return append([]SegmentSummary(nil), w.summaries...), nil
 }
 
+// Abort releases the writer's unpublished active descriptor. Sealed outputs
+// have already transferred ownership to closed descriptors and are removed by
+// RemoveUnpublishedCompactionFiles after Abort returns.
+func (w *CompactionWriter) Abort() error {
+	if w == nil || w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.active == nil {
+		return nil
+	}
+	err := w.active.close()
+	w.active = nil
+	return err
+}
+
 func (l *Log) RegisterCompactionOutputs(summaries []SegmentSummary) error {
 	if l == nil || len(summaries) == 0 {
 		return ErrInvalidConfig

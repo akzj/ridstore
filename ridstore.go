@@ -114,10 +114,6 @@ func (s *Store) Metrics() Metrics {
 		BackgroundCheckpointRequested: current.BackgroundCheckpointRequested,
 		BackgroundCheckpointCompleted: current.BackgroundCheckpointCompleted,
 		BackgroundCheckpointFailed:    current.BackgroundCheckpointFailed,
-		RecordMetaCacheHits:           current.RecordMetaCacheHits,
-		RecordMetaCacheMisses:         current.RecordMetaCacheMisses,
-		RecordMetaCacheEntries:        current.RecordMetaCacheEntries,
-		RecordMetaCacheEvictions:      current.RecordMetaCacheEvictions,
 	}
 }
 

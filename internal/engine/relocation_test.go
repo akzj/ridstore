@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/compactionstate"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -236,6 +237,39 @@ func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
 	}
 }
 
+func TestCompactSegmentRejectsOpenBatchReferenceBeforeJournal(t *testing.T) {
+	store := newRelocationStore(t)
+	pending, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.Create(context.Background(), []byte("open-before-rotation")); err != nil {
+		t.Fatal(err)
+	}
+	source := store.catalog.Snapshot().ActiveDataSegmentID
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("compact err=%v", err)
+	}
+	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
+		t.Fatalf("compaction marker found=%v err=%v", found, err)
+	}
+	if err := pending.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
 	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true})
@@ -259,6 +293,7 @@ func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 
 func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.T) {
 	store := newRelocationStore(t)
+	store.maxRelocationMutations = 1
 	bySegment := make(map[recordlog.SegmentID][]model.ID)
 	for store.catalog.Snapshot().ActiveDataSegmentID < 4 {
 		batch, err := store.Begin(context.Background())
@@ -303,6 +338,10 @@ func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.
 	if len(result.Candidate.Sources) != 2 || result.Candidate.Sources[0].SegmentID != 1 || result.Candidate.Sources[1].SegmentID != 2 {
 		t.Fatalf("candidate=%+v", result.Candidate)
 	}
+	if result.Compaction.Relocation.Applied < 2 ||
+		uint64(result.Compaction.Relocation.LastCommitSeq-result.Compaction.Relocation.FirstCommitSeq)+1 != result.Compaction.Relocation.Applied {
+		t.Fatalf("compaction output was not published in bounded batches: %+v", result.Compaction.Relocation)
+	}
 	manifest := store.catalog.Snapshot()
 	if containsSegmentID(manifest.SealedDataSegments, 1) || containsSegmentID(manifest.SealedDataSegments, 2) {
 		t.Fatal("adjacent inputs were not retired atomically")
@@ -312,6 +351,57 @@ func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.
 		if err != nil || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
 			t.Fatalf("segment=%d record=%+v err=%v", segment, record, err)
 		}
+	}
+}
+
+func TestCompactSegmentPacesBeforePublishingOutputs(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	store.maxRelocationBytes = 1
+	store.gcBytesPerSecond.Store(1)
+	now := time.Unix(100, 0)
+	store.gcNow = func() time.Time { return now }
+	var waits int
+	store.gcWait = func(_ context.Context, delay time.Duration) error {
+		waits++
+		for _, segment := range store.catalog.Snapshot().SealedDataSegments {
+			if recordlog.IsCompactionSegment(segment.SegmentID) {
+				t.Fatal("compaction output was published before copy pacing")
+			}
+		}
+		now = now.Add(delay)
+		return nil
+	}
+	if _, err := store.CompactSegment(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	if waits == 0 {
+		t.Fatal("compaction copy was not paced")
+	}
+}
+
+func TestCompactSegmentCancellationBeforeOutputPublicationRollsBack(t *testing.T) {
+	store, source, id, oldAddr, _ := relocationFixture(t)
+	store.maxRelocationBytes = 1
+	store.gcBytesPerSecond.Store(1)
+	store.gcNow = func() time.Time { return time.Unix(100, 0) }
+	store.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
+	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, context.Canceled) {
+		t.Fatalf("compact err=%v", err)
+	}
+	if store.fault != nil {
+		t.Fatalf("recoverable cancellation faulted store: %v", store.fault)
+	}
+	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
+		t.Fatalf("compaction marker found=%v err=%v", found, err)
+	}
+	for _, segment := range store.catalog.Snapshot().SealedDataSegments {
+		if recordlog.IsCompactionSegment(segment.SegmentID) {
+			t.Fatalf("unpublished output remains in Catalog: %d", segment.SegmentID)
+		}
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || record.Addr != oldAddr {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }
 

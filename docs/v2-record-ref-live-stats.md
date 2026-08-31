@@ -4,11 +4,8 @@
 
 ## 1. 目标
 
-当前 Mapping 保存 `RecordID -> VAddr`。`VAddr` 低三位只是 size class，不能恢复精确
-`PhysicalSize`；因此 Mapping 更新时无法直接增减 Segment live bytes，Checkpoint 需要通过
-`RecordLog.Inspect` 读取 Record Header。
-
-本变更把唯一运行格式直接升级为：
+旧 Mapping 只保存 `RecordID -> VAddr`。`VAddr` 低三位只是 size class，不能恢复精确
+`PhysicalSize`，导致 Checkpoint 需要随机读取 Record Header。当前唯一运行格式已升级为：
 
 ```text
 RecordID -> RecordRef{VAddr, PhysicalSize}
@@ -129,6 +126,11 @@ output seal + fsync
 `journal/DATA-COMPACTION.v3` 记录 reserved、outputs-published、inputs-retired 三个恢复阶段。重启时：未发布
 输出直接清理；已发布输出会根据 RecordID 重新建立 bounded relocation CAS；已移除输入只补做物理清理。
 所有步骤均以 Catalog membership 判定方向，不依赖不可靠的进程内状态。
+
+复制阶段按 `GCBytesPerSecond` 分块节流，避免先突发写完整组、再在 CAS 阶段补偿等待。output 发布后会被
+顺序重扫，并按 `GCBatchBytes` / `GCBatchMutations` 生成有界 relocation batch；正常执行与恢复都不在
+内存中保留整组 live-record 索引。高位 output 地址的持久化先后由 Catalog membership 与完整 Record
+身份校验证明，不能使用面向普通 append Segment 的 VAddr 数值顺序判断。
 
 ## 8. 实施阶段
 

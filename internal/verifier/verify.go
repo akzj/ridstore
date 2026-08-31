@@ -233,9 +233,9 @@ func VerifyHeld(ctx context.Context, root string, config Config) (report Report,
 	if maxStats == 0 {
 		maxStats = 1
 	}
-	stats, err := segmentstats.Build(ctx, tree, dataReader, nil, segmentstats.FileSet{
+	stats, err := segmentstats.Build(ctx, tree, segmentstats.FileSet{
 		Active: manifest.ActiveDataSegmentID, Sealed: manifest.SealedDataSegments,
-	}, manifest.HardLimits.MaxValueSize, maxStats)
+	}, maxStats)
 	if err != nil {
 		return report, classify(err)
 	}

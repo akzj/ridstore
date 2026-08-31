@@ -121,18 +121,6 @@ func TestCreateRejectsUncheckpointableDeltaBudgetBeforeBootstrap(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsUnrepresentableRecordMetaCacheBeforeBootstrap(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "store")
-	config := testCreateConfig()
-	config.Runtime.RecordMetaCacheEntries = ^uint64(0)
-	if _, err := Create(context.Background(), root, config); !errors.Is(err, base.ErrInvalidConfig) {
-		t.Fatalf("create err=%v", err)
-	}
-	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("invalid create changed root err=%v", err)
-	}
-}
-
 func TestCreateRejectsStatusRetentionBelowOpenLimitBeforeBootstrap(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
@@ -411,10 +399,9 @@ func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
 	}
 }
 
-func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T) {
+func TestIncrementalCheckpointUsesRecordRefs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.RecordMetaCacheEntries = 64
 	store, err := Create(context.Background(), root, config)
 	if err != nil {
 		t.Fatal(err)
@@ -430,14 +417,8 @@ func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T
 	if _, err := batch.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 1 || metrics.RecordMetaCacheHits != 0 {
-		t.Fatalf("warm put metrics=%+v", metrics)
-	}
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheHits != 0 || metrics.RecordMetaCacheMisses != 0 {
-		t.Fatalf("warm checkpoint metrics=%+v", metrics)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -450,9 +431,6 @@ func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T
 	defer store.Close()
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 0 || metrics.RecordMetaCacheMisses != 0 {
-		t.Fatalf("cold checkpoint metrics=%+v", metrics)
 	}
 	if _, err := store.Get(context.Background(), id); err != nil {
 		t.Fatal(err)
@@ -469,9 +447,6 @@ func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T
 	}
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 2 || metrics.RecordMetaCacheHits != 0 || metrics.RecordMetaCacheMisses != 0 {
-		t.Fatalf("read-warmed checkpoint metrics=%+v", metrics)
 	}
 }
 

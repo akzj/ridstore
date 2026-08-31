@@ -20,7 +20,6 @@ import (
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
-	"github.com/akzj/ridstore/internal/recordmeta"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
 )
@@ -28,7 +27,6 @@ import (
 type Log interface {
 	coordinator.Appender
 	Read(context.Context, recordlog.VAddr) ([]byte, error)
-	Inspect(context.Context, recordlog.VAddr, uint32) (recordlog.RecordMetadata, []byte, error)
 	Close() error
 }
 
@@ -130,7 +128,6 @@ type Store struct {
 	identity                    [16]byte
 	space                       *spaceGate
 	metrics                     runtimeMetrics
-	recordMeta                  *recordmeta.Cache
 	gcStability                 gcStability
 	checkpointRequests          chan struct{}
 	checkpointStop              chan struct{}
@@ -339,10 +336,6 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 			corrupt := errors.Join(base.ErrCorrupt, err)
 			s.setFault(corrupt)
 			return Record{}, corrupt
-		}
-		physical, sizeErr := recordlog.PhysicalRecordSize(uint64(len(payload)))
-		if sizeErr == nil {
-			s.recordMeta.Remember(addr, id, physical)
 		}
 		return Record{Value: put.Value, Addr: addr}, nil
 	}

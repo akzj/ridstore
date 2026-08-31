@@ -7,8 +7,6 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/compactionstate"
-	"github.com/akzj/ridstore/internal/model"
-	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
@@ -88,66 +86,8 @@ func equalSegmentSummaries(left, right []recordlog.SegmentSummary) bool {
 }
 
 func (s *Store) resumeCompaction(ctx context.Context, state compactionstate.State) error {
-	outputByID := make(map[model.ID]recordlog.RecordRef)
-	for _, output := range state.Outputs {
-		if err := s.maintenance.ScanSegment(ctx, output.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
-			typ, err := recordcodec.TypeOf(payload)
-			if err != nil {
-				return errors.Join(base.ErrCorrupt, err)
-			}
-			if typ != recordcodec.RecordTypePut {
-				return errors.Join(base.ErrCorrupt, errors.New("non-put record in compaction output"))
-			}
-			put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
-			if err != nil {
-				return errors.Join(base.ErrCorrupt, err)
-			}
-			if _, duplicate := outputByID[put.RecordID]; duplicate {
-				return errors.Join(base.ErrCorrupt, errors.New("duplicate compaction output record"))
-			}
-			ref, err := scanned.Ref()
-			if err != nil {
-				return err
-			}
-			outputByID[put.RecordID] = ref
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	var pending []copiedRecord
-	for _, input := range state.Inputs {
-		if err := s.maintenance.ScanSegment(ctx, input.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
-			typ, err := recordcodec.TypeOf(payload)
-			if err != nil {
-				return errors.Join(base.ErrCorrupt, err)
-			}
-			if typ != recordcodec.RecordTypePut {
-				return nil
-			}
-			put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
-			if err != nil {
-				return errors.Join(base.ErrCorrupt, err)
-			}
-			current, exists, err := s.mapping.LookupRef(put.RecordID)
-			if err != nil {
-				return err
-			}
-			if !exists || current.Addr != scanned.Addr {
-				return nil
-			}
-			ref, ok := outputByID[put.RecordID]
-			if !ok {
-				return errors.Join(base.ErrCorrupt, errors.New("live input absent from compaction output"))
-			}
-			pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: scanned.Addr, newRef: ref, valueBytes: uint64(len(put.Value))})
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
 	var relocated SegmentRelocationResult
-	if err := s.publishCopiedRecords(ctx, pending, &relocated, s.gcBytesPerSecond.Load()); err != nil {
+	if err := s.publishCompactionOutputs(ctx, state.Inputs, state.Outputs, &relocated); err != nil {
 		return err
 	}
 	proofs, err := s.checkpointAndProveRetirements(ctx, state.Inputs, relocated.LastCommitSeq)

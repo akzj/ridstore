@@ -4,27 +4,25 @@ package ridstore
 // current process lifetime; gauges describe the instant at which they were
 // sampled. Metrics never authorize recovery, checkpoint, or GC decisions.
 type Metrics struct {
-	CommitQueued, CommitGroups, GroupBatches         uint64
-	Committed, Aborted, Conflicts, CommitUnknown     uint64
-	QueueWaitNanos, ValidationNanos                  uint64
-	WriteSyncNanos, PublishNanos                     uint64
-	DeltaChargedBytes, DeltaReservedBytes            uint64
-	DeltaSoftLimitBytes, DeltaHardLimitBytes         uint64
-	MappingCacheBytes                                uint64
-	DiskAvailableEstimateBytes, WriteStopFreeBytes   uint64
-	WriteStopped                                     uint64
-	WriteStopRejections, DiskSpaceCheckErrors        uint64
-	GCStarted, GCCompleted, GCFailed                 uint64
-	GCNoCandidate                                    uint64
-	GCCopiedBytes, GCReclaimedBytes                  uint64
-	GCRelocated, GCSkipped, GCDurationNanos          uint64
-	GCThrottledNanos, GCSpaceRejections              uint64
-	GCMinFreeBytes, GCBytesPerSecond                 uint64
-	BackgroundCheckpointRequested                    uint64
-	BackgroundCheckpointCompleted                    uint64
-	BackgroundCheckpointFailed                       uint64
-	RecordMetaCacheHits, RecordMetaCacheMisses       uint64
-	RecordMetaCacheEntries, RecordMetaCacheEvictions uint64
+	CommitQueued, CommitGroups, GroupBatches       uint64
+	Committed, Aborted, Conflicts, CommitUnknown   uint64
+	QueueWaitNanos, ValidationNanos                uint64
+	WriteSyncNanos, PublishNanos                   uint64
+	DeltaChargedBytes, DeltaReservedBytes          uint64
+	DeltaSoftLimitBytes, DeltaHardLimitBytes       uint64
+	MappingCacheBytes                              uint64
+	DiskAvailableEstimateBytes, WriteStopFreeBytes uint64
+	WriteStopped                                   uint64
+	WriteStopRejections, DiskSpaceCheckErrors      uint64
+	GCStarted, GCCompleted, GCFailed               uint64
+	GCNoCandidate                                  uint64
+	GCCopiedBytes, GCReclaimedBytes                uint64
+	GCRelocated, GCSkipped, GCDurationNanos        uint64
+	GCThrottledNanos, GCSpaceRejections            uint64
+	GCMinFreeBytes, GCBytesPerSecond               uint64
+	BackgroundCheckpointRequested                  uint64
+	BackgroundCheckpointCompleted                  uint64
+	BackgroundCheckpointFailed                     uint64
 }
 
 type MetricKind uint8
@@ -34,7 +32,7 @@ const (
 	MetricGauge
 )
 
-const MetricSampleCount = 41
+const MetricSampleCount = 37
 
 type MetricSample struct {
 	Name  string
@@ -80,10 +78,6 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_background_checkpoint_requested_total", MetricCounter, m.BackgroundCheckpointRequested},
 		MetricSample{"ridstore_background_checkpoint_completed_total", MetricCounter, m.BackgroundCheckpointCompleted},
 		MetricSample{"ridstore_background_checkpoint_failed_total", MetricCounter, m.BackgroundCheckpointFailed},
-		MetricSample{"ridstore_record_meta_cache_hits_total", MetricCounter, m.RecordMetaCacheHits},
-		MetricSample{"ridstore_record_meta_cache_misses_total", MetricCounter, m.RecordMetaCacheMisses},
-		MetricSample{"ridstore_record_meta_cache_entries", MetricGauge, m.RecordMetaCacheEntries},
-		MetricSample{"ridstore_record_meta_cache_evictions_total", MetricCounter, m.RecordMetaCacheEvictions},
 		MetricSample{"ridstore_gc_bytes_per_second", MetricGauge, m.GCBytesPerSecond},
 	)
 }

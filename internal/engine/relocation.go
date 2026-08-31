@@ -226,6 +226,13 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 			return result, recordlog.ErrSegmentMissing
 		}
 	}
+	excluded, err := s.openBatchSegmentReferences(inputs)
+	if err != nil {
+		return result, err
+	}
+	if len(excluded) != 0 {
+		return result, base.ErrConflict
+	}
 	space, err := s.reserveGCCopies(ctx, manifest, inputs)
 	if err != nil {
 		return result, err
@@ -243,12 +250,34 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	if err := compactionstate.Install(s.root, state); err != nil {
 		return result, errors.Join(base.ErrRecoveryRequired, err)
 	}
+	rollbackUnpublished := func(writer *recordlog.CompactionWriter, cause error) error {
+		cleanupErr := errors.Join(writer.Abort(), s.maintenance.RemoveUnpublishedCompactionFiles(outputIDs))
+		if cleanupErr == nil {
+			cleanupErr = compactionstate.Remove(s.root)
+		}
+		if cleanupErr != nil {
+			return s.compactionFailure(errors.Join(cause, cleanupErr))
+		}
+		return cause
+	}
 
 	writer, err := s.maintenance.NewCompactionWriter(outputIDs)
 	if err != nil {
-		return result, s.compactionFailure(err)
+		return result, rollbackUnpublished(nil, err)
 	}
-	pending := make([]copiedRecord, 0)
+	copyPacer := s.newGCPacer(rate)
+	var unpacedBytes uint64
+	paceCopy := func(force bool) error {
+		if unpacedBytes == 0 || !force && unpacedBytes < s.maxRelocationBytes {
+			return nil
+		}
+		waited, paceErr := copyPacer.pace(ctx, unpacedBytes)
+		if waited > 0 {
+			s.metrics.gcThrottledNanos.Add(uint64(waited))
+		}
+		unpacedBytes = 0
+		return paceErr
+	}
 	for _, input := range inputs {
 		err = s.maintenance.ScanSegment(ctx, input.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
 			result.Relocation.ScannedRecords++
@@ -276,24 +305,28 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 			if appendErr != nil {
 				return appendErr
 			}
-			ref, refErr := copied.Ref()
-			if refErr != nil {
-				return errors.Join(base.ErrCorrupt, refErr)
-			}
-			pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: scanned.Addr, newRef: ref, valueBytes: uint64(len(put.Value))})
 			physical := uint64(copied.End.Offset - copied.Addr.Offset())
+			if result.Relocation.CopiedPhysicalBytes > math.MaxUint64-physical ||
+				result.Relocation.CopiedValueBytes > math.MaxUint64-uint64(len(put.Value)) ||
+				unpacedBytes > math.MaxUint64-physical {
+				return base.ErrOverflow
+			}
 			result.Relocation.CopiedRecords++
 			result.Relocation.CopiedPhysicalBytes += physical
 			result.Relocation.CopiedValueBytes += uint64(len(put.Value))
-			return nil
+			unpacedBytes += physical
+			return paceCopy(false)
 		})
 		if err != nil {
-			return result, s.compactionFailure(err)
+			return result, rollbackUnpublished(writer, err)
 		}
+	}
+	if err = paceCopy(true); err != nil {
+		return result, rollbackUnpublished(writer, err)
 	}
 	outputs, err := writer.Finish()
 	if err != nil {
-		return result, s.compactionFailure(err)
+		return result, rollbackUnpublished(writer, err)
 	}
 	state.Outputs = outputs
 	result.Outputs = append([]recordlog.SegmentSummary(nil), outputs...)
@@ -310,7 +343,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 		return result, s.compactionFailure(err)
 	}
 
-	if err = s.publishCopiedRecords(ctx, pending, &result.Relocation, rate); err != nil {
+	if err = s.publishCompactionOutputs(ctx, inputs, outputs, &result.Relocation); err != nil {
 		return result, s.compactionFailure(err)
 	}
 	proofs, err := s.checkpointAndProveRetirements(ctx, inputs, result.Relocation.LastCommitSeq)
@@ -389,8 +422,7 @@ func (s *Store) compactionFailure(err error) error {
 	return result
 }
 
-func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord, result *SegmentRelocationResult, rate uint64) error {
-	pacer := s.newGCPacer(rate)
+func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord, result *SegmentRelocationResult) error {
 	for len(copied) != 0 {
 		count, bytes := 0, uint64(0)
 		maxCount := min(len(copied), int(min(s.limits.MaxBatchMutations, s.maxRelocationMutations)))
@@ -405,10 +437,8 @@ func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord,
 		batch := copied[:count]
 		sort.Slice(batch, func(i, j int) bool { return batch[i].id < batch[j].id })
 		changes := make([]mapping.Change, len(batch))
-		var physical uint64
 		for i, item := range batch {
 			changes[i] = mapping.Change{RecordID: item.id, ExpectedOldAddr: item.oldAddr, NewRef: item.newRef, Operation: mapping.OperationRelocate}
-			physical += uint64(item.newRef.PhysicalSize)
 		}
 		rawBatchID, err := s.batches.Allocate(ctx)
 		if err != nil {
@@ -424,16 +454,81 @@ func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord,
 		result.LastCommitSeq = published.CommitSeq
 		result.Applied += uint64(published.Applied)
 		result.Skipped += uint64(published.Skipped)
-		waited, err := pacer.pace(ctx, physical)
-		if waited > 0 {
-			s.metrics.gcThrottledNanos.Add(uint64(waited))
-		}
-		if err != nil {
-			return err
-		}
 		copied = copied[count:]
 	}
 	return nil
+}
+
+// publishCompactionOutputs reconstructs relocation proposals from immutable
+// output records in bounded batches. A current ref in one of the input
+// segments is the exact CAS source; refs already moved by an earlier recovery
+// attempt or by a user update need no proposal.
+func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []recordlog.SegmentSummary, result *SegmentRelocationResult) error {
+	inputIDs := make(map[recordlog.SegmentID]struct{}, len(inputs))
+	for _, input := range inputs {
+		inputIDs[input.SegmentID] = struct{}{}
+	}
+	capacity := int(min(s.limits.MaxBatchMutations, s.maxRelocationMutations))
+	if capacity == 0 {
+		return base.ErrInvalidConfig
+	}
+	pending := make([]copiedRecord, 0, capacity)
+	var pendingBytes uint64
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		if err := s.publishCopiedRecords(ctx, pending, result); err != nil {
+			return err
+		}
+		pending = pending[:0]
+		pendingBytes = 0
+		return nil
+	}
+	for _, output := range outputs {
+		if err := s.maintenance.ScanSegment(ctx, output.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
+			typ, err := recordcodec.TypeOf(payload)
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			if typ != recordcodec.RecordTypePut {
+				return errors.Join(base.ErrCorrupt, errors.New("non-put record in compaction output"))
+			}
+			put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			current, exists, err := s.mapping.LookupRef(put.RecordID)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				result.Skipped++
+				return nil
+			}
+			if _, source := inputIDs[current.Addr.SegmentID()]; !source {
+				result.Skipped++
+				return nil
+			}
+			ref, err := scanned.Ref()
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			valueBytes := uint64(len(put.Value))
+			exceedsBytes := valueBytes > s.maxRelocationBytes || pendingBytes > s.maxRelocationBytes-valueBytes
+			if len(pending) != 0 && (len(pending) == capacity || exceedsBytes) {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+			pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: current.Addr, newRef: ref, valueBytes: valueBytes})
+			pendingBytes += valueBytes
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return flush()
 }
 
 func (s *Store) checkpointAndProveRetirements(ctx context.Context, inputs []recordlog.SegmentSummary, end model.CommitSeq) ([]SegmentRetirementProof, error) {
@@ -799,10 +894,6 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		copied, err := s.log.Append(ctx, payload, false)
 		if err != nil {
 			return err
-		}
-		physical, sizeErr := recordlog.PhysicalRecordSize(uint64(len(payload)))
-		if sizeErr == nil {
-			s.recordMeta.Remember(copied.Addr, put.RecordID, physical)
 		}
 		ref, err := copied.Ref()
 		if err != nil {

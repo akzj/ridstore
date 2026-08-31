@@ -19,9 +19,7 @@ Engine.Checkpoint
   -> capture allocator/open-batch state + freeze Delta
   -> release admission fence
   -> build and fsync candidate Root
-  -> incrementally apply folded changes
-  -> sequentially scan the former active Segment after Data rotation
-  -> build exact sealed SegmentStats
+  -> snapshot and validate Mapping exact live stats
   -> Catalog generation CAS
   -> install candidate in runtime Mapping
 ```
@@ -46,20 +44,16 @@ Engine fail closed，重启以 durable Manifest 为准。
 
 ## 3. 精确统计路径
 
-当前实现基于上一代精确 stats 只处理 folded changes；active 转动后顺序扫描
-former-active segment 并与 candidate Mapping join，不回到全量 live-ID walk：
+当前实现由 Mapping publish 在更新 entry 的同一临界区维护 exact live stats：
 
-- folded changes 按 ID 排序，old VAddr 只从 immutable base Root 查询；
-- former-active 按 RecordLog 物理顺序扫描，对 Put 执行 candidate Mapping 精确 join；
-- 只有 base cut 与 Catalog topology 无法证明匹配时才执行 candidate Root `Walk`；
-- 热 `VAddr` 先使用进程内 record metadata cache，hit 时不读盘；
-- cache miss 才由 `RecordLog.Inspect` 读取物理 Header 和固定 Put header，不读取 Value body；
-- Put metadata 必须与 Mapping ID、VAddr、物理大小和 Segment 边界一致；
+- ResolveGroup 已取得 OldRef，append/replay 已验证 NewRef；
+- publish 对实际应用的 old/new Ref 精确扣减和增加，不执行额外数据读取；
+- Checkpoint freeze 同时复制 Mapping live table，后台构建不扫描 Data Segment；
+- Open 从持久化 Root 顺序建立一次 live table，随后 replay 走同一更新逻辑；
 - 只为 sealed Segment 输出非零统计，按 SegmentID 排序；
-- 未知 Segment、统计溢出、身份不一致或损坏都会阻止 Manifest 安装。
+- 未知 Segment、统计溢出、边界不一致或损坏都会阻止 Manifest 安装。
 
-这里验证的是统计所需 Header，不声称校验未读取 Value 的 payload CRC。正常 Get、Replay、Verify/GC
-仍负责完整 Record 校验。
+正常 Get、Replay、Verify/GC 仍负责完整 Record 校验。
 
 ## 4. 已验证
 
