@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/akzj/ridstore/internal/model"
+	"github.com/akzj/ridstore/internal/recordlog"
 )
 
 // Generation describes one independently built, fully synced Mapping file
@@ -63,6 +64,20 @@ func CreateGenerationWriter(root string, storeID StoreID, segmentSize uint32, fi
 }
 
 func (w *GenerationWriter) Append(level uint8, prefix uint64, covered model.CommitSeq, slots [NodeSlots]uint64) (model.MapAddr, error) {
+	return w.appendBuild(NodeBuild{Level: level, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots})
+}
+
+func (w *GenerationWriter) AppendLeaf(prefix uint64, covered model.CommitSeq, refs [NodeSlots]recordlog.RecordRef) (model.MapAddr, error) {
+	var build NodeBuild
+	build.Level, build.Prefix, build.CoveredCommitSeq = 0, prefix, covered
+	for index, ref := range refs {
+		build.Slots[index] = uint64(ref.Addr)
+		build.Sizes[index] = ref.PhysicalSize
+	}
+	return w.appendBuild(build)
+}
+
+func (w *GenerationWriter) appendBuild(build NodeBuild) (model.MapAddr, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed || w.finished {
@@ -74,7 +89,7 @@ func (w *GenerationWriter) Append(level uint8, prefix uint64, covered model.Comm
 	if w.nextSeq == math.MaxUint64 {
 		return 0, ErrFull
 	}
-	build := NodeBuild{Level: level, NodeSeq: w.nextSeq, Prefix: prefix, CoveredCommitSeq: covered, Slots: slots}
+	build.NodeSeq = w.nextSeq
 	encoded, err := EncodeNode(build)
 	if err != nil {
 		return 0, err

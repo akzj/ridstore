@@ -19,28 +19,26 @@ import (
 	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
-	"github.com/akzj/ridstore/internal/recordmeta"
 	"github.com/akzj/ridstore/internal/replay"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/transaction"
 )
 
 type OpenConfig struct {
-	RecordLog              recordlog.Config
-	Commit                 coordinator.Config
-	MappingCacheBytes      uint64
-	RecordMetaCacheEntries uint64
-	CheckpointSortBytes    uint64
-	MaxSegmentStats        uint64
-	DeltaSoftLimitBytes    uint64
-	DeltaHardLimitBytes    uint64
-	StatusRetention        uint64
-	WriteStopFreeBytes     uint64
-	SpaceCheckInterval     time.Duration
-	GCBatchBytes           uint64
-	GCBatchMutations       uint64
-	GCMinFreeBytes         uint64
-	GCBytesPerSecond       uint64
+	RecordLog           recordlog.Config
+	Commit              coordinator.Config
+	MappingCacheBytes   uint64
+	CheckpointSortBytes uint64
+	MaxSegmentStats     uint64
+	DeltaSoftLimitBytes uint64
+	DeltaHardLimitBytes uint64
+	StatusRetention     uint64
+	WriteStopFreeBytes  uint64
+	SpaceCheckInterval  time.Duration
+	GCBatchBytes        uint64
+	GCBatchMutations    uint64
+	GCMinFreeBytes      uint64
+	GCBytesPerSecond    uint64
 }
 
 type CreateConfig struct {
@@ -87,7 +85,7 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 	}
 	store, err := openLocked(ctx, root, config.Runtime, openFaultHooks{catalog: catalogHook}, dirLock)
 	if err != nil {
-		return fail(err)
+		return nil, err
 	}
 	return store, nil
 }
@@ -129,12 +127,18 @@ func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHo
 	}
 	store, err := openLocked(ctx, root, config, hooks, dirLock)
 	if err != nil {
-		return failLock(err)
+		return nil, err
 	}
 	return store, nil
 }
 
-func openLocked(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks, dirLock *filelock.Lock) (*Store, error) {
+func openLocked(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks, dirLock *filelock.Lock) (opened *Store, resultErr error) {
+	runtimeOwnsLock := false
+	defer func() {
+		if resultErr != nil && !runtimeOwnsLock {
+			resultErr = errors.Join(resultErr, dirLock.Close())
+		}
+	}()
 	manifest, err := storecatalog.Load(root)
 	if err != nil {
 		return nil, err
@@ -151,6 +155,10 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 		return nil, err
 	}
 	if err := recoverMaintenance(root, catalog, hooks.maintenance, hooks.recordLog); err != nil {
+		return nil, err
+	}
+	pendingCompaction, err := recoverCompactionBeforeOpen(root, catalog)
+	if err != nil {
 		return nil, err
 	}
 	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, catalog, hooks.recordLog)
@@ -174,6 +182,9 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	}
 	current, err := mapping.OpenPersistent(tree, physicalMapping, persistentConfig(config))
 	if err != nil {
+		return fail(err)
+	}
+	if err := current.InitializeLiveStats(ctx); err != nil {
 		return fail(err)
 	}
 	recovered, err := replay.Recover(ctx, log, replay.Checkpoint{
@@ -256,16 +267,20 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.gcNow = time.Now
 	store.gcWait = waitContext
 	store.dirLock = dirLock
+	runtimeOwnsLock = true
 	store.identity = [16]byte(manifest.StoreUUID)
-	store.recordMeta = recordmeta.New(config.RecordMetaCacheEntries)
-	store.userAppender = &metadataAppender{next: store.userAppender, cache: store.recordMeta, maxValueSize: store.limits.MaxValueSize}
+	store.gcStability.sample(catalog.Snapshot(), store.gcNow())
+	if pendingCompaction != nil {
+		if err := store.resumeCompaction(ctx, *pendingCompaction); err != nil {
+			return nil, errors.Join(base.ErrRecoveryRequired, err, store.Close())
+		}
+	}
 	store.startBackgroundCheckpoint()
 	return store, nil
 }
 
 func validOpenConfig(config OpenConfig) bool {
 	return config.MappingCacheBytes != 0 && config.MaxSegmentStats != 0 && config.StatusRetention != 0 &&
-		recordmeta.ValidCapacity(config.RecordMetaCacheEntries) &&
 		(config.WriteStopFreeBytes == 0 || config.SpaceCheckInterval > 0) &&
 		coordinator.ValidateConfig(config.Commit) == nil &&
 		mapping.ValidatePersistentConfig(persistentConfig(config)) == nil

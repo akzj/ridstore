@@ -49,11 +49,7 @@ Prometheus SDK 引入 ridstore 内核。OpenTelemetry 或自有 exporter 可直�
   `ridstore_background_checkpoint_completed_total`、`ridstore_background_checkpoint_failed_total`。
   requested 统计被调度器接受的不同 Delta pressure generation；同代重复通知以及已被其他成功
   Checkpoint 覆盖的迟到通知不会重复计数。
-- Record metadata cache：`ridstore_record_meta_cache_hits_total`、
-  `ridstore_record_meta_cache_misses_total`、`ridstore_record_meta_cache_entries`、
-  `ridstore_record_meta_cache_evictions_total`。
-
-Commit pipeline 数据直接来自 v2 Coordinator；终态计数由 v2 Batch 生命周期产生；Delta、Cache、
+Commit pipeline 数据直接来自 v2 Coordinator；终态计数由 v2 Batch 生命周期产生；Delta、Mapping cache、
 space admission 是即时 gauge；Data GC copied/reclaimed 使用物理 Record bytes。GC throttle 和独立
 space admission 指标来自真实 pacing 与两阶段准入结果。
 

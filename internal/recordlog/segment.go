@@ -592,29 +592,6 @@ func readRecordAt(file fileHandle, summary SegmentSummary, addr VAddr) ([]byte, 
 	return append([]byte(nil), payload...), nil
 }
 
-func inspectRecordAt(file fileHandle, summary SegmentSummary, addr VAddr, prefixBytes uint32) (RecordHeader, []byte, error) {
-	if !addr.Valid() || addr.SegmentID() != summary.SegmentID || addr.Offset() < SegmentHeaderSize || addr.Offset() >= summary.ValidEnd {
-		return RecordHeader{}, nil, ErrInvalidVAddr
-	}
-	headerBytes := make([]byte, RecordHeaderSize)
-	if err := readFullAt(file, headerBytes, int64(addr.Offset())); err != nil {
-		return RecordHeader{}, nil, err
-	}
-	header, err := DecodeRecordHeader(headerBytes)
-	if err != nil {
-		return RecordHeader{}, nil, err
-	}
-	available := summary.ValidEnd - addr.Offset()
-	if header.Addr != addr || header.PhysicalSize > available || prefixBytes > header.PayloadSize {
-		return RecordHeader{}, nil, fmt.Errorf("record identity, boundary, or prefix: %w", ErrCorrupt)
-	}
-	prefix := make([]byte, prefixBytes)
-	if err := readFullAt(file, prefix, int64(addr.Offset()+RecordHeaderSize)); err != nil {
-		return RecordHeader{}, nil, err
-	}
-	return header, prefix, nil
-}
-
 func scanRecordRange(file fileHandle, summary SegmentSummary, from uint32, visit func(AppendResult, []byte) error) error {
 	if visit == nil || from < SegmentHeaderSize || from > summary.ValidEnd || from&uint32(RecordAlignment-1) != 0 {
 		return ErrInvalidConfig
@@ -664,16 +641,6 @@ func (s *activeSegment) read(addr VAddr) ([]byte, error) {
 	s.mu.RUnlock()
 	return readRecordAt(file, summary, addr)
 }
-func (s *activeSegment) inspect(addr VAddr, prefixBytes uint32) (RecordHeader, []byte, error) {
-	s.mu.RLock()
-	if s.file == nil {
-		s.mu.RUnlock()
-		return RecordHeader{}, nil, ErrClosed
-	}
-	file, summary := s.file, s.summaryLocked()
-	s.mu.RUnlock()
-	return inspectRecordAt(file, summary, addr, prefixBytes)
-}
 func (s *activeSegment) scan(from uint32, visit func(AppendResult, []byte) error) error {
 	return s.scanTo(from, s.summary().ValidEnd, visit)
 }
@@ -697,12 +664,6 @@ func (s *sealedSegment) read(addr VAddr) ([]byte, error) {
 		return nil, ErrClosed
 	}
 	return readRecordAt(s.file, s.summary, addr)
-}
-func (s *sealedSegment) inspect(addr VAddr, prefixBytes uint32) (RecordHeader, []byte, error) {
-	if s.file == nil {
-		return RecordHeader{}, nil, ErrClosed
-	}
-	return inspectRecordAt(s.file, s.summary, addr, prefixBytes)
 }
 func (s *sealedSegment) scan(from uint32, visit func(AppendResult, []byte) error) error {
 	if s.file == nil {

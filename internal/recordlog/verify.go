@@ -27,6 +27,7 @@ type ReadOnly struct {
 	files   map[SegmentID]*sealedSegment
 	refs    uint64
 	closed  bool
+	active  SegmentID
 }
 
 // VerifyFiles validates the authoritative RecordLog file set without starting
@@ -62,7 +63,7 @@ func OpenVerifiedReader(ctx context.Context, root string, snapshot CatalogSnapsh
 	}
 
 	report := PhysicalReport{Segments: uint64(len(snapshot.SealedSegments)) + 1, SealedSegments: uint64(len(snapshot.SealedSegments))}
-	reader := &ReadOnly{files: make(map[SegmentID]*sealedSegment, len(snapshot.SealedSegments)+1)}
+	reader := &ReadOnly{files: make(map[SegmentID]*sealedSegment, len(snapshot.SealedSegments)+1), active: snapshot.ActiveSegmentID}
 	reader.changed = sync.NewCond(&reader.mu)
 	fail := func(cause error) (*ReadOnly, PhysicalReport, error) {
 		return nil, report, errors.Join(cause, reader.Close())
@@ -149,28 +150,6 @@ func (r *ReadOnly) Read(ctx context.Context, addr VAddr) ([]byte, error) {
 	return segment.read(addr)
 }
 
-func (r *ReadOnly) Inspect(ctx context.Context, addr VAddr, prefixBytes uint32) (RecordMetadata, []byte, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return RecordMetadata{}, nil, err
-	}
-	if r == nil || !addr.Valid() {
-		return RecordMetadata{}, nil, ErrInvalidVAddr
-	}
-	if !r.acquire() {
-		return RecordMetadata{}, nil, ErrClosed
-	}
-	defer r.release()
-	segment := r.files[addr.SegmentID()]
-	if segment == nil {
-		return RecordMetadata{}, nil, ErrSegmentMissing
-	}
-	header, prefix, err := segment.inspect(addr, prefixBytes)
-	return RecordMetadata{PhysicalSize: header.PhysicalSize, PayloadSize: header.PayloadSize, Addr: header.Addr}, prefix, err
-}
-
 func (r *ReadOnly) Scan(ctx context.Context, from LogPos, visit func(AppendResult, []byte) error) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -194,7 +173,7 @@ func (r *ReadOnly) Scan(ctx context.Context, from LogPos, visit func(AppendResul
 		return ErrInvalidLogPos
 	}
 	for _, id := range ids {
-		if id < from.SegmentID {
+		if id < from.SegmentID || id > r.active {
 			continue
 		}
 		segment := r.files[id]

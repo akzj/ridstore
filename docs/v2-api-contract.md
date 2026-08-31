@@ -179,10 +179,6 @@ OriginBatchID 不进入 Mapping、不由 Get 返回、不参与用户条件，�
 GC relocation 使用共享的 durable BatchID/CommitSeq 顺序，但不是用户提交，不进入公开 Status 保留集。
 Replay 仍验证其 CommitSeq、Descriptor 和 mutation，只是不为它生成可查询状态。
 
-`RuntimeConfig.RecordMetaCacheEntries` 限制进程内 VAddr metadata cache 的近似条目数，
-零值使用 65,536。该配置不持久化，可在每次 Open 时更换；缓存 miss 不改变 API 结果或
-任何恢复/GC 决策。
-
 Data GC 的运行时资源由 `GCBatchBytes`、`GCBatchMutations`、`GCMinFreeBytes` 与
 `GCBytesPerSecond` 约束。它们可以在每次 Open 时调整，但不能超过持久化 Batch 上限，也不能改变
 relocation CAS、Checkpoint coverage 或 source retirement proof。

@@ -55,7 +55,7 @@ func TestStoreAppendSyncReadAndOpen(t *testing.T) {
 	var leaf [NodeSlots]uint64
 	addr, _ := recordlog.NewVAddr(2, 64, 64)
 	leaf[17] = uint64(addr)
-	leafAddr, err := store.Append(0, 9, 3, leaf)
+	leafAddr, err := store.AppendLeaf(9, 3, testLeafRefs(leaf))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestStoreReadDoesNotWaitForNodeAppendIO(t *testing.T) {
 	var slots [NodeSlots]uint64
 	addr, _ := recordlog.NewVAddr(1, 64, 64)
 	slots[1] = uint64(addr)
-	first, err := store.Append(0, 0, 1, slots)
+	first, err := store.AppendLeaf(0, 1, testLeafRefs(slots))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestStoreReadDoesNotWaitForNodeAppendIO(t *testing.T) {
 	}
 	appendDone := make(chan error, 1)
 	go func() {
-		_, appendErr := store.Append(0, 1, 2, slots)
+		_, appendErr := store.AppendLeaf(1, 2, testLeafRefs(slots))
 		appendDone <- appendErr
 	}()
 	select {
@@ -236,7 +236,7 @@ func TestStoreAppendDoesNotWaitForReadIO(t *testing.T) {
 	var slots [NodeSlots]uint64
 	addr, _ := recordlog.NewVAddr(1, 64, 64)
 	slots[1] = uint64(addr)
-	first, err := store.Append(0, 0, 1, slots)
+	first, err := store.AppendLeaf(0, 1, testLeafRefs(slots))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestStoreAppendDoesNotWaitForReadIO(t *testing.T) {
 	}
 	appendDone := make(chan error, 1)
 	go func() {
-		_, appendErr := store.Append(0, 1, 2, slots)
+		_, appendErr := store.AppendLeaf(1, 2, testLeafRefs(slots))
 		appendDone <- appendErr
 	}()
 	select {
@@ -302,7 +302,7 @@ func TestStoreCloseWaitsForReadIO(t *testing.T) {
 	var slots [NodeSlots]uint64
 	addr, _ := recordlog.NewVAddr(1, 64, 64)
 	slots[1] = uint64(addr)
-	first, err := store.Append(0, 0, 1, slots)
+	first, err := store.AppendLeaf(0, 1, testLeafRefs(slots))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestStoreRepairsOnlyIncompleteUnpublishedTail(t *testing.T) {
 	var slots [NodeSlots]uint64
 	addr, _ := recordlog.NewVAddr(1, 64, 64)
 	slots[1] = uint64(addr)
-	_, err = store.Append(0, 0, 1, slots)
+	_, err = store.AppendLeaf(0, 1, testLeafRefs(slots))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,4 +480,17 @@ func TestStoreRotatesBeforeAssigningNextAddress(t *testing.T) {
 func mapValue(index int) (uint64, error) {
 	addr, err := model.NewMapAddr(1, SegmentHeaderSize+uint32(index)*8)
 	return uint64(addr), err
+}
+
+func testLeafRefs(slots [NodeSlots]uint64) [NodeSlots]recordlog.RecordRef {
+	var refs [NodeSlots]recordlog.RecordRef
+	for index, value := range slots {
+		if value == 0 {
+			continue
+		}
+		addr := recordlog.VAddr(value)
+		size, _ := addr.ReadHint()
+		refs[index] = recordlog.RecordRef{Addr: addr, PhysicalSize: size}
+	}
+	return refs
 }

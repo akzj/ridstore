@@ -32,6 +32,7 @@ const (
 	tlvOpenBatches
 	tlvSegmentStats
 	tlvMappingEntries
+	tlvCompactionFloor
 	tlvCount
 )
 
@@ -71,6 +72,7 @@ func Encode(m Manifest) ([]byte, error) {
 		{tlvOpenBatches, encodeBatchIDs(m.OpenBatchIDsAtCut)},
 		{tlvSegmentStats, encodeStats(m.StatsCoveredCommitSeq, m.SegmentStats)},
 		{tlvMappingEntries, encodeUint64(m.MappingEntryCount)},
+		{tlvCompactionFloor, encodeUint32(uint32(m.CompactionSegmentFloor))},
 	}
 	payloadSize := 0
 	for _, item := range items {
@@ -156,6 +158,10 @@ func Decode(src []byte) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("mapping entries: %w", ErrCorrupt)
 	}
 	m.MappingEntryCount = binary.LittleEndian.Uint64(items[tlvMappingEntries])
+	if len(items[tlvCompactionFloor]) != 4 {
+		return Manifest{}, fmt.Errorf("compaction floor: %w", ErrCorrupt)
+	}
+	m.CompactionSegmentFloor = recordlog.SegmentID(binary.LittleEndian.Uint32(items[tlvCompactionFloor]))
 	if err := Validate(m); err != nil {
 		return Manifest{}, fmt.Errorf("manifest values: %w", ErrCorrupt)
 	}
@@ -261,9 +267,15 @@ func validateHardLimits(h HardLimits) error {
 }
 
 func validateDataSet(m Manifest) error {
+	if m.ActiveDataSegmentID >= recordlog.CompactionSegmentBase || m.NextDataSegmentID != m.ActiveDataSegmentID+1 ||
+		m.CompactionSegmentFloor != 0 && m.CompactionSegmentFloor < recordlog.CompactionSegmentBase-1 {
+		return ErrInvalid
+	}
 	var previous recordlog.SegmentID
 	for _, summary := range m.SealedDataSegments {
-		if summary.SegmentID == 0 || summary.SegmentID >= m.ActiveDataSegmentID || summary.SegmentID >= m.NextDataSegmentID || summary.SegmentID <= previous ||
+		regular := summary.SegmentID < m.ActiveDataSegmentID
+		compacted := recordlog.IsCompactionSegment(summary.SegmentID) && m.CompactionSegmentFloor != 0 && summary.SegmentID > m.CompactionSegmentFloor
+		if summary.SegmentID == 0 || (!regular && !compacted) || summary.SegmentID == m.ActiveDataSegmentID || summary.SegmentID <= previous ||
 			summary.ValidEnd < recordlog.SegmentHeaderSize || uint64(summary.ValidEnd) > m.HardLimits.SegmentSize-uint64(recordlog.SegmentFooterSize) || summary.ValidEnd&uint32(recordlog.RecordAlignment-1) != 0 {
 			return ErrInvalid
 		}
@@ -544,6 +556,12 @@ func decodePair32(src []byte) (uint32, uint32, error) {
 func encodeUint64(value uint64) []byte {
 	dst := make([]byte, 8)
 	binary.LittleEndian.PutUint64(dst, value)
+	return dst
+}
+
+func encodeUint32(value uint32) []byte {
+	dst := make([]byte, 4)
+	binary.LittleEndian.PutUint32(dst, value)
 	return dst
 }
 

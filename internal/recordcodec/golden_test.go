@@ -11,7 +11,7 @@ func TestPutGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "5253503202000100200000002300000007000000000000000900000000000000616263"
+	const want = "5253503203000100200000002300000007000000000000000900000000000000616263"
 	if got := hex.EncodeToString(encoded); got != want {
 		t.Fatalf("golden mismatch\ngot:  %s\nwant: %s", got, want)
 	}

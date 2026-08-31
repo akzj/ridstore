@@ -36,13 +36,10 @@ type RuntimeConfig struct {
 	MaxGroupBatches     int
 	MaxGroupPayload     uint64
 	MappingCacheBytes   uint64
-	// RecordMetaCacheEntries bounds the process-local VAddr-to-record-metadata
-	// cache used to avoid repeated header reads during checkpoint statistics.
-	RecordMetaCacheEntries uint64
-	CheckpointSortBytes    uint64
-	MaxSegmentStats        uint64
-	DeltaSoftLimitBytes    uint64
-	DeltaHardLimitBytes    uint64
+	CheckpointSortBytes uint64
+	MaxSegmentStats     uint64
+	DeltaSoftLimitBytes uint64
+	DeltaHardLimitBytes uint64
 	// StatusRetention bounds retained/replayed user Batch outcomes and must be
 	// at least HardLimits.MaxOpenBatches.
 	StatusRetention uint64
@@ -141,9 +138,6 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	if c.MappingCacheBytes == 0 {
 		c.MappingCacheBytes = 256 * mib
 	}
-	if c.RecordMetaCacheEntries == 0 {
-		c.RecordMetaCacheEntries = 1 << 16
-	}
 	if c.CheckpointSortBytes == 0 {
 		c.CheckpointSortBytes = 256 * mib
 	}
@@ -168,7 +162,7 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	return engine.OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: c.MaxQueuedBytes, QueueCapacity: c.AppendQueueCapacity, BufferBytes: c.AppendBufferBytes, BufferRecords: c.AppendBufferRecords},
 		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload},
-		MappingCacheBytes: c.MappingCacheBytes, RecordMetaCacheEntries: c.RecordMetaCacheEntries, CheckpointSortBytes: c.CheckpointSortBytes,
+		MappingCacheBytes: c.MappingCacheBytes, CheckpointSortBytes: c.CheckpointSortBytes,
 		MaxSegmentStats: c.MaxSegmentStats, DeltaSoftLimitBytes: c.DeltaSoftLimitBytes,
 		DeltaHardLimitBytes: c.DeltaHardLimitBytes, StatusRetention: c.StatusRetention,
 		WriteStopFreeBytes: c.WriteStopFreeBytes, SpaceCheckInterval: c.SpaceCheckInterval,

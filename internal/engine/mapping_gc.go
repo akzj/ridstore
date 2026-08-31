@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/compactionstate"
 	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -52,6 +53,11 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	} else if artifacts {
 		return errors.Join(base.ErrRecoveryRequired, errors.New("data maintenance is active"))
 	}
+	if artifacts, err := compactionstate.RecoveryArtifacts(s.root); err != nil {
+		return err
+	} else if artifacts {
+		return errors.Join(base.ErrRecoveryRequired, errors.New("data compaction is active"))
+	}
 	if artifacts, err := mapstore.RecoveryArtifacts(s.root); err != nil {
 		return err
 	} else if artifacts {
@@ -96,12 +102,12 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return cleanupWriter(err)
 	}
 	var oldCount uint64
-	if err := view.Walk(ctx, func(id model.ID, addr recordlog.VAddr) error {
+	if err := view.WalkRefs(ctx, func(id model.ID, ref recordlog.RecordRef) error {
 		if oldCount == ^uint64(0) {
 			return base.ErrOverflow
 		}
 		oldCount++
-		return builder.Add(id, addr)
+		return builder.Add(id, ref)
 	}); err != nil {
 		return cleanupWriter(err)
 	}
@@ -117,12 +123,12 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return cleanupWriter(err)
 	}
 	var newCount uint64
-	if err := newTree.Walk(ctx, func(id model.ID, addr recordlog.VAddr) error {
-		oldAddr, exists, lookupErr := view.Lookup(id)
+	if err := newTree.WalkRefs(ctx, func(id model.ID, ref recordlog.RecordRef) error {
+		oldRef, exists, lookupErr := view.LookupRef(id)
 		if lookupErr != nil {
 			return lookupErr
 		}
-		if !exists || oldAddr != addr {
+		if !exists || oldRef != ref {
 			return base.ErrCorrupt
 		}
 		newCount++

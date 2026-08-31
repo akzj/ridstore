@@ -13,7 +13,7 @@ func TestManifestGoldenDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(encoded)
-	const want = "eeb1616eddf25b08bbd7686d6d252956aad1e971a20c5b9b823fd102405c4e77"
+	const want = "a92c2ab3476822830f5c91f16e34a9d17ba5ae120529ba550884f2b8ac0f6479"
 	if got := hex.EncodeToString(digest[:]); got != want {
 		t.Fatalf("golden digest mismatch\ngot:  %s\nwant: %s", got, want)
 	}

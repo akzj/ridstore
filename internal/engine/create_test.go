@@ -111,20 +111,8 @@ func TestOpenCleansUnpublishedManifestTemp(t *testing.T) {
 func TestCreateRejectsUncheckpointableDeltaBudgetBeforeBootstrap(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.CheckpointSortBytes = 16
+	config.Runtime.CheckpointSortBytes = 24
 	config.Runtime.DeltaHardLimitBytes = 128
-	if _, err := Create(context.Background(), root, config); !errors.Is(err, base.ErrInvalidConfig) {
-		t.Fatalf("create err=%v", err)
-	}
-	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("invalid create changed root err=%v", err)
-	}
-}
-
-func TestCreateRejectsUnrepresentableRecordMetaCacheBeforeBootstrap(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "store")
-	config := testCreateConfig()
-	config.Runtime.RecordMetaCacheEntries = ^uint64(0)
 	if _, err := Create(context.Background(), root, config); !errors.Is(err, base.ErrInvalidConfig) {
 		t.Fatalf("create err=%v", err)
 	}
@@ -188,7 +176,7 @@ func TestCreateRejectsGCConfigOutsidePersistentBounds(t *testing.T) {
 func TestCommitAdvancesCheckpointUnderDeltaHardPressure(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.CheckpointSortBytes = 16
+	config.Runtime.CheckpointSortBytes = 24
 	config.Runtime.DeltaSoftLimitBytes = 32
 	config.Runtime.DeltaHardLimitBytes = 64
 	store, err := Create(context.Background(), root, config)
@@ -239,7 +227,7 @@ func TestCommitAdvancesCheckpointUnderDeltaHardPressure(t *testing.T) {
 func TestDeltaSoftPressureSchedulesBackgroundCheckpoint(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.CheckpointSortBytes = 96
 	config.Runtime.DeltaSoftLimitBytes = 64
 	config.Runtime.DeltaHardLimitBytes = 256
 	store, err := Create(context.Background(), root, config)
@@ -285,7 +273,7 @@ func TestDeltaSoftPressureSchedulesBackgroundCheckpoint(t *testing.T) {
 func TestCheckpointPressureGenerationDeduplicatesLateRequest(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.CheckpointSortBytes = 96
 	config.Runtime.DeltaSoftLimitBytes = 64
 	config.Runtime.DeltaHardLimitBytes = 256
 	store, err := Create(context.Background(), root, config)
@@ -350,7 +338,7 @@ func TestCheckpointPressureGenerationDeduplicatesLateRequest(t *testing.T) {
 func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.CheckpointSortBytes = 96
 	config.Runtime.DeltaSoftLimitBytes = 64
 	config.Runtime.DeltaHardLimitBytes = 256
 	store, err := Create(context.Background(), root, config)
@@ -411,10 +399,9 @@ func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
 	}
 }
 
-func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T) {
+func TestIncrementalCheckpointUsesRecordRefs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.RecordMetaCacheEntries = 64
 	store, err := Create(context.Background(), root, config)
 	if err != nil {
 		t.Fatal(err)
@@ -430,14 +417,8 @@ func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T
 	if _, err := batch.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 1 || metrics.RecordMetaCacheHits != 0 {
-		t.Fatalf("warm put metrics=%+v", metrics)
-	}
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheHits != 0 || metrics.RecordMetaCacheMisses != 0 {
-		t.Fatalf("warm checkpoint metrics=%+v", metrics)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -450,9 +431,6 @@ func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T
 	defer store.Close()
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 0 || metrics.RecordMetaCacheMisses != 0 {
-		t.Fatalf("cold checkpoint metrics=%+v", metrics)
 	}
 	if _, err := store.Get(context.Background(), id); err != nil {
 		t.Fatal(err)
@@ -470,15 +448,12 @@ func TestIncrementalCheckpointSkipsUnchangedAndActiveRecordMetadata(t *testing.T
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if metrics := store.Metrics(); metrics.RecordMetaCacheEntries != 2 || metrics.RecordMetaCacheHits != 0 || metrics.RecordMetaCacheMisses != 0 {
-		t.Fatalf("read-warmed checkpoint metrics=%+v", metrics)
-	}
 }
 
 func TestCloseStopsBackgroundCheckpointBeforeClosingStorage(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
-	config.Runtime.CheckpointSortBytes = 64
+	config.Runtime.CheckpointSortBytes = 96
 	config.Runtime.DeltaSoftLimitBytes = 64
 	config.Runtime.DeltaHardLimitBytes = 256
 	store, err := Create(context.Background(), root, config)
@@ -698,7 +673,7 @@ func testCreateConfig() CreateConfig {
 		Runtime: OpenConfig{
 			RecordLog:         recordlog.Config{MaxQueuedBytes: 1 << 20, QueueCapacity: 32, BufferBytes: 64 << 10, BufferRecords: 32},
 			Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
-			MappingCacheBytes: 1 << 20, CheckpointSortBytes: 16 << 10, MaxSegmentStats: 1024,
+			MappingCacheBytes: 1 << 20, CheckpointSortBytes: 24 << 10, MaxSegmentStats: 1024,
 			DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
 			StatusRetention: 64, GCBytesPerSecond: ^uint64(0),
 		},

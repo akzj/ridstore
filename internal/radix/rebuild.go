@@ -13,10 +13,16 @@ import (
 type RebuildBuilder struct {
 	tree      *Tree
 	hierarchy streamingBuilder
-	leaf      nodeAccumulator
+	leaf      rebuildLeaf
 	last      model.ID
 	entries   uint64
 	finished  bool
+}
+
+type rebuildLeaf struct {
+	active bool
+	prefix uint64
+	refs   [mapstore.NodeSlots]recordlog.RecordRef
 }
 
 func NewRebuildBuilder(store NodeStore, covered model.CommitSeq, cacheBytes uint64) (*RebuildBuilder, error) {
@@ -30,8 +36,8 @@ func NewRebuildBuilder(store NodeStore, covered model.CommitSeq, cacheBytes uint
 	return &RebuildBuilder{tree: tree, hierarchy: streamingBuilder{tree: tree, covered: covered}}, nil
 }
 
-func (b *RebuildBuilder) Add(id model.ID, addr recordlog.VAddr) error {
-	if b == nil || b.finished || b.tree == nil || b.hierarchy.covered == 0 || id == 0 || !addr.Valid() || id <= b.last {
+func (b *RebuildBuilder) Add(id model.ID, ref recordlog.RecordRef) error {
+	if b == nil || b.finished || b.tree == nil || b.hierarchy.covered == 0 || id == 0 || !ref.Valid() || id <= b.last {
 		return ErrInvalid
 	}
 	prefix := nodePrefix(id, 0)
@@ -41,9 +47,9 @@ func (b *RebuildBuilder) Add(id model.ID, addr recordlog.VAddr) error {
 		}
 	}
 	if !b.leaf.active {
-		b.leaf = nodeAccumulator{active: true, prefix: prefix}
+		b.leaf = rebuildLeaf{active: true, prefix: prefix}
 	}
-	b.leaf.slots[nodeSlot(id, 0)] = uint64(addr)
+	b.leaf.refs[nodeSlot(id, 0)] = ref
 	b.last = id
 	b.entries++
 	return nil
@@ -72,9 +78,9 @@ func (b *RebuildBuilder) flushLeaf() error {
 	if !b.leaf.active {
 		return nil
 	}
-	prefix, slots := b.leaf.prefix, b.leaf.slots
-	b.leaf = nodeAccumulator{}
-	addr, err := b.tree.writeChangedNode(0, prefix, b.hierarchy.covered, [mapstore.NodeSlots]uint64{}, slots, 0)
+	prefix, refs := b.leaf.prefix, b.leaf.refs
+	b.leaf = rebuildLeaf{}
+	addr, err := b.tree.writeChangedLeaf(prefix, b.hierarchy.covered, [mapstore.NodeSlots]recordlog.RecordRef{}, refs, 0)
 	if err != nil {
 		return err
 	}

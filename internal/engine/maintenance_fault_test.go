@@ -33,7 +33,7 @@ func TestCompactMarkerPublicationBoundary(t *testing.T) {
 				}
 				return nil
 			}
-			_, err := store.CompactSegment(context.Background(), source)
+			_, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load())
 			if !errors.Is(err, injected) || errors.Is(err, base.ErrRecoveryRequired) != test.recoveryRequired {
 				t.Fatalf("compact err=%v recoveryRequired=%v", err, test.recoveryRequired)
 			}
@@ -65,7 +65,7 @@ func TestCompactMarkerRemovalFailureRecovers(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, base.ErrRecoveryRequired) || !errors.Is(err, injected) {
+	if _, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrRecoveryRequired) || !errors.Is(err, injected) {
 		t.Fatalf("compact err=%v", err)
 	}
 	if err := store.Close(); err != nil {

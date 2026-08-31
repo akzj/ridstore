@@ -35,14 +35,15 @@ Active Segment 没有 Footer。Open 只能截断最后一个 body 不完整或�
 
 ## 4. Node
 
-Radix 固定 9-bit stride、8 层：Level 0 保存 tagged RecordLog VAddr，Level 1..7 保存 MapAddr。
+Radix 固定 9-bit stride、8 层：Level 0 保存 `RecordRef{VAddr, PhysicalSize}`，Level 1..7 保存 MapAddr。
 Level 7 只允许 slots 0..1。
 
 每个 Node 有 64-byte Header，包含 format version、Level、Encoding、NodeSize、NodeSeq、Prefix、
 CoveredCommitSeq、EntryCount、payload CRC 和 header CRC。
 
-- Sparse：64-byte occupancy bitmap + 按 slot 排序的 packed uint64 values；
-- Dense：512 个 uint64 slots；
+- Sparse internal：64-byte occupancy bitmap + 按 slot 排序的 packed uint64 MapAddr；
+- Sparse leaf：64-byte occupancy bitmap + packed 12-byte RecordRef，末尾补齐到 8-byte；
+- Dense internal：512 个 uint64 slots；Dense leaf：512 个 12-byte RecordRef slots；
 - writer 在 EntryCount `< 504` 时选择 Sparse，否则选择 Dense；
 - reader 接受任意 occupancy 的合法 Sparse/Dense，不把 writer threshold 当兼容条件；
 - 空 Node 不编码；
@@ -65,9 +66,10 @@ Builder 只产生新 Root，不执行 fsync 或发布 Catalog；durability 仍�
 `internal/mapping.Persistent` 已实现 v2 运行时基础的 `active Delta + frozen Delta + persistent Root`：
 
 - Lookup 先检查 active/frozen，miss 才进入 radix；
-- Root leaf 只保存 VAddr；Lookup 和条件解析均不读取 PutRecord，VAddr 本身就是内部一致性 token；
+- Root leaf 保存精确 RecordRef；Lookup 和条件解析均不读取 PutRecord，VAddr 仍是 CAS token；
 - ResolveGroup 对 cold read 使用 epoch 重试，不在 Mapping 锁内执行磁盘 I/O；
 - PublishGroup 只修改 active Delta，并保持整个 group 的原子可见性；
+- PublishGroup 在同一临界区维护 per-segment live bytes/records；Freeze 同时冻结统计快照；
 - Commit 在 Prepare 和 durable Descriptor 之前预留 Delta，Publish 消费实际 entry charge 并退回余量；
 - Freeze 原子切换 active Delta，失败/Abort 不丢弃 frozen layer；
 - Build 折叠所有待处理 frozen layer，生成并 fsync candidate Root；
@@ -90,7 +92,6 @@ v2 Open/Replay 已接线。Engine 只接受 `mapping.Persistent`；旧的全量�
 后端，仅待迁移为 Mapping 模型测试 oracle 后删除生产定义。
 
 当前已实现 soft-limit 后台主动调度；显式 Mapping GC 与 MapStore/RecordLog syscall/crash matrix
-已经接入。v2 Create 与目录锁已经接入。精确 SegmentStats 在 active segment 未转动时从上一代
-表增量应用 folded changes；active 转动后顺序扫描 former-active segment 并与 candidate
-Mapping join。需要 metadata 时优先使用
-进程内 cache，miss 才由 `RecordLog.Inspect` 读取物理 Header 与 Put protocol header，不读取 Value body。
+已经接入。v2 Create 与目录锁已经接入。精确 SegmentStats 由 Mapping publication 实时维护，Freeze
+获得与 covered sequence 一致的统计快照；Checkpoint 只过滤 sealed segment 并校验物理边界，不读取
+Record Header。

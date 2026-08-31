@@ -44,7 +44,7 @@ type IDAllocator interface {
 type Mutation struct {
 	RecordID   model.ID
 	Operation  mapping.Operation
-	Addr       recordlog.VAddr
+	Ref        recordlog.RecordRef
 	ValueBytes uint64
 }
 
@@ -58,7 +58,7 @@ type Prepared struct {
 func (p Prepared) Proposal() mapping.Proposal {
 	changes := make([]mapping.Change, len(p.Mutations))
 	for i, mutation := range p.Mutations {
-		changes[i] = mapping.Change{RecordID: mutation.RecordID, NewAddr: mutation.Addr, Operation: mutation.Operation}
+		changes[i] = mapping.Change{RecordID: mutation.RecordID, NewRef: mutation.Ref, Operation: mutation.Operation}
 	}
 	return mapping.Proposal{
 		Kind:       mapping.ProposalUserCommit,
@@ -228,7 +228,7 @@ func (b *Batch) ReferencesSegment(segment recordlog.SegmentID) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, mutation := range b.mutations {
-		if mutation.Operation == mapping.OperationPut && mutation.Addr.SegmentID() == segment {
+		if mutation.Operation == mapping.OperationPut && mutation.Ref.Addr.SegmentID() == segment {
 			return true
 		}
 	}
@@ -341,12 +341,13 @@ func (b *Batch) putLocked(ctx context.Context, id model.ID, value []byte) error 
 		b.state = StateFailed
 		return err
 	}
-	if !result.Addr.Valid() {
+	ref, err := result.Ref()
+	if err != nil {
 		b.state = StateFailed
 		return fmt.Errorf("put append address: %w", base.ErrCorrupt)
 	}
 	b.appendedBytes += uint64(len(value))
-	b.mutations[id] = Mutation{RecordID: id, Operation: mapping.OperationPut, Addr: result.Addr, ValueBytes: uint64(len(value))}
+	b.mutations[id] = Mutation{RecordID: id, Operation: mapping.OperationPut, Ref: ref, ValueBytes: uint64(len(value))}
 	return nil
 }
 

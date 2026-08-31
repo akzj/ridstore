@@ -49,7 +49,7 @@ func TestTreePersistsThroughMapStoreReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := testDataAddr(t, 7, 64)
-	tree, err = tree.Build(1, []Mutation{{ID: 99, Addr: addr}})
+	tree, err = tree.Build(1, []Mutation{{ID: 99, Ref: testDataRef(t, addr)}})
 	if err != nil {
 		t.Fatal(err)
 	}

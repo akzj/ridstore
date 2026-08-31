@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/compactionstate"
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapping"
@@ -17,6 +18,8 @@ import (
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
+
+var errCheckpointStatsStale = errors.New("checkpoint stats still count source segment")
 
 // SegmentRelocationResult describes only the copy-and-CAS phase of data GC.
 // It does not imply checkpoint coverage or authorize Segment retirement.
@@ -47,6 +50,8 @@ type SegmentRetirementProof struct {
 type SegmentCompactionResult struct {
 	Relocation SegmentRelocationResult
 	Proof      SegmentRetirementProof
+	Proofs     []SegmentRetirementProof
+	Outputs    []recordlog.SegmentSummary
 }
 
 type NextSegmentCompactionResult struct {
@@ -55,9 +60,10 @@ type NextSegmentCompactionResult struct {
 }
 
 type copiedRecord struct {
-	id      model.ID
-	oldAddr recordlog.VAddr
-	newAddr recordlog.VAddr
+	id         model.ID
+	oldAddr    recordlog.VAddr
+	newRef     recordlog.RecordRef
+	valueBytes uint64
 }
 
 // RelocateSegment scans one sealed source Segment and copies records that are
@@ -113,11 +119,7 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	if err != nil {
 		return SegmentRetirementProof{}, relocated, err
 	}
-	if err := s.checkpoint(ctx, true); err != nil {
-		return SegmentRetirementProof{}, relocated, err
-	}
-
-	proof, err := s.proveSegmentRetirement(ctx, source, relocated.LastCommitSeq)
+	proof, err := s.checkpointAndProveRetirement(ctx, source, relocated.LastCommitSeq)
 	return proof, relocated, err
 }
 
@@ -144,7 +146,12 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	rate := s.gcBytesPerSecond.Load()
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
-	result, err := s.compactSegmentLocked(ctx, source, rate)
+	manifest := s.catalog.Snapshot()
+	index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool { return manifest.SealedDataSegments[i].SegmentID >= source })
+	if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source || recordlog.IsCompactionSegment(source) {
+		return SegmentCompactionResult{}, recordlog.ErrSegmentMissing
+	}
+	result, err := s.compactSegmentsLocked(ctx, []recordlog.SegmentSummary{manifest.SealedDataSegments[index]}, rate)
 	s.recordCompactionMetrics(started, result, err)
 	return result, err
 }
@@ -159,6 +166,7 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	if err := ctx.Err(); err != nil {
 		return NextSegmentCompactionResult{}, false, err
 	}
+	policy = normalizeCompactionPolicy(policy)
 	if policy.MinReclaimableRatioBasis > compactionRatioScale {
 		return NextSegmentCompactionResult{}, false, base.ErrInvalidConfig
 	}
@@ -177,7 +185,13 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	if err != nil {
 		return NextSegmentCompactionResult{}, false, fmt.Errorf("collect open batch segment references: %w", err)
 	}
-	candidate, found, err := selectCompactionCandidate(manifest, policy, excluded)
+	now := time.Now()
+	if s.gcNow != nil {
+		now = s.gcNow()
+	}
+	candidate, found, err := selectCompactionCandidate(manifest, policy, excluded, func(id recordlog.SegmentID) (gcStabilityView, bool) {
+		return s.gcStability.view(id, now, policy)
+	})
 	if err != nil {
 		if errors.Is(err, base.ErrCorrupt) {
 			s.setFault(err)
@@ -190,12 +204,357 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	}
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
-	compaction, err := s.compactSegmentLocked(ctx, candidate.Source.SegmentID, rate)
+	compaction, err := s.compactSegmentsLocked(ctx, candidate.Sources, rate)
 	s.recordCompactionMetrics(started, compaction, err)
 	if err != nil {
 		err = fmt.Errorf("compact segment %d: %w", candidate.Source.SegmentID, err)
 	}
 	return NextSegmentCompactionResult{Candidate: candidate, Compaction: compaction}, true, err
+}
+
+// compactSegmentsLocked rewrites a bounded adjacent run into immutable
+// high-namespace output segments. User appends continue on the normal active
+// segment throughout copying and CAS publication.
+func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.SegmentSummary, rate uint64) (SegmentCompactionResult, error) {
+	var result SegmentCompactionResult
+	if len(inputs) == 0 || s.catalog == nil || s.maintenance == nil {
+		return result, base.ErrInvalidConfig
+	}
+	manifest := s.catalog.Snapshot()
+	for _, input := range inputs {
+		if !containsSealedSegment(manifest, input) {
+			return result, recordlog.ErrSegmentMissing
+		}
+	}
+	excluded, err := s.openBatchSegmentReferences(inputs)
+	if err != nil {
+		return result, err
+	}
+	if len(excluded) != 0 {
+		return result, base.ErrConflict
+	}
+	space, err := s.reserveGCCopies(ctx, manifest, inputs)
+	if err != nil {
+		return result, err
+	}
+	defer space.complete(false)
+
+	// One output slot per input is a strict upper bound: repacking only live
+	// records cannot require more segments than their original sealed inputs.
+	reserved, outputIDs, err := s.reserveCompactionOutputIDs(inputs, uint32(len(inputs)))
+	if err != nil {
+		return result, err
+	}
+	state := compactionstate.State{Phase: compactionstate.PhaseReserved, StoreUUID: reserved.StoreUUID,
+		LogID: reserved.RecordLogID, BaseGeneration: reserved.Generation, Inputs: append([]recordlog.SegmentSummary(nil), inputs...), OutputIDs: outputIDs}
+	if err := compactionstate.Install(s.root, state); err != nil {
+		return result, errors.Join(base.ErrRecoveryRequired, err)
+	}
+	rollbackUnpublished := func(writer *recordlog.CompactionWriter, cause error) error {
+		cleanupErr := errors.Join(writer.Abort(), s.maintenance.RemoveUnpublishedCompactionFiles(outputIDs))
+		if cleanupErr == nil {
+			cleanupErr = compactionstate.Remove(s.root)
+		}
+		if cleanupErr != nil {
+			return s.compactionFailure(errors.Join(cause, cleanupErr))
+		}
+		return cause
+	}
+
+	writer, err := s.maintenance.NewCompactionWriter(outputIDs)
+	if err != nil {
+		return result, rollbackUnpublished(nil, err)
+	}
+	copyPacer := s.newGCPacer(rate)
+	var unpacedBytes uint64
+	paceCopy := func(force bool) error {
+		if unpacedBytes == 0 || !force && unpacedBytes < s.maxRelocationBytes {
+			return nil
+		}
+		waited, paceErr := copyPacer.pace(ctx, unpacedBytes)
+		if waited > 0 {
+			s.metrics.gcThrottledNanos.Add(uint64(waited))
+		}
+		unpacedBytes = 0
+		return paceErr
+	}
+	for _, input := range inputs {
+		err = s.maintenance.ScanSegment(ctx, input.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
+			result.Relocation.ScannedRecords++
+			typ, decodeErr := recordcodec.TypeOf(payload)
+			if decodeErr != nil {
+				return errors.Join(base.ErrCorrupt, decodeErr)
+			}
+			if typ != recordcodec.RecordTypePut {
+				return nil
+			}
+			result.Relocation.PutRecords++
+			put, decodeErr := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+			if decodeErr != nil {
+				return errors.Join(base.ErrCorrupt, decodeErr)
+			}
+			current, exists, lookupErr := s.mapping.LookupRef(put.RecordID)
+			if lookupErr != nil {
+				return lookupErr
+			}
+			if !exists || current.Addr != scanned.Addr {
+				return nil
+			}
+			result.Relocation.LiveCandidates++
+			copied, appendErr := writer.Append(ctx, payload)
+			if appendErr != nil {
+				return appendErr
+			}
+			physical := uint64(copied.End.Offset - copied.Addr.Offset())
+			if result.Relocation.CopiedPhysicalBytes > math.MaxUint64-physical ||
+				result.Relocation.CopiedValueBytes > math.MaxUint64-uint64(len(put.Value)) ||
+				unpacedBytes > math.MaxUint64-physical {
+				return base.ErrOverflow
+			}
+			result.Relocation.CopiedRecords++
+			result.Relocation.CopiedPhysicalBytes += physical
+			result.Relocation.CopiedValueBytes += uint64(len(put.Value))
+			unpacedBytes += physical
+			return paceCopy(false)
+		})
+		if err != nil {
+			return result, rollbackUnpublished(writer, err)
+		}
+	}
+	if err = paceCopy(true); err != nil {
+		return result, rollbackUnpublished(writer, err)
+	}
+	outputs, err := writer.Finish()
+	if err != nil {
+		return result, rollbackUnpublished(writer, err)
+	}
+	state.Outputs = outputs
+	result.Outputs = append([]recordlog.SegmentSummary(nil), outputs...)
+	if len(outputs) != 0 {
+		if _, err = s.installCompactionOutputs(outputs); err != nil {
+			return result, s.compactionFailure(err)
+		}
+		if err = s.maintenance.RegisterCompactionOutputs(outputs); err != nil {
+			return result, s.compactionFailure(err)
+		}
+	}
+	state.Phase = compactionstate.PhaseOutputsPublished
+	if err = compactionstate.Update(s.root, state); err != nil {
+		return result, s.compactionFailure(err)
+	}
+
+	if err = s.publishCompactionOutputs(ctx, inputs, outputs, &result.Relocation); err != nil {
+		return result, s.compactionFailure(err)
+	}
+	proofs, err := s.checkpointAndProveRetirements(ctx, inputs, result.Relocation.LastCommitSeq)
+	if err != nil {
+		return result, s.compactionFailure(err)
+	}
+	result.Proofs = proofs
+	if len(proofs) != 0 {
+		result.Proof = proofs[0]
+	}
+	installed, err := s.installCompactionRetirement(inputs)
+	if err != nil {
+		return result, s.compactionFailure(err)
+	}
+	state.Phase = compactionstate.PhaseInputsRetired
+	if err = compactionstate.Update(s.root, state); err != nil {
+		return result, s.compactionFailure(err)
+	}
+	if err = s.maintenance.FinalizeCompactionRetirement(ctx, inputs, installed.Generation); err != nil {
+		return result, s.compactionFailure(err)
+	}
+	if err = compactionstate.Remove(s.root); err != nil {
+		return result, s.compactionFailure(err)
+	}
+	space.complete(true)
+	return result, nil
+}
+
+func (s *Store) reserveCompactionOutputIDs(inputs []recordlog.SegmentSummary, count uint32) (storecatalog.Manifest, []recordlog.SegmentID, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		current := s.catalog.Snapshot()
+		for _, input := range inputs {
+			if !containsSealedSegment(current, input) {
+				return storecatalog.Manifest{}, nil, recordlog.ErrSegmentMissing
+			}
+		}
+		installed, ids, err := s.catalog.ReserveCompactionSegments(current.Generation, count)
+		if errors.Is(err, storecatalog.ErrConflict) {
+			continue
+		}
+		return installed, ids, err
+	}
+	return storecatalog.Manifest{}, nil, base.ErrConflict
+}
+
+func (s *Store) installCompactionOutputs(outputs []recordlog.SegmentSummary) (storecatalog.Manifest, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		current := s.catalog.Snapshot()
+		installed, err := s.catalog.InstallCompactionOutputs(current.Generation, outputs)
+		if errors.Is(err, storecatalog.ErrConflict) {
+			continue
+		}
+		return installed, err
+	}
+	return storecatalog.Manifest{}, base.ErrConflict
+}
+
+func (s *Store) installCompactionRetirement(inputs []recordlog.SegmentSummary) (storecatalog.Manifest, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		current := s.catalog.Snapshot()
+		installed, err := s.catalog.InstallDataCompaction(current.Generation, inputs, current.CoveredCommitSeq, current.ReplayStart)
+		if errors.Is(err, storecatalog.ErrConflict) {
+			continue
+		}
+		return installed, err
+	}
+	return storecatalog.Manifest{}, base.ErrConflict
+}
+
+func (s *Store) compactionFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	result := errors.Join(base.ErrRecoveryRequired, err)
+	s.setFault(result)
+	return result
+}
+
+func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord, result *SegmentRelocationResult) error {
+	for len(copied) != 0 {
+		count, bytes := 0, uint64(0)
+		maxCount := min(len(copied), int(min(s.limits.MaxBatchMutations, s.maxRelocationMutations)))
+		maxBytes := min(s.limits.MaxBatchBytes, s.maxRelocationBytes)
+		for count < maxCount && (count == 0 || copied[count].valueBytes <= maxBytes-bytes) {
+			bytes += copied[count].valueBytes
+			count++
+		}
+		if count == 0 {
+			return base.ErrBatchTooLarge
+		}
+		batch := copied[:count]
+		sort.Slice(batch, func(i, j int) bool { return batch[i].id < batch[j].id })
+		changes := make([]mapping.Change, len(batch))
+		for i, item := range batch {
+			changes[i] = mapping.Change{RecordID: item.id, ExpectedOldAddr: item.oldAddr, NewRef: item.newRef, Operation: mapping.OperationRelocate}
+		}
+		rawBatchID, err := s.batches.Allocate(ctx)
+		if err != nil {
+			return err
+		}
+		published, err := s.commits.Relocate(ctx, coordinator.Relocation{BatchID: model.BatchID(rawBatchID), Changes: changes, LogicalPayloadBytes: bytes})
+		if err != nil {
+			return err
+		}
+		if result.FirstCommitSeq == 0 {
+			result.FirstCommitSeq = published.CommitSeq
+		}
+		result.LastCommitSeq = published.CommitSeq
+		result.Applied += uint64(published.Applied)
+		result.Skipped += uint64(published.Skipped)
+		copied = copied[count:]
+	}
+	return nil
+}
+
+// publishCompactionOutputs reconstructs relocation proposals from immutable
+// output records in bounded batches. A current ref in one of the input
+// segments is the exact CAS source; refs already moved by an earlier recovery
+// attempt or by a user update need no proposal.
+func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []recordlog.SegmentSummary, result *SegmentRelocationResult) error {
+	inputIDs := make(map[recordlog.SegmentID]struct{}, len(inputs))
+	for _, input := range inputs {
+		inputIDs[input.SegmentID] = struct{}{}
+	}
+	capacity := int(min(s.limits.MaxBatchMutations, s.maxRelocationMutations))
+	if capacity == 0 {
+		return base.ErrInvalidConfig
+	}
+	pending := make([]copiedRecord, 0, capacity)
+	var pendingBytes uint64
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		if err := s.publishCopiedRecords(ctx, pending, result); err != nil {
+			return err
+		}
+		pending = pending[:0]
+		pendingBytes = 0
+		return nil
+	}
+	for _, output := range outputs {
+		if err := s.maintenance.ScanSegment(ctx, output.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
+			typ, err := recordcodec.TypeOf(payload)
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			if typ != recordcodec.RecordTypePut {
+				return errors.Join(base.ErrCorrupt, errors.New("non-put record in compaction output"))
+			}
+			put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			current, exists, err := s.mapping.LookupRef(put.RecordID)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				result.Skipped++
+				return nil
+			}
+			if _, source := inputIDs[current.Addr.SegmentID()]; !source {
+				result.Skipped++
+				return nil
+			}
+			ref, err := scanned.Ref()
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			valueBytes := uint64(len(put.Value))
+			exceedsBytes := valueBytes > s.maxRelocationBytes || pendingBytes > s.maxRelocationBytes-valueBytes
+			if len(pending) != 0 && (len(pending) == capacity || exceedsBytes) {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+			pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: current.Addr, newRef: ref, valueBytes: valueBytes})
+			pendingBytes += valueBytes
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return flush()
+}
+
+func (s *Store) checkpointAndProveRetirements(ctx context.Context, inputs []recordlog.SegmentSummary, end model.CommitSeq) ([]SegmentRetirementProof, error) {
+	const maxAttempts = 32
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := s.checkpoint(ctx, true); err != nil {
+			return nil, err
+		}
+		proofs := make([]SegmentRetirementProof, 0, len(inputs))
+		stale := false
+		for _, input := range inputs {
+			proof, err := s.proveSegmentRetirement(ctx, input.SegmentID, end)
+			if errors.Is(err, errCheckpointStatsStale) {
+				stale = true
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			proofs = append(proofs, proof)
+		}
+		if !stale {
+			return proofs, nil
+		}
+	}
+	return nil, errors.Join(base.ErrConflict, errCheckpointStatsStale)
 }
 
 func (s *Store) recordCompactionMetrics(started time.Time, result SegmentCompactionResult, err error) {
@@ -208,9 +567,15 @@ func (s *Store) recordCompactionMetrics(started time.Time, result SegmentCompact
 	s.metrics.gcCopiedBytes.Add(result.Relocation.CopiedPhysicalBytes)
 	s.metrics.gcRelocated.Add(result.Relocation.Applied)
 	s.metrics.gcSkipped.Add(result.Relocation.Skipped)
-	sourceBytes := uint64(result.Proof.Source.ValidEnd)
-	if sourceBytes >= uint64(recordlog.SegmentHeaderSize) {
-		sourceBytes -= uint64(recordlog.SegmentHeaderSize)
+	var sourceBytes uint64
+	proofs := result.Proofs
+	if len(proofs) == 0 && result.Proof.Source.SegmentID != 0 {
+		proofs = []SegmentRetirementProof{result.Proof}
+	}
+	for _, proof := range proofs {
+		if proof.Source.ValidEnd >= recordlog.SegmentHeaderSize {
+			sourceBytes += uint64(proof.Source.ValidEnd - recordlog.SegmentHeaderSize)
+		}
 	}
 	if sourceBytes >= result.Relocation.CopiedPhysicalBytes {
 		s.metrics.gcReclaimedBytes.Add(sourceBytes - result.Relocation.CopiedPhysicalBytes)
@@ -225,11 +590,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 	if err != nil {
 		return result, fmt.Errorf("relocate segment %d: %w", source, err)
 	}
-	if err := s.checkpoint(ctx, true); err != nil {
-		return result, fmt.Errorf("checkpoint relocated segment %d: %w", source, err)
-	}
-
-	proof, err := s.proveSegmentRetirement(ctx, source, relocated.LastCommitSeq)
+	proof, err := s.checkpointAndProveRetirement(ctx, source, relocated.LastCommitSeq)
 	result.Proof = proof
 	if err != nil {
 		return result, fmt.Errorf("prove retirement of segment %d: %w", source, err)
@@ -275,6 +636,24 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		return result, recoveryErr
 	}
 	return result, nil
+}
+
+// checkpointAndProveRetirement retries only when a concurrent post-cut update
+// has already removed the last runtime reference but the frozen checkpoint
+// still conservatively counts it. Each retry is a normal online checkpoint;
+// commits are paused only for the existing short cut barrier.
+func (s *Store) checkpointAndProveRetirement(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq) (SegmentRetirementProof, error) {
+	const maxAttempts = 32
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := s.checkpoint(ctx, true); err != nil {
+			return SegmentRetirementProof{}, fmt.Errorf("checkpoint relocated segment %d: %w", source, err)
+		}
+		proof, err := s.proveSegmentRetirement(ctx, source, relocationEnd)
+		if !errors.Is(err, errCheckpointStatsStale) {
+			return proof, err
+		}
+	}
+	return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errCheckpointStatsStale)
 }
 
 func (s *Store) openBatchSegmentReferences(sealed []recordlog.SegmentSummary) (map[recordlog.SegmentID]struct{}, error) {
@@ -359,12 +738,6 @@ func (s *Store) proveSegmentRetirement(ctx context.Context, source recordlog.Seg
 	if !storecatalog.StatsKnownForSegment(manifest.ReplayStart, manifest.SealedDataSegments[index]) {
 		return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("segment stats are not complete at checkpoint boundary"))
 	}
-	for _, stat := range manifest.SegmentStats {
-		if stat.SegmentID == source && (stat.LiveBytes != 0 || stat.LiveRecords != 0) {
-			return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("checkpoint still maps source segment"))
-		}
-	}
-
 	err := s.maintenance.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
 		typ, err := recordcodec.TypeOf(payload)
 		if err != nil {
@@ -391,6 +764,12 @@ func (s *Store) proveSegmentRetirement(ctx context.Context, source recordlog.Seg
 			s.setFault(err)
 		}
 		return SegmentRetirementProof{}, err
+	}
+	for _, stat := range manifest.SegmentStats {
+		if stat.SegmentID == source && (stat.LiveBytes != 0 || stat.LiveRecords != 0) {
+			return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errCheckpointStatsStale,
+				fmt.Errorf("live_bytes=%d live_records=%d", stat.LiveBytes, stat.LiveRecords))
+		}
 	}
 	return SegmentRetirementProof{
 		Source: manifest.SealedDataSegments[index], CatalogGeneration: manifest.Generation,
@@ -450,7 +829,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		for i, copied := range pending {
 			changes[i] = mapping.Change{
 				RecordID: copied.id, ExpectedOldAddr: copied.oldAddr,
-				NewAddr: copied.newAddr, Operation: mapping.OperationRelocate,
+				NewRef: copied.newRef, Operation: mapping.OperationRelocate,
 			}
 		}
 		published, err := s.commits.Relocate(ctx, coordinator.Relocation{
@@ -516,11 +895,11 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		if err != nil {
 			return err
 		}
-		physical, sizeErr := recordlog.PhysicalRecordSize(uint64(len(payload)))
-		if sizeErr == nil {
-			s.recordMeta.Remember(copied.Addr, put.RecordID, physical)
+		ref, err := copied.Ref()
+		if err != nil {
+			return errors.Join(base.ErrCorrupt, err)
 		}
-		pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: scanned.Addr, newAddr: copied.Addr})
+		pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: scanned.Addr, newRef: ref, valueBytes: valueBytes})
 		pendingBytes += valueBytes
 		physicalCopied := uint64(copied.End.Offset - copied.Addr.Offset())
 		if pendingPhysical > math.MaxUint64-physicalCopied {

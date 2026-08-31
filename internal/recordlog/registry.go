@@ -183,27 +183,6 @@ func (p *segmentPin) read(addr VAddr) ([]byte, error) {
 	return nil, ErrSegmentMissing
 }
 
-func (p *segmentPin) inspect(addr VAddr, prefixBytes uint32) (RecordHeader, []byte, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.released || p.registry == nil {
-		return RecordHeader{}, nil, ErrClosed
-	}
-	if addr.SegmentID() != p.id {
-		return RecordHeader{}, nil, ErrInvalidVAddr
-	}
-	p.registry.mu.Lock()
-	active, sealed := p.entry.active, p.entry.sealed
-	p.registry.mu.Unlock()
-	if active != nil {
-		return active.inspect(addr, prefixBytes)
-	}
-	if sealed != nil {
-		return sealed.inspect(addr, prefixBytes)
-	}
-	return RecordHeader{}, nil, ErrSegmentMissing
-}
-
 func (p *segmentPin) release() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -249,6 +228,27 @@ func (r *segmentRegistry) publishRotation(oldID SegmentID, sealed *sealedSegment
 	old.sealed = sealed
 	r.entries[active.header.SegmentID] = &registryEntry{state: segmentActive, active: active}
 	r.active = active.header.SegmentID
+	r.signalLocked()
+	return nil
+}
+
+func (r *segmentRegistry) publishSealed(segments []*sealedSegment) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || len(segments) == 0 {
+		return ErrInvalidConfig
+	}
+	for _, segment := range segments {
+		if segment == nil || segment.file == nil || !IsCompactionSegment(segment.header.SegmentID) {
+			return ErrInvalidConfig
+		}
+		if _, exists := r.entries[segment.header.SegmentID]; exists {
+			return ErrInvalidConfig
+		}
+	}
+	for _, segment := range segments {
+		r.entries[segment.header.SegmentID] = &registryEntry{state: segmentSealed, sealed: segment}
+	}
 	r.signalLocked()
 	return nil
 }

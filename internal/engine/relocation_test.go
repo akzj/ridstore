@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/compactionstate"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -231,11 +232,47 @@ func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
 	if err != nil || string(record.Value) != "source-value" || record.Addr == oldAddr {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
+	if !recordlog.IsCompactionSegment(record.Addr.SegmentID()) || record.Addr.SegmentID() == store.catalog.Snapshot().ActiveDataSegmentID {
+		t.Fatalf("GC copy was not isolated from user active segment: addr=%v active=%d", record.Addr, store.catalog.Snapshot().ActiveDataSegmentID)
+	}
+}
+
+func TestCompactSegmentRejectsOpenBatchReferenceBeforeJournal(t *testing.T) {
+	store := newRelocationStore(t)
+	pending, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.Create(context.Background(), []byte("open-before-rotation")); err != nil {
+		t.Fatal(err)
+	}
+	source := store.catalog.Snapshot().ActiveDataSegmentID
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("compact err=%v", err)
+	}
+	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
+		t.Fatalf("compaction marker found=%v err=%v", found, err)
+	}
+	if err := pending.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
-	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{})
+	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true})
 	if err != nil || !found {
 		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
@@ -254,10 +291,124 @@ func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	}
 }
 
+func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.T) {
+	store := newRelocationStore(t)
+	store.maxRelocationMutations = 1
+	bySegment := make(map[recordlog.SegmentID][]model.ID)
+	for store.catalog.Snapshot().ActiveDataSegmentID < 4 {
+		batch, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := batch.Create(context.Background(), bytes.Repeat([]byte{'a'}, 512))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		record, err := store.Get(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bySegment[record.Addr.SegmentID()] = append(bySegment[record.Addr.SegmentID()], id)
+	}
+	for _, segment := range []recordlog.SegmentID{1, 2} {
+		ids := bySegment[segment]
+		if len(ids) < 2 {
+			t.Fatalf("segment %d has only %d puts", segment, len(ids))
+		}
+		for _, id := range ids[1:] {
+			batch, err := store.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := batch.Put(context.Background(), id, []byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := batch.Commit(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true, MaxInputSegments: 2, MinReclaimableRatioBasis: 5_000})
+	if err != nil || !found {
+		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
+	}
+	if len(result.Candidate.Sources) != 2 || result.Candidate.Sources[0].SegmentID != 1 || result.Candidate.Sources[1].SegmentID != 2 {
+		t.Fatalf("candidate=%+v", result.Candidate)
+	}
+	if result.Compaction.Relocation.Applied < 2 ||
+		uint64(result.Compaction.Relocation.LastCommitSeq-result.Compaction.Relocation.FirstCommitSeq)+1 != result.Compaction.Relocation.Applied {
+		t.Fatalf("compaction output was not published in bounded batches: %+v", result.Compaction.Relocation)
+	}
+	manifest := store.catalog.Snapshot()
+	if containsSegmentID(manifest.SealedDataSegments, 1) || containsSegmentID(manifest.SealedDataSegments, 2) {
+		t.Fatal("adjacent inputs were not retired atomically")
+	}
+	for _, segment := range []recordlog.SegmentID{1, 2} {
+		record, err := store.Get(context.Background(), bySegment[segment][0])
+		if err != nil || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
+			t.Fatalf("segment=%d record=%+v err=%v", segment, record, err)
+		}
+	}
+}
+
+func TestCompactSegmentPacesBeforePublishingOutputs(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	store.maxRelocationBytes = 1
+	store.gcBytesPerSecond.Store(1)
+	now := time.Unix(100, 0)
+	store.gcNow = func() time.Time { return now }
+	var waits int
+	store.gcWait = func(_ context.Context, delay time.Duration) error {
+		waits++
+		for _, segment := range store.catalog.Snapshot().SealedDataSegments {
+			if recordlog.IsCompactionSegment(segment.SegmentID) {
+				t.Fatal("compaction output was published before copy pacing")
+			}
+		}
+		now = now.Add(delay)
+		return nil
+	}
+	if _, err := store.CompactSegment(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	if waits == 0 {
+		t.Fatal("compaction copy was not paced")
+	}
+}
+
+func TestCompactSegmentCancellationBeforeOutputPublicationRollsBack(t *testing.T) {
+	store, source, id, oldAddr, _ := relocationFixture(t)
+	store.maxRelocationBytes = 1
+	store.gcBytesPerSecond.Store(1)
+	store.gcNow = func() time.Time { return time.Unix(100, 0) }
+	store.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
+	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, context.Canceled) {
+		t.Fatalf("compact err=%v", err)
+	}
+	if store.fault != nil {
+		t.Fatalf("recoverable cancellation faulted store: %v", store.fault)
+	}
+	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
+		t.Fatalf("compaction marker found=%v err=%v", found, err)
+	}
+	for _, segment := range store.catalog.Snapshot().SealedDataSegments {
+		if recordlog.IsCompactionSegment(segment.SegmentID) {
+			t.Fatalf("unpublished output remains in Catalog: %d", segment.SegmentID)
+		}
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || record.Addr != oldAddr {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
 func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{MinReclaimableBytes: ^uint64(0)})
-	if err != nil || found || result != (NextSegmentCompactionResult{}) {
+	if err != nil || found || result.Candidate.Source.SegmentID != 0 || result.Compaction.Relocation.ScannedRecords != 0 {
 		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
 	if !containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
@@ -306,7 +457,7 @@ func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T
 		uint64(summary.RecordCount)*(uint64(commitPhysical)+uint64(reservePhysical)) + 2*manifest.HardLimits.SegmentSize
 	store.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return copyEstimate + 1, nil })
 	store.gcMinFreeBytes = 1
-	result, err := store.CompactSegment(context.Background(), source)
+	result, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load())
 	if !errors.Is(err, base.ErrInsufficientSpace) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -317,7 +468,7 @@ func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T
 	if getErr != nil || record.Addr == oldAddr || string(record.Value) != "source-value" {
 		t.Fatalf("record=%+v err=%v", record, getErr)
 	}
-	if metrics := store.Metrics(); metrics.GCSpaceRejections != 1 || metrics.GCFailed != 1 {
+	if metrics := store.Metrics(); metrics.GCSpaceRejections != 1 {
 		t.Fatalf("metrics=%+v", metrics)
 	}
 	if err := store.Checkpoint(context.Background()); err != nil {
@@ -353,7 +504,7 @@ func TestCompactNextSegmentSkipsOpenBatchReferences(t *testing.T) {
 	if err := pending.Abort(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{}); err != nil || !found || result.Candidate.Source.SegmentID != source {
+	if result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true}); err != nil || !found || result.Candidate.Source.SegmentID != source {
 		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
 }

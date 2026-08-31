@@ -49,13 +49,15 @@ Segment 同时满足以下条件才可进入 Cleaning：
 - 不是当前故障诊断保留文件；
 - 预估 dead ratio 达到阈值或磁盘压力要求强制清理。
 
-候选估算使用 `segment-stats-design.md` 定义的 `LiveUpperBytes`：
+候选估算使用 `segment-stats-design.md` 定义的 checkpoint exact live bytes：
 
 ```text
-reclaimableLowerBound = max(0, reclaimablePhysicalBytes - LiveUpperBytes)
+reclaimableBytes = reclaimablePhysicalBytes - ExactLiveBytesAtCut
 ```
 
-上界可能因 cut 后多次覆盖而高估 live，只会漏选一时值得清理的 Segment，不会把 live 空间误报为可回收。即使 `LiveUpperBytes == 0`，删除前仍必须完成本协议的精确 Mapping 扫描、Relocation 后复查、Checkpoint、Pin、Manifest 和 Trash 全部门禁；SegmentStats 永不授权删除。
+候选只允许严格位于 checkpoint ReplayStart 之前的 sealed Segment；cut 后它不会获得新的用户引用，
+所以 cut 时精确 live bytes 在选择时构成安全上界。即使统计为零，删除前仍必须完成 relocation、
+后置 Checkpoint、Pin、Manifest 和 Trash 全部门禁；SegmentStats 永不单独授权删除。
 
 v2 的 `CompactNextSegment` 在选择前主动创建一次 Checkpoint，并且只考虑 `segment.end < ReplayStart`
 的 sealed Segment。这样的 Segment 不再接受新 append；同一时刻又只有一个 maintenance 操作，因此 cut
@@ -265,7 +267,7 @@ score = reclaimableBytes / (copyBytes + fixedCost)
 
 考虑：
 
-- `LiveUpperBytes` 推导的 live ratio 上界和 reclaimable bytes 下界；
+- checkpoint exact live bytes 推导的 live ratio 和 reclaimable bytes；
 - Segment age；
 - 预计 copy bytes；
 - 当前前台 fsync/带宽压力；

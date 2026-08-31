@@ -14,7 +14,7 @@
 ## 2. 第一版 Config
 
 公开配置分为 `CreateConfig{HardLimits, Runtime}` 与 `OpenConfig{Runtime}`。持久化字段使用 `uint64`；
-runtime 包含 RecordLog queue/buffer、Commit group、Mapping/metadata cache、Checkpoint sort、Delta、Status、
+runtime 包含 RecordLog queue/buffer、Commit group、Mapping cache、Checkpoint sort、Delta、Status、
 前台空间水位，以及 `GCBatchBytes`、`GCBatchMutations`、`GCMinFreeBytes`、`GCBytesPerSecond`。
 
 第一版默认值：
@@ -33,7 +33,6 @@ runtime 包含 RecordLog queue/buffer、Commit group、Mapping/metadata cache、
 | DeltaSoftLimitBytes | 256 MiB |
 | DeltaHardLimitBytes | 512 MiB |
 | CheckpointSortBytes | 256 MiB |
-| RecordMetaCacheEntries | 65,536 |
 | MaxSegmentStats | 65,536 |
 | StatusRetention | 65,536 |
 | MaxGroupPayload | 64 MiB |

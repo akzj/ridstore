@@ -70,13 +70,13 @@ func TestCommitGroupRoundTrip(t *testing.T) {
 		{
 			Kind: DescriptorUserCommit, BatchID: 10, CommitSeq: 20, LogicalPayloadBytes: 7,
 			Mutations: []Mutation{
-				{RecordID: 1, NewAddr: a1, Operation: OperationPut},
+				{RecordID: 1, NewAddr: a1, PhysicalSize: 64, Operation: OperationPut},
 				{RecordID: 3, Operation: OperationDelete},
 			},
 		},
 		{
 			Kind: DescriptorRelocation, BatchID: 11, CommitSeq: 21, LogicalPayloadBytes: 9,
-			Mutations: []Mutation{{RecordID: 2, NewAddr: a3, ExpectedOldAddr: a2, Operation: OperationRelocate}},
+			Mutations: []Mutation{{RecordID: 2, NewAddr: a3, ExpectedOldAddr: a2, PhysicalSize: 64, Operation: OperationRelocate}},
 		},
 	}}
 	encoded, err := EncodeCommitGroup(want, 4096)

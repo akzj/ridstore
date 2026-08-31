@@ -1,6 +1,6 @@
 # SegmentStats 设计
 
-状态：Implemented hybrid incremental builder
+状态：Implemented RecordRef live accounting
 
 ## 1. 定位
 
@@ -14,7 +14,8 @@ SegmentStats 只提供保守候选提示
 GC 删除前必须重新执行精确 Mapping 校验
 ```
 
-Put/Commit 热路径不能为了更新统计而读取旧 Mapping Record Header。统计的精确基线由 Mapping Checkpoint 后台批量生成。
+Put/Commit 热路径不读取 Record Header。Mapping entry 自带 `PhysicalSize`，因此 Mapping 在发布变更时可在
+同一临界区精确增减 live bytes/records。
 
 ## 2. 统计状态
 
@@ -43,58 +44,34 @@ segment.end >= ReplayStart  => Stats 可能未覆盖，缺失表示 unknown
 严格小于而不是小于等于，是为了覆盖 Checkpoint 构建后、安装前 Active Segment 发生 rotation 的边界。
 unknown Segment 即使缺失 Stats 也不能成为 GC 候选或进入 retire。
 
-运行时另维护：
+运行时 Mapping 维护：
 
 ```text
-PhysicalBytes          // 来自 append position/Footer，精确
-PutRecordBytes         // 来自 Frame scan/append，精确
-LiveUpperBytes         // 基线 + cut 后成功发布的新 Record bytes
-LiveUpperRecords
-KnownDeadBytes         // 可选提示，不参与删除证明
-StatsBaseCommitSeq
+SegmentID
+LiveBytes
+LiveRecords
+LastChangedCommitSeq
 ```
 
-`LiveUpperBytes` 是当前 live bytes 的保守上界：cut 后每个成功映射到 NewVAddr 的用户 Put 或成功 Relocation 都累加新 Record 大小，但不在前台同步扣减 old VAddr。Delete 不累加。这样 Blind Commit 不需要读取旧 Record，重复覆盖只会高估，不会低估。
+每次成功发布都已从解析计划中持有 OldRef 和 NewRef，因此覆盖、删除和 relocation CAS 可以精确扣减旧值并
+增加新值，不产生额外 Mapping lookup 或数据 I/O。失败、冲突和 relocation skip 不改变统计。
 
-## 3. Checkpoint 批量统计
+## 3. Checkpoint 快照
 
-Mapping Checkpoint barrier 得到 `(C, F, ReplayStart)` 并冻结 Overlay 后，Builder 同时构建新 Root 和 SegmentStats(C)：
+Mapping Checkpoint barrier 得到 `(C, F, ReplayStart)` 并冻结 Overlay 时，在同一 Mapping 锁内复制 exact live table：
 
 ```text
-base Mapping Root R0 at C0
-base SegmentStats at C0
-+ all frozen final mutations through C
-=> new Mapping Root R1 at C
-=> exact SegmentStats at C
+Mapping entries at C + live table at C
+=> new Mapping Root R1 at C + SegmentStats(C)
 ```
 
-处理步骤：
+Builder 只负责构建 COW Root；Checkpoint 将冻结的 live table 按当前 Catalog 文件集过滤、校验和排序，
+再与新 Root 一起写入同一 Manifest generation。active Segment 不写入持久化表；如果它在 cut 后发生
+rotation，`ReplayStart` 的严格边界仍会把它标为 unknown，直到下一次 Checkpoint 覆盖。
 
-1. 将所有 frozen layer 从旧到新折叠，每个 ID 只保留 cut 时最终 mutation；
-2. 从 base Root 查出该 ID 的 OldVAddr；
-3. 根据最终 mutation 得到 NewVAddr 或 NotFound；
-4. OldVAddr==NewVAddr 时跳过；
-5. 对 sealed Old/New VAddr 优先查 metadata cache，miss 时读取并校验 Record/Put Header；
-6. active 转动时顺序扫描 former-active，以 candidate Mapping 精确 join；
-7. 从 metadata 或扫描边界获得物理 Record bytes；
-8. 从 old Segment 的 live bytes/count 扣减，从 new Segment 增加；
-9. 删除归零的表项，按 SegmentID 排序编码；
-10. 与新 Mapping Root 一起写入同一 Manifest generation。
-
-当前实现执行上述 base-to-final 差分，不遍历未变的 Mapping ID。如果 active 已转动，
-上一代 stats 中被省略的 active segment 通过单 Segment 顺序扫描与 candidate Mapping join
-重建；转动后新建 Segment 中的 live 记录完全来自 frozen changes。只有基线拓扑无法证明
-匹配时才保留全量 candidate Root 回退。
-
-同一 ID 在两个 checkpoint 之间被覆盖多次，只统计：
-
-```text
-base-root OldVAddr -> cut-time final NewVAddr
-```
-
-中间版本、Abort Record、冲突 Batch Record 和失败 Relocation 副本从未进入新 Root，因此自然不计入 live stats。
-
-统计扣减发生 underflow、VAddr 指向错误 RecordID、Header/CRC 错误或 Segment 身份冲突都表示 corruption/实现错误；Checkpoint 不得安装新 Root。
+首次 Open 从持久化 Mapping Root 顺序遍历一次以建立 live table，随后 replay 与在线 publish 使用同一
+增减逻辑。Offline Verify 独立遍历 Mapping 并读取完整 Record，既核对 `RecordRef.PhysicalSize`，也重算
+SegmentStats；它不依赖运行时派生状态。
 
 ## 4. 原子安装
 
@@ -113,44 +90,26 @@ SegmentStatsTable(C)
 
 统计构建属于后台 Checkpoint 工作，不持有 `publishMu`。只有 cut 指针交换和最终 immutable state 切换使用短锁。
 
-## 5. Commit 与 Recovery 增量
+## 5. Commit 与 Recovery
 
-Checkpoint cut 后，前台 Mapping Publish 对成功产生 NewVAddr 的 mutation执行：
-
-```text
-LiveUpperBytes[new.segment] += new.TotalSize
-LiveUpperRecords[new.segment]++
-```
-
-不要求查找或扣减 old VAddr。增量不是一个会在 checkpoint 时整体清零的全局 counter，而是附着于 active/frozen Delta layer：
+Mapping Publish 对每个实际应用的 mutation 执行：
 
 ```text
-LiveUpper = exact Stats Base
-          + active Delta stats additions
-          + every frozen Delta stats additions
+old exists: live[old.segment] -= old.PhysicalSize / 1 record
+new exists: live[new.segment] += new.PhysicalSize / 1 record
 ```
 
-Mutation 与当前 active Delta 的 additions 在同一次 Mapping Publish 临界区更新。Checkpoint 安装新 Base 时只移除已被精确统计吸收的 merged layers；cut 后的 layer 仍保留，因此并发 Commit 的增量不会在 Base 切换时丢失。它仍是派生状态；崩溃后由 Manifest Base + replay 重建，不影响 Mapping 正确性。
-
-Open/Recovery 加载 exact Stats(C)，随后重放 ReplayStart 后的 Commit/Relocation：
-
-- 用户 Put：累加 NewVAddr；
-- Delete：不累加；
-- Relocation CAS 成功：累加 NewVAddr；
-- Relocation CAS 失败：不累加；
-- Abort/无 Seal Record：不累加。
-
-Recovery 本来就必须验证被提交 NewVAddr 的 PutRecord，因此可以使用已读取 Header.TotalSize，不增加旧 Record 随机读取。
-
-下一次 Mapping Checkpoint 重新生成 exact Stats，并消除上界中的重复累加。
+OldRef 已由 ResolveGroup 取得，NewRef 来自 append 结果或 replay 验证，因此增减不增加随机 I/O。
+统计与 Mapping entry 在同一锁内发布；Checkpoint freeze 同时复制二者。Recovery 首先从 Root 重建统计，
+随后重放 Commit/Relocation 并走同一 publish 逻辑。
 
 ## 6. GC 使用规则
 
 候选估算：
 
 ```text
-reclaimableLowerBound = max(0, reclaimablePhysicalBytes - LiveUpperBytes)
-liveRatioUpperBound   = LiveUpperBytes / reclaimablePhysicalBytes
+reclaimableBytes = reclaimablePhysicalBytes - ExactLiveBytesAtCut
+liveRatio        = ExactLiveBytesAtCut / reclaimablePhysicalBytes
 ```
 
 Stats 可以决定扫描优先级，不能跳过以下删除门禁：
@@ -164,17 +123,14 @@ Stats 可以决定扫描优先级，不能跳过以下删除门禁：
 
 即使 Stats 显示 live=0，也不能直接删除。
 
-v2 的自动候选路径在选择前先做 Checkpoint，并只选择严格落在 ReplayStart 之前的 immutable sealed
-Segment。由于用户 Put 只能 append 到 active Segment，且 relocation 由全局 maintenance gate 串行，
-Checkpoint 后不会新增指向该候选 source 的 Mapping；该 source 的 exact stats 因而可直接作为选择阶段
-的 live upper bound。这个约束替代了为当前 v2 热路径维护全局 `LiveUpper` 镜像状态，但不改变删除前的
-精确证明要求。
+自动候选路径在选择前先做 Checkpoint，并只选择严格落在 ReplayStart 之前的 immutable sealed Segment。
+Checkpoint 后不会新增指向候选 source 的 Mapping，因此 cut 时的精确值在选择时也是安全上界；删除仍需
+完成 relocation CAS、后置 Checkpoint 和退休证明。
 
 ## 7. 资源与 Backpressure
 
 - SegmentStats 表项数量受当前含 live Record 的 Segment 数限制；
-- Header 读取按 Segment/offset 排序并使用有界 buffer；
-- Builder 不一次性加载 Value payload；
+- checkpoint 不读取 Data Segment；
 - Stats 内存计入 Checkpoint memory budget；
 - Checkpoint 失败保留旧 Root、旧 Stats 和 frozen Delta；
 - stats build 速度追不上时由总 Overlay hard limit 对新 Commit backpressure，不能丢弃统计或 Delta。
@@ -182,10 +138,9 @@ Checkpoint 后不会新增指向该候选 source 的 Mapping；该 source 的 ex
 ## 8. 验收
 
 - 连续 create、overwrite、delete 后 Stats(C) 与全量 Mapping 遍历一致；
-- 同 ID 多次覆盖只计算 base→final；
+- 同 ID 多次覆盖逐次精确扣减旧 Ref、增加新 Ref；
 - Abort、冲突和 CAS 失败副本不计 live；
-- cut 后 LiveUpper 从不低于精确 live；
-- Recovery replay 后 LiveUpper 仍为上界；
+- Recovery replay 后 live table 与 Mapping 一致；
 - Stats/Root Manifest 崩溃点只能同时选择旧代或新代；
 - Stats=0 不能绕过 GC 精确校验；
 - 长期 checkpoint/GC 后 physical/live/dead 指标收敛。

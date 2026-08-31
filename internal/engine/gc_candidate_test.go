@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/model"
@@ -27,13 +28,41 @@ func TestSelectCompactionCandidateUsesSparseStatsAndStableOrdering(t *testing.T)
 	if err != nil || !found {
 		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
 	}
-	if candidate.Source.SegmentID != 3 || candidate.LiveBytesUpper != 0 || candidate.ReclaimableBytesLower != 256 || candidate.ReclaimableRatioBasis != 10_000 {
+	if candidate.Source.SegmentID != 1 || len(candidate.Sources) != 3 || candidate.LiveBytesUpper != 192 || candidate.ReclaimableBytesLower != 576 || candidate.ReclaimableRatioBasis != 7_500 {
 		t.Fatalf("candidate=%+v", candidate)
 	}
 
 	manifest.SegmentStats = append(manifest.SegmentStats, storecatalog.SegmentStats{SegmentID: 3, LiveBytes: 64, LiveRecords: 1})
 	candidate, found, err = selectCompactionCandidate(manifest, CompactionPolicy{}, map[recordlog.SegmentID]struct{}{1: {}})
-	if err != nil || !found || candidate.Source.SegmentID != 3 {
+	if err != nil || !found || candidate.Source.SegmentID != 2 || len(candidate.Sources) != 2 {
+		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+}
+
+func TestSelectCompactionCandidateRequiresCooldownUnlessBypassed(t *testing.T) {
+	manifest := candidateManifest(t)
+	manifest.SealedDataSegments = []recordlog.SegmentSummary{candidateSummary(t, 1, 320, 4)}
+	manifest.SegmentStats = []storecatalog.SegmentStats{{SegmentID: 1, LiveBytes: 64, LiveRecords: 1}}
+	manifest.ReplayStart = recordlog.LogPos{SegmentID: 2, Offset: recordlog.SegmentHeaderSize}
+	unstable := func(recordlog.SegmentID) (gcStabilityView, bool) {
+		return gcStabilityView{Age: time.Hour, StableRounds: 1, LatestDeathPerCommit: 10}, true
+	}
+	if _, found, err := selectCompactionCandidate(manifest, CompactionPolicy{MinStableRounds: 2}, nil, unstable); err != nil || found {
+		t.Fatalf("unstable candidate found=%v err=%v", found, err)
+	}
+	if candidate, found, err := selectCompactionCandidate(manifest, CompactionPolicy{MinStableRounds: 2, BypassCooldown: true}, nil, unstable); err != nil || !found || candidate.Source.SegmentID != 1 {
+		t.Fatalf("bypass candidate=%+v found=%v err=%v", candidate, found, err)
+	}
+}
+
+func TestSelectCompactionCandidateCapsAdjacentGroup(t *testing.T) {
+	manifest := candidateManifest(t)
+	for id := recordlog.SegmentID(1); id <= 4; id++ {
+		manifest.SealedDataSegments = append(manifest.SealedDataSegments, candidateSummary(t, id, 320, 4))
+	}
+	manifest.ReplayStart = recordlog.LogPos{SegmentID: 5, Offset: recordlog.SegmentHeaderSize}
+	candidate, found, err := selectCompactionCandidate(manifest, CompactionPolicy{MaxInputSegments: 2, BypassCooldown: true}, nil)
+	if err != nil || !found || len(candidate.Sources) != 2 {
 		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)
 	}
 }

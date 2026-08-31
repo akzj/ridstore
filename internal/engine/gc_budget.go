@@ -87,10 +87,14 @@ func (p *gcPacer) pace(ctx context.Context, copied uint64) (time.Duration, error
 }
 
 func (s *Store) reserveGCCopy(ctx context.Context, manifest storecatalog.Manifest, source recordlog.SegmentSummary) (*spaceReservation, error) {
+	return s.reserveGCCopies(ctx, manifest, []recordlog.SegmentSummary{source})
+}
+
+func (s *Store) reserveGCCopies(ctx context.Context, manifest storecatalog.Manifest, sources []recordlog.SegmentSummary) (*spaceReservation, error) {
 	if s.space == nil || s.gcMinFreeBytes == 0 {
 		return nil, nil
 	}
-	if s.maxRelocationMutations == 0 || s.maxRelocationBytes == 0 {
+	if len(sources) == 0 || s.maxRelocationMutations == 0 || s.maxRelocationBytes == 0 {
 		return nil, base.ErrInvalidConfig
 	}
 	// One CommitGroup and one BatchID reserve Record per source Record is the
@@ -104,12 +108,19 @@ func (s *Store) reserveGCCopy(ctx context.Context, manifest storecatalog.Manifes
 	if err != nil {
 		return nil, err
 	}
-	controlBytes, ok := checkedGCMul(source.RecordCount, uint64(commitPhysical)+uint64(reservePhysical))
+	var recordCount, copyBytes uint64
+	for _, source := range sources {
+		if source.ValidEnd < recordlog.SegmentHeaderSize || recordCount > math.MaxUint64-source.RecordCount || copyBytes > math.MaxUint64-uint64(source.ValidEnd-recordlog.SegmentHeaderSize) {
+			return nil, base.ErrOverflow
+		}
+		recordCount += source.RecordCount
+		copyBytes += uint64(source.ValidEnd - recordlog.SegmentHeaderSize)
+	}
+	controlBytes, ok := checkedGCMul(recordCount, uint64(commitPhysical)+uint64(reservePhysical))
 	if !ok {
 		return nil, base.ErrOverflow
 	}
-	copyBytes := uint64(source.ValidEnd - recordlog.SegmentHeaderSize)
-	rotationBytes, ok := checkedGCMul(manifest.HardLimits.SegmentSize, 2)
+	rotationBytes, ok := checkedGCMul(manifest.HardLimits.SegmentSize, uint64(len(sources))+1)
 	if !ok {
 		return nil, base.ErrOverflow
 	}

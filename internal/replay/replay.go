@@ -250,17 +250,22 @@ func descriptorProposal(ctx context.Context, log Log, descriptor recordcodec.Des
 		if uint64(mutation.RecordID) >= reservedIDHigh {
 			return mapping.Proposal{}, corrupt(errors.New("mutation outside reserved ID range"))
 		}
-		change := mapping.Change{RecordID: mutation.RecordID, NewAddr: mutation.NewAddr, ExpectedOldAddr: mutation.ExpectedOldAddr}
+		change := mapping.Change{RecordID: mutation.RecordID, NewRef: recordlog.RecordRef{Addr: mutation.NewAddr, PhysicalSize: mutation.PhysicalSize}, ExpectedOldAddr: mutation.ExpectedOldAddr}
 		switch mutation.Operation {
 		case recordcodec.OperationDelete:
 			change.Operation = mapping.OperationDelete
 		case recordcodec.OperationPut, recordcodec.OperationRelocate:
-			if !before(mutation.NewAddr, commitAddr) || mutation.Operation == recordcodec.OperationRelocate && !before(mutation.ExpectedOldAddr, commitAddr) {
-				return mapping.Proposal{}, corrupt(errors.New("mutation address does not precede commit"))
+			newAvailable := before(mutation.NewAddr, commitAddr)
+			if mutation.Operation == recordcodec.OperationRelocate {
+				newAvailable = availableBeforeCommit(mutation.NewAddr, commitAddr)
+			}
+			if !newAvailable || mutation.Operation == recordcodec.OperationRelocate && !availableBeforeCommit(mutation.ExpectedOldAddr, commitAddr) {
+				return mapping.Proposal{}, corrupt(errors.New("mutation address was not available before commit"))
 			}
 			put, err := readPut(ctx, log, mutation.NewAddr, maxValue)
-			if err != nil || put.RecordID != mutation.RecordID {
-				return mapping.Proposal{}, corruptAt("new put identity", err)
+			physicalSize, sizeErr := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize) + uint64(len(put.Value)))
+			if err != nil || sizeErr != nil || put.RecordID != mutation.RecordID || physicalSize != mutation.PhysicalSize {
+				return mapping.Proposal{}, corruptAt("new put identity", errors.Join(err, sizeErr))
 			}
 			if logical > math.MaxUint64-uint64(len(put.Value)) {
 				return mapping.Proposal{}, corrupt(errors.New("logical payload overflow"))
@@ -287,6 +292,16 @@ func descriptorProposal(ctx context.Context, log Log, descriptor recordcodec.Des
 		return mapping.Proposal{}, corrupt(errors.New("logical payload size mismatch"))
 	}
 	return proposal, nil
+}
+
+// Normal append addresses must precede their Commit record in the ordered
+// user log. Compaction outputs live in a disjoint high SegmentID namespace:
+// they are sealed and Catalog-published before a relocation Commit, but their
+// numeric addresses intentionally sort after every normal Commit address.
+// Read below proves that a referenced compaction output is present in the
+// authoritative Catalog file set and validates its complete Put identity.
+func availableBeforeCommit(addr, commit recordlog.VAddr) bool {
+	return recordlog.IsCompactionSegment(addr.SegmentID()) || before(addr, commit)
 }
 
 func before(addr, limit recordlog.VAddr) bool {

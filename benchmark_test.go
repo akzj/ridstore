@@ -255,7 +255,7 @@ func openMaintenanceBenchmarkStore(b *testing.B) (*Store, string) {
 		Runtime: RuntimeConfig{
 			MaxQueuedBytes: 64 << 20, AppendQueueCapacity: 4096, AppendBufferBytes: 8 << 20,
 			AppendBufferRecords: 4096, CommitQueueCapacity: 4096, MaxGroupBatches: 64,
-			MaxGroupPayload: 256 << 10, MappingCacheBytes: 64 << 20, RecordMetaCacheEntries: 1 << 16,
+			MaxGroupPayload: 256 << 10, MappingCacheBytes: 64 << 20,
 			CheckpointSortBytes: 64 << 20, MaxSegmentStats: 1 << 16,
 			DeltaSoftLimitBytes: 64 << 20, DeltaHardLimitBytes: 128 << 20,
 			StatusRetention: 1 << 16, WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second,

@@ -131,7 +131,6 @@ RecordLog 保持单一同步动作。是否需要持久化只是请求属性，�
 type RecordLog interface {
     Append(context.Context, []byte, bool) (AppendResult, error) // bool means sync
     Read(context.Context, VAddr) ([]byte, error)
-    Inspect(context.Context, VAddr, prefixBytes) (RecordMetadata, []byte, error)
     Scan(context.Context, LogPos, func(VAddr, []byte) error) error
     Status() LogStatus
     Close() error
@@ -186,12 +185,8 @@ RecordLog 统一解析 VAddr：
 - sealed Record：经内部 Registry 和 Reader Pin 读取；
 - retired Segment：拒绝新 pin，等待已有 pin 后才允许删除。
 
-SegmentStats 只处理 checkpoint folded changes；active segment 转动后另外顺序扫描 former-active
-segment 并与 candidate Mapping join。需要 record metadata 时优先使用进程内
-`VAddr -> {RecordID, PhysicalSize}` cache；hit 时跳过物理读。miss 时
-`Inspect` 只读取并校验物理 Record Header 与调用者要求的 payload prefix；它返回不含 checksum
-字段的 `RecordMetadata`，避免让 buffered Record 假装已经拥有磁盘 Header CRC。Checkpoint 用它读取
-32-byte Put protocol header，因此统计阶段不读取大 Value body，也不声称验证未读取的 payload CRC。
+Mapping publish 从 Old/New `RecordRef` 同步维护精确 live stats；Checkpoint 与 Mapping entry
+一起冻结该表，因此不执行随机 Record Header I/O，也不扫描 active 或 former-active Segment。
 
 读取能力属于物理 RecordLog，但 Mapping 决定某个地址是否代表当前逻辑值。调用者不能绕过
 Mapping，直接把任意可读 Record 当成已提交数据。

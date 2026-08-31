@@ -7,13 +7,14 @@ import (
 )
 
 type CatalogSnapshot struct {
-	Generation      uint64
-	LogID           LogID
-	SegmentSize     uint32
-	MaxPayloadBytes uint32
-	ActiveSegmentID SegmentID
-	NextSegmentID   SegmentID
-	SealedSegments  []SegmentSummary
+	Generation             uint64
+	LogID                  LogID
+	SegmentSize            uint32
+	MaxPayloadBytes        uint32
+	ActiveSegmentID        SegmentID
+	NextSegmentID          SegmentID
+	CompactionSegmentFloor SegmentID
+	SealedSegments         []SegmentSummary
 }
 
 func (s CatalogSnapshot) Clone() CatalogSnapshot {
@@ -22,7 +23,7 @@ func (s CatalogSnapshot) Clone() CatalogSnapshot {
 }
 
 func (s CatalogSnapshot) validate() error {
-	if s.Generation == 0 || s.LogID == (LogID{}) || s.ActiveSegmentID == 0 || s.NextSegmentID != s.ActiveSegmentID+1 || s.ActiveSegmentID == SegmentID(math.MaxUint32) || s.SegmentSize > math.MaxUint32 || s.MaxPayloadBytes == 0 {
+	if s.Generation == 0 || s.LogID == (LogID{}) || s.ActiveSegmentID == 0 || s.NextSegmentID != s.ActiveSegmentID+1 || s.ActiveSegmentID >= CompactionSegmentBase || s.SegmentSize > math.MaxUint32 || s.MaxPayloadBytes == 0 || s.CompactionSegmentFloor != 0 && s.CompactionSegmentFloor < CompactionSegmentBase-1 {
 		return ErrInvalidConfig
 	}
 	if _, err := EncodeSegmentHeader(s.headerFor(s.ActiveSegmentID)); err != nil {
@@ -34,7 +35,9 @@ func (s CatalogSnapshot) validate() error {
 	}
 	var previous SegmentID
 	for _, summary := range s.SealedSegments {
-		if summary.SegmentID <= previous || summary.SegmentID >= s.ActiveSegmentID || summary.validate(s.SegmentSize) != nil {
+		regular := summary.SegmentID < s.ActiveSegmentID
+		compacted := IsCompactionSegment(summary.SegmentID) && s.CompactionSegmentFloor != 0 && summary.SegmentID > s.CompactionSegmentFloor
+		if summary.SegmentID <= previous || (!regular && !compacted) || summary.SegmentID == s.ActiveSegmentID || summary.validate(s.SegmentSize) != nil {
 			return ErrInvalidConfig
 		}
 		previous = summary.SegmentID

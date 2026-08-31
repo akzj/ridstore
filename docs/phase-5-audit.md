@@ -79,8 +79,8 @@ scheduler 负责，不进入持久化协议。
 公开 API 切换到 v2 Engine 时，旧 runtime metrics 实现随 v1 一并删除，但本文与 Metrics 契约仍错误标记为完成。
 当前实现已从 v2 的真实所有者重新建立 bounded snapshot：Coordinator 记录用户 Commit queue/group 与分段耗时，
 Batch 生命周期记录 committed/aborted/unknown，Persistent Mapping 和 space gate 提供即时 gauge，完整 Data GC
-记录物理 copied/reclaimed bytes 与结果计数。根包导出固定 41 个样本（含 GC throttle/space admission、
-后台 Checkpoint requested/completed/failed 和 Record metadata cache hit/miss/entries/evictions）以及无第三方依赖的 Prometheus adapter。
+记录物理 copied/reclaimed bytes 与结果计数。根包导出固定 37 个样本（含 GC throttle/space admission
+和后台 Checkpoint requested/completed/failed）以及无第三方依赖的 Prometheus adapter。
 
 ### P1：长时与对比证据
 
