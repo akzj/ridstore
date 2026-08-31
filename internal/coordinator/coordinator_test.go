@@ -299,6 +299,152 @@ func TestCheckpointFenceStopsAdmissionOnlyUntilRelease(t *testing.T) {
 	}
 }
 
+func TestCommitRedirectsRewriteUserDescriptorWithoutCheckpointMarker(t *testing.T) {
+	log := &fakeLog{}
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+	batch := newBatch(t, 1, log)
+	if err := batch.Put(context.Background(), 7, []byte("pending")); err != nil {
+		t.Fatal(err)
+	}
+	oldRef := batch.PendingPutRefs()[0]
+	prepared, err := batch.Prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, _, err := current.ReserveDelta([]model.ID{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAddr, err := recordlog.NewVAddr(recordlog.CompactionSegmentBase, recordlog.SegmentHeaderSize, oldRef.PhysicalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRef, err := recordlog.NewRecordRef(newAddr, oldRef.PhysicalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirects, err := c.InstallCommitRedirects(context.Background(), map[recordlog.VAddr]recordlog.RecordRef{oldRef.Addr: newRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model a Submit that prepared before redirect installation but reached the
+	// Coordinator queue afterwards. This is the race the redirect table closes.
+	result := make(chan response, 1)
+	c.requests <- request{batch: batch, prepared: prepared, reserve: reservation, result: result, queuedAt: time.Now()}
+	if answer := <-result; answer.err != nil {
+		t.Fatal(answer.err)
+	}
+	if _, err := redirects.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	log.mu.Lock()
+	checkpoints := len(log.checkpoints)
+	log.mu.Unlock()
+	if checkpoints != 0 {
+		t.Fatalf("checkpoints=%d", checkpoints)
+	}
+	if got, exists, err := current.LookupRef(7); err != nil || !exists || got != newRef {
+		t.Fatalf("ref=%+v exists=%v err=%v", got, exists, err)
+	}
+	groups := log.snapshotGroups()
+	if len(groups) != 1 || len(groups[0].Descriptors) != 1 || groups[0].Descriptors[0].Mutations[0].NewAddr != newRef.Addr {
+		t.Fatalf("groups=%+v", groups)
+	}
+}
+
+func TestCommitRedirectInstallDoesNotBlockLaterAdmission(t *testing.T) {
+	log := &fakeLog{firstSync: make(chan struct{}), releaseSync: make(chan struct{})}
+	defer func() {
+		select {
+		case <-log.releaseSync:
+		default:
+			close(log.releaseSync)
+		}
+	}()
+	current := mapping.NewEmpty()
+	c := newCoordinator(t, log, current)
+
+	first := newBatch(t, 1, log)
+	if err := first.Put(context.Background(), 1, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	firstReceipt, err := c.Submit(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-log.firstSync:
+	case <-time.After(time.Second):
+		t.Fatal("first commit did not reach durable append")
+	}
+
+	second := newBatch(t, 2, log)
+	if err := second.Put(context.Background(), 2, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	oldRef := second.PendingPutRefs()[0]
+	newAddr, err := recordlog.NewVAddr(recordlog.CompactionSegmentBase, recordlog.SegmentHeaderSize, oldRef.PhysicalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRef, err := recordlog.NewRecordRef(newAddr, oldRef.PhysicalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type installResult struct {
+		redirects *CommitRedirects
+		err       error
+	}
+	installed := make(chan installResult, 1)
+	go func() {
+		redirects, err := c.InstallCommitRedirects(context.Background(), map[recordlog.VAddr]recordlog.RecordRef{oldRef.Addr: newRef})
+		installed <- installResult{redirects: redirects, err: err}
+	}()
+	waitForQueuedRequests(t, c, 1)
+
+	submitted := make(chan struct {
+		receipt Receipt
+		err     error
+	}, 1)
+	go func() {
+		receipt, err := c.Submit(context.Background(), second)
+		submitted <- struct {
+			receipt Receipt
+			err     error
+		}{receipt: receipt, err: err}
+	}()
+	var secondReceipt Receipt
+	select {
+	case answer := <-submitted:
+		if answer.err != nil {
+			t.Fatal(answer.err)
+		}
+		secondReceipt = answer.receipt
+	case <-time.After(time.Second):
+		t.Fatal("redirect installation blocked later commit admission")
+	}
+	waitForQueuedRequests(t, c, 2)
+	close(log.releaseSync)
+
+	redirects := <-installed
+	if redirects.err != nil {
+		t.Fatal(redirects.err)
+	}
+	if _, err := redirects.redirects.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstReceipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondReceipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got, exists, err := current.LookupRef(2); err != nil || !exists || got != newRef {
+		t.Fatalf("ref=%+v exists=%v err=%v", got, exists, err)
+	}
+}
+
 func TestRelocationSharesCommitOrderAndUsesAddressCAS(t *testing.T) {
 	log := &fakeLog{}
 	current := mapping.NewEmpty()

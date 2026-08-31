@@ -255,10 +255,10 @@ func descriptorProposal(ctx context.Context, log Log, descriptor recordcodec.Des
 		case recordcodec.OperationDelete:
 			change.Operation = mapping.OperationDelete
 		case recordcodec.OperationPut, recordcodec.OperationRelocate:
-			newAvailable := before(mutation.NewAddr, commitAddr)
-			if mutation.Operation == recordcodec.OperationRelocate {
-				newAvailable = availableBeforeCommit(mutation.NewAddr, commitAddr)
-			}
+			// A GC-redirection may rewrite an unpublished user Put to an
+			// immutable, Catalog-published compaction output. Its high namespace
+			// address sorts after the Commit record but is already durable.
+			newAvailable := availableBeforeCommit(mutation.NewAddr, commitAddr)
 			if !newAvailable || mutation.Operation == recordcodec.OperationRelocate && !availableBeforeCommit(mutation.ExpectedOldAddr, commitAddr) {
 				return mapping.Proposal{}, corrupt(errors.New("mutation address was not available before commit"))
 			}
@@ -294,12 +294,12 @@ func descriptorProposal(ctx context.Context, log Log, descriptor recordcodec.Des
 	return proposal, nil
 }
 
-// Normal append addresses must precede their Commit record in the ordered
-// user log. Compaction outputs live in a disjoint high SegmentID namespace:
-// they are sealed and Catalog-published before a relocation Commit, but their
-// numeric addresses intentionally sort after every normal Commit address.
-// Read below proves that a referenced compaction output is present in the
-// authoritative Catalog file set and validates its complete Put identity.
+// Normal append addresses must precede their Commit record in the ordered user
+// log. Compaction outputs live in a disjoint high SegmentID namespace: they are
+// sealed and Catalog-published before either a relocation Commit or a redirected
+// user Commit, but their numeric addresses intentionally sort after every normal
+// Commit address. Read below proves presence in the authoritative Catalog file
+// set and validates the complete Put identity.
 func availableBeforeCommit(addr, commit recordlog.VAddr) bool {
 	return recordlog.IsCompactionSegment(addr.SegmentID()) || before(addr, commit)
 }

@@ -268,9 +268,14 @@ Barrier 请求排在 Commit publish 序列中。轮到它时，coordinator 先�
 
 第 6 步必须以安装时最新的 durable Data/Mapping 文件集合为基底，只替换同代 Mapping Root、checkpoint cut 与 SegmentStats 字段；不能用切点时缓存的旧 Manifest 覆盖并发 rotation 的结果。Root 或 Stats 任一构建/校验失败都不安装该 generation，并保留旧 Root/Stats 与 frozen Delta。
 
-Open Batch 的 payload 可以早于 F，但其 Commit Descriptor 只在未来 Commit 时生成并位于 F 之后。Descriptor 自包含旧 payload 的 VAddr，因此恢复从 ReplayStart 扫描仍能找到所有未覆盖 Commit 的最终 Mutation集合并回读验证 payload。
+Open Batch 的 payload 可以早于 F，但其 Commit Descriptor 只在未来 Commit 时生成并位于 F 之后。Descriptor
+自包含最终 payload 的 VAddr，因此恢复从 ReplayStart 扫描仍能回读并验证 payload。若 Data GC 已复制该
+未提交 Put，Descriptor 可以引用已 seal、fsync 且进入 Catalog 的高位 Compaction Segment；Replay 对普通
+日志地址证明 `NewAddr < CommitAddr`，对高位地址则通过 Catalog reader 验证完整 Put identity。
 
-Checkpoint 不需要等待 Open Batch 结束，但 Open Batch 引用的 Data Segment不能被 GC 删除。
+Checkpoint 不需要等待 Open Batch 结束。GC 会复制它位于 sealed source 的最终 Put，在 Coordinator
+顺序流安装临时地址重定向，并原地改写尚未 Prepare 的 mutation。已 Prepare 的 Commit 在 descriptor
+编码前由 Coordinator 转换，因此不需要在排空旧 Commit 队列期间停止新 admission。
 
 ## 12. Open/Recovery 总流程
 
@@ -383,7 +388,9 @@ Rotation 只能由 append sequencer执行：
 
 Open 在普通 Frame replay 前先恢复 ROTATION journal。没有 journal 时，Manifest 未引用的正式 Data 文件不能自动收编；只能报告 orphan 或由显式离线工具处理。
 
-Open Batch 可以引用已 Sealed Segment 中的 PutRecord。Segment Registry 记录这些引用，直到 Batch Commit/Abort，GC 不选择有 Open Batch ref 的 Segment。
+Open Batch 可以引用已 Sealed Segment 中的 PutRecord。GC 将最终、仍可发布的 Put 引用作为 pending root
+复制；已越过提交顺序点的 Batch 由 Mapping CAS 搬迁，仍为 Open 的 Batch 在原地改写 `RecordRef`。因此
+长 Batch 不再排除候选，也不要求 source 一直保留到 Commit/Abort。
 
 ## 17. Close 与崩溃差异
 

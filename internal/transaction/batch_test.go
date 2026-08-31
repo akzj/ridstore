@@ -120,11 +120,44 @@ func TestReferencedSegmentTracksOnlyFinalPublishablePut(t *testing.T) {
 	if !b.ReferencesSegment(1) {
 		t.Fatal("committing Put lost its reference before publication")
 	}
+	if refs := b.PendingPutRefs(); len(refs) != 1 || refs[0].Addr.SegmentID() != 1 {
+		t.Fatalf("committing refs=%v", refs)
+	}
 	if err := b.MarkCommitted(1); err != nil {
 		t.Fatal(err)
 	}
 	if b.ReferencesSegment(1) {
 		t.Fatal("terminal batch retained a segment reference")
+	}
+}
+
+func TestPendingPutRefsCanBeRewrittenBeforePrepare(t *testing.T) {
+	log := &fakeLog{}
+	b := testBatch(t, log, Limits{})
+	if err := b.Put(context.Background(), 1, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	refs := b.PendingPutRefs()
+	if len(refs) != 1 {
+		t.Fatalf("refs=%v", refs)
+	}
+	addr, err := recordlog.NewVAddr(9, 64, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRef, err := recordlog.NewRecordRef(addr, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten := b.RewritePutRefs(map[recordlog.VAddr]recordlog.RecordRef{refs[0].Addr: newRef}); rewritten != 1 {
+		t.Fatalf("rewritten=%d", rewritten)
+	}
+	prepared, err := b.Prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.Mutations) != 1 || prepared.Mutations[0].Ref != newRef {
+		t.Fatalf("prepared=%+v", prepared)
 	}
 }
 

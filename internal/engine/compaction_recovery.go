@@ -87,7 +87,10 @@ func equalSegmentSummaries(left, right []recordlog.SegmentSummary) bool {
 
 func (s *Store) resumeCompaction(ctx context.Context, state compactionstate.State) error {
 	var relocated SegmentRelocationResult
-	if err := s.publishCompactionOutputs(ctx, state.Inputs, state.Outputs, &relocated); err != nil {
+	// Open Batches do not survive restart. Payload equality reconstructs the
+	// exact source/output pairing when interrupted compaction copied multiple
+	// unpublished versions of the same RecordID.
+	if err := s.publishCompactionOutputs(ctx, state.Inputs, state.Outputs, nil, true, &relocated); err != nil {
 		return err
 	}
 	proofs, err := s.checkpointAndProveRetirements(ctx, state.Inputs, relocated.LastCommitSeq)

@@ -285,7 +285,7 @@ Mapping、Close 并 offline Verify。`make test-soak-smoke` 只验证 harness �
 - 连续高 occupancy 与随机稀疏 ID 的 Mapping bytes/Lookup；
 - 大量 Delete 后 Dense→Sparse 的空间收敛；
 - foreground + checkpoint；
-- foreground + GC；
+- foreground + 单轮 Data GC/Open Batch redirect 已有开发期 A/B；仍需多轮稳态 GC；
 - 不同 live ratio 稳定态。
 
 ### 10.2 指标

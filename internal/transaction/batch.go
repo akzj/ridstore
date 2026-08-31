@@ -235,6 +235,57 @@ func (b *Batch) ReferencesSegment(segment recordlog.SegmentID) bool {
 	return false
 }
 
+// PendingPutRefs returns the final Put references currently owned by an open
+// or committing Batch. A committing proposal may be queued but not yet visible
+// in Mapping, so compaction must retain it until the Coordinator redirect
+// boundary has transformed or resolved that proposal. Superseded Put records
+// are deliberately excluded.
+func (b *Batch) PendingPutRefs() []recordlog.RecordRef {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != StateOpen && b.state != StateCommitting {
+		return nil
+	}
+	refs := make([]recordlog.RecordRef, 0, len(b.mutations))
+	for _, mutation := range b.mutations {
+		if mutation.Operation == mapping.OperationPut {
+			refs = append(refs, mutation.Ref)
+		}
+	}
+	return refs
+}
+
+// RewritePutRefs atomically redirects final, unpublished Put mutations. A
+// committing or terminal Batch is deliberately left unchanged: an already
+// prepared commit is transformed by the Coordinator redirect table instead.
+func (b *Batch) RewritePutRefs(redirects map[recordlog.VAddr]recordlog.RecordRef) uint64 {
+	if b == nil || len(redirects) == 0 {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != StateOpen {
+		return 0
+	}
+	var rewritten uint64
+	for id, mutation := range b.mutations {
+		if mutation.Operation != mapping.OperationPut {
+			continue
+		}
+		redirected, ok := redirects[mutation.Ref.Addr]
+		if !ok {
+			continue
+		}
+		mutation.Ref = redirected
+		b.mutations[id] = mutation
+		rewritten++
+	}
+	return rewritten
+}
+
 func (b *Batch) Prepare() (Prepared, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

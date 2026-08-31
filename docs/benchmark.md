@@ -13,6 +13,11 @@
   分别报告 p50/p99/p999/max、已完成维护次数和实际 Data rotation 数；该 workload 使用
   1MiB Segment，令持续 overwrite 在测量期间自然触发 Data rotation，同时覆盖 Catalog
   generation rebase；
+- `BenchmarkDurableDataCompactionInterference`：idle 与 Data Compact 使用完全相同的
+  sealed/dead/open-Batch fixture，只改变计时区间是否运行 GC。它除前台延迟外还报告完成 GC 数、
+  commit redirect 次数、每次 redirect 平均顺序等待/admission boundary 时间和实际重定向 ref 数；取消只阻止下一轮
+  maintenance，不会中断已经跨过 durable publication boundary 的 Compaction。长 Open Batch 在第一次
+  redirect 后仍保持 Open，用于验证后续 GC 不会让同一批 pending refs 在 Compaction Outputs 间反复搬家；
 - `BenchmarkDurableAppendBaseline`：向同一 regular file append 一个 value 并每次 `fsync`。
 
 raw append 只是设备和文件系统的 durable lower bound。它没有 framing、recovery、Mapping、
@@ -45,7 +50,7 @@ dirty tree 仍可用于开发期调试，但 `git_dirty=true` 的产物不得作
 ## 3. 仍未完成
 
 - Pebble/RocksDB 在相同 fsync/WAL、batch、value size、concurrency 和稳态 compaction 条件下的 adapter；
-- random/conditional/delete/mixed/read/checkpoint/GC workload matrix；
+- random/conditional/delete/mixed/read workload matrix，以及多轮稳态 checkpoint/GC 曲线；
 - CPU、RSS、FD、space amplification、recovery 与独立侧车采集；
 - paced Checkpoint/Data Compact 与真实日夜调度曲线；
 - 固定机型和文件系统上的多轮稳态原始报告。

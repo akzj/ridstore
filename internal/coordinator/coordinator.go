@@ -103,6 +103,28 @@ type relocationResponse struct {
 	err    error
 }
 
+type redirectResponse struct {
+	generation uint64
+	err        error
+}
+
+type redirectRequest struct {
+	install map[recordlog.VAddr]recordlog.RecordRef
+	release uint64
+	result  chan redirectResponse
+}
+
+// CommitRedirects rewrites already-prepared user Put references at the unique
+// Coordinator publication point. Release briefly closes admission only while
+// enqueueing the removal boundary; it does not wait for older fsyncs while
+// holding the admission lock.
+type CommitRedirects struct {
+	mu         sync.Mutex
+	c          *Coordinator
+	generation uint64
+	released   bool
+}
+
 type request struct {
 	batch      *transaction.Batch
 	prepared   transaction.Prepared
@@ -111,6 +133,7 @@ type request struct {
 	result     chan response
 	relocated  chan relocationResponse
 	barrier    chan checkpointResponse
+	redirect   *redirectRequest
 	queuedAt   time.Time
 }
 
@@ -129,6 +152,8 @@ type Coordinator struct {
 	closed      bool
 	requests    chan request
 	done        chan struct{}
+	redirects   map[recordlog.VAddr]recordlog.RecordRef
+	redirectGen uint64
 	metrics     runtimeMetrics
 }
 
@@ -293,14 +318,22 @@ func (c *Coordinator) CheckpointCut(ctx context.Context) (CheckpointCut, error) 
 // the call. New Commit and Relocation admission remains stopped until Release;
 // callers must keep the fenced section short and must always release it.
 func (c *Coordinator) AcquireCheckpointFence(ctx context.Context) (*CheckpointFence, error) {
+	answer, err := c.acquireCheckpointFence(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &CheckpointFence{Cut: answer.cut, c: c}, nil
+}
+
+func (c *Coordinator) acquireCheckpointFence(ctx context.Context) (checkpointResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return checkpointResponse{}, err
 	}
 	if err := c.Fault(); err != nil {
-		return nil, errors.Join(base.ErrReadOnly, err)
+		return checkpointResponse{}, errors.Join(base.ErrReadOnly, err)
 	}
 	c.admissionMu.Lock()
 	release := true
@@ -313,21 +346,107 @@ func (c *Coordinator) AcquireCheckpointFence(ctx context.Context) (*CheckpointFe
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()
-		return nil, base.ErrClosed
+		return checkpointResponse{}, base.ErrClosed
 	}
 	select {
 	case c.requests <- req:
 		c.submitMu.Unlock()
 	case <-ctx.Done():
 		c.submitMu.Unlock()
-		return nil, ctx.Err()
+		return checkpointResponse{}, ctx.Err()
 	}
 	answer := <-req.barrier
 	if answer.err != nil {
-		return nil, answer.err
+		return checkpointResponse{}, answer.err
 	}
 	release = false
-	return &CheckpointFence{Cut: answer.cut, c: c}, nil
+	return answer, nil
+}
+
+// InstallCommitRedirects orders an in-memory old-address rewrite table after
+// previously queued commits. Later user Commit requests are rewritten before
+// Mapping resolution and descriptor encoding. The table is intentionally not
+// durable: Open Batches do not survive restart, while durable older commits
+// are handled by normal relocation recovery.
+func (c *Coordinator) InstallCommitRedirects(ctx context.Context, redirects map[recordlog.VAddr]recordlog.RecordRef) (*CommitRedirects, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(redirects) == 0 {
+		return nil, base.ErrInvalidConfig
+	}
+	owned := make(map[recordlog.VAddr]recordlog.RecordRef, len(redirects))
+	for old, replacement := range redirects {
+		if !old.Valid() || !replacement.Valid() || old == replacement.Addr || !recordlog.IsCompactionSegment(replacement.Addr.SegmentID()) {
+			return nil, base.ErrInvalidConfig
+		}
+		owned[old] = replacement
+	}
+	command := &redirectRequest{install: owned, result: make(chan redirectResponse, 1)}
+	if err := c.submitRedirect(ctx, command, false); err != nil {
+		return nil, err
+	}
+	answer := <-command.result
+	if answer.err != nil {
+		return nil, answer.err
+	}
+	return &CommitRedirects{c: c, generation: answer.generation}, nil
+}
+
+// Release establishes an admission boundary after callers have rewritten all
+// still-open Batches. Prepared stale requests are already queued before the
+// removal command; newer requests can only contain rewritten refs. The returned
+// duration is the only interval in which new admission was blocked.
+func (r *CommitRedirects) Release(ctx context.Context) (time.Duration, error) {
+	if r == nil || r.c == nil {
+		return 0, base.ErrInvalidConfig
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return 0, base.ErrConflict
+	}
+	command := &redirectRequest{release: r.generation, result: make(chan redirectResponse, 1)}
+	started := time.Now()
+	if err := r.c.submitRedirect(ctx, command, true); err != nil {
+		return time.Since(started), err
+	}
+	admissionDuration := time.Since(started)
+	r.released = true
+	answer := <-command.result
+	return admissionDuration, answer.err
+}
+
+func (c *Coordinator) submitRedirect(ctx context.Context, command *redirectRequest, fenceAdmission bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.Fault(); err != nil {
+		return errors.Join(base.ErrReadOnly, err)
+	}
+	if fenceAdmission {
+		c.admissionMu.Lock()
+		defer c.admissionMu.Unlock()
+	}
+	c.submitMu.Lock()
+	if c.closed {
+		c.submitMu.Unlock()
+		return base.ErrClosed
+	}
+	select {
+	case c.requests <- request{redirect: command}:
+		c.submitMu.Unlock()
+		return nil
+	case <-ctx.Done():
+		c.submitMu.Unlock()
+		return ctx.Err()
+	}
 }
 
 func (c *Coordinator) Fault() error {
@@ -360,6 +479,10 @@ func (c *Coordinator) Close() error {
 func (c *Coordinator) run() {
 	defer close(c.done)
 	for first := range c.requests {
+		if first.redirect != nil {
+			c.processRedirect(first.redirect)
+			continue
+		}
 		if first.barrier != nil {
 			c.processCheckpoint(first)
 			continue
@@ -378,9 +501,13 @@ func (c *Coordinator) run() {
 					c.process(group)
 					return
 				}
-				if next.barrier != nil {
+				if next.barrier != nil || next.redirect != nil {
 					c.process(group)
-					c.processCheckpoint(next)
+					if next.redirect != nil {
+						c.processRedirect(next.redirect)
+					} else {
+						c.processCheckpoint(next)
+					}
 					group = nil
 					break
 				}
@@ -436,6 +563,30 @@ func (c *Coordinator) processCheckpoint(req request) {
 	req.barrier <- checkpointResponse{cut: CheckpointCut{CoveredCommitSeq: covered, ReplayStart: physical.End}}
 }
 
+func (c *Coordinator) processRedirect(command *redirectRequest) {
+	if fault := c.Fault(); fault != nil {
+		command.result <- redirectResponse{err: errors.Join(base.ErrReadOnly, fault)}
+		return
+	}
+	if len(command.install) != 0 {
+		if len(c.redirects) != 0 || c.redirectGen == math.MaxUint64 {
+			command.result <- redirectResponse{err: base.ErrConflict}
+			return
+		}
+		c.redirectGen++
+		c.redirects = command.install
+		command.result <- redirectResponse{generation: c.redirectGen}
+		return
+	}
+	if command.release == 0 || command.release != c.redirectGen || len(c.redirects) == 0 {
+		command.result <- redirectResponse{err: base.ErrConflict}
+		return
+	}
+	clear(c.redirects)
+	c.redirects = nil
+	command.result <- redirectResponse{generation: command.release}
+}
+
 func (c *Coordinator) process(group []request) {
 	started := time.Now()
 	userRequests := uint64(0)
@@ -452,6 +603,9 @@ func (c *Coordinator) process(group []request) {
 		return
 	}
 	active := orderUserBeforeRelocation(group)
+	for i := range active {
+		c.applyCommitRedirects(&active[i])
+	}
 	proposals := make([]mapping.Proposal, 0, len(group))
 	for _, req := range active {
 		proposals = append(proposals, requestProposal(req))
@@ -593,6 +747,21 @@ func (c *Coordinator) process(group []request) {
 		seq := sequences[i]
 		if err := c.completeSuccess(req, seq, plan.Proposals[i]); err != nil {
 			c.fail(err)
+		}
+	}
+}
+
+func (c *Coordinator) applyCommitRedirects(req *request) {
+	if req == nil || req.relocation != nil || len(c.redirects) == 0 {
+		return
+	}
+	for i := range req.prepared.Mutations {
+		mutation := &req.prepared.Mutations[i]
+		if mutation.Operation != mapping.OperationPut {
+			continue
+		}
+		if replacement, exists := c.redirects[mutation.Ref.Addr]; exists {
+			mutation.Ref = replacement
 		}
 	}
 }

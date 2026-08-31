@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -64,6 +65,11 @@ type copiedRecord struct {
 	oldAddr    recordlog.VAddr
 	newRef     recordlog.RecordRef
 	valueBytes uint64
+}
+
+type openBatchCompactionRefs struct {
+	refs    map[recordlog.VAddr]recordlog.RecordRef
+	batches []*Batch
 }
 
 // RelocateSegment scans one sealed source Segment and copies records that are
@@ -157,8 +163,9 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 }
 
 // CompactNextSegment checkpoints current Mapping state, selects at most one
-// checkpoint-safe candidate, and runs the full retirement protocol. A false
-// found result means no Segment passed the policy and open-Batch gates.
+// checkpoint-safe candidate, and runs the full retirement protocol. Open Batch
+// Put references are copied and redirected rather than excluding a candidate.
+// A false found result means no Segment passed the policy gates.
 func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy) (NextSegmentCompactionResult, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -177,26 +184,41 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	rate := s.gcBytesPerSecond.Load()
-	if err := s.checkpoint(ctx, true); err != nil {
-		return NextSegmentCompactionResult{}, false, fmt.Errorf("checkpoint before candidate selection: %w", err)
+	selectCandidate := func() (SegmentCompactionCandidate, bool, error) {
+		manifest := s.catalog.Snapshot()
+		excluded, err := s.openBatchCompactionOutputReferences(manifest.SealedDataSegments)
+		if err != nil {
+			return SegmentCompactionCandidate{}, false, fmt.Errorf("collect open batch compaction-output references: %w", err)
+		}
+		now := time.Now()
+		if s.gcNow != nil {
+			now = s.gcNow()
+		}
+		return selectCompactionCandidate(manifest, policy, excluded, func(id recordlog.SegmentID) (gcStabilityView, bool) {
+			return s.gcStability.view(id, now, policy)
+		})
 	}
-	manifest := s.catalog.Snapshot()
-	excluded, err := s.openBatchSegmentReferences(manifest.SealedDataSegments)
-	if err != nil {
-		return NextSegmentCompactionResult{}, false, fmt.Errorf("collect open batch segment references: %w", err)
-	}
-	now := time.Now()
-	if s.gcNow != nil {
-		now = s.gcNow()
-	}
-	candidate, found, err := selectCompactionCandidate(manifest, policy, excluded, func(id recordlog.SegmentID) (gcStabilityView, bool) {
-		return s.gcStability.view(id, now, policy)
-	})
+	// A durable checkpoint remains an exact scheduling snapshot until replaced.
+	// Try it first so a successful GC normally pays only the post-relocation
+	// checkpoint. Refresh only when no existing candidate is usable.
+	candidate, found, err := selectCandidate()
 	if err != nil {
 		if errors.Is(err, base.ErrCorrupt) {
 			s.setFault(err)
 		}
 		return NextSegmentCompactionResult{}, false, err
+	}
+	if !found {
+		if err := s.checkpoint(ctx, true); err != nil {
+			return NextSegmentCompactionResult{}, false, fmt.Errorf("checkpoint before candidate selection: %w", err)
+		}
+		candidate, found, err = selectCandidate()
+		if err != nil {
+			if errors.Is(err, base.ErrCorrupt) {
+				s.setFault(err)
+			}
+			return NextSegmentCompactionResult{}, false, err
+		}
 	}
 	if !found {
 		s.metrics.gcNoCandidate.Add(1)
@@ -226,12 +248,9 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 			return result, recordlog.ErrSegmentMissing
 		}
 	}
-	excluded, err := s.openBatchSegmentReferences(inputs)
+	pending, err := s.snapshotOpenBatchCompactionRefs(inputs)
 	if err != nil {
 		return result, err
-	}
-	if len(excluded) != 0 {
-		return result, base.ErrConflict
 	}
 	space, err := s.reserveGCCopies(ctx, manifest, inputs)
 	if err != nil {
@@ -266,6 +285,8 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 		return result, rollbackUnpublished(nil, err)
 	}
 	copyPacer := s.newGCPacer(rate)
+	redirects := make(map[recordlog.VAddr]recordlog.RecordRef, len(pending.refs))
+	pendingOrigins := make(map[recordlog.VAddr]recordlog.VAddr, len(pending.refs))
 	var unpacedBytes uint64
 	paceCopy := func(force bool) error {
 		if unpacedBytes == 0 || !force && unpacedBytes < s.maxRelocationBytes {
@@ -297,7 +318,14 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 			if lookupErr != nil {
 				return lookupErr
 			}
-			if !exists || current.Addr != scanned.Addr {
+			pendingRef, pendingLive := pending.refs[scanned.Addr]
+			if pendingLive {
+				scannedRef, refErr := scanned.Ref()
+				if refErr != nil || scannedRef != pendingRef {
+					return errors.Join(base.ErrCorrupt, refErr)
+				}
+			}
+			if (!exists || current.Addr != scanned.Addr) && !pendingLive {
 				return nil
 			}
 			result.Relocation.LiveCandidates++
@@ -315,6 +343,14 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 			result.Relocation.CopiedPhysicalBytes += physical
 			result.Relocation.CopiedValueBytes += uint64(len(put.Value))
 			unpacedBytes += physical
+			if pendingLive {
+				newRef, refErr := copied.Ref()
+				if refErr != nil {
+					return errors.Join(base.ErrCorrupt, refErr)
+				}
+				redirects[scanned.Addr] = newRef
+				pendingOrigins[newRef.Addr] = scanned.Addr
+			}
 			return paceCopy(false)
 		})
 		if err != nil {
@@ -343,7 +379,13 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 		return result, s.compactionFailure(err)
 	}
 
-	if err = s.publishCompactionOutputs(ctx, inputs, outputs, &result.Relocation); err != nil {
+	if len(redirects) != len(pending.refs) {
+		return result, s.compactionFailure(errors.Join(base.ErrCorrupt, errors.New("open batch compaction reference was not copied")))
+	}
+	if err = s.rewriteOpenBatchCompactionRefs(ctx, pending.batches, redirects); err != nil {
+		return result, s.compactionFailure(err)
+	}
+	if err = s.publishCompactionOutputs(ctx, inputs, outputs, pendingOrigins, false, &result.Relocation); err != nil {
 		return result, s.compactionFailure(err)
 	}
 	proofs, err := s.checkpointAndProveRetirements(ctx, inputs, result.Relocation.LastCommitSeq)
@@ -463,16 +505,21 @@ func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord,
 // output records in bounded batches. A current ref in one of the input
 // segments is the exact CAS source; refs already moved by an earlier recovery
 // attempt or by a user update need no proposal.
-func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []recordlog.SegmentSummary, result *SegmentRelocationResult) error {
+func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []recordlog.SegmentSummary, pendingOrigins map[recordlog.VAddr]recordlog.VAddr, verifySourcePayload bool, result *SegmentRelocationResult) error {
 	inputIDs := make(map[recordlog.SegmentID]struct{}, len(inputs))
 	for _, input := range inputs {
 		inputIDs[input.SegmentID] = struct{}{}
+	}
+	pendingSources := make(map[recordlog.VAddr]struct{}, len(pendingOrigins))
+	for _, source := range pendingOrigins {
+		pendingSources[source] = struct{}{}
 	}
 	capacity := int(min(s.limits.MaxBatchMutations, s.maxRelocationMutations))
 	if capacity == 0 {
 		return base.ErrInvalidConfig
 	}
 	pending := make([]copiedRecord, 0, capacity)
+	pendingIDs := make(map[model.ID]struct{}, capacity)
 	var pendingBytes uint64
 	flush := func() error {
 		if len(pending) == 0 {
@@ -483,6 +530,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 		}
 		pending = pending[:0]
 		pendingBytes = 0
+		clear(pendingIDs)
 		return nil
 	}
 	for _, output := range outputs {
@@ -514,6 +562,32 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
 			}
+			if origin, pendingCopy := pendingOrigins[scanned.Addr]; pendingCopy {
+				if current.Addr != origin {
+					result.Skipped++
+					return nil
+				}
+			} else if _, currentIsPending := pendingSources[current.Addr]; currentIsPending {
+				// The same RecordID may have both a committed source version and
+				// several unpublished Batch versions in the input run. Only the
+				// output copied from the exact pending source may relocate it.
+				result.Skipped++
+				return nil
+			}
+			if verifySourcePayload {
+				sourcePayload, readErr := s.log.Read(ctx, current.Addr)
+				if readErr != nil {
+					return readErr
+				}
+				if !bytes.Equal(sourcePayload, payload) {
+					result.Skipped++
+					return nil
+				}
+			}
+			if _, duplicate := pendingIDs[put.RecordID]; duplicate {
+				result.Skipped++
+				return nil
+			}
 			valueBytes := uint64(len(put.Value))
 			exceedsBytes := valueBytes > s.maxRelocationBytes || pendingBytes > s.maxRelocationBytes-valueBytes
 			if len(pending) != 0 && (len(pending) == capacity || exceedsBytes) {
@@ -522,6 +596,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 				}
 			}
 			pending = append(pending, copiedRecord{id: put.RecordID, oldAddr: current.Addr, newRef: ref, valueBytes: valueBytes})
+			pendingIDs[put.RecordID] = struct{}{}
 			pendingBytes += valueBytes
 			return nil
 		}); err != nil {
@@ -529,6 +604,81 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 		}
 	}
 	return flush()
+}
+
+// snapshotOpenBatchCompactionRefs captures the only unpublished addresses that
+// can still enter Mapping for sealed inputs. Put-like operations are drained so
+// a Record append cannot be observed without its final Batch mutation.
+func (s *Store) snapshotOpenBatchCompactionRefs(inputs []recordlog.SegmentSummary) (openBatchCompactionRefs, error) {
+	inputIDs := make(map[recordlog.SegmentID]struct{}, len(inputs))
+	for _, input := range inputs {
+		inputIDs[input.SegmentID] = struct{}{}
+	}
+	s.mutationFence.Lock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.mutationFence.Unlock()
+		return openBatchCompactionRefs{}, base.ErrClosed
+	}
+	if s.fault != nil {
+		fault := s.fault
+		s.mu.Unlock()
+		s.mutationFence.Unlock()
+		return openBatchCompactionRefs{}, errors.Join(base.ErrReadOnly, fault)
+	}
+	open := make([]*Batch, 0, len(s.open))
+	for _, batch := range s.open {
+		open = append(open, batch)
+	}
+	s.mu.Unlock()
+	// Taking the write side above drains Put-like operations that may have
+	// appended to a now-sealed input but not yet installed their Batch mutation.
+	// Once drained, later Put records can only enter the active Segment. Release
+	// the global fence before inspecting individual Batches so the scan cost is
+	// never added to foreground Put latency.
+	s.mutationFence.Unlock()
+	result := openBatchCompactionRefs{refs: make(map[recordlog.VAddr]recordlog.RecordRef)}
+	for _, batch := range open {
+		referenced := false
+		for _, ref := range batch.inner.PendingPutRefs() {
+			if _, ok := inputIDs[ref.Addr.SegmentID()]; !ok {
+				continue
+			}
+			result.refs[ref.Addr] = ref
+			referenced = true
+		}
+		if referenced {
+			result.batches = append(result.batches, batch)
+		}
+	}
+	return result, nil
+}
+
+// rewriteOpenBatchCompactionRefs establishes the publication boundary for
+// unpublished Put addresses. The Coordinator first installs an address rewrite
+// table after older requests, so already-prepared and concurrent Commit requests
+// do not have to stop while still-open Batch mutations are rewritten. Release
+// briefly fences admission only to enqueue the redirect-removal boundary.
+func (s *Store) rewriteOpenBatchCompactionRefs(ctx context.Context, batches []*Batch, redirects map[recordlog.VAddr]recordlog.RecordRef) error {
+	if len(redirects) == 0 {
+		return nil
+	}
+	waitStarted := time.Now()
+	installed, err := s.commits.InstallCommitRedirects(ctx, redirects)
+	if err != nil {
+		return err
+	}
+	s.metrics.gcCommitRedirects.Add(1)
+	s.metrics.gcCommitRedirectWaitNanos.Add(uint64(time.Since(waitStarted)))
+	var rewritten uint64
+	for _, batch := range batches {
+		rewritten += batch.inner.RewritePutRefs(redirects)
+	}
+	admissionNanos, err := installed.Release(ctx)
+	s.metrics.gcCommitRedirectAdmissionNanos.Add(uint64(admissionNanos))
+	s.metrics.gcOpenRefsRedirected.Add(rewritten)
+	return err
 }
 
 func (s *Store) checkpointAndProveRetirements(ctx context.Context, inputs []recordlog.SegmentSummary, end model.CommitSeq) ([]SegmentRetirementProof, error) {
@@ -540,7 +690,7 @@ func (s *Store) checkpointAndProveRetirements(ctx context.Context, inputs []reco
 		proofs := make([]SegmentRetirementProof, 0, len(inputs))
 		stale := false
 		for _, input := range inputs {
-			proof, err := s.proveSegmentRetirement(ctx, input.SegmentID, end)
+			proof, err := s.proveCompactionRetirement(input.SegmentID, end)
 			if errors.Is(err, errCheckpointStatsStale) {
 				stale = true
 				break
@@ -656,17 +806,28 @@ func (s *Store) checkpointAndProveRetirement(ctx context.Context, source recordl
 	return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errCheckpointStatsStale)
 }
 
-func (s *Store) openBatchSegmentReferences(sealed []recordlog.SegmentSummary) (map[recordlog.SegmentID]struct{}, error) {
-	s.mutationFence.Lock()
+// openBatchCompactionOutputReferences prevents a long-lived unpublished root
+// from being copied from one GC output into another on every scheduler pass.
+// Normal sealed segments remain eligible for their first compaction; once the
+// pending roots have moved into a dedicated output, that output waits for the
+// owning Batch to commit, abort, or overwrite them.
+func (s *Store) openBatchCompactionOutputReferences(sealed []recordlog.SegmentSummary) (map[recordlog.SegmentID]struct{}, error) {
+	compactionOutputs := make(map[recordlog.SegmentID]struct{})
+	for _, source := range sealed {
+		if recordlog.IsCompactionSegment(source.SegmentID) {
+			compactionOutputs[source.SegmentID] = struct{}{}
+		}
+	}
+	if len(compactionOutputs) == 0 {
+		return nil, nil
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		s.mutationFence.Unlock()
 		return nil, base.ErrClosed
 	}
 	if s.fault != nil {
 		s.mu.Unlock()
-		s.mutationFence.Unlock()
 		return nil, errors.Join(base.ErrReadOnly, s.fault)
 	}
 	open := make([]*Batch, 0, len(s.open))
@@ -674,13 +835,12 @@ func (s *Store) openBatchSegmentReferences(sealed []recordlog.SegmentSummary) (m
 		open = append(open, batch)
 	}
 	s.mu.Unlock()
-	s.mutationFence.Unlock()
 	result := make(map[recordlog.SegmentID]struct{})
-	for _, source := range sealed {
-		for _, batch := range open {
-			if batch.inner.ReferencesSegment(source.SegmentID) {
-				result[source.SegmentID] = struct{}{}
-				break
+	for _, batch := range open {
+		for _, ref := range batch.inner.PendingPutRefs() {
+			segment := ref.Addr.SegmentID()
+			if _, exists := compactionOutputs[segment]; exists {
+				result[segment] = struct{}{}
 			}
 		}
 	}
@@ -695,6 +855,19 @@ func containsSealedSegment(manifest storecatalog.Manifest, source recordlog.Segm
 }
 
 func (s *Store) proveSegmentRetirement(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq) (SegmentRetirementProof, error) {
+	return s.proveSegmentRetirementAtCheckpoint(ctx, source, relocationEnd, true)
+}
+
+// proveCompactionRetirement consumes the exact post-relocation checkpoint.
+// RecordRef live accounting proves that a known zero-live Segment has no
+// Mapping references; the complete input scan already performed by this
+// compaction need not be repeated. The open-Batch gate remains independent
+// because unpublished Put refs are not part of Mapping stats.
+func (s *Store) proveCompactionRetirement(source recordlog.SegmentID, relocationEnd model.CommitSeq) (SegmentRetirementProof, error) {
+	return s.proveSegmentRetirementAtCheckpoint(context.Background(), source, relocationEnd, false)
+}
+
+func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq, scanMapping bool) (SegmentRetirementProof, error) {
 	s.mutationFence.Lock()
 	s.mu.Lock()
 	closed, fault := s.closed, s.fault
@@ -738,32 +911,34 @@ func (s *Store) proveSegmentRetirement(ctx context.Context, source recordlog.Seg
 	if !storecatalog.StatsKnownForSegment(manifest.ReplayStart, manifest.SealedDataSegments[index]) {
 		return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("segment stats are not complete at checkpoint boundary"))
 	}
-	err := s.maintenance.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
-		typ, err := recordcodec.TypeOf(payload)
-		if err != nil {
-			return errors.Join(base.ErrCorrupt, err)
-		}
-		if typ != recordcodec.RecordTypePut {
+	if scanMapping {
+		err := s.maintenance.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
+			typ, err := recordcodec.TypeOf(payload)
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			if typ != recordcodec.RecordTypePut {
+				return nil
+			}
+			put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+			if err != nil {
+				return errors.Join(base.ErrCorrupt, err)
+			}
+			current, exists, err := s.mapping.Lookup(put.RecordID)
+			if err != nil {
+				return err
+			}
+			if exists && current == scanned.Addr {
+				return errors.Join(base.ErrConflict, errors.New("mapping still references source segment"))
+			}
 			return nil
-		}
-		put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+		})
 		if err != nil {
-			return errors.Join(base.ErrCorrupt, err)
+			if errors.Is(err, base.ErrCorrupt) {
+				s.setFault(err)
+			}
+			return SegmentRetirementProof{}, err
 		}
-		current, exists, err := s.mapping.Lookup(put.RecordID)
-		if err != nil {
-			return err
-		}
-		if exists && current == scanned.Addr {
-			return errors.Join(base.ErrConflict, errors.New("mapping still references source segment"))
-		}
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, base.ErrCorrupt) {
-			s.setFault(err)
-		}
-		return SegmentRetirementProof{}, err
 	}
 	for _, stat := range manifest.SegmentStats {
 		if stat.SegmentID == source && (stat.LiveBytes != 0 || stat.LiveRecords != 0) {

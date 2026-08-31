@@ -85,8 +85,10 @@ LastChangedCommitSeq
 ```
 
 表与 Mapping publication 在同一临界区更新；任何下溢、溢出或非法 ref 都使 Store fail-closed。
-Checkpoint freeze 同时获得一个 covered-sequence 一致的统计视图。Manifest 中的 SegmentStats 仍是
-退休授权的 durable 证据；实时表只减少构建成本并服务调度，不能单独授权删除。
+Checkpoint freeze 同时获得一个 covered-sequence 一致的统计视图。Manifest 中的 SegmentStats 与
+checkpoint coverage、Open Batch source gate、Catalog generation 和 reader pin 共同组成完整 Compaction
+的退休证明；实时表本身不能授权删除。由于它与 Mapping publication 原子更新，post-checkpoint 的已知
+zero-live stats 可以替代退休前第二次 Input 全量扫描。
 
 ## 6. 冷静度采样
 
@@ -99,8 +101,9 @@ DeathPerCommit  = NewDeadBytes / CommitSeqDelta
 DeathPerSecond  = NewDeadBytes / WallTimeDelta
 ```
 
-`LiveBytes` 增长会重置稳定轮数。只有无 Open Batch 引用且连续多个样本变化低于阈值的 Segment 才进入
-正常 compaction 候选。空间压力可以绕过冷静期，但不能绕过 relocation、Checkpoint 和退休证明。
+`LiveBytes` 增长会重置稳定轮数。只有连续多个样本变化低于阈值的 Segment 才进入正常 compaction 候选。
+Open/Committing Batch 的最终 Put 引用由 Compaction 一并复制，并在 Output durable 后重定向，因此不再
+把长 Batch 作为候选排除条件。空间压力可以绕过冷静期，但不能绕过 relocation、Checkpoint 和退休证明。
 
 该历史是有界、非权威的 runtime scheduling state；重启后重新积累样本，只会推迟 GC。
 

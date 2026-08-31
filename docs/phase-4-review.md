@@ -10,10 +10,10 @@ Phase 4 已闭合单 Segment Data GC 的真实删除主路径：
 
 1. Checkpoint 生成 exact SegmentStats 和 replay-safe 候选边界；
 2. Candidate 只负责排序，删除仍以 `Mapping[ID] == scanned VAddr` 为唯一 live 判定；
-3. Reader pin、Open Batch ref、Cleaning、Retired 与 tombstone 阻止 lookup/acquire/delete 竞态；
+3. Reader pin、Cleaning、Retired 与 tombstone 阻止 lookup/acquire/delete 竞态，Open Batch ref 由复制重定向收敛；
 4. live PutRecord 复制 Value 并保留 OriginBatchID/LogicalRevision；
 5. Relocation Descriptor 与用户 Commit 共享 CommitSeq、fsync 和 deterministic expected-old CAS；
-6. post-copy exact scan 证明源 Segment 已无 Mapping 引用；
+6. post-relocation Checkpoint 的 exact zero-live stats 证明源 Segment 已无 Mapping 引用；
 7. GC-required Checkpoint 覆盖全部 Relocation，并把嵌套 Mapping rotation 记录进同一个 DataGC Journal；
 8. Retire、pin drain、Manifest remove、rename-to-trash、unlink 和目录 fsync 按可恢复顺序执行；
 9. Open 对 Journal Phase 1–3 安全放弃清理，对 Phase 4–7 验证并完成既定删除；
@@ -26,9 +26,9 @@ Phase 4 已闭合单 Segment Data GC 的真实删除主路径：
 删除源文件前必须同时成立：
 
 - RelocationSeal 已 durable，runtime/recovery CAS 结果一致；
-- exact second scan 不再发现指向 source VAddr 的 Mapping；
+- post-relocation Checkpoint 的 exact stats 对 source 为零；
 - durable Manifest 的 Mapping Root、CoveredCommitSeq、Stats 与 ReplayStart 覆盖本轮 Relocation；
-- Reader pin 与 Open Batch ref 已归零；
+- Reader pin 已归零，Open Batch 已不再持有 source 地址；
 - Manifest 已移除 source；
 - source 已移入 trash，data/trash 目录已 fsync；
 - unlink 后 trash 目录再次 fsync。

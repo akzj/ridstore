@@ -44,7 +44,9 @@ Prometheus SDK 引入 ridstore 内核。OpenTelemetry 或自有 exporter 可直�
   `ridstore_write_stopped`、拒绝和检查错误 counter；
 - GC counters：`ridstore_gc_*_total`，copied/reclaimed 使用 bytes，relocated/skipped
   使用 records；另导出 throttled nanoseconds、Data/Mapping GC space rejection、
-  `gc_min_free_bytes` 和当前 `gc_bytes_per_second`。
+  `gc_min_free_bytes` 和当前 `gc_bytes_per_second`。Open Batch redirect 额外报告 redirect
+  次数、顺序流等待/admission boundary nanoseconds 和实际重定向 ref 数；wait 表示 redirect install
+  在 Coordinator 顺序流中的等待，admission 表示 removal boundary 短暂关闭 admission 的时间。
 - 后台 Checkpoint counters：`ridstore_background_checkpoint_requested_total`、
   `ridstore_background_checkpoint_completed_total`、`ridstore_background_checkpoint_failed_total`。
   requested 统计被调度器接受的不同 Delta pressure generation；同代重复通知以及已被其他成功

@@ -87,83 +87,118 @@ func BenchmarkDurableHotOverwrite(b *testing.B) {
 func BenchmarkDurableMaintenanceInterference(b *testing.B) {
 	for _, maintenance := range []string{"none", "checkpoint", "mapping-compact"} {
 		b.Run(maintenance, func(b *testing.B) {
-			store, dir := openMaintenanceBenchmarkStore(b)
-			ids := seedMaintenanceBenchmark(b, store, 2800, 256)
-			value := make([]byte, 256)
-
-			ctx, cancel := context.WithCancel(context.Background())
-			var maintenanceCount atomic.Uint64
-			maintenanceDone := startBenchmarkMaintenance(ctx, store, maintenance, &maintenanceCount)
-
-			getLatency := make([]int64, b.N)
-			putLatency := make([]int64, b.N)
-			commitLatency := make([]int64, b.N)
-			var sampleIndex atomic.Uint64
-			var nextID atomic.Uint64
-			var firstErr benchmarkFirstError
-
-			b.SetBytes(int64(len(value)))
-			b.ReportAllocs()
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					id := ids[(nextID.Add(1)-1)%uint64(len(ids))]
-					getStarted := time.Now()
-					_, err := store.Get(ctx, id)
-					getElapsed := time.Since(getStarted)
-					if err != nil {
-						firstErr.set(err)
-						cancel()
-						return
-					}
-					batch, err := store.Begin(ctx)
-					if err != nil {
-						firstErr.set(err)
-						cancel()
-						return
-					}
-					putStarted := time.Now()
-					err = batch.Put(ctx, id, value)
-					putElapsed := time.Since(putStarted)
-					if err != nil {
-						firstErr.set(err)
-						cancel()
-						return
-					}
-					commitStarted := time.Now()
-					_, err = batch.Commit(ctx)
-					commitElapsed := time.Since(commitStarted)
-					if err != nil {
-						firstErr.set(err)
-						cancel()
-						return
-					}
-					index := sampleIndex.Add(1) - 1
-					getLatency[index] = getElapsed.Nanoseconds()
-					putLatency[index] = putElapsed.Nanoseconds()
-					commitLatency[index] = commitElapsed.Nanoseconds()
-				}
-			})
-			b.StopTimer()
-			cancel()
-			if err := <-maintenanceDone; err != nil {
-				b.Fatal(err)
-			}
-			if err := firstErr.get(); err != nil {
-				b.Fatal(err)
-			}
-			completed := int(sampleIndex.Load())
-			reportLatencyDistribution(b, "get", getLatency[:completed])
-			reportLatencyDistribution(b, "put", putLatency[:completed])
-			reportLatencyDistribution(b, "commit", commitLatency[:completed])
-			b.ReportMetric(float64(maintenanceCount.Load()), "maintenance-ops")
-			sealed, err := filepath.Glob(filepath.Join(dir, "records", "record-*.sealed"))
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.ReportMetric(float64(len(sealed)), "data-rotations")
+			runDurableMaintenanceInterference(b, maintenance, false)
 		})
 	}
+}
+
+// BenchmarkDurableDataCompactionInterference gives idle and aggressive Data GC
+// the same sealed/dead/open-Batch fixture. Compare the two sub-benchmarks from
+// one invocation; absolute filesystem latency is not portable across hosts.
+func BenchmarkDurableDataCompactionInterference(b *testing.B) {
+	for _, maintenance := range []string{"none", "data-compact"} {
+		b.Run(maintenance, func(b *testing.B) {
+			runDurableMaintenanceInterference(b, maintenance, true)
+		})
+	}
+}
+
+func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepareDataCompaction bool) {
+	b.Helper()
+	store, dir := openMaintenanceBenchmarkStore(b)
+	ids := seedMaintenanceBenchmark(b, store, 2800, 256)
+	value := make([]byte, 256)
+	var pending *Batch
+	if prepareDataCompaction {
+		pending = prepareDataCompactionBenchmark(b, store, ids, value)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var maintenanceCount atomic.Uint64
+	startMaintenance := make(chan struct{})
+	maintenanceDone := startBenchmarkMaintenance(ctx, startMaintenance, store, maintenance, &maintenanceCount)
+
+	getLatency := make([]int64, b.N)
+	putLatency := make([]int64, b.N)
+	commitLatency := make([]int64, b.N)
+	var sampleIndex atomic.Uint64
+	var nextID atomic.Uint64
+	var firstErr benchmarkFirstError
+
+	b.SetBytes(int64(len(value)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	close(startMaintenance)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := ids[(nextID.Add(1)-1)%uint64(len(ids))]
+			getStarted := time.Now()
+			_, err := store.Get(ctx, id)
+			getElapsed := time.Since(getStarted)
+			if err != nil {
+				firstErr.set(err)
+				cancel()
+				return
+			}
+			batch, err := store.Begin(ctx)
+			if err != nil {
+				firstErr.set(err)
+				cancel()
+				return
+			}
+			putStarted := time.Now()
+			err = batch.Put(ctx, id, value)
+			putElapsed := time.Since(putStarted)
+			if err != nil {
+				firstErr.set(err)
+				cancel()
+				return
+			}
+			commitStarted := time.Now()
+			_, err = batch.Commit(ctx)
+			commitElapsed := time.Since(commitStarted)
+			if err != nil {
+				firstErr.set(err)
+				cancel()
+				return
+			}
+			index := sampleIndex.Add(1) - 1
+			getLatency[index] = getElapsed.Nanoseconds()
+			putLatency[index] = putElapsed.Nanoseconds()
+			commitLatency[index] = commitElapsed.Nanoseconds()
+		}
+	})
+	b.StopTimer()
+	cancel()
+	if err := <-maintenanceDone; err != nil {
+		b.Fatal(err)
+	}
+	if pending != nil {
+		if err := pending.Abort(context.Background()); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := firstErr.get(); err != nil {
+		b.Fatal(err)
+	}
+	completed := int(sampleIndex.Load())
+	reportLatencyDistribution(b, "get", getLatency[:completed])
+	reportLatencyDistribution(b, "put", putLatency[:completed])
+	reportLatencyDistribution(b, "commit", commitLatency[:completed])
+	b.ReportMetric(float64(maintenanceCount.Load()), "maintenance-ops")
+	metrics := store.Metrics()
+	b.ReportMetric(float64(metrics.GCCompleted), "gc-completed")
+	b.ReportMetric(float64(metrics.GCCommitRedirects), "gc-redirects")
+	b.ReportMetric(float64(metrics.GCOpenRefsRedirected), "gc-redirected-refs")
+	if metrics.GCCommitRedirects != 0 {
+		b.ReportMetric(float64(metrics.GCCommitRedirectWaitNanos)/float64(metrics.GCCommitRedirects), "gc-redirect-wait-ns/op")
+		b.ReportMetric(float64(metrics.GCCommitRedirectAdmissionNanos)/float64(metrics.GCCommitRedirects), "gc-redirect-admission-ns/op")
+	}
+	sealed, err := filepath.Glob(filepath.Join(dir, "records", "record-*.sealed"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(len(sealed)), "data-rotations")
 }
 
 type benchmarkFirstError struct {
@@ -185,14 +220,20 @@ func (e *benchmarkFirstError) get() error {
 	return e.err
 }
 
-func startBenchmarkMaintenance(ctx context.Context, store *Store, kind string, count *atomic.Uint64) <-chan error {
+func startBenchmarkMaintenance(ctx context.Context, start <-chan struct{}, store *Store, kind string, count *atomic.Uint64) <-chan error {
 	done := make(chan error, 1)
-	if kind == "none" {
-		done <- nil
-		return done
-	}
 	go func() {
 		defer close(done)
+		select {
+		case <-start:
+		case <-ctx.Done():
+			done <- nil
+			return
+		}
+		if kind == "none" {
+			done <- nil
+			return
+		}
 		for ctx.Err() == nil {
 			var err error
 			switch kind {
@@ -200,6 +241,11 @@ func startBenchmarkMaintenance(ctx context.Context, store *Store, kind string, c
 				err = store.Checkpoint(ctx)
 			case "mapping-compact":
 				err = store.CompactMapping(ctx)
+			case "data-compact":
+				// Cancellation stops admission of the next maintenance operation.
+				// Do not interrupt a compaction after it has crossed a durable
+				// publication boundary merely because the benchmark timer ended.
+				_, _, err = store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true})
 			default:
 				err = fmt.Errorf("unknown benchmark maintenance %q", kind)
 			}
@@ -296,6 +342,37 @@ func seedMaintenanceBenchmark(b *testing.B, store *Store, records, valueSize int
 		b.Fatal(err)
 	}
 	return ids
+}
+
+func prepareDataCompactionBenchmark(b *testing.B, store *Store, ids []ID, value []byte) *Batch {
+	b.Helper()
+	pending, err := store.Begin(context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	// These uncommitted records are appended before the overwrite run forces a
+	// rotation, making Open Batch redirect deterministic for the first GC.
+	for range 128 {
+		if _, err := pending.Create(context.Background(), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	overwrite, err := store.Begin(context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, id := range ids {
+		if err := overwrite.Put(context.Background(), id, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if _, err := overwrite.Commit(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	return pending
 }
 
 // BenchmarkDurableAppendBaseline is a lower-bound reference, not a competing

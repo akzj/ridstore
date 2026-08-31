@@ -114,6 +114,108 @@ func TestOpenResumesPublishedCompaction(t *testing.T) {
 	}
 }
 
+func TestOpenResumesPublishedCompactionWithDuplicatePendingRecordIDs(t *testing.T) {
+	store := newRelocationStore(t)
+	seed, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := seed.Create(context.Background(), []byte("committed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Put(context.Background(), id, []byte("pending-first")); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Put(context.Background(), id, []byte("pending-second")); err != nil {
+		t.Fatal(err)
+	}
+	source := store.catalog.Snapshot().ActiveDataSegmentID
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), make([]byte, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := store.catalog.Snapshot()
+	input := findSummary(t, manifest.SealedDataSegments, source)
+	reserved, ids, err := store.catalog.ReserveCompactionSegments(manifest.Generation, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := compactionstate.State{Phase: compactionstate.PhaseReserved, StoreUUID: reserved.StoreUUID, LogID: reserved.RecordLogID, BaseGeneration: reserved.Generation, Inputs: []recordlog.SegmentSummary{input}, OutputIDs: ids}
+	if err := compactionstate.Install(store.root, state); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := store.maintenance.NewCompactionWriter(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.maintenance.ScanSegment(context.Background(), source, func(_ recordlog.AppendResult, payload []byte) error {
+		typ, err := recordcodec.TypeOf(payload)
+		if err != nil {
+			return err
+		}
+		if typ != recordcodec.RecordTypePut {
+			return nil
+		}
+		_, err = writer.Append(context.Background(), payload)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	outputs, err := writer.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.installCompactionOutputs(outputs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.maintenance.RegisterCompactionOutputs(outputs); err != nil {
+		t.Fatal(err)
+	}
+	state.Phase, state.Outputs = compactionstate.PhaseOutputsPublished, outputs
+	if err := compactionstate.Update(store.root, state); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	root := store.root
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), root, relocationConfig().Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	record, err := reopened.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "pending-second" || record.Addr.SegmentID() == source || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	if containsSegmentID(reopened.catalog.Snapshot().SealedDataSegments, source) {
+		t.Fatal("source remains after duplicate-ID recovery")
+	}
+}
+
 func TestOpenReplaysDurableCompactionRelocationBeforeCheckpoint(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
 	manifest := store.catalog.Snapshot()

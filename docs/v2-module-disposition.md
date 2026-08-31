@@ -121,10 +121,10 @@ v2 不再存在：
 
 - SegmentStats 已由 Checkpoint 精确派生；
 - Relocation 已接入 sealed Segment pin/scan、共享 BatchID、唯一 Coordinator 和 Mapping VAddr CAS；
-- Checkpoint coverage、open-batch gate 和二次精确 liveness 证明已组合为退休前 proof；
+- Checkpoint coverage、exact zero-live stats、open-batch gate 和 Catalog generation 已组合为退休前 proof；
 - 最小 durable maintenance marker、retire gate、Catalog remove、trash/delete 与 Open 恢复已接入；
 - durable marker/retire 的 syscall fault matrix 与四阶段 process-crash recovery 已闭合；
-- bounded candidate selection 已基于 fresh Checkpoint、ReplayStart、open-Batch refs 和显式阈值接入；
+- bounded candidate selection 已基于可复用的 exact Checkpoint、ReplayStart、稳定度和显式阈值接入；
 - 已完成 GC copy/checkpoint 两阶段空间 admission、运行时 batch 上限和 context-aware pacing；
 - 已完成可复现的并发 model test，组合条件 Put/Delete、Abort、Checkpoint、Data/Mapping GC 与 Close/Reopen，并逐轮对照逻辑模型；
 - 待完成 convergence soak。

@@ -237,13 +237,29 @@ func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
 	}
 }
 
-func TestCompactSegmentRejectsOpenBatchReferenceBeforeJournal(t *testing.T) {
+func TestCompactSegmentScansEachInputOnlyOnce(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	counted := &countingScanLog{maintenanceLog: store.maintenance, source: source}
+	store.maintenance = counted
+	if _, err := store.CompactSegment(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	counted.mu.Lock()
+	scans := counted.scans
+	counted.mu.Unlock()
+	if scans != 1 {
+		t.Fatalf("source scans=%d, want 1", scans)
+	}
+}
+
+func TestCompactSegmentRedirectsOpenBatchReference(t *testing.T) {
 	store := newRelocationStore(t)
 	pending, err := store.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.Create(context.Background(), []byte("open-before-rotation")); err != nil {
+	id, err := pending.Create(context.Background(), []byte("open-before-rotation"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	source := store.catalog.Snapshot().ActiveDataSegmentID
@@ -259,14 +275,216 @@ func TestCompactSegmentRejectsOpenBatchReferenceBeforeJournal(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, base.ErrConflict) {
+	result, err := store.CompactSegment(context.Background(), source)
+	if err != nil {
 		t.Fatalf("compact err=%v", err)
+	}
+	if containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
+		t.Fatal("source referenced by open Batch was not retired")
+	}
+	if result.Relocation.CopiedRecords == 0 || result.Relocation.Skipped == 0 {
+		t.Fatalf("result=%+v", result)
+	}
+	metrics := store.Metrics()
+	if metrics.GCCommitRedirects != 1 || metrics.GCOpenRefsRedirected != 1 {
+		t.Fatalf("ordering-fence metrics=%+v", metrics)
+	}
+	if _, err := pending.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "open-before-rotation" || record.Addr.SegmentID() == source || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
 		t.Fatalf("compaction marker found=%v err=%v", found, err)
 	}
-	if err := pending.Abort(context.Background()); err != nil {
+	root := store.root
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), root, relocationConfig().Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	record, err = reopened.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "open-before-rotation" || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
+		t.Fatalf("reopened record=%+v err=%v", record, err)
+	}
+}
+
+func TestCompactSegmentRelocatesOpenBatchThatCommitsDuringCopy(t *testing.T) {
+	store := newRelocationStore(t)
+	pending, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := pending.Create(context.Background(), []byte("commit-during-copy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := store.catalog.Snapshot().ActiveDataSegmentID
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := &blockingProofLog{
+		maintenanceLog: store.maintenance, source: source,
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.maintenance = blocked
+	type answer struct {
+		result SegmentCompactionResult
+		err    error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		result, err := store.CompactSegment(context.Background(), source)
+		done <- answer{result: result, err: err}
+	}()
+	<-blocked.reached
+	if _, err := pending.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(blocked.release)
+	got := <-done
+	if got.err != nil || got.result.Relocation.Applied == 0 {
+		t.Fatalf("result=%+v err=%v", got.result, got.err)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "commit-during-copy" || record.Addr.SegmentID() == source {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
+func TestCompactSegmentRedirectsDistinctPendingVersionsOfSameRecord(t *testing.T) {
+	store := newRelocationStore(t)
+	seed, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := seed.Create(context.Background(), []byte("committed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Put(context.Background(), id, []byte("pending-first")); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Put(context.Background(), id, []byte("pending-second")); err != nil {
+		t.Fatal(err)
+	}
+	source := store.catalog.Snapshot().ActiveDataSegmentID
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.CompactSegment(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "pending-second" || record.Addr.SegmentID() == source || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
+func TestCompactSegmentRelocatesExactPendingVersionAfterConcurrentCommits(t *testing.T) {
+	store := newRelocationStore(t)
+	seed, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := seed.Create(context.Background(), []byte("committed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Put(context.Background(), id, []byte("pending-first")); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Put(context.Background(), id, []byte("pending-second")); err != nil {
+		t.Fatal(err)
+	}
+	source := store.catalog.Snapshot().ActiveDataSegmentID
+	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filler.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := &blockingSegmentVisitLog{
+		maintenanceLog: store.maintenance, source: source, target: id, value: []byte("committed"),
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.maintenance = blocked
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.CompactSegment(context.Background(), source)
+		done <- err
+	}()
+	<-blocked.reached
+	if _, err := first.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(blocked.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "pending-second" || record.Addr.SegmentID() == source {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }
 
@@ -288,6 +506,53 @@ func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	metrics := store.Metrics()
 	if metrics.GCStarted != 1 || metrics.GCCompleted != 1 || metrics.GCFailed != 0 || metrics.GCCopiedBytes == 0 || metrics.GCRelocated == 0 || metrics.GCDurationNanos == 0 {
 		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestCompactNextSegmentReusesExistingCheckpointBeforeCopy(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingProofLog{
+		maintenanceLog: store.maintenance, source: source,
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	store.maintenance = blocked
+	store.checkpointMu.Lock()
+	checkpointHeld := true
+	released := false
+	defer func() {
+		if !released {
+			close(blocked.release)
+		}
+		if checkpointHeld {
+			store.checkpointMu.Unlock()
+		}
+	}()
+	type answer struct {
+		found bool
+		err   error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		_, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true})
+		done <- answer{found: found, err: err}
+	}()
+	select {
+	case <-blocked.reached:
+		// Copy started while checkpointMu was unavailable, proving selection
+		// reused the already durable checkpoint.
+	case <-time.After(time.Second):
+		t.Fatal("compaction attempted a redundant selection checkpoint")
+	}
+	close(blocked.release)
+	released = true
+	store.checkpointMu.Unlock()
+	checkpointHeld = false
+	got := <-done
+	if got.err != nil || !got.found {
+		t.Fatalf("found=%v err=%v", got.found, got.err)
 	}
 }
 
@@ -476,13 +741,14 @@ func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T
 	}
 }
 
-func TestCompactNextSegmentSkipsOpenBatchReferences(t *testing.T) {
+func TestCompactNextSegmentRedirectsOpenBatchReferences(t *testing.T) {
 	store := newRelocationStore(t)
 	pending, err := store.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.Create(context.Background(), []byte("open-before-rotation")); err != nil {
+	id, err := pending.Create(context.Background(), []byte("open-before-rotation"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	source := recordlog.SegmentID(1)
@@ -498,14 +764,21 @@ func TestCompactNextSegmentSkipsOpenBatchReferences(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{}); err != nil || found {
-		t.Fatalf("found=%v err=%v", found, err)
+	result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true})
+	if err != nil || !found || result.Candidate.Source.SegmentID != source {
+		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
-	if err := pending.Abort(context.Background()); err != nil {
+	if second, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true}); err != nil || found {
+		t.Fatalf("pending output was selected again: result=%+v found=%v err=%v", second, found, err)
+	}
+	if metrics := store.Metrics(); metrics.GCCommitRedirects != 1 || metrics.GCOpenRefsRedirected != 1 {
+		t.Fatalf("repeated redirect metrics=%+v", metrics)
+	}
+	if _, err := pending.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if result, found, err := store.CompactNextSegment(context.Background(), CompactionPolicy{BypassCooldown: true}); err != nil || !found || result.Candidate.Source.SegmentID != source {
-		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
+	if record, err := store.Get(context.Background(), id); err != nil || string(record.Value) != "open-before-rotation" || record.Addr.SegmentID() == source {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }
 
@@ -713,6 +986,51 @@ type blockingProofLog struct {
 	reached chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type countingScanLog struct {
+	maintenanceLog
+	mu     sync.Mutex
+	source recordlog.SegmentID
+	scans  int
+}
+
+func (l *countingScanLog) ScanSegment(ctx context.Context, source recordlog.SegmentID, visit func(recordlog.AppendResult, []byte) error) error {
+	if source == l.source {
+		l.mu.Lock()
+		l.scans++
+		l.mu.Unlock()
+	}
+	return l.maintenanceLog.ScanSegment(ctx, source, visit)
+}
+
+type blockingSegmentVisitLog struct {
+	maintenanceLog
+	source  recordlog.SegmentID
+	target  model.ID
+	value   []byte
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (l *blockingSegmentVisitLog) ScanSegment(ctx context.Context, source recordlog.SegmentID, visit func(recordlog.AppendResult, []byte) error) error {
+	return l.maintenanceLog.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
+		if err := visit(scanned, payload); err != nil {
+			return err
+		}
+		if source != l.source {
+			return nil
+		}
+		put, err := recordcodec.DecodePut(payload, 1<<20)
+		if err == nil && put.RecordID == l.target && bytes.Equal(put.Value, l.value) {
+			l.once.Do(func() {
+				close(l.reached)
+				<-l.release
+			})
+		}
+		return nil
+	})
 }
 
 func (l *blockingProofLog) ScanSegment(ctx context.Context, source recordlog.SegmentID, visit func(recordlog.AppendResult, []byte) error) error {

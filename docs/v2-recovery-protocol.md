@@ -154,20 +154,19 @@ live iff Mapping[ID] == scanned VAddr
 存活 Record 通过 RelocationRecord 形成带 expected-old-VAddr 的 CAS mutation。安全顺序：
 
 ```text
-1. Registry 标记 Cleaning，阻止新的 open-batch 引用
-2. 扫描并复制仍存活 Record
-3. durable RelocationRecord
-4. Mapping CAS 发布
-5. Checkpoint 覆盖 relocation
-6. Registry 进入 Retiring，阻止新 reader
-7. 等待 Reader Pin 和 open-batch refs 清零
-8. Catalog Manifest 移除源 Segment；失败则撤销 Retiring
+1. 快照 Mapping-live 和 Open/Committing Batch pending refs
+2. 扫描并复制两类仍可能发布的 Record
+3. Output seal、fsync 并进入 Catalog
+4. Coordinator 安装临时 redirect 表并重写仍为 Open 的 Batch refs
+5. 已 Prepare Commit 在发布点转换；Mapping CAS 搬迁 redirect 安装前已提交的地址
+6. Checkpoint 覆盖 relocation
+7. Catalog Manifest 原子移除全部 source Segment
+8. Registry 进入 Retiring 并等待已有 Reader Pin 清零
 9. Registry detach 并关闭文件
-10. rename 到 trash 并 fsync directory
-11. 删除 trash 文件并 fsync directory
+10. rename 到 trash、fsync、删除并再次 fsync
 ```
 
-第 8 步前不能删除文件。第 8 步后旧文件即使因崩溃仍残留，也只是 orphan，恢复不得重新接纳。
+Catalog 移除前不能删除文件。移除后旧文件即使因崩溃仍残留，也只是待恢复清理文件，不得重新接纳。
 
 ## 9. Reserve 与 ID 不复用
 

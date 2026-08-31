@@ -58,12 +58,11 @@ Mapping[ID] != scanned VAddr
 1. 搬迁当前 live Put；
 2. 创建覆盖 `LastCommitSeq` 的 durable Checkpoint；
 3. 快照并检查仍以最终 Put mutation 引用 source 的 Open/Committing Batch；
-5. 验证 checkpoint sparse stats 对 source 为零；
-6. 再扫描 source，并逐条确认当前 `Mapping[ID] != scanned VAddr`；
-7. 返回绑定 source summary、Catalog generation、CoveredCommitSeq 和 ReplayStart 的 proof。
+4. 验证 checkpoint sparse stats 对 source 为零；
+5. 返回绑定 source summary、Catalog generation、CoveredCommitSeq 和 ReplayStart 的 proof。
 
 历史 Put 若已被同 Batch 的 Put/Delete 覆盖，不会进入 Mapping，因此不属于 open-batch 引用。proof 不是
-独立删除令牌；retire 操作必须在 maintenance gate 内消费并重新验证。引用检查和 source 精确扫描不持有
+独立删除令牌；retire 操作必须在 maintenance gate 内消费并重新验证。引用与 proof 元数据检查不持有
 Store 生命周期锁，Get/Put/Commit 可继续运行；sealed source 不会被新 Put 重新引用。
 
 `CompactSegment` 在 proof 之后安装唯一 durable `MAINTENANCE.v2` marker，再调用 RecordLog retire gate、
@@ -102,8 +101,8 @@ Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable p
 Checkpoint builder 只编码含 live Record 的 sealed Segment。对 `segment.end < ReplayStart` 的 Segment，
 表项缺失明确表示零存活；对 `segment.end >= ReplayStart` 的 Segment，缺失表示 unknown，因为它可能在
 Checkpoint 构建后、安装前才由 Active rotation 成为 sealed。Catalog retire 门禁只接受前一种已覆盖
-Segment 的缺失或显式零值，任何非零值和 unknown 都拒绝。它仍只是必要条件；Engine 的二次 Mapping
-证明与 open-batch gate 仍是物理 retire 的前置条件。
+Segment 的缺失或显式零值，任何非零值和 unknown 都拒绝。完整 Compaction 以该 exact checkpoint stats
+替代第二次 Input 扫描，并继续组合 open-batch、generation 与 reader-pin 门禁。
 
 ## 6. M5 剩余范围
 
@@ -116,10 +115,11 @@ Segment 的缺失或显式零值，任何非零值和 unknown 都拒绝。它仍
 
 ### 6.1 已完成的候选选择
 
-`CompactNextSegment` 先生成 exact Checkpoint，再以单遍、有界工作空间选择至多一个 Segment。候选必须：
+`CompactNextSegment` 先复用已有 exact Checkpoint；没有可用候选时才刷新一次，再以单遍、有界工作空间
+选择至多一个 Segment。候选必须：
 
 - sealed Segment 的 end 严格早于 ReplayStart；
-- 不被任何 open Batch 的最终 Put 引用；
+- Open Batch 的最终 Put 可由 Compaction 复制并重定向；
 - 同时满足调用者提供的最小 reclaimable bytes 与最小 reclaimable ratio；
 - 在多个候选中优先 reclaimable bytes 最大、live bytes 更小、SegmentID 更早者。
 

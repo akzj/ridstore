@@ -107,6 +107,12 @@ RecordLog payload 和 Segment 上限。
 
 GC 受 `GCBatchBytes/GCBatchMutations`、`GCBytesPerSecond`、Delta reservation、前台队列优先级和可用磁盘共同限制。每个 durable Relocation Batch 后按本轮累计 copied bytes 对 wall clock 做 Context-aware pacing；已经排队的用户 Commit 优先于下一批 Relocation，已经选中的单个有限 Relocation Batch 不被拆开。Runtime budget 只能降低后台工作速度，不能改变 Relocation durability、CAS 或删除门禁。
 
+Open Batch ref 重定向只在 Output durable 后安装临时 Coordinator redirect 表。`GCCommitRedirectWaitNanos`
+统计 install boundary 等待此前 Coordinator 队列推进的总时间，但该等待不关闭新 admission；
+`GCCommitRedirectAdmissionNanos` 统计 removal boundary 获取 admission 写侧并入队的时间，这是实际可能阻塞新
+Commit admission 的短区间。`GCCommitRedirects` 和 `GCOpenRefsRedirected` 可用于计算每轮/每 ref 平均成本。
+它们都是进程级观测 counter，不参与 admission 或退休授权。
+
 `SetGCBytesPerSecond(rate)` 原子修改后续 Data Compact 的复制速率。每次 Compact 只在创建 pacer
 时读取一次，新值不影响正在运行的 Compact；`rate == 0` 非法。暂停、时间窗、容量水位和调用频率
 属于外部 maintenance scheduler，不进入 Store 的持久化状态。

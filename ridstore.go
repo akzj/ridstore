@@ -109,6 +109,8 @@ func (s *Store) Metrics() Metrics {
 		GCCopiedBytes: current.GCCopiedBytes, GCReclaimedBytes: current.GCReclaimedBytes,
 		GCRelocated: current.GCRelocated, GCSkipped: current.GCSkipped, GCDurationNanos: current.GCDurationNanos,
 		GCThrottledNanos: current.GCThrottledNanos, GCSpaceRejections: current.GCSpaceRejections,
+		GCCommitRedirects: current.GCCommitRedirects, GCCommitRedirectWaitNanos: current.GCCommitRedirectWaitNanos,
+		GCCommitRedirectAdmissionNanos: current.GCCommitRedirectAdmissionNanos, GCOpenRefsRedirected: current.GCOpenRefsRedirected,
 		GCMinFreeBytes:                current.GCMinFreeBytes,
 		GCBytesPerSecond:              current.GCBytesPerSecond,
 		BackgroundCheckpointRequested: current.BackgroundCheckpointRequested,

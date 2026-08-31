@@ -43,7 +43,7 @@ Segment 同时满足以下条件才可进入 Cleaning：
 
 - 状态为 Sealed；
 - Segment end position 不晚于当前 durable Mapping Checkpoint 的安全扫描边界；
-- 没有 Open Batch 引用其中的 PutRecord；
+- Open/Committing Batch 中指向它的最终 PutRecord 可被本轮 Compaction 复制并重定向；
 - 没有其他 GC/Backup/Scrub 持有 maintenance pin；
 - 不包含恢复仍需读取且未被 Checkpoint 覆盖的 Commit Descriptor；
 - 不是当前故障诊断保留文件；
@@ -55,20 +55,24 @@ Segment 同时满足以下条件才可进入 Cleaning：
 reclaimableBytes = reclaimablePhysicalBytes - ExactLiveBytesAtCut
 ```
 
-候选只允许严格位于 checkpoint ReplayStart 之前的 sealed Segment；cut 后它不会获得新的用户引用，
-所以 cut 时精确 live bytes 在选择时构成安全上界。即使统计为零，删除前仍必须完成 relocation、
-后置 Checkpoint、Pin、Manifest 和 Trash 全部门禁；SegmentStats 永不单独授权删除。
+候选只允许严格位于 checkpoint ReplayStart 之前的 sealed Segment。`CompactNextSegment` 先尝试复用
+Catalog 中已有的 exact checkpoint；只有没有可用候选时才刷新一次 selection checkpoint。成功 GC 因而
+通常只承担 relocation 后用于退休证明的一次 Checkpoint。已有统计可以因后续提交而变旧，但只决定调度；
+扫描时仍以 Mapping 和 Open Batch pending refs 决定实际复制集合。
 
-v2 的 `CompactNextSegment` 在选择前主动创建一次 Checkpoint，并且只考虑 `segment.end < ReplayStart`
-的 sealed Segment。这样的 Segment 不再接受新 append；同一时刻又只有一个 maintenance 操作，因此 cut
-后的用户提交只能减少、不能增加指向该 source 的 Mapping。于是该 Checkpoint 的 exact live bytes 对选择
-时刻自然成为 live upper bound，不需要在热路径维护第二套全局计数。
+删除授权不是单独依赖一个统计数值，而是组合验证 post-checkpoint coverage、已知边界上的 exact zero-live
+stats、Open Batch 不再持有 source 地址、Catalog generation 和 reader pin。RecordRef 统计与 Mapping 在同一
+publish 临界区更新，因此完整 Compaction 不再重复扫描整个 input 来重新证明相同事实。
 
-选择器单遍扫描 Manifest，额外空间只与被 open Batch 引用的 Segment 集合有关，并且一次最多返回一个
+选择器单遍扫描 Manifest，并且一次最多返回一个
 候选。排序依次采用 reclaimable bytes 降序、live bytes 升序、SegmentID 升序。调用方可以同时设置最小
-可回收字节数和最小回收比例（basis points）；两个非零门槛都必须满足。被 open Batch 最终 Put 引用、
-或尚未严格位于 ReplayStart 之前的 Segment 不进入候选集。等于 ReplayStart 的边界 Segment 仍视为
+可回收字节数和最小回收比例（basis points）；两个非零门槛都必须满足。尚未严格位于 ReplayStart 之前
+的 Segment 不进入候选集。等于 ReplayStart 的边界 Segment 仍视为
 unknown：它可能在 Stats 构建后、Manifest 安装前才完成 rotation，必须由下一次 Checkpoint 补齐。
+
+普通 sealed Segment 即使含 Open Batch pending refs 也允许第一次 Compaction，以释放同 Segment 的其他
+垃圾；但若 pending refs 已被重定向到高位 Compaction Output，该 Output 在 Batch Commit/Abort/覆盖前
+不再进入候选。否则 pending ref 不属于 Mapping stats，Output 会持续表现为可回收并在每轮 GC 中反复搬家。
 
 ## 4. 存活判定
 
@@ -146,18 +150,17 @@ GC 扫描完源 Segment 并处理所有候选 Record 后，不能立即删除源
 
 ```text
 1. 所有 Relocation Batch 得到确定结果
-2. 再扫描/校验 Mapping，不再有 VAddr 指向源 Segment
-3. 创建覆盖所有 Relocation CommitSeq 的 Mapping Checkpoint
-4. 确认新 Mapping Root/Manifest durable
-5. 将源 Segment 标记 Retired
-6. 等待所有 pin/ref 清零
-7. 从正式 Manifest 移除并移动到 trash
-8. fsync data/trash/root directory
-9. 删除 trash 文件
-10. fsync trash directory
+2. 创建覆盖所有 Relocation CommitSeq 的 Mapping Checkpoint
+3. 验证 source 的 stats 已知且 `LiveBytes=0, LiveRecords=0`
+4. 验证 Open Batch 不再持有 source 地址和 Catalog generation 连续
+5. 从 Catalog 原子移除 source
+6. 等待 reader pin 清零并 detach/close
+7. 移动到 trash 并 fsync data/trash directory
+8. 删除 trash 文件并 fsync trash directory
 ```
 
-步骤 2 若发现 Mapping 仍指向源 Segment，说明并发变化或遗漏，源 Segment 保留并重新调度，不允许部分删除。
+步骤 3 若仍为非零，说明并发提交尚未被 relocation 覆盖或统计边界过旧，源 Segment 保留并重新建立
+checkpoint；不能部分删除。离线 Verify 和底层 `PrepareSegmentRetirement` 仍可执行逐 Record 扫描诊断。
 
 ## 8. Reader Pin
 
@@ -186,13 +189,24 @@ Reader 再 Acquire
 
 第一版 Get 在复制 payload 完成后立即 Release；返回 slice 不引用 mmap。
 
-## 9. Open Batch Ref
+## 9. Open Batch Ref Redirect
 
-PutRecord 在 Commit 前可能位于后来 Sealed 的 Segment。Batch 为每个包含其最终或历史 PutRecord 的 Segment持有 open-batch ref，直到 Commit/Abort/Failed 清理。
+PutRecord 在 Commit 前可能位于后来 Sealed 的 Segment。GC 在短暂的 batch-mutation fence 下快照
+Open/Committing Batch 的最终 Put `RecordRef`，并把这些 pending roots 与 Mapping-live roots 一起复制；
+同 Batch 已被后续 Put/Delete 覆盖的历史 Record 不复制。
 
-GC 不选择 open-batch ref > 0 的 Segment。Batch 只需按 Segment 去重持有 ref，避免每个 Record 一个引用。
+Output seal、fsync 并进入 Catalog 后，GC 在 Coordinator 顺序流中安装临时 `oldRef -> newRef` 表，再把
+仍为 Open 的 Batch mutation 原地改写。已经 Prepare 或同时进入的 Commit 在唯一发布点被表转换：
 
-即使 Commit Descriptor 自包含最终 VAddr，也不能在 Commit 前删除 payload Segment。
+- redirect 安装前已经提交的地址由随后执行的 Mapping relocation CAS 搬迁；
+- redirect 生效期间已 Prepare/提交的 Descriptor 使用新地址；
+- 原地改写后的 Batch 后续提交天然携带新地址；
+- 已 Abort、已覆盖或未提交的地址在 Mapping relocation 中自然 skip。
+
+移除 redirect 表时只短暂关闭 admission，把 removal boundary 排在所有可能携带旧 ref 的 Prepared Commit
+之后；等待这些请求完成时，新 Commit 仍可 admission。该边界不覆盖 Segment 扫描、Output 写入、
+Checkpoint 构建或物理删除。重启不会恢复未提交 Batch，所以内存中的重定向无需成为新的持久化状态。
+承载这些未提交 refs 的 Compaction Output 暂缓再次选择；Batch 终结后门禁自然消失。
 
 ## 10. Maintenance Marker
 
@@ -330,7 +344,8 @@ GC 遇到 corruption 不能通过复制“看起来可读”的部分掩盖错�
 - Manifest 移除前后崩溃；
 - rename-to-trash 前后崩溃；
 - unlink/dir fsync 前后崩溃；
-- Open Batch 跨 Rotation 长时间不结束；
+- Open Batch 跨 Rotation 后由 GC 重定向、GC 过程中 Commit/Abort/覆盖；
+- 同一 RecordID 存在多个未提交版本时只搬迁当前实际发布的版本；
 - ENOSPC、fsync error、permission error；
 - Close 与 GC 的 marker/Catalog/remove 各 durable boundary 并发。
 
@@ -340,7 +355,7 @@ GC 只有满足以下证据才算完成：
 
 - 源 Segment 无 Mapping 引用；
 - Relocation 已被 durable Mapping Checkpoint 覆盖；
-- Reader/Open Batch/Maintenance pin 为 0；
+- Reader pin 为 0，Open Batch 已不再持有 source 地址；
 - Manifest 不引用源文件；
 - 文件从正式目录消失且目录已 fsync；
 - Journal 已完成或清理；
