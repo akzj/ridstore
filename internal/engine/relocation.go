@@ -486,7 +486,7 @@ func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord,
 		if err != nil {
 			return err
 		}
-		published, err := s.commits.Relocate(ctx, coordinator.Relocation{BatchID: model.BatchID(rawBatchID), Changes: changes, LogicalPayloadBytes: bytes})
+		published, err := s.relocateWithBudgetRetry(ctx, coordinator.Relocation{BatchID: model.BatchID(rawBatchID), Changes: changes, LogicalPayloadBytes: bytes})
 		if err != nil {
 			return err
 		}
@@ -1007,7 +1007,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 				NewRef: copied.newRef, Operation: mapping.OperationRelocate,
 			}
 		}
-		published, err := s.commits.Relocate(ctx, coordinator.Relocation{
+		published, err := s.relocateWithBudgetRetry(ctx, coordinator.Relocation{
 			BatchID: model.BatchID(rawBatchID), Changes: changes, LogicalPayloadBytes: pendingBytes,
 		})
 		if err != nil {
@@ -1104,4 +1104,22 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 	}
 	space.complete(true)
 	return result, nil
+}
+
+// relocateWithBudgetRetry keeps transient Delta pressure out of the
+// compaction failure path. ErrBudget is returned before queue admission, so
+// retrying the same durable BatchID and proposal after a checkpoint is safe.
+func (s *Store) relocateWithBudgetRetry(ctx context.Context, relocation coordinator.Relocation) (coordinator.RelocationResult, error) {
+	for {
+		result, err := s.commits.Relocate(ctx, relocation)
+		if !errors.Is(err, mapping.ErrBudget) {
+			if err == nil && result.DeltaPressureGeneration() != 0 {
+				s.requestBackgroundCheckpoint(result.DeltaPressureGeneration())
+			}
+			return result, err
+		}
+		if err := s.awaitCheckpointPressure(ctx, result.DeltaPressureGeneration(), false); err != nil {
+			return coordinator.RelocationResult{}, err
+		}
+	}
 }

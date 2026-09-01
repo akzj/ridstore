@@ -286,6 +286,171 @@ func TestDeltaSoftPressureSchedulesBackgroundCheckpoint(t *testing.T) {
 	}
 }
 
+func TestPeriodicCheckpointFlushesOnlyNonEmptyDelta(t *testing.T) {
+	config := testCreateConfig()
+	config.Runtime.CheckpointInterval = 10 * time.Millisecond
+	config.Runtime.DeltaSoftLimitBytes = 128
+	config.Runtime.DeltaHardLimitBytes = 256
+	config.Runtime.CheckpointSortBytes = 96
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	time.Sleep(30 * time.Millisecond)
+	if started := store.Metrics().CheckpointsStarted; started != 0 {
+		t.Fatalf("empty periodic checkpoints=%d", started)
+	}
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(context.Background(), []byte("periodic")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.Metrics().CheckpointsCompleted == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("periodic checkpoint did not flush Delta: %+v", store.Metrics())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if metrics := store.Metrics(); metrics.DeltaChargedBytes != 0 || metrics.BackgroundCheckpointRequested != 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestCheckpointPressureWaitHonorsCallerCancellation(t *testing.T) {
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 24
+	config.Runtime.DeltaSoftLimitBytes = 32
+	config.Runtime.DeltaHardLimitBytes = 64
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.checkpointMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			store.checkpointMu.Unlock()
+		}
+	}()
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(context.Background(), []byte("pressure")); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := store.submitCommit(context.Background(), batch.inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := receipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	batch.finish()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := store.awaitCheckpointPressure(ctx, receipt.DeltaPressureGeneration(), false); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait err=%v", err)
+	}
+	store.checkpointMu.Unlock()
+	locked = false
+	deadline := time.Now().Add(2 * time.Second)
+	for store.mapping.CoveredCommitSeq() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("shared checkpoint stopped after waiter cancellation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCheckpointPressureWaitersShareOneGeneration(t *testing.T) {
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 24
+	config.Runtime.DeltaSoftLimitBytes = 32
+	config.Runtime.DeltaHardLimitBytes = 64
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.checkpointMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			store.checkpointMu.Unlock()
+		}
+	}()
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Create(context.Background(), []byte("pressure")); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := store.submitCommit(context.Background(), batch.inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := receipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	batch.finish()
+	generation := receipt.DeltaPressureGeneration()
+	if generation == 0 {
+		t.Fatal("missing pressure generation")
+	}
+	store.requestBackgroundCheckpoint(generation)
+	deadline := time.Now().Add(2 * time.Second)
+	for store.Metrics().CheckpointsStarted == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("checkpoint worker did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	const waiterCount = 8
+	done := make(chan error, waiterCount)
+	for index := 0; index < waiterCount; index++ {
+		go func() { done <- store.awaitCheckpointPressure(context.Background(), generation, false) }()
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		store.checkpointRequestMu.Lock()
+		queued := len(store.checkpointWaiters)
+		store.checkpointRequestMu.Unlock()
+		if queued == waiterCount {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queued waiters=%d", queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.checkpointMu.Unlock()
+	locked = false
+	for index := 0; index < waiterCount; index++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("checkpoint waiter did not complete")
+		}
+	}
+	if metrics := store.Metrics(); metrics.CheckpointsCompleted != 1 || metrics.DeltaChargedBytes != 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
 func TestCheckpointPressureGenerationDeduplicatesLateRequest(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
@@ -296,7 +461,6 @@ func TestCheckpointPressureGenerationDeduplicatesLateRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.stopBackgroundCheckpoint()
 	defer func() {
 		if err := store.Close(); err != nil && !errors.Is(err, base.ErrClosed) {
 			t.Errorf("close: %v", err)
@@ -699,7 +863,7 @@ func testCreateConfig() CreateConfig {
 			Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
 			MappingCacheBytes: 1 << 20, CheckpointSortBytes: 24 << 10, MaxSegmentStats: 1024,
 			DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
-			StatusRetention: 64, GCBytesPerSecond: ^uint64(0),
+			StatusRetention: 64, GCBytesPerSecond: ^uint64(0), CheckpointInterval: time.Hour,
 		},
 	}
 }

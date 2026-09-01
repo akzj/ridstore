@@ -463,8 +463,6 @@ func TestCompactMappingAllowsCheckpointDuringRebuild(t *testing.T) {
 	}
 	defer store.Close()
 	defer release()
-	store.stopBackgroundCheckpoint()
-
 	compactDone := make(chan error, 1)
 	go func() { compactDone <- store.CompactMapping(ctx) }()
 	select {

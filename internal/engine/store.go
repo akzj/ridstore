@@ -133,6 +133,10 @@ type Store struct {
 	checkpointStop              chan struct{}
 	checkpointDone              chan struct{}
 	checkpointStopOnce          sync.Once
+	checkpointRequestMu         sync.Mutex
+	checkpointWaiters           []checkpointWaiter
+	checkpointWorkerStopped     bool
+	checkpointInterval          time.Duration
 	checkpointPressurePending   atomic.Uint64
 	checkpointPressureCompleted atomic.Uint64
 }
@@ -350,7 +354,6 @@ func (s *Store) Close() error {
 	s.closing = true
 	s.signalLocked()
 	s.mu.Unlock()
-	s.stopBackgroundCheckpoint()
 	s.mu.Lock()
 	for s.activeOps != 0 {
 		notify := s.notify
@@ -365,6 +368,7 @@ func (s *Store) Close() error {
 	}
 	s.signalLocked()
 	s.mu.Unlock()
+	s.stopCheckpointWorker()
 	var result error
 	for _, batch := range open {
 		state, _ := batch.inner.State()
@@ -394,7 +398,14 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	return s.checkpoint(ctx, false)
 }
 
-func (s *Store) checkpoint(ctx context.Context, gcAdmission bool) (err error) {
+func (s *Store) checkpoint(ctx context.Context, gcAdmission bool) error {
+	return s.requestCheckpoint(ctx, 0, true, gcAdmission)
+}
+
+// executeCheckpoint is owned by the checkpoint worker. Callers enqueue work
+// through checkpoint so pressure, periodic, GC, and explicit requests share
+// one serialized execution path.
+func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -736,10 +747,9 @@ func (b *Batch) Commit(ctx context.Context) (coordinator.Result, error) {
 	for {
 		receipt, err := b.store.submitCommit(ctx, b.inner)
 		if errors.Is(err, mapping.ErrBudget) {
-			// Reservation failed before Prepare or durable append. The failed
-			// admission owns no Coordinator fence, so Checkpoint can
-			// install a Root and release frozen Delta charge before retry.
-			if err := b.store.Checkpoint(ctx); err != nil {
+			// Reservation failed before Prepare or durable append. Wait for the
+			// shared worker to checkpoint this Delta generation, then retry.
+			if err := b.store.awaitCheckpointPressure(ctx, receipt.DeltaPressureGeneration(), false); err != nil {
 				return coordinator.Result{}, err
 			}
 			continue

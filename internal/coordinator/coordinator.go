@@ -39,11 +39,14 @@ type Relocation struct {
 }
 
 type RelocationResult struct {
-	BatchID   model.BatchID
-	CommitSeq model.CommitSeq
-	Applied   uint32
-	Skipped   uint32
+	BatchID                 model.BatchID
+	CommitSeq               model.CommitSeq
+	Applied                 uint32
+	Skipped                 uint32
+	deltaPressureGeneration uint64
 }
+
+func (r RelocationResult) DeltaPressureGeneration() uint64 { return r.deltaPressureGeneration }
 
 type response struct {
 	result Result
@@ -133,15 +136,16 @@ type CommitRedirects struct {
 }
 
 type request struct {
-	batch      *transaction.Batch
-	prepared   transaction.Prepared
-	relocation *Relocation
-	reserve    mapping.DeltaReservation
-	result     chan response
-	relocated  chan relocationResponse
-	barrier    chan checkpointResponse
-	redirect   *redirectRequest
-	queuedAt   time.Time
+	batch                   *transaction.Batch
+	prepared                transaction.Prepared
+	relocation              *Relocation
+	reserve                 mapping.DeltaReservation
+	deltaPressureGeneration uint64
+	result                  chan response
+	relocated               chan relocationResponse
+	barrier                 chan checkpointResponse
+	redirect                *redirectRequest
+	queuedAt                time.Time
 }
 
 type Coordinator struct {
@@ -222,13 +226,16 @@ func (c *Coordinator) Relocate(ctx context.Context, relocation Relocation) (Relo
 	for i := range relocation.Changes {
 		ids[i] = relocation.Changes[i].RecordID
 	}
-	reservation, _, err := c.mapping.ReserveDelta(ids)
+	reservation, pressureGeneration, err := c.mapping.ReserveDelta(ids)
 	if err != nil {
-		return RelocationResult{}, err
+		return RelocationResult{deltaPressureGeneration: pressureGeneration}, err
 	}
 	owned := relocation
 	owned.Changes = append([]mapping.Change(nil), relocation.Changes...)
-	req := request{relocation: &owned, reserve: reservation, relocated: make(chan relocationResponse, 1)}
+	req := request{
+		relocation: &owned, reserve: reservation, deltaPressureGeneration: pressureGeneration,
+		relocated: make(chan relocationResponse, 1),
+	}
 	c.submitMu.Lock()
 	if c.closed {
 		c.submitMu.Unlock()
@@ -273,7 +280,7 @@ func (c *Coordinator) Submit(ctx context.Context, batch *transaction.Batch) (Rec
 	}
 	reservation, pressureGeneration, err := c.mapping.ReserveDelta(mutationIDs)
 	if err != nil {
-		return Receipt{}, err
+		return Receipt{deltaPressureGeneration: pressureGeneration}, err
 	}
 	prepared, err := batch.Prepare()
 	if err != nil {
@@ -838,7 +845,10 @@ func requestDescriptor(req request, seq model.CommitSeq) recordcodec.Descriptor 
 
 func (c *Coordinator) completeSuccess(req request, seq model.CommitSeq, resolved mapping.ResolvedProposal) error {
 	if req.relocation != nil {
-		result := RelocationResult{BatchID: req.relocation.BatchID, CommitSeq: seq}
+		result := RelocationResult{
+			BatchID: req.relocation.BatchID, CommitSeq: seq,
+			deltaPressureGeneration: req.deltaPressureGeneration,
+		}
 		for _, change := range resolved.Changes {
 			if change.Apply {
 				result.Applied++

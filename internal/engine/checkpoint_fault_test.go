@@ -455,7 +455,7 @@ func TestCheckpointSupportsDataRotationAfterCut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.stopBackgroundCheckpoint()
+	store.stopCheckpointWorker()
 	batch, err := store.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -558,6 +558,6 @@ func prepareCheckpointStore(t *testing.T) (string, OpenConfig) {
 		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 64 << 10},
 		MappingCacheBytes: 1 << 20, CheckpointSortBytes: 24 << 10, MaxSegmentStats: 1024,
 		DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
-		StatusRetention: 64,
+		StatusRetention: 64, CheckpointInterval: time.Hour,
 	}
 }

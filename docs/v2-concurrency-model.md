@@ -34,12 +34,12 @@ Checkpoint / GC
 | `Store.mu` | lifecycle, fault, open/status bookkeeping | no | brief entry/exit bookkeeping only |
 | `batchSnapshotMu` | Begin/Abort versus checkpoint recovery metadata snapshot | ID reservation during Begin may append | Begin/Abort/checkpoint snapshot; not Get/Put/Commit I/O |
 | `mutationFence` | drains `Record append -> Batch mutation visible` before retirement | read side covers one Put append | Put-like calls only; write side is released before Segment scan |
-| `checkpointMu` | serializes Checkpoint builders | yes | Checkpoint callers only |
+| `checkpointMu` | serializes the Checkpoint worker with Mapping-GC Root publication | yes | maintenance only; data-plane callers wait by generation |
 | `maintenanceMu` | serializes Data/Mapping maintenance | yes | maintenance callers only |
 | `activeOps` + `closing` | Close admission and drain | no lock is held while draining | new operations after Close begins |
 
-`Close` never owns `checkpointMu` or `maintenanceMu` while waiting for `activeOps`; an operation already admitted can finish
-without a lifecycle lock cycle.
+`Close` never owns `checkpointMu` or `maintenanceMu` while waiting for `activeOps`; the Checkpoint worker remains alive
+until admitted waiters finish, then Close stops it before closing storage files.
 
 ## 3. Coordinator and Mapping
 

@@ -161,6 +161,31 @@ func TestPersistentPressureGenerationFollowsActiveDelta(t *testing.T) {
 	reservation.Release()
 }
 
+func TestPersistentHardBudgetReturnsCheckpointGeneration(t *testing.T) {
+	current, physical := newPersistentForTest(t)
+	defer physical.Close()
+	ids := make([]model.ID, 1024)
+	for index := range ids {
+		ids[index] = model.ID(index + 1)
+	}
+	reservation, generation, err := current.ReserveDelta(ids)
+	if err != nil || generation == 0 {
+		t.Fatalf("fill generation=%d err=%v", generation, err)
+	}
+	defer reservation.Release()
+
+	if _, blockedGeneration, err := current.ReserveDelta([]model.ID{2048}); !errors.Is(err, ErrBudget) || blockedGeneration != generation {
+		t.Fatalf("blocked generation=%d want=%d err=%v", blockedGeneration, generation, err)
+	}
+	tooLarge := make([]model.ID, 1025)
+	for index := range tooLarge {
+		tooLarge[index] = model.ID(3000 + index)
+	}
+	if _, blockedGeneration, err := current.ReserveDelta(tooLarge); !errors.Is(err, base.ErrBatchTooLarge) || blockedGeneration != 0 {
+		t.Fatalf("oversized generation=%d err=%v", blockedGeneration, err)
+	}
+}
+
 func TestPersistentPressureGenerationExhaustionReleasesReservation(t *testing.T) {
 	current, physical := newPersistentForTest(t)
 	defer physical.Close()

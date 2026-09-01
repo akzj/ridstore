@@ -390,7 +390,7 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 		Commit:            coordinator.Config{QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 4096},
 		MappingCacheBytes: 1 << 20, CheckpointSortBytes: 24 << 10, MaxSegmentStats: 1024,
 		DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
-		StatusRetention: 64,
+		StatusRetention: 64, CheckpointInterval: time.Hour,
 	}
 	store, err := Open(context.Background(), root, config)
 	if err != nil {

@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/compactionstate"
+	"github.com/akzj/ridstore/internal/coordinator"
+	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordcodec"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -37,6 +40,106 @@ func TestRelocateSegmentCopiesLivePutAndPreservesOrigin(t *testing.T) {
 	put, err := recordcodec.DecodePut(payload, store.limits.MaxValueSize)
 	if err != nil || put.OriginBatchID != origin || put.RecordID != id {
 		t.Fatalf("put=%+v err=%v", put, err)
+	}
+}
+
+func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 24
+	config.Runtime.DeltaSoftLimitBytes = 32
+	config.Runtime.DeltaHardLimitBytes = 64
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rootBatch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := rootBatch.Create(context.Background(), []byte("root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootBatch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	old, exists, err := store.mapping.LookupRef(id)
+	if err != nil || !exists {
+		t.Fatalf("old=%+v exists=%v err=%v", old, exists, err)
+	}
+	payload, err := store.log.Read(context.Background(), old.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied, err := store.log.Append(context.Background(), payload, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRef, err := copied.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawBatchID, err := store.batches.Allocate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.checkpointMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			store.checkpointMu.Unlock()
+		}
+	}()
+	filler, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filler.Create(context.Background(), []byte("fill Delta")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filler.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, relocateErr := store.relocateWithBudgetRetry(context.Background(), coordinator.Relocation{
+			BatchID: model.BatchID(rawBatchID), LogicalPayloadBytes: 4,
+			Changes: []mapping.Change{{RecordID: id, ExpectedOldAddr: old.Addr, NewRef: newRef, Operation: mapping.OperationRelocate}},
+		})
+		done <- relocateErr
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		store.checkpointRequestMu.Lock()
+		waiting := len(store.checkpointWaiters) != 0
+		store.checkpointRequestMu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("relocation did not wait for checkpoint pressure")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.checkpointMu.Unlock()
+	locked = false
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relocation did not resume after checkpoint")
+	}
+	if current, exists, err := store.mapping.LookupRef(id); err != nil || !exists || current != newRef {
+		t.Fatalf("current=%+v exists=%v err=%v", current, exists, err)
 	}
 }
 

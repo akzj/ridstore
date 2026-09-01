@@ -88,8 +88,8 @@ v2 禁止该锁环。Commit 的正确流程是：
 1. 进入短生命周期计数并检查 Store lifecycle
 2. 在 Coordinator admission read lock 内 reservation、Prepare 并进入 queue
 3. queue 接管请求后立即释放 admission read lock；不等待 durable result
-4. hard pressure 时不持有 admission lock，由该调用者推进一次 Checkpoint
-5. Checkpoint 安装释放 frozen charge
+4. hard pressure 时不持有 admission lock，通知唯一 Checkpoint worker 并等待对应 Delta generation
+5. worker 合并同 generation 请求；Checkpoint 安装释放 frozen charge 并唤醒等待者
 6. 重试 admission；成功后再等待 durable Publish
 ```
 
@@ -97,26 +97,29 @@ v2 禁止该锁环。Commit 的正确流程是：
 reservation 针对旧 active layer 计算，而 Commit 最终写入新 active layer。它只覆盖无 I/O 的 admission；
 durable append 和调用者等待都不持有它。
 
-soft pressure 不走 hard-pressure 的同步重试路径。`Receipt` 携带 admission 时的 advisory
-signal；Store 在 admission 完成后向容量为 1 的 channel 投递请求。已排队请求会合并，
-但 worker 执行期间 channel 保持为空，因此 checkpoint cut 之后出现的新 pressure 仍可再排队一次。
-Coordinator barrier 保证 cut 覆盖它之前已 admission 的 Commit。这个调度只来自用户 Commit；
-Relocation 不在其 maintenance 锁域内反向触发后台 worker。
+soft pressure 不阻塞 Commit。`Receipt` 携带 admission 时的 advisory signal；Store 在 admission
+完成后通知唯一 Checkpoint worker。hard pressure 同样携带 generation，但调用者等待 worker 覆盖该
+generation 后重试。用户 Commit、Relocation、显式 API、周期触发共享同一 worker；调用者不直接构建
+Checkpoint。Coordinator barrier 保证 cut 覆盖它之前已 admission 的 Commit。
 
-后台 Checkpoint 使用内部 `context.Background()`，不继承已返回 Commit 调用者的取消。任务失败时
-记录 failed counter 并将 Store fail closed，避免 soft-pressure 收敛失败被静默吞掉。`Close`
-先停止并等待 worker，再将 lifecycle 标记为 closing、等待短操作计数归零，然后关闭 Coordinator 和底层文件。
-Close 在 drain 时不占有 `checkpointMu` 或 maintenance 锁，避免与尚未进入 checkpoint 的 active operation 互锁。
+worker 使用内部 `context.Background()`，不把一个等待者的取消传播给共享任务；调用者 Context 只取消
+自己的等待。自动 pressure/periodic Checkpoint 失败时记录 failed counter 并将 Store fail closed，避免
+收敛失败被静默吞掉。`Close` 先拒绝新操作并等待已进入的 waiter 完成，再停止 worker，最后关闭
+Coordinator 和底层文件。Close 在 drain 时不占有 `checkpointMu` 或 maintenance 锁。
 
 Batch 在步骤 2–4 仍是 Open，因此 Checkpoint 可以把它记入 open-batch cut；它后续的 Commit Record 位于
 该 cut 之后。Close 与 Commit 通过 Batch 状态机、Coordinator queue ownership 和 Close drain 协调，不能
 依赖 Commit 长时间持有 Store lifecycle RLock。
 
-多个 pressure caller 可以同时请求 Checkpoint；`checkpointMu` 保证实际构建串行。每个 pressure receipt
+多个 pressure caller 可以同时请求 Checkpoint；唯一 worker 保证实际构建串行，`checkpointMu` 继续隔离
+Mapping GC 的 Root publication 临界区。每个 pressure receipt
 携带它被 admission 时所属的 Active Delta generation；Freeze 后的新 Active 使用下一 generation。Store
 分别维护 pending 与 completed generation，channel 只负责唤醒：已被显式、hard-pressure 或后台
 Checkpoint 覆盖的迟到请求会直接丢弃，只有 cut 后新 Active 上的 pressure 才继续触发下一轮。因此不会
 为了已经释放的 Delta 再构建一代空 checkpoint，也不会误丢 cut 后的新压力。
+
+worker 还按 `CheckpointInterval` 定时检查；仅当 Delta charge 非零时才触发周期 Checkpoint，空闲 Store
+不会产生空 Manifest/fsync。显式 `Checkpoint` 作为 force request 入队并等待结果。
 
 ## 6. Checkpoint 释放
 

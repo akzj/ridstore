@@ -127,7 +127,16 @@ func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, uint64, err
 		}
 	}
 	reservation, pressure, err := m.budget.reserve(entries)
-	if err != nil || !pressure {
+	if err != nil {
+		if err != ErrBudget || !pressure {
+			return reservation, 0, err
+		}
+		if m.checkpointID == math.MaxUint64 {
+			return nil, 0, base.ErrGenerationExhausted
+		}
+		return nil, m.checkpointID + 1, err
+	}
+	if !pressure {
 		return reservation, 0, err
 	}
 	if m.checkpointID == math.MaxUint64 {

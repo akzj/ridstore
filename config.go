@@ -47,6 +47,9 @@ type RuntimeConfig struct {
 	// and GC after new user Put records have been stopped.
 	WriteStopFreeBytes uint64
 	SpaceCheckInterval time.Duration
+	// CheckpointInterval bounds how long a non-empty Mapping Delta remains
+	// uncheckpointed when it stays below the pressure threshold.
+	CheckpointInterval time.Duration
 	// GCBatchBytes bounds copied Value bytes and GCBatchMutations bounds changes
 	// in one relocation publication. A single legal value may exceed the
 	// runtime byte budget and is relocated alone.
@@ -159,6 +162,9 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	if c.SpaceCheckInterval == 0 {
 		c.SpaceCheckInterval = 100 * time.Millisecond
 	}
+	if c.CheckpointInterval == 0 {
+		c.CheckpointInterval = 30 * time.Second
+	}
 	return engine.OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: c.MaxQueuedBytes, QueueCapacity: c.AppendQueueCapacity, BufferBytes: c.AppendBufferBytes, BufferRecords: c.AppendBufferRecords},
 		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload},
@@ -166,7 +172,8 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 		MaxSegmentStats: c.MaxSegmentStats, DeltaSoftLimitBytes: c.DeltaSoftLimitBytes,
 		DeltaHardLimitBytes: c.DeltaHardLimitBytes, StatusRetention: c.StatusRetention,
 		WriteStopFreeBytes: c.WriteStopFreeBytes, SpaceCheckInterval: c.SpaceCheckInterval,
-		GCBatchBytes: c.GCBatchBytes, GCBatchMutations: c.GCBatchMutations,
+		CheckpointInterval: c.CheckpointInterval,
+		GCBatchBytes:       c.GCBatchBytes, GCBatchMutations: c.GCBatchMutations,
 		GCMinFreeBytes: c.GCMinFreeBytes, GCBytesPerSecond: c.GCBytesPerSecond,
 	}
 }

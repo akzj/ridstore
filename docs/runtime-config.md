@@ -43,6 +43,7 @@ runtime 包含 RecordLog queue/buffer、Commit group、Mapping cache、Checkpoin
 | GCBytesPerSecond | 64 MiB/s |
 | WriteStopFreeBytes | 512 MiB |
 | SpaceCheckInterval | 100 ms |
+| CheckpointInterval | 30 s |
 
 这些是可运行的安全起点，不是性能承诺；基准可以改变后续默认值，但持久化 hard limits 的改变必须遵守 Open 兼容规则。
 
@@ -65,6 +66,7 @@ Create 先填充零值、再验证、最后把 8 个 FormatHardLimits 写入 INI
 - `GCBytesPerSecond > 0`；零值采用 64 MiB/s；
 - `WriteStopFreeBytes >= GCMinFreeBytes`；公开层零值采用 512 MiB；
 - `SpaceCheckInterval > 0`；公开层零值采用 100ms；
+- `CheckpointInterval > 0`；公开层零值采用 30s；仅在 Mapping Delta 非空时触发周期 Checkpoint；
 - 任何 runtime budget 不能解释为允许绕过持久化 hard limit。
 
 ## 4. Delta 计费
