@@ -20,9 +20,9 @@ type FileSet struct {
 	Sealed []recordlog.SegmentSummary
 }
 
-// Build derives exact live statistics for one immutable Mapping checkpoint.
-// Active-segment records are validated but omitted because the Manifest stats
-// table describes only sealed segments.
+// Build derives complete live statistics for one immutable Mapping checkpoint.
+// The active Segment is included so the result can seed WAL replay without a
+// second traversal of the Mapping root.
 func Build(ctx context.Context, current Mapping, files FileSet, maxEntries uint64) ([]storecatalog.SegmentStats, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -46,10 +46,11 @@ func Build(ctx context.Context, current Mapping, files FileSet, maxEntries uint6
 		if !ref.Valid() || isSealed && (ref.Addr.Offset() > summary.ValidEnd || ref.PhysicalSize > summary.ValidEnd-ref.Addr.Offset()) {
 			return base.ErrCorrupt
 		}
-		if !isSealed {
-			return nil
+		segmentID := ref.Addr.SegmentID()
+		if isSealed {
+			segmentID = summary.SegmentID
 		}
-		if err := add(stats, summary.SegmentID, ref.PhysicalSize); err != nil {
+		if err := add(stats, segmentID, ref.PhysicalSize); err != nil {
 			return err
 		}
 		if uint64(len(stats)) > maxEntries {

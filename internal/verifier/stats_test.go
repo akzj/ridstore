@@ -7,15 +7,15 @@ import (
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
-func TestEqualCoveredSegmentStatsAllowsMissingUnknownSegment(t *testing.T) {
+func TestEqualCoveredSegmentStatsRejectsMissingReplaySegment(t *testing.T) {
 	segment := storecatalog.DataSegmentSummary{SegmentID: 2, ValidEnd: 320}
 	manifest := storecatalog.Manifest{
 		ReplayStart:        recordlog.LogPos{SegmentID: 2, Offset: 192},
 		SealedDataSegments: []storecatalog.DataSegmentSummary{segment},
 	}
 	exact := []storecatalog.SegmentStats{{SegmentID: 2, LiveBytes: 64, LiveRecords: 1}}
-	if !equalCoveredSegmentStats(exact, nil, manifest) {
-		t.Fatal("a Segment crossing ReplayStart may be absent from the checkpoint Stats table")
+	if equalCoveredSegmentStats(exact, nil, manifest) {
+		t.Fatal("the complete checkpoint Stats table must include a live ReplayStart Segment")
 	}
 }
 

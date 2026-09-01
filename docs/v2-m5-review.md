@@ -98,11 +98,11 @@ Mapping，因此不阻塞 GC；Open/Committing Batch 的最终 Put 在 durable p
 
 ## 5. Sparse SegmentStats 语义修正
 
-Checkpoint builder 只编码含 live Record 的 sealed Segment。对 `segment.end < ReplayStart` 的 Segment，
-表项缺失明确表示零存活；对 `segment.end >= ReplayStart` 的 Segment，缺失表示 unknown，因为它可能在
-Checkpoint 构建后、安装前才由 Active rotation 成为 sealed。Catalog retire 门禁只接受前一种已覆盖
-Segment 的缺失或显式零值，任何非零值和 unknown 都拒绝。完整 Compaction 以该 exact checkpoint stats
-替代第二次 Input 扫描，并继续组合 open-batch、generation 与 reader-pin 门禁。
+Checkpoint builder 编码同代 Mapping cut 中所有含 live Record 的 Segment，包括 Active/ReplayStart
+Segment；表项缺失统一表示该 cut 中零存活，且 live-record 总和必须等于 `MappingEntryCount`。不过对
+`segment.end >= ReplayStart` 的 sealed Segment，cut 后 WAL 仍可能改变其状态，因此 Catalog retire 门禁
+继续把它视为 unknown。完整 Compaction 以 exact checkpoint stats 替代第二次 Input 扫描，并继续组合
+open-batch、generation 与 reader-pin 门禁。
 
 ## 6. M5 剩余范围
 

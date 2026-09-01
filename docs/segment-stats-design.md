@@ -33,16 +33,16 @@ ExactLiveRecordsAtCut
 StatsCoveredCommitSeq
 ```
 
-它必须与同一 Manifest 中的 Mapping Root `CoveredCommitSeq` 相等。表只保存非零项并按 SegmentID
-升序排列。稀疏表的覆盖水位由 `ReplayStart` 定义：
+它必须与同一 Manifest 中的 Mapping Root `CoveredCommitSeq` 相等。表保存该 Mapping cut 中所有
+Data Segment（包括 Active/ReplayStart Segment）的非零项并按 SegmentID 升序排列：
 
 ```text
-segment.end < ReplayStart   => Stats 已覆盖，缺失表示 live bytes/count 均为 0
-segment.end >= ReplayStart  => Stats 可能未覆盖，缺失表示 unknown
+sum(SegmentStats.LiveRecords) == MappingEntryCount
+缺失 SegmentStats             => 该 cut 中 live bytes/count 均为 0
 ```
 
-严格小于而不是小于等于，是为了覆盖 Checkpoint 构建后、安装前 Active Segment 发生 rotation 的边界。
-unknown Segment 即使缺失 Stats 也不能成为 GC 候选或进入 retire。
+`StatsKnownForSegment` 仍使用 `segment.end < ReplayStart` 限制 GC：跨越 replay boundary 的 Segment
+虽然已有精确 cut 统计，但其 cut 后 WAL 仍可能改变 live 集合，必须等后续 Checkpoint 才能退休。
 
 运行时 Mapping 维护：
 
@@ -65,13 +65,13 @@ Mapping entries at C + live table at C
 => new Mapping Root R1 at C + SegmentStats(C)
 ```
 
-Builder 只负责构建 COW Root；Checkpoint 将冻结的 live table 按当前 Catalog 文件集过滤、校验和排序，
-再与新 Root 一起写入同一 Manifest generation。active Segment 不写入持久化表；如果它在 cut 后发生
-rotation，`ReplayStart` 的严格边界仍会把它标为 unknown，直到下一次 Checkpoint 覆盖。
+Builder 只负责构建 COW Root；Checkpoint 将冻结的完整 live table 按当前 Catalog 文件集校验和排序，
+再与新 Root 一起写入同一 Manifest generation。Active Segment 的统计边界是同代 `ReplayStart`；如果它
+在 cut 后发生 rotation，统计仍随 SegmentID 保留，而 GC 继续把该 replay-boundary Segment 视为 unknown。
 
-首次 Open 从持久化 Mapping Root 顺序遍历一次以建立 live table，随后 replay 与在线 publish 使用同一
-增减逻辑。Offline Verify 独立遍历 Mapping 并读取完整 Record，既核对 `RecordRef.PhysicalSize`，也重算
-SegmentStats；它不依赖运行时派生状态。
+Open 从 Manifest 同时加载 Mapping Root 和完整 live table，然后一次 WAL replay 同步推进 Mapping、Stats、
+Batch 状态与水位，不再遍历 Mapping Root 重建 Stats。Offline Verify 仍独立遍历 Mapping 并读取完整
+Record，核对 `RecordRef.PhysicalSize` 并重算完整 SegmentStats。
 
 ## 4. 原子安装
 

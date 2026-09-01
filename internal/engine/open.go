@@ -180,11 +180,12 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return fail(err)
 	}
-	current, err := mapping.OpenPersistent(tree, physicalMapping, persistentConfig(config))
+	checkpointState, err := mappingCheckpointState(manifest)
 	if err != nil {
 		return fail(err)
 	}
-	if err := current.InitializeLiveStats(ctx); err != nil {
+	current, err := mapping.OpenPersistent(tree, physicalMapping, persistentConfig(config), checkpointState)
+	if err != nil {
 		return fail(err)
 	}
 	recovered, err := replay.Recover(ctx, log, replay.Checkpoint{
@@ -277,6 +278,26 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	}
 	store.startBackgroundCheckpoint()
 	return store, nil
+}
+
+func mappingCheckpointState(manifest storecatalog.Manifest) (mapping.PersistentState, error) {
+	if manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq {
+		return mapping.PersistentState{}, base.ErrCorrupt
+	}
+	live := make(map[recordlog.SegmentID]mapping.SegmentLiveStats, len(manifest.SegmentStats))
+	for _, stat := range manifest.SegmentStats {
+		if stat.LiveBytes == 0 && stat.LiveRecords == 0 {
+			continue
+		}
+		if stat.LiveBytes == 0 || stat.LiveRecords == 0 {
+			return mapping.PersistentState{}, base.ErrCorrupt
+		}
+		live[stat.SegmentID] = mapping.SegmentLiveStats{
+			LiveBytes: stat.LiveBytes, LiveRecords: stat.LiveRecords,
+			LastChangedCommitSeq: manifest.StatsCoveredCommitSeq,
+		}
+	}
+	return mapping.PersistentState{StatsCoveredCommitSeq: manifest.StatsCoveredCommitSeq, LiveStats: live}, nil
 }
 
 func validOpenConfig(config OpenConfig) bool {

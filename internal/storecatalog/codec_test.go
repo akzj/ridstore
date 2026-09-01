@@ -94,6 +94,7 @@ func TestManifestAllowsCanonicalEmptyMappingRoot(t *testing.T) {
 	manifest := testManifest()
 	manifest.MappingRoot = 0
 	manifest.MappingEntryCount = 0
+	manifest.SegmentStats = nil
 	manifest.CoveredCommitSeq = 7
 	manifest.StatsCoveredCommitSeq = 7
 	encoded, err := Encode(manifest)
@@ -106,6 +107,22 @@ func TestManifestAllowsCanonicalEmptyMappingRoot(t *testing.T) {
 	}
 	if decoded.MappingRoot != 0 || decoded.CoveredCommitSeq != 7 {
 		t.Fatalf("decoded=%+v", decoded)
+	}
+}
+
+func TestManifestRequiresCompleteActiveSegmentStats(t *testing.T) {
+	manifest := testManifest()
+	manifest.ReplayStart = recordlog.LogPos{SegmentID: manifest.ActiveDataSegmentID, Offset: 128}
+	manifest.MappingEntryCount = 2
+	manifest.SegmentStats = append(manifest.SegmentStats, SegmentStats{
+		SegmentID: manifest.ActiveDataSegmentID, LiveBytes: 64, LiveRecords: 1,
+	})
+	if _, err := Encode(manifest); err != nil {
+		t.Fatalf("complete stats rejected: %v", err)
+	}
+	manifest.SegmentStats = manifest.SegmentStats[:1]
+	if _, err := Encode(manifest); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("incomplete stats err=%v", err)
 	}
 }
 

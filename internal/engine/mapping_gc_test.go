@@ -140,9 +140,9 @@ func TestCompactMappingAdmissionCountsLiveRecordInActiveSegment(t *testing.T) {
 	id := createMappingGCRecord(t, ctx, store, "active-only")
 
 	// One live Mapping entry requires eight worst-case dense radix nodes. At
-	// this segment size only one dense node fits per segment. SegmentStats is
-	// empty because the record remains in the active Data Segment; the durable
-	// MappingEntryCount must nevertheless reject a one-segment budget.
+	// this segment size only one dense node fits per segment. The complete
+	// checkpoint Stats includes the active Data Segment, while MappingEntryCount
+	// remains the admission authority for the Mapping rewrite.
 	minimum := uint64(1)
 	free := uint64(config.HardLimits.SegmentSize) + minimum
 	store.space = newSpaceGate(root, 1, time.Second, func(string) (uint64, error) { return free, nil })
@@ -151,7 +151,8 @@ func TestCompactMappingAdmissionCountsLiveRecordInActiveSegment(t *testing.T) {
 		t.Fatalf("compact err=%v", err)
 	}
 	manifest := store.catalog.Snapshot()
-	if manifest.MappingEntryCount != 1 || len(manifest.SegmentStats) != 0 {
+	if manifest.MappingEntryCount != 1 || len(manifest.SegmentStats) != 1 ||
+		manifest.SegmentStats[0].SegmentID != manifest.ActiveDataSegmentID || manifest.SegmentStats[0].LiveRecords != 1 {
 		t.Fatalf("entries=%d stats=%+v", manifest.MappingEntryCount, manifest.SegmentStats)
 	}
 	if _, err := os.Lstat(mapgcstate.StagingRoot(root)); !errors.Is(err, os.ErrNotExist) {

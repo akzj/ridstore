@@ -22,7 +22,7 @@ func TestSelectCompactionCandidateUsesSparseStatsAndStableOrdering(t *testing.T)
 		{SegmentID: 1, LiveBytes: 64, LiveRecords: 1},
 		{SegmentID: 2, LiveBytes: 128, LiveRecords: 2},
 	}
-	manifest.ReplayStart = recordlog.LogPos{SegmentID: 4, Offset: recordlog.SegmentHeaderSize}
+	manifest.ReplayStart = recordlog.LogPos{SegmentID: 4, Offset: 128}
 
 	candidate, found, err := selectCompactionCandidate(manifest, CompactionPolicy{}, nil)
 	if err != nil || !found {
@@ -33,6 +33,8 @@ func TestSelectCompactionCandidateUsesSparseStatsAndStableOrdering(t *testing.T)
 	}
 
 	manifest.SegmentStats = append(manifest.SegmentStats, storecatalog.SegmentStats{SegmentID: 3, LiveBytes: 64, LiveRecords: 1})
+	manifest.ActiveDataSegmentID = 4
+	manifest.SegmentStats = append(manifest.SegmentStats, storecatalog.SegmentStats{SegmentID: 4, LiveBytes: 64, LiveRecords: 1})
 	candidate, found, err = selectCompactionCandidate(manifest, CompactionPolicy{}, map[recordlog.SegmentID]struct{}{1: {}})
 	if err != nil || !found || candidate.Source.SegmentID != 2 || len(candidate.Sources) != 2 {
 		t.Fatalf("candidate=%+v found=%v err=%v", candidate, found, err)

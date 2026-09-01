@@ -57,7 +57,8 @@ Radix 仍为固定 9-bit stride、8 层。
 运行时 append 已返回精确 Record physical size。事务准备阶段把新记录表示为 RecordRef，并交给
 Mapping proposal。CommitGroup mutation 当前 32 bytes，其中 7 bytes 为 reserved；新格式使用其中
 4 bytes 编码 `NewPhysicalSize`，其余 3 bytes 保持为零。Record protocol format version 同步升级到 3，
-StoreCatalog minor version 升级到 3；不接受旧目录。
+StoreCatalog minor version 升级到 4；不接受旧目录。版本 4 的 Checkpoint Stats 是完整 Mapping cut
+快照，包含 Active/ReplayStart Segment，可直接作为恢复基线。
 
 - Put/Relocate 必须携带合法 NewRef；
 - Delete 的 NewRef 必须为零；
@@ -89,6 +90,9 @@ Checkpoint freeze 同时获得一个 covered-sequence 一致的统计视图。Ma
 checkpoint coverage、Open Batch source gate、Catalog generation 和 reader pin 共同组成完整 Compaction
 的退休证明；实时表本身不能授权删除。由于它与 Mapping publication 原子更新，post-checkpoint 的已知
 zero-live stats 可以替代退休前第二次 Input 全量扫描。
+
+Open 将同代 Mapping Root 与完整 SegmentStats 一次性装入 Mapping，随后从 `ReplayStart` 扫描 WAL；
+每个 replay commit 通过同一个 `PublishGroup` 同步推进 Mapping 和 Stats。正常恢复不再遍历 Mapping Root。
 
 ## 6. 冷静度采样
 

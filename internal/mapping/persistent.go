@@ -53,13 +53,20 @@ type Persistent struct {
 	checkpointSortBytes uint64
 	budget              *deltaBudget
 	live                map[recordlog.SegmentID]SegmentLiveStats
-	liveReady           bool
 }
 
 type PersistentConfig struct {
 	CheckpointSortBytes uint64
 	DeltaSoftLimitBytes uint64
 	DeltaHardLimitBytes uint64
+}
+
+// PersistentState is the complete logical state carried by one durable
+// checkpoint. Recovery opens the immutable Mapping root and its live Segment
+// statistics from the same cut, then advances both through WAL replay.
+type PersistentState struct {
+	StatsCoveredCommitSeq model.CommitSeq
+	LiveStats             map[recordlog.SegmentID]SegmentLiveStats
 }
 
 const checkpointMutationBytes = uint64(24)
@@ -75,8 +82,21 @@ func ValidatePersistentConfig(config PersistentConfig) error {
 	return nil
 }
 
-func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig) (*Persistent, error) {
+func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig, state PersistentState) (*Persistent, error) {
 	if root == nil || syncer == nil || ValidatePersistentConfig(config) != nil {
+		return nil, ErrInvalid
+	}
+	if state.StatsCoveredCommitSeq != root.Covered() {
+		return nil, ErrInvalid
+	}
+	live := make(map[recordlog.SegmentID]SegmentLiveStats, len(state.LiveStats))
+	for segment, stat := range state.LiveStats {
+		if segment == 0 || stat.LiveBytes == 0 || stat.LiveRecords == 0 || stat.LastChangedCommitSeq > root.Covered() {
+			return nil, ErrInvalid
+		}
+		live[segment] = stat
+	}
+	if root.Root() != 0 && len(live) == 0 {
 		return nil, ErrInvalid
 	}
 	budget, _ := newDeltaBudget(config.DeltaSoftLimitBytes, config.DeltaHardLimitBytes)
@@ -85,39 +105,8 @@ func OpenPersistent(root *radix.Tree, syncer NodeSyncer, config PersistentConfig
 		active:              &deltaLayer{values: make(map[model.ID]persistentDelta)},
 		checkpointSortBytes: config.CheckpointSortBytes,
 		budget:              budget,
-		live:                make(map[recordlog.SegmentID]SegmentLiveStats),
-		liveReady:           root.Root() == 0,
+		live:                live,
 	}, nil
-}
-
-func (m *Persistent) InitializeLiveStats(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	m.mu.RLock()
-	if m.liveReady {
-		m.mu.RUnlock()
-		return nil
-	}
-	root, owner, epoch := m.root, m.owner, m.epoch
-	owner.readers.Add(1)
-	m.mu.RUnlock()
-	live := make(map[recordlog.SegmentID]SegmentLiveStats)
-	err := root.WalkRefs(ctx, func(_ model.ID, ref recordlog.RecordRef) error {
-		return addLiveRef(live, ref, root.Covered())
-	})
-	m.releaseRoot(owner)
-	if err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.epoch != epoch || m.root != root || m.owner != owner || m.covered != root.Covered() {
-		return ErrStalePlan
-	}
-	m.live = live
-	m.liveReady = true
-	return nil
 }
 
 func (m *Persistent) ReserveDelta(ids []model.ID) (DeltaReservation, uint64, error) {
@@ -243,9 +232,6 @@ func (m *Persistent) PublishGroup(first model.CommitSeq, plan GroupPlan, reserva
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.liveReady {
-		return PublishResult{}, ErrCorrupt
-	}
 	if plan.BaseCommitSeq != m.covered {
 		return PublishResult{}, ErrStalePlan
 	}

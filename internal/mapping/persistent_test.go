@@ -58,7 +58,7 @@ func newPersistentForTest(t *testing.T) (*Persistent, *mapstore.Store) {
 	}
 	current, err := OpenPersistent(tree, physical, PersistentConfig{
 		CheckpointSortBytes: 24 << 10, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
-	})
+	}, PersistentState{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +449,7 @@ func TestPersistentRejectsDeltaLimitLargerThanCheckpointCapacity(t *testing.T) {
 	}
 	if _, err := OpenPersistent(tree, nodes, PersistentConfig{
 		CheckpointSortBytes: 24, DeltaSoftLimitBytes: 64, DeltaHardLimitBytes: 128,
-	}); !errors.Is(err, ErrInvalid) {
+	}, PersistentState{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("open err=%v", err)
 	}
 }
@@ -528,7 +528,7 @@ func TestReplaceCheckpointRootWaitsOnlyForOldReaders(t *testing.T) {
 	}
 	current, err := OpenPersistent(oldTree, oldStore, PersistentConfig{
 		CheckpointSortBytes: 24 << 10, DeltaSoftLimitBytes: 32 << 10, DeltaHardLimitBytes: 64 << 10,
-	})
+	}, PersistentState{StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), LiveStats: candidate.LiveStats()})
 	if err != nil {
 		t.Fatal(err)
 	}

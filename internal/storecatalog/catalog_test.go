@@ -18,6 +18,7 @@ func TestManagerDrivesMapStoreRotation(t *testing.T) {
 	manifest.SealedMapSegments = nil
 	manifest.MappingRoot = 0
 	manifest.MappingEntryCount = 0
+	manifest.SegmentStats = nil
 	manifest.HardLimits.SegmentSize = 8192
 	manifest.HardLimits.MaxValueSize = 64
 	manifest.HardLimits.MaxBatchBytes = 4096
@@ -158,6 +159,8 @@ func TestInstallCheckpointRebasesAcrossDataRotation(t *testing.T) {
 func TestInstallCheckpointRejectsDataRetireRebase(t *testing.T) {
 	t.Parallel()
 	initial := testManifest()
+	initial.MappingRoot = 0
+	initial.MappingEntryCount = 0
 	initial.SegmentStats = nil
 	manager, err := NewManager(t.TempDir(), initial, nil)
 	if err != nil {
@@ -334,6 +337,8 @@ func TestDataRetireAcceptsMissingSparseStatsEntryAsZero(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	initial := testManifest()
+	initial.MappingRoot = 0
+	initial.MappingEntryCount = 0
 	initial.SegmentStats = nil
 	if err := Install(root, initial, nil); err != nil {
 		t.Fatal(err)
@@ -372,7 +377,7 @@ func TestManagerImplementsRecordLogCatalogPort(t *testing.T) {
 		MappingRoot: rootAddr, MappingEntryCount: 1, CoveredCommitSeq: 1, ReplayStart: initial.ReplayStart,
 		ReservedIDHigh: 100, ReservedBatchIDHigh: 100, IssuedBatchIDHighAtCut: 50,
 		OpenBatchIDsAtCut: []model.BatchID{2, 7}, StatsCoveredCommitSeq: 1,
-		SegmentStats: []SegmentStats{{SegmentID: 1}, {SegmentID: 2}},
+		SegmentStats: []SegmentStats{{SegmentID: 2, LiveBytes: 64, LiveRecords: 1}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -386,6 +391,8 @@ func TestManagerImplementsRecordLogCatalogPort(t *testing.T) {
 func TestRemoveRecordLogSegmentRebasesAcrossDataRotation(t *testing.T) {
 	t.Parallel()
 	initial := testManifest()
+	initial.MappingRoot = 0
+	initial.MappingEntryCount = 0
 	initial.SegmentStats = nil
 	manager, err := NewManager(t.TempDir(), initial, nil)
 	if err != nil {

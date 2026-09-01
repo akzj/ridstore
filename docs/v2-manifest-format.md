@@ -107,8 +107,9 @@ Active Segment 的当前 end 不写 Manifest，因为它会持续增长；Open �
 
 Mapping 文件集与 Data 文件集分开编号。`MappingRoot=0` 是空 Mapping 的唯一表示；此时
 `MappingEntryCount=0`，非空 Root 的 count 必须非零。该精确计数与 Root 在同一个 Checkpoint
-generation 中安装，供 Mapping GC 在创建 staging 前完成空间 admission，不依赖只覆盖 sealed Data
-Segment 的 `SegmentStats`。Radix checkpoint 在已有 leaf before/after slots 上计算 count 变化，不增加
+generation 中安装，供 Mapping GC 在创建 staging 前完成空间 admission。完整 `SegmentStats`（包括
+Active/ReplayStart Segment）的 live-record 总和必须等于该计数。Radix checkpoint 在已有 leaf
+before/after slots 上计算 count 变化，不增加
 全树扫描。空 Node 不为满足
 Manifest 约束而落盘。非零 MappingRoot 必须落在 active 或 sealed Mapping Segment 的合法边界内。
 Root、CoveredCommitSeq 和 ReplayStart 是一个不可拆分的 checkpoint tuple：

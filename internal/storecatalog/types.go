@@ -7,7 +7,7 @@ import (
 
 const (
 	FormatMajor = uint16(2)
-	FormatMinor = uint16(3)
+	FormatMinor = uint16(4)
 )
 
 type StoreUUID [16]byte

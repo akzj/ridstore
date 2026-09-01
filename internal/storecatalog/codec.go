@@ -218,15 +218,31 @@ func Validate(m Manifest) error {
 		sealed[summary.SegmentID] = summary
 	}
 	var previous recordlog.SegmentID
+	var liveRecords uint64
 	for _, stat := range m.SegmentStats {
 		if stat.SegmentID == 0 || stat.SegmentID <= previous {
 			return ErrInvalid
 		}
-		summary, ok := sealed[stat.SegmentID]
-		if !ok || stat.LiveRecords > summary.RecordCount || stat.LiveBytes > uint64(summary.ValidEnd-recordlog.SegmentHeaderSize) {
+		if (stat.LiveBytes == 0) != (stat.LiveRecords == 0) || liveRecords > math.MaxUint64-stat.LiveRecords {
 			return ErrInvalid
 		}
+		liveRecords += stat.LiveRecords
+		if stat.SegmentID == m.ActiveDataSegmentID {
+			if m.ReplayStart.SegmentID != stat.SegmentID || m.ReplayStart.Offset < recordlog.SegmentHeaderSize ||
+				stat.LiveBytes > uint64(m.ReplayStart.Offset-recordlog.SegmentHeaderSize) ||
+				stat.LiveRecords > stat.LiveBytes/uint64(recordlog.RecordHeaderSize) {
+				return ErrInvalid
+			}
+		} else {
+			summary, ok := sealed[stat.SegmentID]
+			if !ok || stat.LiveRecords > summary.RecordCount || stat.LiveBytes > uint64(summary.ValidEnd-recordlog.SegmentHeaderSize) {
+				return ErrInvalid
+			}
+		}
 		previous = stat.SegmentID
+	}
+	if liveRecords != m.MappingEntryCount {
+		return ErrInvalid
 	}
 	return nil
 }

@@ -508,7 +508,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		s.setFault(err)
 		return abort(err)
 	}
-	stats, err := checkpointSegmentStats(candidate.LiveStats(), manifest, s.maxStats)
+	stats, err := checkpointSegmentStats(candidate.LiveStats(), manifest, work.cut.ReplayStart, s.maxStats)
 	if err != nil {
 		if errors.Is(err, base.ErrCorrupt) {
 			s.setFault(err)
@@ -546,29 +546,38 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 	return nil
 }
 
-func checkpointSegmentStats(live map[recordlog.SegmentID]mapping.SegmentLiveStats, manifest storecatalog.Manifest, maxEntries uint64) ([]storecatalog.SegmentStats, error) {
-	known := make(map[recordlog.SegmentID]struct{}, len(manifest.SealedDataSegments)+1)
-	known[manifest.ActiveDataSegmentID] = struct{}{}
-	result := make([]storecatalog.SegmentStats, 0, min(len(live), len(manifest.SealedDataSegments)))
-	for _, segment := range manifest.SealedDataSegments {
-		known[segment.SegmentID] = struct{}{}
-		stat, ok := live[segment.SegmentID]
-		if !ok {
-			continue
-		}
-		if segment.ValidEnd < recordlog.SegmentHeaderSize || stat.LiveBytes > uint64(segment.ValidEnd-recordlog.SegmentHeaderSize) || stat.LiveRecords > segment.RecordCount {
+func checkpointSegmentStats(live map[recordlog.SegmentID]mapping.SegmentLiveStats, manifest storecatalog.Manifest, replayStart recordlog.LogPos, maxEntries uint64) ([]storecatalog.SegmentStats, error) {
+	if !replayStart.Valid() {
+		return nil, base.ErrCorrupt
+	}
+	sealed := make(map[recordlog.SegmentID]recordlog.SegmentSummary, len(manifest.SealedDataSegments))
+	for _, summary := range manifest.SealedDataSegments {
+		sealed[summary.SegmentID] = summary
+	}
+	result := make([]storecatalog.SegmentStats, 0, len(live))
+	for segmentID, stat := range live {
+		if stat.LiveBytes == 0 || stat.LiveRecords == 0 {
 			return nil, base.ErrCorrupt
+		}
+		if segmentID == manifest.ActiveDataSegmentID {
+			if replayStart.SegmentID != segmentID || replayStart.Offset < recordlog.SegmentHeaderSize ||
+				stat.LiveBytes > uint64(replayStart.Offset-recordlog.SegmentHeaderSize) ||
+				stat.LiveRecords > stat.LiveBytes/uint64(recordlog.RecordHeaderSize) {
+				return nil, base.ErrCorrupt
+			}
+		} else {
+			summary, ok := sealed[segmentID]
+			if !ok || summary.ValidEnd < recordlog.SegmentHeaderSize ||
+				stat.LiveBytes > uint64(summary.ValidEnd-recordlog.SegmentHeaderSize) || stat.LiveRecords > summary.RecordCount {
+				return nil, base.ErrCorrupt
+			}
 		}
 		if uint64(len(result)) == maxEntries {
 			return nil, base.ErrOverflow
 		}
-		result = append(result, storecatalog.SegmentStats{SegmentID: segment.SegmentID, LiveBytes: stat.LiveBytes, LiveRecords: stat.LiveRecords})
+		result = append(result, storecatalog.SegmentStats{SegmentID: segmentID, LiveBytes: stat.LiveBytes, LiveRecords: stat.LiveRecords})
 	}
-	for segment := range live {
-		if _, ok := known[segment]; !ok {
-			return nil, base.ErrCorrupt
-		}
-	}
+	sort.Slice(result, func(i, j int) bool { return result[i].SegmentID < result[j].SegmentID })
 	return result, nil
 }
 

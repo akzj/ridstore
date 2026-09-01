@@ -420,6 +420,14 @@ func TestIncrementalCheckpointUsesRecordRefs(t *testing.T) {
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	manifest, err := storecatalog.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.SegmentStats) != 1 || manifest.SegmentStats[0].SegmentID != manifest.ActiveDataSegmentID ||
+		manifest.SegmentStats[0].LiveRecords != manifest.MappingEntryCount {
+		t.Fatalf("checkpoint does not carry complete active stats: %+v", manifest)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}

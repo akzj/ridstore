@@ -122,7 +122,7 @@ Data GC 使用两段磁盘 admission。copy 前按 source 全部物理 bytes、�
 Mapping GC 在创建 staging 目录前，以和 Mapping Root 原子安装的精确 `MappingEntryCount` 计算完整
 替换 generation 上界：每条记录最多八层 Mapping Node，每个 Node 按 Dense 编码、每个输出 Segment
 按完整 `SegmentSize` 计费。该 count 在 Checkpoint 已有的 leaf before/after 更新中增减，不增加全 Root
-扫描，也不依赖排除 active Data Segment 的 `SegmentStats`。空间不足不创建 staging/marker、不改变旧 Mapping。该检查与 Data GC 共用
+扫描，也不把 SegmentStats bytes 当作 Mapping entry 数。空间不足不创建 staging/marker、不改变旧 Mapping。该检查与 Data GC 共用
 reservation 账本和 `GCMinFreeBytes`；真实 ENOSPC 仍遵守 Mapping GC 恢复协议。
 
 ## 7. 前台新写停止水位

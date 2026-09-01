@@ -51,7 +51,7 @@ func recordRef(records fakeRecords, addr recordlog.VAddr) recordlog.RecordRef {
 	return recordlog.RecordRef{Addr: addr, PhysicalSize: records[addr]}
 }
 
-func TestBuildExactSealedStats(t *testing.T) {
+func TestBuildExactCheckpointStats(t *testing.T) {
 	records := make(fakeRecords)
 	a := addPut(t, records, 1, 64, 1, 7)
 	b := addPut(t, records, 1, 128, 2, 80)
@@ -60,15 +60,17 @@ func TestBuildExactSealedStats(t *testing.T) {
 	stats, err := Build(context.Background(), fakeMapping{{1, recordRef(records, a)}, {2, recordRef(records, b)}, {3, recordRef(records, c)}, {4, recordRef(records, active)}}, FileSet{
 		Active: 3,
 		Sealed: []recordlog.SegmentSummary{{SegmentID: 1, ValidEnd: 512}, {SegmentID: 2, ValidEnd: 512}},
-	}, 2)
+	}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	aSize, _ := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize + 7))
 	bSize, _ := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize + 80))
 	cSize, _ := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize + 1))
-	if len(stats) != 2 || stats[0].SegmentID != 1 || stats[0].LiveRecords != 2 || stats[0].LiveBytes != uint64(aSize+bSize) ||
-		stats[1].SegmentID != 2 || stats[1].LiveRecords != 1 || stats[1].LiveBytes != uint64(cSize) {
+	activeSize, _ := recordlog.PhysicalRecordSize(uint64(recordcodec.PutHeaderSize + 900))
+	if len(stats) != 3 || stats[0].SegmentID != 1 || stats[0].LiveRecords != 2 || stats[0].LiveBytes != uint64(aSize+bSize) ||
+		stats[1].SegmentID != 2 || stats[1].LiveRecords != 1 || stats[1].LiveBytes != uint64(cSize) ||
+		stats[2].SegmentID != 3 || stats[2].LiveRecords != 1 || stats[2].LiveBytes != uint64(activeSize) {
 		t.Fatalf("stats=%+v", stats)
 	}
 }

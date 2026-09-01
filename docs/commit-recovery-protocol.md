@@ -284,10 +284,11 @@ Checkpoint 不需要等待 Open Batch 结束。GC 会复制它位于 sealed sour
 2. 读取有效 CURRENT 和 Manifest；以 CURRENT 为发布权威，删除并 fsync 可证明未发布的 `.CURRENT.tmp`、合法 `MANIFEST-*.tmp` 与 generation 高于 CURRENT 的 orphan final Manifest；保留当前和更老 generation
 3. 校验 Store UUID、格式、硬限制、文件集合及 sealed Header/Footer/terminal Seal envelope
 4. 恢复或完成 Maintenance Journal
-5. 打开 Persistent Mapping Root，并加载 `StatsCoveredCommitSeq == CoveredCommitSeq` 的精确 SegmentStats Base
+5. 从同一 Manifest checkpoint 打开 Persistent Mapping Root，并加载
+   `StatsCoveredCommitSeq == CoveredCommitSeq` 的完整 SegmentStats Base（包含 Active/ReplayStart Segment）
 6. 从 ReplayStart 所在 Segment 开始扫描 Data Frames；更早 sealed Segment 不做启动全扫
 7. 验证 Frame/Commit Descriptor
-8. 按 CommitSeq 重放 Mapping；用户 Put 和成功 Relocation 的 NewVAddr 同时累加到 replay Delta 的保守 SegmentStats 上界
+8. 按 CommitSeq 重放 Mapping；每次成功发布同时从 Stats 扣除 OldRef 并加入 NewRef
 9. 恢复 IDReserve、BatchIDReserve、FrameSeq、CommitSeq high watermark
 10. 修复 Active Segment torn tail
 11. 重建 Segment live/open/pin 元数据
@@ -328,7 +329,9 @@ Replay 扫描规则：
 6. 用户 Commit 原子应用整个 Mutation 集合；Relocation 按 Entry 执行 expected-old-VAddr CAS；
 7. 两类 Seal 共享一个严格递增的 CommitSeq 序列，必须按该序列重放。
 
-重放时 SegmentStats 只处理成功进入 Mapping 的 NewVAddr：用户 Put 累加，Delete 不累加，Relocation CAS 成功累加、失败不累加。使用步骤 3/4 已验证的 PutRecord Header.TotalSize，不读取或扣减 old VAddr。恢复完成后的 `exact Base + replay Delta additions` 必须仍是当前 live bytes/count 的上界。
+重放与在线提交共用 Mapping `PublishGroup`：用户 Put/Delete 和成功 Relocation 都使用 Mapping 中已有的
+OldRef 精确扣减旧 Segment，并按 descriptor 携带的 `PhysicalSize` 增加 NewRef；Relocation CAS skip 不改变
+统计。恢复完成后 Mapping 与 SegmentStats 位于同一 CommitSeq，不需要第二次扫描 Mapping Root。
 
 没有对应 Seal 的完整 CommitPart/RelocationPart 是未提交垃圾，可以忽略并由 GC 回收；它不得改变 Mapping。已经存在完整有效 Seal 时，缺 Part、CRC 不匹配或引用不存在的 Record 才是 corruption，不能作为 Abort 静默跳过。Active 尾部 torn Frame 按第 13 节截断规则处理。
 

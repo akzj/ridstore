@@ -63,11 +63,21 @@ func selectCompactionCandidate(manifest storecatalog.Manifest, policy Compaction
 	if manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq || !manifest.ReplayStart.Valid() {
 		return SegmentCompactionCandidate{}, false, errors.Join(base.ErrCorrupt, errors.New("invalid compaction checkpoint boundary"))
 	}
+	var previousStat recordlog.SegmentID
+	for _, stat := range manifest.SegmentStats {
+		if stat.SegmentID == 0 || stat.SegmentID <= previousStat {
+			return SegmentCompactionCandidate{}, false, errors.Join(base.ErrCorrupt, errors.New("segment stats are not strictly ordered"))
+		}
+		previousStat = stat.SegmentID
+	}
 	statIndex := 0
 	eligible := make([]SegmentCompactionCandidate, 0, len(manifest.SealedDataSegments))
 	for _, source := range manifest.SealedDataSegments {
 		for statIndex < len(manifest.SegmentStats) && manifest.SegmentStats[statIndex].SegmentID < source.SegmentID {
-			return SegmentCompactionCandidate{}, false, errors.Join(base.ErrCorrupt, errors.New("segment stats reference unknown source"))
+			if manifest.SegmentStats[statIndex].SegmentID != manifest.ActiveDataSegmentID {
+				return SegmentCompactionCandidate{}, false, errors.Join(base.ErrCorrupt, errors.New("segment stats reference unknown source"))
+			}
+			statIndex++
 		}
 		var liveBytes, liveRecords uint64
 		if statIndex < len(manifest.SegmentStats) && manifest.SegmentStats[statIndex].SegmentID == source.SegmentID {
@@ -113,6 +123,9 @@ func selectCompactionCandidate(manifest storecatalog.Manifest, policy Compaction
 			StableRounds: view.StableRounds, DeathBytesPerCommit: view.LatestDeathPerCommit, DeathBytesPerSecond: view.LatestDeathBytesPerSec,
 		}
 		eligible = append(eligible, candidate)
+	}
+	for statIndex < len(manifest.SegmentStats) && manifest.SegmentStats[statIndex].SegmentID == manifest.ActiveDataSegmentID {
+		statIndex++
 	}
 	if statIndex != len(manifest.SegmentStats) {
 		return SegmentCompactionCandidate{}, false, errors.Join(base.ErrCorrupt, errors.New("segment stats reference unknown source"))

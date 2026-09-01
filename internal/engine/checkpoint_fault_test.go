@@ -460,7 +460,8 @@ func TestCheckpointSupportsDataRotationAfterCut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := batch.Create(context.Background(), []byte("covered before checkpoint cut")); err != nil {
+	id, err := batch.Create(context.Background(), []byte("covered before checkpoint cut"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := batch.Commit(context.Background()); err != nil {
@@ -496,7 +497,28 @@ func TestCheckpointSupportsDataRotationAfterCut(t *testing.T) {
 		after.ReplayStart != work.cut.ReplayStart || after.ActiveDataSegmentID != rotated.ActiveDataSegmentID {
 		t.Fatalf("checkpoint did not publish across data rotation: before=%+v rotated=%+v after=%+v", before, rotated, after)
 	}
+	var liveRecords uint64
+	var replaySegmentFound bool
+	for _, stat := range after.SegmentStats {
+		liveRecords += stat.LiveRecords
+		if stat.SegmentID == work.cut.ReplayStart.SegmentID {
+			replaySegmentFound = true
+		}
+	}
+	if !replaySegmentFound || liveRecords != after.MappingEntryCount {
+		t.Fatalf("checkpoint stats do not carry the rotated replay segment: %+v", after)
+	}
 	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Get(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
