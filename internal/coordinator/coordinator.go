@@ -81,21 +81,28 @@ type CheckpointCut struct {
 // callers perform short cross-component state transitions without stopping
 // reads, record appends, or GC copying.
 type CheckpointFence struct {
-	Cut  CheckpointCut
-	once sync.Once
-	c    *Coordinator
+	Cut      CheckpointCut
+	once     sync.Once
+	c        *Coordinator
+	acquired time.Time
 }
 
 func (f *CheckpointFence) Release() {
 	if f == nil || f.c == nil {
 		return
 	}
-	f.once.Do(func() { f.c.admissionMu.Unlock() })
+	f.once.Do(func() {
+		held := uint64(time.Since(f.acquired))
+		f.c.metrics.checkpointFenceHeldNanos.Add(held)
+		updateMax(&f.c.metrics.checkpointFenceMaxHeldNanos, held)
+		f.c.admissionMu.Unlock()
+	})
 }
 
 type checkpointResponse struct {
-	cut CheckpointCut
-	err error
+	cut      CheckpointCut
+	err      error
+	acquired time.Time
 }
 
 type relocationResponse struct {
@@ -322,7 +329,7 @@ func (c *Coordinator) AcquireCheckpointFence(ctx context.Context) (*CheckpointFe
 	if err != nil {
 		return nil, err
 	}
-	return &CheckpointFence{Cut: answer.cut, c: c}, nil
+	return &CheckpointFence{Cut: answer.cut, c: c, acquired: answer.acquired}, nil
 }
 
 func (c *Coordinator) acquireCheckpointFence(ctx context.Context) (checkpointResponse, error) {
@@ -335,7 +342,9 @@ func (c *Coordinator) acquireCheckpointFence(ctx context.Context) (checkpointRes
 	if err := c.Fault(); err != nil {
 		return checkpointResponse{}, errors.Join(base.ErrReadOnly, err)
 	}
+	started := time.Now()
 	c.admissionMu.Lock()
+	acquired := time.Now()
 	release := true
 	defer func() {
 		if release {
@@ -359,6 +368,9 @@ func (c *Coordinator) acquireCheckpointFence(ctx context.Context) (checkpointRes
 	if answer.err != nil {
 		return checkpointResponse{}, answer.err
 	}
+	c.metrics.checkpointFences.Add(1)
+	c.metrics.checkpointFenceAcquireNanos.Add(uint64(time.Since(started)))
+	answer.acquired = acquired
 	release = false
 	return answer, nil
 }

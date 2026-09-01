@@ -142,6 +142,10 @@ func TestLogRotatesBeforeAssigningAddress(t *testing.T) {
 	if len(segments) != 2 || segments[0] != 1 || segments[1] != 2 {
 		t.Fatalf("segments=%v", segments)
 	}
+	status := log.Status()
+	if status.RotationCalls != 1 || status.RotationNanos == 0 || status.RotationMaxNanos == 0 || status.RotationMaxNanos > status.RotationNanos {
+		t.Fatalf("rotation status=%+v", status)
+	}
 	if err := log.Close(); err != nil {
 		t.Fatal(err)
 	}

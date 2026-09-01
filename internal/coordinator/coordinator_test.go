@@ -297,6 +297,11 @@ func TestCheckpointFenceStopsAdmissionOnlyUntilRelease(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("submit did not resume after checkpoint fence release")
 	}
+	metrics := c.Metrics()
+	if metrics.CheckpointFences != 1 || metrics.CheckpointFenceAcquireNanos == 0 || metrics.CheckpointFenceHeldNanos == 0 || metrics.CheckpointFenceMaxHeldNanos == 0 ||
+		metrics.CheckpointFenceMaxHeldNanos > metrics.CheckpointFenceHeldNanos {
+		t.Fatalf("checkpoint fence metrics=%+v", metrics)
+	}
 }
 
 func TestCommitRedirectsRewriteUserDescriptorWithoutCheckpointMarker(t *testing.T) {

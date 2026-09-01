@@ -3,41 +3,56 @@ package engine
 import "sync/atomic"
 
 type Metrics struct {
-	CommitQueued, CommitGroups, GroupBatches             uint64
-	Committed, Aborted, Conflicts, CommitUnknown         uint64
-	QueueWaitNanos, ValidationNanos                      uint64
-	WriteSyncNanos, PublishNanos                         uint64
-	DeltaChargedBytes, DeltaReservedBytes                uint64
-	DeltaSoftLimitBytes, DeltaHardLimitBytes             uint64
-	MappingCacheBytes                                    uint64
-	DiskAvailableEstimateBytes, WriteStopFreeBytes       uint64
-	WriteStopped                                         uint64
-	WriteStopRejections, DiskSpaceCheckErrors            uint64
-	GCStarted, GCCompleted, GCFailed                     uint64
-	GCNoCandidate                                        uint64
-	GCCopiedBytes, GCReclaimedBytes                      uint64
-	GCRelocated, GCSkipped, GCDurationNanos              uint64
-	GCThrottledNanos, GCSpaceRejections                  uint64
-	GCCommitRedirects, GCCommitRedirectWaitNanos         uint64
-	GCCommitRedirectAdmissionNanos, GCOpenRefsRedirected uint64
-	GCMinFreeBytes, GCBytesPerSecond                     uint64
-	BackgroundCheckpointRequested                        uint64
-	BackgroundCheckpointCompleted                        uint64
-	BackgroundCheckpointFailed                           uint64
+	CommitQueued, CommitGroups, GroupBatches                                  uint64
+	Committed, Aborted, Conflicts, CommitUnknown                              uint64
+	QueueWaitNanos, ValidationNanos                                           uint64
+	WriteSyncNanos, PublishNanos                                              uint64
+	CheckpointFences, CheckpointFenceAcquireNanos                             uint64
+	CheckpointFenceHeldNanos, CheckpointFenceMaxHeldNanos                     uint64
+	CheckpointsStarted, CheckpointsCompleted, CheckpointsFailed               uint64
+	CheckpointDurationNanos, CheckpointMaxDurationNanos                       uint64
+	RecordLogRotations, RecordLogRotationNanos, RecordLogRotationMaxNanos     uint64
+	MappingGCStarted, MappingGCCompleted, MappingGCFailed, MappingGCConflicts uint64
+	MappingGCDurationNanos, MappingGCMaxDurationNanos                         uint64
+	MappingGCRebuildNanos, MappingGCVerifyNanos                               uint64
+	MappingGCPublishNanos, MappingGCMaxPublishNanos                           uint64
+	DeltaChargedBytes, DeltaReservedBytes                                     uint64
+	DeltaSoftLimitBytes, DeltaHardLimitBytes                                  uint64
+	MappingCacheBytes                                                         uint64
+	DiskAvailableEstimateBytes, WriteStopFreeBytes                            uint64
+	WriteStopped                                                              uint64
+	WriteStopRejections, DiskSpaceCheckErrors                                 uint64
+	GCStarted, GCCompleted, GCFailed                                          uint64
+	GCNoCandidate                                                             uint64
+	GCCopiedBytes, GCReclaimedBytes                                           uint64
+	GCRelocated, GCSkipped, GCDurationNanos                                   uint64
+	GCThrottledNanos, GCSpaceRejections                                       uint64
+	GCCommitRedirects, GCCommitRedirectWaitNanos                              uint64
+	GCCommitRedirectAdmissionNanos, GCOpenRefsRedirected                      uint64
+	GCMinFreeBytes, GCBytesPerSecond                                          uint64
+	BackgroundCheckpointRequested                                             uint64
+	BackgroundCheckpointCompleted                                             uint64
+	BackgroundCheckpointFailed                                                uint64
 }
 
 type runtimeMetrics struct {
-	committed, aborted, unknown                          atomic.Uint64
-	gcStarted, gcCompleted, gcFailed                     atomic.Uint64
-	gcNoCandidate                                        atomic.Uint64
-	gcCopiedBytes, gcReclaimedBytes                      atomic.Uint64
-	gcRelocated, gcSkipped, gcDurationNanos              atomic.Uint64
-	gcThrottledNanos, gcSpaceRejections                  atomic.Uint64
-	gcCommitRedirects, gcCommitRedirectWaitNanos         atomic.Uint64
-	gcCommitRedirectAdmissionNanos, gcOpenRefsRedirected atomic.Uint64
-	backgroundCheckpointRequested                        atomic.Uint64
-	backgroundCheckpointCompleted                        atomic.Uint64
-	backgroundCheckpointFailed                           atomic.Uint64
+	committed, aborted, unknown                                               atomic.Uint64
+	gcStarted, gcCompleted, gcFailed                                          atomic.Uint64
+	gcNoCandidate                                                             atomic.Uint64
+	gcCopiedBytes, gcReclaimedBytes                                           atomic.Uint64
+	gcRelocated, gcSkipped, gcDurationNanos                                   atomic.Uint64
+	gcThrottledNanos, gcSpaceRejections                                       atomic.Uint64
+	gcCommitRedirects, gcCommitRedirectWaitNanos                              atomic.Uint64
+	gcCommitRedirectAdmissionNanos, gcOpenRefsRedirected                      atomic.Uint64
+	backgroundCheckpointRequested                                             atomic.Uint64
+	backgroundCheckpointCompleted                                             atomic.Uint64
+	backgroundCheckpointFailed                                                atomic.Uint64
+	checkpointsStarted, checkpointsCompleted, checkpointsFailed               atomic.Uint64
+	checkpointDurationNanos, checkpointMaxDurationNanos                       atomic.Uint64
+	mappingGCStarted, mappingGCCompleted, mappingGCFailed, mappingGCConflicts atomic.Uint64
+	mappingGCDurationNanos, mappingGCMaxDurationNanos                         atomic.Uint64
+	mappingGCRebuildNanos, mappingGCVerifyNanos                               atomic.Uint64
+	mappingGCPublishNanos, mappingGCMaxPublishNanos                           atomic.Uint64
 }
 
 func (s *Store) Metrics() Metrics {
@@ -50,7 +65,18 @@ func (s *Store) Metrics() Metrics {
 		Committed: s.metrics.committed.Load(), Aborted: s.metrics.aborted.Load(), Conflicts: commit.Conflicts,
 		CommitUnknown: s.metrics.unknown.Load(), QueueWaitNanos: commit.QueueWaitNanos,
 		ValidationNanos: commit.ValidationNanos, WriteSyncNanos: commit.WriteSyncNanos, PublishNanos: commit.PublishNanos,
-		GCStarted: s.metrics.gcStarted.Load(), GCCompleted: s.metrics.gcCompleted.Load(), GCFailed: s.metrics.gcFailed.Load(),
+		CheckpointFences: commit.CheckpointFences, CheckpointFenceAcquireNanos: commit.CheckpointFenceAcquireNanos,
+		CheckpointFenceHeldNanos: commit.CheckpointFenceHeldNanos, CheckpointFenceMaxHeldNanos: commit.CheckpointFenceMaxHeldNanos,
+		CheckpointsStarted: s.metrics.checkpointsStarted.Load(), CheckpointsCompleted: s.metrics.checkpointsCompleted.Load(),
+		CheckpointsFailed: s.metrics.checkpointsFailed.Load(), CheckpointDurationNanos: s.metrics.checkpointDurationNanos.Load(),
+		CheckpointMaxDurationNanos: s.metrics.checkpointMaxDurationNanos.Load(),
+		MappingGCStarted:           s.metrics.mappingGCStarted.Load(), MappingGCCompleted: s.metrics.mappingGCCompleted.Load(),
+		MappingGCFailed: s.metrics.mappingGCFailed.Load(), MappingGCConflicts: s.metrics.mappingGCConflicts.Load(),
+		MappingGCDurationNanos:    s.metrics.mappingGCDurationNanos.Load(),
+		MappingGCMaxDurationNanos: s.metrics.mappingGCMaxDurationNanos.Load(), MappingGCRebuildNanos: s.metrics.mappingGCRebuildNanos.Load(),
+		MappingGCVerifyNanos: s.metrics.mappingGCVerifyNanos.Load(), MappingGCPublishNanos: s.metrics.mappingGCPublishNanos.Load(),
+		MappingGCMaxPublishNanos: s.metrics.mappingGCMaxPublishNanos.Load(),
+		GCStarted:                s.metrics.gcStarted.Load(), GCCompleted: s.metrics.gcCompleted.Load(), GCFailed: s.metrics.gcFailed.Load(),
 		GCNoCandidate: s.metrics.gcNoCandidate.Load(),
 		GCCopiedBytes: s.metrics.gcCopiedBytes.Load(), GCReclaimedBytes: s.metrics.gcReclaimedBytes.Load(),
 		GCRelocated: s.metrics.gcRelocated.Load(), GCSkipped: s.metrics.gcSkipped.Load(),
@@ -63,6 +89,12 @@ func (s *Store) Metrics() Metrics {
 		BackgroundCheckpointRequested: s.metrics.backgroundCheckpointRequested.Load(),
 		BackgroundCheckpointCompleted: s.metrics.backgroundCheckpointCompleted.Load(),
 		BackgroundCheckpointFailed:    s.metrics.backgroundCheckpointFailed.Load(),
+	}
+	if s.log != nil {
+		status := s.log.Status()
+		result.RecordLogRotations = status.RotationCalls
+		result.RecordLogRotationNanos = status.RotationNanos
+		result.RecordLogRotationMaxNanos = status.RotationMaxNanos
 	}
 	if s.mapping != nil {
 		result.DeltaChargedBytes, result.DeltaReservedBytes, result.DeltaSoftLimitBytes, result.DeltaHardLimitBytes = s.mapping.DeltaUsage()
@@ -79,4 +111,12 @@ func (s *Store) Metrics() Metrics {
 		}
 	}
 	return result
+}
+
+func updateAtomicMax(target *atomic.Uint64, value uint64) {
+	for current := target.Load(); value > current; current = target.Load() {
+		if target.CompareAndSwap(current, value) {
+			return
+		}
+	}
 }

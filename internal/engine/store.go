@@ -394,10 +394,22 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 	return s.checkpoint(ctx, false)
 }
 
-func (s *Store) checkpoint(ctx context.Context, gcAdmission bool) error {
+func (s *Store) checkpoint(ctx context.Context, gcAdmission bool) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	started := time.Now()
+	s.metrics.checkpointsStarted.Add(1)
+	defer func() {
+		duration := uint64(time.Since(started))
+		s.metrics.checkpointDurationNanos.Add(duration)
+		updateAtomicMax(&s.metrics.checkpointMaxDurationNanos, duration)
+		if err == nil {
+			s.metrics.checkpointsCompleted.Add(1)
+		} else {
+			s.metrics.checkpointsFailed.Add(1)
+		}
+	}()
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
 

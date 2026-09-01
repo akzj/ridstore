@@ -4,27 +4,36 @@ package ridstore
 // current process lifetime; gauges describe the instant at which they were
 // sampled. Metrics never authorize recovery, checkpoint, or GC decisions.
 type Metrics struct {
-	CommitQueued, CommitGroups, GroupBatches             uint64
-	Committed, Aborted, Conflicts, CommitUnknown         uint64
-	QueueWaitNanos, ValidationNanos                      uint64
-	WriteSyncNanos, PublishNanos                         uint64
-	DeltaChargedBytes, DeltaReservedBytes                uint64
-	DeltaSoftLimitBytes, DeltaHardLimitBytes             uint64
-	MappingCacheBytes                                    uint64
-	DiskAvailableEstimateBytes, WriteStopFreeBytes       uint64
-	WriteStopped                                         uint64
-	WriteStopRejections, DiskSpaceCheckErrors            uint64
-	GCStarted, GCCompleted, GCFailed                     uint64
-	GCNoCandidate                                        uint64
-	GCCopiedBytes, GCReclaimedBytes                      uint64
-	GCRelocated, GCSkipped, GCDurationNanos              uint64
-	GCThrottledNanos, GCSpaceRejections                  uint64
-	GCCommitRedirects, GCCommitRedirectWaitNanos         uint64
-	GCCommitRedirectAdmissionNanos, GCOpenRefsRedirected uint64
-	GCMinFreeBytes, GCBytesPerSecond                     uint64
-	BackgroundCheckpointRequested                        uint64
-	BackgroundCheckpointCompleted                        uint64
-	BackgroundCheckpointFailed                           uint64
+	CommitQueued, CommitGroups, GroupBatches                                  uint64
+	Committed, Aborted, Conflicts, CommitUnknown                              uint64
+	QueueWaitNanos, ValidationNanos                                           uint64
+	WriteSyncNanos, PublishNanos                                              uint64
+	CheckpointFences, CheckpointFenceAcquireNanos                             uint64
+	CheckpointFenceHeldNanos, CheckpointFenceMaxHeldNanos                     uint64
+	CheckpointsStarted, CheckpointsCompleted, CheckpointsFailed               uint64
+	CheckpointDurationNanos, CheckpointMaxDurationNanos                       uint64
+	RecordLogRotations, RecordLogRotationNanos, RecordLogRotationMaxNanos     uint64
+	MappingGCStarted, MappingGCCompleted, MappingGCFailed, MappingGCConflicts uint64
+	MappingGCDurationNanos, MappingGCMaxDurationNanos                         uint64
+	MappingGCRebuildNanos, MappingGCVerifyNanos                               uint64
+	MappingGCPublishNanos, MappingGCMaxPublishNanos                           uint64
+	DeltaChargedBytes, DeltaReservedBytes                                     uint64
+	DeltaSoftLimitBytes, DeltaHardLimitBytes                                  uint64
+	MappingCacheBytes                                                         uint64
+	DiskAvailableEstimateBytes, WriteStopFreeBytes                            uint64
+	WriteStopped                                                              uint64
+	WriteStopRejections, DiskSpaceCheckErrors                                 uint64
+	GCStarted, GCCompleted, GCFailed                                          uint64
+	GCNoCandidate                                                             uint64
+	GCCopiedBytes, GCReclaimedBytes                                           uint64
+	GCRelocated, GCSkipped, GCDurationNanos                                   uint64
+	GCThrottledNanos, GCSpaceRejections                                       uint64
+	GCCommitRedirects, GCCommitRedirectWaitNanos                              uint64
+	GCCommitRedirectAdmissionNanos, GCOpenRefsRedirected                      uint64
+	GCMinFreeBytes, GCBytesPerSecond                                          uint64
+	BackgroundCheckpointRequested                                             uint64
+	BackgroundCheckpointCompleted                                             uint64
+	BackgroundCheckpointFailed                                                uint64
 }
 
 type MetricKind uint8
@@ -34,7 +43,7 @@ const (
 	MetricGauge
 )
 
-const MetricSampleCount = 41
+const MetricSampleCount = 63
 
 type MetricSample struct {
 	Name  string
@@ -55,6 +64,25 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_validation_nanoseconds_total", MetricCounter, m.ValidationNanos},
 		MetricSample{"ridstore_write_sync_nanoseconds_total", MetricCounter, m.WriteSyncNanos},
 		MetricSample{"ridstore_publish_nanoseconds_total", MetricCounter, m.PublishNanos},
+		MetricSample{"ridstore_checkpoint_fences_total", MetricCounter, m.CheckpointFences},
+		MetricSample{"ridstore_checkpoint_fence_acquire_nanoseconds_total", MetricCounter, m.CheckpointFenceAcquireNanos},
+		MetricSample{"ridstore_checkpoint_fence_held_nanoseconds_total", MetricCounter, m.CheckpointFenceHeldNanos},
+		MetricSample{"ridstore_checkpoint_fence_max_held_nanoseconds", MetricGauge, m.CheckpointFenceMaxHeldNanos},
+		MetricSample{"ridstore_checkpoints_started_total", MetricCounter, m.CheckpointsStarted},
+		MetricSample{"ridstore_checkpoints_completed_total", MetricCounter, m.CheckpointsCompleted},
+		MetricSample{"ridstore_checkpoints_failed_total", MetricCounter, m.CheckpointsFailed},
+		MetricSample{"ridstore_checkpoint_duration_nanoseconds_total", MetricCounter, m.CheckpointDurationNanos},
+		MetricSample{"ridstore_checkpoint_max_duration_nanoseconds", MetricGauge, m.CheckpointMaxDurationNanos},
+		MetricSample{"ridstore_record_log_rotations_total", MetricCounter, m.RecordLogRotations},
+		MetricSample{"ridstore_record_log_rotation_nanoseconds_total", MetricCounter, m.RecordLogRotationNanos},
+		MetricSample{"ridstore_record_log_rotation_max_nanoseconds", MetricGauge, m.RecordLogRotationMaxNanos},
+		MetricSample{"ridstore_mapping_gc_started_total", MetricCounter, m.MappingGCStarted},
+		MetricSample{"ridstore_mapping_gc_completed_total", MetricCounter, m.MappingGCCompleted},
+		MetricSample{"ridstore_mapping_gc_failed_total", MetricCounter, m.MappingGCFailed},
+		MetricSample{"ridstore_mapping_gc_duration_nanoseconds_total", MetricCounter, m.MappingGCDurationNanos},
+		MetricSample{"ridstore_mapping_gc_max_duration_nanoseconds", MetricGauge, m.MappingGCMaxDurationNanos},
+		MetricSample{"ridstore_mapping_gc_rebuild_nanoseconds_total", MetricCounter, m.MappingGCRebuildNanos},
+		MetricSample{"ridstore_mapping_gc_verify_nanoseconds_total", MetricCounter, m.MappingGCVerifyNanos},
 		MetricSample{"ridstore_delta_charged_bytes", MetricGauge, m.DeltaChargedBytes},
 		MetricSample{"ridstore_delta_reserved_bytes", MetricGauge, m.DeltaReservedBytes},
 		MetricSample{"ridstore_delta_soft_limit_bytes", MetricGauge, m.DeltaSoftLimitBytes},
@@ -85,5 +113,8 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_background_checkpoint_completed_total", MetricCounter, m.BackgroundCheckpointCompleted},
 		MetricSample{"ridstore_background_checkpoint_failed_total", MetricCounter, m.BackgroundCheckpointFailed},
 		MetricSample{"ridstore_gc_bytes_per_second", MetricGauge, m.GCBytesPerSecond},
+		MetricSample{"ridstore_mapping_gc_publish_nanoseconds_total", MetricCounter, m.MappingGCPublishNanos},
+		MetricSample{"ridstore_mapping_gc_max_publish_nanoseconds", MetricGauge, m.MappingGCMaxPublishNanos},
+		MetricSample{"ridstore_mapping_gc_conflicts_total", MetricCounter, m.MappingGCConflicts},
 	)
 }

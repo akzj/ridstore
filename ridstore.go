@@ -99,6 +99,17 @@ func (s *Store) Metrics() Metrics {
 		Committed: current.Committed, Aborted: current.Aborted, Conflicts: current.Conflicts, CommitUnknown: current.CommitUnknown,
 		QueueWaitNanos: current.QueueWaitNanos, ValidationNanos: current.ValidationNanos,
 		WriteSyncNanos: current.WriteSyncNanos, PublishNanos: current.PublishNanos,
+		CheckpointFences: current.CheckpointFences, CheckpointFenceAcquireNanos: current.CheckpointFenceAcquireNanos,
+		CheckpointFenceHeldNanos: current.CheckpointFenceHeldNanos, CheckpointFenceMaxHeldNanos: current.CheckpointFenceMaxHeldNanos,
+		CheckpointsStarted: current.CheckpointsStarted, CheckpointsCompleted: current.CheckpointsCompleted, CheckpointsFailed: current.CheckpointsFailed,
+		CheckpointDurationNanos: current.CheckpointDurationNanos, CheckpointMaxDurationNanos: current.CheckpointMaxDurationNanos,
+		RecordLogRotations: current.RecordLogRotations, RecordLogRotationNanos: current.RecordLogRotationNanos,
+		RecordLogRotationMaxNanos: current.RecordLogRotationMaxNanos,
+		MappingGCStarted:          current.MappingGCStarted, MappingGCCompleted: current.MappingGCCompleted, MappingGCFailed: current.MappingGCFailed,
+		MappingGCConflicts:     current.MappingGCConflicts,
+		MappingGCDurationNanos: current.MappingGCDurationNanos, MappingGCMaxDurationNanos: current.MappingGCMaxDurationNanos,
+		MappingGCRebuildNanos: current.MappingGCRebuildNanos, MappingGCVerifyNanos: current.MappingGCVerifyNanos,
+		MappingGCPublishNanos: current.MappingGCPublishNanos, MappingGCMaxPublishNanos: current.MappingGCMaxPublishNanos,
 		DeltaChargedBytes: current.DeltaChargedBytes, DeltaReservedBytes: current.DeltaReservedBytes,
 		DeltaSoftLimitBytes: current.DeltaSoftLimitBytes, DeltaHardLimitBytes: current.DeltaHardLimitBytes,
 		MappingCacheBytes: current.MappingCacheBytes, DiskAvailableEstimateBytes: current.DiskAvailableEstimateBytes,
@@ -197,7 +208,9 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 }
 
 // CompactMapping rewrites all reachable Mapping nodes into a fresh physical
-// generation without changing logical records or commit sequence.
+// generation without changing logical records or commit sequence. It returns
+// ErrConflict without faulting the Store if a concurrent Checkpoint advances
+// the immutable Root before publication; callers may retry later.
 func (s *Store) CompactMapping(ctx context.Context) error {
 	if s == nil || s.inner == nil {
 		return base.ErrClosed

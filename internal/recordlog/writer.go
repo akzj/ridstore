@@ -3,6 +3,7 @@ package recordlog
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 type writer struct {
@@ -99,7 +100,16 @@ func (w *writer) stage(request *appendRequest) bool {
 		return false
 	}
 	if request.physical > w.active.remaining() {
+		started := time.Now()
 		next, err := w.log.rotate(w.active)
+		duration := uint64(time.Since(started))
+		w.log.stateMu.Lock()
+		w.log.status.RotationCalls++
+		w.log.status.RotationNanos += duration
+		if duration > w.log.status.RotationMaxNanos {
+			w.log.status.RotationMaxNanos = duration
+		}
+		w.log.stateMu.Unlock()
 		if err != nil {
 			w.reject(request, w.poison(err))
 			return false

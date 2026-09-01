@@ -32,15 +32,18 @@ type Watermarks struct {
 }
 
 type Status struct {
-	Watermarks     Watermarks
-	PendingRecords int
-	PendingBytes   uint64
-	QueuedRequests int
-	QueuedBytes    uint64
-	WriteCalls     uint64
-	SyncCalls      uint64
-	Poisoned       bool
-	Closed         bool
+	Watermarks       Watermarks
+	PendingRecords   int
+	PendingBytes     uint64
+	QueuedRequests   int
+	QueuedBytes      uint64
+	WriteCalls       uint64
+	SyncCalls        uint64
+	RotationCalls    uint64
+	RotationNanos    uint64
+	RotationMaxNanos uint64
+	Poisoned         bool
+	Closed           bool
 }
 
 type appendResponse struct {

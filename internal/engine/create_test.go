@@ -173,6 +173,22 @@ func TestCreateRejectsGCConfigOutsidePersistentBounds(t *testing.T) {
 	}
 }
 
+func TestCheckpointMetricsRecordCompletedOperation(t *testing.T) {
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), testCreateConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	metrics := store.Metrics()
+	if metrics.CheckpointsStarted != 1 || metrics.CheckpointsCompleted != 1 || metrics.CheckpointsFailed != 0 ||
+		metrics.CheckpointDurationNanos == 0 || metrics.CheckpointMaxDurationNanos == 0 || metrics.CheckpointFences != 1 {
+		t.Fatalf("checkpoint metrics=%+v", metrics)
+	}
+}
+
 func TestCommitAdvancesCheckpointUnderDeltaHardPressure(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()

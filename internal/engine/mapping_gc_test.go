@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,6 +76,13 @@ func TestCompactMappingSwitchesRuntimeAndSurvivesReopen(t *testing.T) {
 	afterSecond := store.catalog.Snapshot()
 	if afterSecond.ActiveMapSegmentID <= firstRewriteActive {
 		t.Fatalf("mapping segment ID was not advanced: first=%d second=%d", firstRewriteActive, afterSecond.ActiveMapSegmentID)
+	}
+	metrics := store.Metrics()
+	if metrics.MappingGCStarted != 2 || metrics.MappingGCCompleted != 2 || metrics.MappingGCFailed != 0 ||
+		metrics.MappingGCDurationNanos == 0 || metrics.MappingGCMaxDurationNanos == 0 ||
+		metrics.MappingGCRebuildNanos == 0 || metrics.MappingGCVerifyNanos == 0 ||
+		metrics.MappingGCPublishNanos == 0 || metrics.MappingGCMaxPublishNanos == 0 {
+		t.Fatalf("mapping gc metrics=%+v", metrics)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -409,6 +417,123 @@ func TestCompactMappingAllowsCommitDuringRebuildAndPreservesDelta(t *testing.T) 
 	record, err = reopened.Get(ctx, id)
 	if err != nil || string(record.Value) != "during" {
 		t.Fatalf("reopened record=%+v err=%v", record, err)
+	}
+}
+
+func TestCompactMappingAllowsCheckpointDuringRebuild(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	config.Runtime.CheckpointSortBytes = 24
+	config.Runtime.DeltaSoftLimitBytes = 32
+	config.Runtime.DeltaHardLimitBytes = 64
+	created, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := createMappingGCRecord(t, ctx, created, "before")
+	if err := created.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	enteredRebuild := make(chan struct{})
+	releaseRebuild := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRebuild) }) }
+	checkpointWrite := make(chan struct{})
+	var appendWrites atomic.Uint64
+	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+		if point != mapstore.FaultBeforeAppendWrite {
+			return nil
+		}
+		switch appendWrites.Add(1) {
+		case 1:
+			close(enteredRebuild)
+			<-releaseRebuild
+		case 2:
+			close(checkpointWrite)
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	defer release()
+	store.stopBackgroundCheckpoint()
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- store.CompactMapping(ctx) }()
+	select {
+	case <-enteredRebuild:
+	case <-time.After(time.Second):
+		t.Fatal("Mapping GC rebuild did not start")
+	}
+	batch, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Put(ctx, id, []byte("during")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pressure, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pressure.Create(ctx, []byte("forces checkpoint")); err != nil {
+		t.Fatal(err)
+	}
+	commitDone := make(chan error, 1)
+	go func() {
+		_, err := pressure.Commit(ctx)
+		commitDone <- err
+	}()
+	select {
+	case <-checkpointWrite:
+		// Reaching Mapping append proves the hard-pressure Checkpoint is not
+		// blocked by the Mapping GC rebuild.
+	case <-time.After(time.Second):
+		t.Fatal("hard-pressure Checkpoint blocked behind Mapping GC rebuild")
+	}
+	select {
+	case err := <-commitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hard-pressure Commit did not resume after Checkpoint")
+	}
+	release()
+	select {
+	case err := <-compactDone:
+		if !errors.Is(err, base.ErrConflict) {
+			t.Fatalf("stale mapping gc err=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale Mapping GC did not finish")
+	}
+	store.mu.Lock()
+	fault := store.operationFaultLocked()
+	store.mu.Unlock()
+	if fault != nil {
+		t.Fatalf("optimistic conflict faulted store: %v", fault)
+	}
+	metrics := store.Metrics()
+	if metrics.MappingGCStarted != 1 || metrics.MappingGCCompleted != 0 || metrics.MappingGCFailed != 0 || metrics.MappingGCConflicts != 1 {
+		t.Fatalf("conflict metrics=%+v", metrics)
+	}
+	if err := store.CompactMapping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(ctx, id)
+	if err != nil || string(record.Value) != "during" {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }
 

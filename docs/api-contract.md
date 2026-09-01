@@ -226,13 +226,13 @@ Batch 不提供跨 Store 原子性。
 
 ### 7.1 Mapping 维护
 
-`Checkpoint(ctx)` 将当前 durable Data Log cut、Persistent Mapping Root、allocator high watermark 与精确 SegmentStats 同代安装。`CompactMapping(ctx)` 先推进 Checkpoint，再把可达 Mapping Node 复制到全新的文件 generation，安装新 Root，等待旧 Root reader 退出后通过 trash 协议回收全部旧 Mapping 文件。两者都与 Close 协调，但 Mapping copy 期间用户 Commit 可以继续进入新 active Delta。
+`Checkpoint(ctx)` 将当前 durable Data Log cut、Persistent Mapping Root、allocator high watermark 与精确 SegmentStats 同代安装。`CompactMapping(ctx)` 先推进 Checkpoint，再把可达 Mapping Node 复制到全新的文件 generation，安装新 Root，等待旧 Root reader 退出后通过 trash 协议回收全部旧 Mapping 文件。两者都与 Close 协调，但 Mapping copy 期间用户 Commit 和普通 Checkpoint 均可继续；若并发 Checkpoint 推进了 Root，本次未发布 generation 会被清理并返回 `ErrConflict`，Store 不进入只读故障。
 
 `MappingSpaceUsage(ctx)` 显式遍历 durable Root，返回 Mapping Node 的 Total/Reachable/Unreachable encoded bytes；它是可能执行冷 I/O 的维护查询，不属于廉价 Metrics snapshot。
 
 `CompactData(ctx)` 至多清理一个 checkpoint-safe sealed Data Segment；没有候选时返回零值结果和 nil。成功结果报告 Source/Copied bytes 以及 Relocation applied/skipped 数。它优先复用 Catalog 中已有的 exact Stats cut，没有候选时才刷新 selection Checkpoint；随后执行 Mapping/Open Batch roots 复制、Coordinator 临时 redirect、Relocation、post-relocation Mapping Checkpoint、Reader pin drain、Manifest remove 和 trash/delete。`ErrInsufficientSpace` 表示在安装 Journal 前未通过保守临时空间 admission，源数据保持可读。若 Context 或 I/O 错误发生在 GC-required Checkpoint durable 之后，Store fail closed，Open 根据 Journal 完成删除，不能把 durable 新 Root 当作已回滚。
 
-`Metrics()` 是无 I/O 快照，除 Commit/Delta 字段外还包含 GC started/completed/failed/no-candidate/insufficient-space 计数、copied/reclaimed bytes、Relocation applied/skipped、累计 duration/throttled nanos、Open Batch commit redirect 次数/顺序等待/admission boundary 时间/重定向 ref 数，以及最近缓存的磁盘 available bytes、write-stop 水位/状态/拒绝/检查错误。它们用于调度与诊断，不参与删除授权。
+`Metrics()` 是无 I/O 快照，除 Commit/Delta 字段外还包含 Checkpoint fence 获取/持有时间、完整 Checkpoint、RecordLog rotation、Mapping GC rebuild/verify、Data GC started/completed/failed/no-candidate/insufficient-space、copied/reclaimed bytes、Relocation applied/skipped、累计 duration/throttled nanos、Open Batch commit redirect 次数/顺序等待/admission boundary 时间/重定向 ref 数，以及最近缓存的磁盘 available bytes、write-stop 水位/状态/拒绝/检查错误。它们用于调度与诊断，不参与删除授权。
 
 `Metrics.AppendMetricSamples(dst)` 提供固定顺序、稳定名称和 counter/gauge kind 的
 无后端绑定 export contract；Prometheus HTTP 适配与 counter reset、label 约束见

@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"time"
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/compactionstate"
 	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapgcstate"
+	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/radix"
@@ -18,8 +20,10 @@ import (
 
 // CompactMapping rewrites the current logical Mapping into a fresh physical
 // generation. The immutable checkpoint Root is rebuilt without blocking data
-// operations; commit admission is fenced only for capture and publication.
-func (s *Store) CompactMapping(ctx context.Context) error {
+// operations or later checkpoints. Commit admission is fenced only by the
+// initial checkpoint cut; final publication serializes with checkpoints and
+// returns ErrConflict if one advanced the Root during the rebuild.
+func (s *Store) CompactMapping(ctx context.Context) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -30,15 +34,23 @@ func (s *Store) CompactMapping(ctx context.Context) error {
 		return err
 	}
 	defer s.endOperation()
+	started := time.Now()
+	s.metrics.mappingGCStarted.Add(1)
+	defer func() {
+		duration := uint64(time.Since(started))
+		s.metrics.mappingGCDurationNanos.Add(duration)
+		updateAtomicMax(&s.metrics.mappingGCMaxDurationNanos, duration)
+		if err == nil {
+			s.metrics.mappingGCCompleted.Add(1)
+		} else if errors.Is(err, base.ErrConflict) {
+			s.metrics.mappingGCConflicts.Add(1)
+		} else {
+			s.metrics.mappingGCFailed.Add(1)
+		}
+	}()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	s.checkpointMu.Lock()
-	defer s.checkpointMu.Unlock()
-	work, err := s.prepareCheckpoint(ctx)
-	if err != nil {
-		return err
-	}
-	if err := s.finishCheckpoint(ctx, work); err != nil {
+	if err := s.checkpoint(ctx, false); err != nil {
 		return err
 	}
 	return s.compactCheckpointMapping(ctx)
@@ -69,14 +81,21 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return errors.Join(base.ErrRecoveryRequired, errors.New("mapping gc is active"))
 	}
 
+	// Capture a self-consistent immutable Root, then release checkpointMu for
+	// the complete rebuild. A concurrent checkpoint may advance this Root; the
+	// publication phase detects that as a normal optimistic conflict.
+	s.checkpointMu.Lock()
 	manifest := s.catalog.Snapshot()
 	view, err := s.mapping.CheckpointView()
 	if err != nil {
+		s.checkpointMu.Unlock()
 		return err
 	}
 	if view.Root() != manifest.MappingRoot || view.Covered() != manifest.CoveredCommitSeq {
+		s.checkpointMu.Unlock()
 		return base.ErrCorrupt
 	}
+	s.checkpointMu.Unlock()
 	space, err := s.reserveMappingGC(ctx, manifest, manifest.MappingEntryCount)
 	if err != nil {
 		return err
@@ -95,8 +114,13 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
 	}
 	cleanupWriter := func(cause error) error {
-		return s.mappingGCPrepublishFailure(cause, errors.Join(writer.Close(), discardMappingGCStaging(s.root)))
+		cleanup := errors.Join(writer.Close(), discardMappingGCStaging(s.root))
+		if errors.Is(cause, mapping.ErrStalePlan) {
+			return s.mappingGCConflict(cause, cleanup)
+		}
+		return s.mappingGCPrepublishFailure(cause, cleanup)
 	}
+	rebuildStarted := time.Now()
 	builder, err := radix.NewRebuildBuilder(writer, manifest.CoveredCommitSeq, s.mappingCacheBytes)
 	if err != nil {
 		return cleanupWriter(err)
@@ -122,6 +146,8 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	if err != nil {
 		return cleanupWriter(err)
 	}
+	s.metrics.mappingGCRebuildNanos.Add(uint64(time.Since(rebuildStarted)))
+	verifyStarted := time.Now()
 	var newCount uint64
 	if err := newTree.WalkRefs(ctx, func(id model.ID, ref recordlog.RecordRef) error {
 		oldRef, exists, lookupErr := view.LookupRef(id)
@@ -139,16 +165,37 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		}
 		return cleanupWriter(err)
 	}
+	s.metrics.mappingGCVerifyNanos.Add(uint64(time.Since(verifyStarted)))
 	if err := writer.Close(); err != nil {
 		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
 	}
 
+	// Publication and recovery-marker cleanup remain serialized with
+	// checkpoints. The long rebuild and verification above do not.
+	s.checkpointMu.Lock()
+	publishStarted := time.Now()
+	unlockPublication := func() {
+		duration := uint64(time.Since(publishStarted))
+		s.metrics.mappingGCPublishNanos.Add(duration)
+		updateAtomicMax(&s.metrics.mappingGCMaxPublishNanos, duration)
+		s.checkpointMu.Unlock()
+	}
 	latest := s.catalog.Snapshot()
+	currentView, currentErr := s.mapping.CheckpointView()
+	if currentErr != nil || currentView.Root() != latest.MappingRoot || currentView.Covered() != latest.CoveredCommitSeq {
+		unlockPublication()
+		if currentErr == nil {
+			currentErr = base.ErrCorrupt
+		}
+		return s.mappingGCPrepublishFailure(currentErr, discardMappingGCStaging(s.root))
+	}
 	oldSet := mappingGCFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot)
 	if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
 		!manifestMatchesMappingSet(latest, oldSet) {
-		return s.mappingGCPrepublishFailure(base.ErrCorrupt, discardMappingGCStaging(s.root))
+		unlockPublication()
+		return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.root))
 	}
+	defer unlockPublication()
 	state := mapgcstate.State{
 		StoreID: [16]byte(latest.StoreUUID), BaseGeneration: latest.Generation,
 		SegmentSize: uint32(latest.HardLimits.SegmentSize), Covered: latest.CoveredCommitSeq,
@@ -229,6 +276,15 @@ func (s *Store) mappingGCPrepublishFailure(cause, cleanup error) error {
 	if cleanup != nil {
 		result = errors.Join(base.ErrRecoveryRequired, result)
 	}
+	s.setFault(result)
+	return result
+}
+
+func (s *Store) mappingGCConflict(cause, cleanup error) error {
+	if cleanup == nil {
+		return errors.Join(base.ErrConflict, cause)
+	}
+	result := errors.Join(base.ErrRecoveryRequired, base.ErrConflict, cause, cleanup)
 	s.setFault(result)
 	return result
 }
