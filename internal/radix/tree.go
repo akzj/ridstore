@@ -48,7 +48,7 @@ func (t *Tree) walkNode(ctx context.Context, addr model.MapAddr, level uint8, pr
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel)
+	node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel, false)
 	if err != nil {
 		return err
 	}
@@ -110,7 +110,7 @@ func open(reader NodeReader, writer NodeStore, root model.MapAddr, covered model
 	}
 	tree := &Tree{reader: reader, writer: writer, root: root, covered: covered, cache: newNodeCache(cacheBytes)}
 	if root != 0 {
-		if _, err := tree.load(root, mapstore.MaxLevel, 0, true); err != nil {
+		if _, err := tree.load(root, mapstore.MaxLevel, 0, true, true); err != nil {
 			return nil, err
 		}
 	}
@@ -136,7 +136,7 @@ func (t *Tree) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
 	}
 	for level := mapstore.MaxLevel; ; level-- {
 		prefix := nodePrefix(id, level)
-		node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel)
+		node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel, true)
 		if err != nil {
 			return recordlog.RecordRef{}, false, err
 		}
@@ -162,8 +162,8 @@ func (t *Tree) LookupRef(id model.ID) (recordlog.RecordRef, bool, error) {
 	}
 }
 
-func (t *Tree) load(addr model.MapAddr, level uint8, prefix uint64, pin bool) (mapstore.Node, error) {
-	node, err := t.cache.get(addr, pin, func() (mapstore.Node, error) { return t.reader.Read(addr) })
+func (t *Tree) load(addr model.MapAddr, level uint8, prefix uint64, pin, promote bool) (mapstore.Node, error) {
+	node, err := t.cache.get(addr, pin, promote, func() (mapstore.Node, error) { return t.reader.Read(addr) })
 	if err != nil {
 		return mapstore.Node{}, err
 	}

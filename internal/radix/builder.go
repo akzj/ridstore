@@ -129,7 +129,7 @@ func (t *Tree) oldRefs(addr model.MapAddr, prefix uint64) ([mapstore.NodeSlots]r
 	if addr == 0 {
 		return [mapstore.NodeSlots]recordlog.RecordRef{}, nil
 	}
-	node, err := t.load(addr, 0, prefix, false)
+	node, err := t.load(addr, 0, prefix, false, false)
 	if err != nil {
 		return [mapstore.NodeSlots]recordlog.RecordRef{}, err
 	}
@@ -227,7 +227,7 @@ func (t *Tree) oldSlots(addr model.MapAddr, level uint8, prefix uint64) ([mapsto
 	if addr == 0 {
 		return [mapstore.NodeSlots]uint64{}, nil
 	}
-	node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel)
+	node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel, false)
 	if err != nil {
 		return [mapstore.NodeSlots]uint64{}, err
 	}
@@ -244,7 +244,7 @@ func (t *Tree) nodeAddress(level uint8, prefix uint64) (model.MapAddr, error) {
 	id := model.ID(prefix << (9 * (level + 1)))
 	addr := t.root
 	for current := mapstore.MaxLevel; current > level; current-- {
-		node, err := t.load(addr, current, nodePrefix(id, current), current == mapstore.MaxLevel)
+		node, err := t.load(addr, current, nodePrefix(id, current), current == mapstore.MaxLevel, false)
 		if err != nil {
 			return 0, err
 		}
