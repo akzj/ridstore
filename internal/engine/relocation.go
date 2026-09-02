@@ -327,7 +327,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 				return nil
 			}
 			result.Relocation.PutRecords++
-			put, decodeErr := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+			put, decodeErr := recordcodec.DecodePut(payload, s.state.limits.MaxValueSize)
 			if decodeErr != nil {
 				return errors.Join(base.ErrCorrupt, decodeErr)
 			}
@@ -484,8 +484,8 @@ func (s *Store) compactionFailure(err error) error {
 func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord, result *SegmentRelocationResult) error {
 	for len(copied) != 0 {
 		count, bytes := 0, uint64(0)
-		maxCount := min(len(copied), int(min(s.limits.MaxBatchMutations, s.maxRelocationMutations)))
-		maxBytes := min(s.limits.MaxBatchBytes, s.maxRelocationBytes)
+		maxCount := min(len(copied), int(min(s.state.limits.MaxBatchMutations, s.maxRelocationMutations)))
+		maxBytes := min(s.state.limits.MaxBatchBytes, s.maxRelocationBytes)
 		for count < maxCount && (count == 0 || copied[count].valueBytes <= maxBytes-bytes) {
 			bytes += copied[count].valueBytes
 			count++
@@ -531,7 +531,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 	for _, source := range pendingOrigins {
 		pendingSources[source] = struct{}{}
 	}
-	capacity := int(min(s.limits.MaxBatchMutations, s.maxRelocationMutations))
+	capacity := int(min(s.state.limits.MaxBatchMutations, s.maxRelocationMutations))
 	if capacity == 0 {
 		return base.ErrInvalidConfig
 	}
@@ -559,7 +559,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 			if typ != recordcodec.RecordTypePut {
 				return errors.Join(base.ErrCorrupt, errors.New("non-put record in compaction output"))
 			}
-			put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+			put, err := recordcodec.DecodePut(payload, s.state.limits.MaxValueSize)
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
 			}
@@ -632,23 +632,23 @@ func (s *Store) snapshotOpenBatchCompactionRefs(inputs []recordlog.SegmentSummar
 		inputIDs[input.SegmentID] = struct{}{}
 	}
 	s.mutationAdmission.writeLock()
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	s.state.mu.Lock()
+	if s.state.closed {
+		s.state.mu.Unlock()
 		s.mutationAdmission.writeUnlock()
 		return openBatchCompactionRefs{}, base.ErrClosed
 	}
-	if s.fault != nil {
-		fault := s.fault
-		s.mu.Unlock()
+	if s.state.fault != nil {
+		fault := s.state.fault
+		s.state.mu.Unlock()
 		s.mutationAdmission.writeUnlock()
 		return openBatchCompactionRefs{}, errors.Join(base.ErrReadOnly, fault)
 	}
-	open := make([]*Batch, 0, len(s.open))
-	for _, batch := range s.open {
+	open := make([]*Batch, 0, len(s.state.open))
+	for _, batch := range s.state.open {
 		open = append(open, batch)
 	}
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 	// Taking the write side above drains Put-like operations that may have
 	// appended to a now-sealed input but not yet installed their Batch mutation.
 	// Once drained, later Put records can only enter the active Segment. Release
@@ -867,20 +867,20 @@ func (s *Store) openBatchCompactionOutputReferences(sealed []recordlog.SegmentSu
 	if len(compactionOutputs) == 0 {
 		return nil, nil
 	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	s.state.mu.Lock()
+	if s.state.closed {
+		s.state.mu.Unlock()
 		return nil, base.ErrClosed
 	}
-	if s.fault != nil {
-		s.mu.Unlock()
-		return nil, errors.Join(base.ErrReadOnly, s.fault)
+	if s.state.fault != nil {
+		s.state.mu.Unlock()
+		return nil, errors.Join(base.ErrReadOnly, s.state.fault)
 	}
-	open := make([]*Batch, 0, len(s.open))
-	for _, batch := range s.open {
+	open := make([]*Batch, 0, len(s.state.open))
+	for _, batch := range s.state.open {
 		open = append(open, batch)
 	}
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 	result := make(map[recordlog.SegmentID]struct{})
 	for _, batch := range open {
 		for _, ref := range batch.inner.PendingPutRefs() {
@@ -915,23 +915,23 @@ func (s *Store) proveCompactionRetirement(source recordlog.SegmentID, relocation
 
 func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq, scanMapping bool) (SegmentRetirementProof, error) {
 	s.mutationAdmission.writeLock()
-	s.mu.Lock()
-	closed, fault := s.closed, s.fault
+	s.state.mu.Lock()
+	closed, fault := s.state.closed, s.state.fault
 	if closed {
-		s.mu.Unlock()
+		s.state.mu.Unlock()
 		s.mutationAdmission.writeUnlock()
 		return SegmentRetirementProof{}, base.ErrClosed
 	}
 	if fault != nil {
-		s.mu.Unlock()
+		s.state.mu.Unlock()
 		s.mutationAdmission.writeUnlock()
 		return SegmentRetirementProof{}, errors.Join(base.ErrReadOnly, fault)
 	}
-	open := make([]*Batch, 0, len(s.open))
-	for _, batch := range s.open {
+	open := make([]*Batch, 0, len(s.state.open))
+	for _, batch := range s.state.open {
 		open = append(open, batch)
 	}
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 	s.mutationAdmission.writeUnlock()
 	for _, batch := range open {
 		if batch.inner.ReferencesSegment(source) {
@@ -966,7 +966,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 			if typ != recordcodec.RecordTypePut {
 				return nil
 			}
-			put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+			put, err := recordcodec.DecodePut(payload, s.state.limits.MaxValueSize)
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
 			}
@@ -1002,9 +1002,9 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 // Store lets a later complete GC operation compose relocation, checkpoint and
 // retirement without recursively acquiring the maintenance lock.
 func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentRelocationResult, error) {
-	s.mu.Lock()
-	closed, fault := s.closed, s.fault
-	s.mu.Unlock()
+	s.state.mu.Lock()
+	closed, fault := s.state.closed, s.state.fault
+	s.state.mu.Unlock()
 	if closed {
 		return SegmentRelocationResult{}, base.ErrClosed
 	}
@@ -1031,7 +1031,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 	defer space.complete(false)
 
 	var result SegmentRelocationResult
-	pending := make([]copiedRecord, 0, min(s.limits.MaxBatchMutations, s.maxRelocationMutations))
+	pending := make([]copiedRecord, 0, min(s.state.limits.MaxBatchMutations, s.maxRelocationMutations))
 	var pendingBytes uint64
 	var pendingPhysical uint64
 	pacer := s.newGCPacer(rate)
@@ -1091,7 +1091,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 			return nil
 		}
 		result.PutRecords++
-		put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+		put, err := recordcodec.DecodePut(payload, s.state.limits.MaxValueSize)
 		if err != nil {
 			return errors.Join(base.ErrCorrupt, err)
 		}
@@ -1105,8 +1105,8 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		result.LiveCandidates++
 		valueBytes := uint64(len(put.Value))
 		exceeds := func(limit uint64) bool { return valueBytes > limit || pendingBytes > limit-valueBytes }
-		if len(pending) != 0 && (uint64(len(pending)) == s.limits.MaxBatchMutations ||
-			uint64(len(pending)) == s.maxRelocationMutations || exceeds(s.limits.MaxBatchBytes) ||
+		if len(pending) != 0 && (uint64(len(pending)) == s.state.limits.MaxBatchMutations ||
+			uint64(len(pending)) == s.maxRelocationMutations || exceeds(s.state.limits.MaxBatchBytes) ||
 			exceeds(s.maxRelocationBytes)) {
 			if err := flush(); err != nil {
 				return err

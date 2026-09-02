@@ -37,7 +37,7 @@ func TestRelocateSegmentCopiesLivePutAndPreservesOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	put, err := recordcodec.DecodePut(payload, store.limits.MaxValueSize)
+	put, err := recordcodec.DecodePut(payload, store.state.limits.MaxValueSize)
 	if err != nil || put.OriginBatchID != origin || put.RecordID != id {
 		t.Fatalf("put=%+v err=%v", put, err)
 	}
@@ -774,8 +774,8 @@ func TestCompactSegmentCancellationBeforeOutputPublicationRollsBack(t *testing.T
 	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, context.Canceled) {
 		t.Fatalf("compact err=%v", err)
 	}
-	if store.fault != nil {
-		t.Fatalf("recoverable cancellation faulted store: %v", store.fault)
+	if store.state.fault != nil {
+		t.Fatalf("recoverable cancellation faulted store: %v", store.state.fault)
 	}
 	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
 		t.Fatalf("compaction marker found=%v err=%v", found, err)

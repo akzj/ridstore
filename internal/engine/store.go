@@ -76,12 +76,41 @@ type statusOrderEntry struct {
 	serial uint64
 }
 
+// storeState is the single lock domain for lifecycle and user Batch registry
+// state. Close, status retention, and checkpoint recovery snapshots require
+// one atomic view of these fields, so this refactor intentionally keeps their
+// existing lock boundary intact.
+type storeState struct {
+	mu sync.Mutex
+
+	activeOps uint64
+	closing   bool
+	closed    bool
+	fault     error
+	notify    chan struct{}
+
+	limits          transaction.Limits
+	maxOpen         int
+	open            map[model.BatchID]*Batch
+	statuses        map[model.BatchID]statusEntry
+	statusOrder     []statusOrderEntry
+	statusOrderHead int
+	statusSerial    uint64
+	statusRetention uint64
+	terminalTotal   uint64
+	terminalBase    uint64
+	openCount       int
+	batchEpoch      atomic.Uint64
+
+	recoveryAbortedStart uint64
+	recoveryAbortedEnd   uint64
+	recoveryAbortedValid bool
+}
+
 type Store struct {
-	mu                sync.Mutex
+	state             storeState
 	mutationAdmission mutationAdmission
 	checkpoints       checkpointRuntime
-	activeOps         uint64
-	closing           bool
 
 	log                    Log
 	maintenance            maintenanceLog
@@ -95,25 +124,7 @@ type Store struct {
 	ids                    *idalloc.Allocator
 	batches                *idalloc.Allocator
 	commits                *coordinator.Coordinator
-	limits                 transaction.Limits
 	userAppender           transaction.Appender
-	maxOpen                int
-	open                   map[model.BatchID]*Batch
-	statuses               map[model.BatchID]statusEntry
-	statusOrder            []statusOrderEntry
-	statusOrderHead        int
-	statusSerial           uint64
-	statusRetention        uint64
-	terminalTotal          uint64
-	terminalBase           uint64
-	openCount              int
-	batchEpoch             atomic.Uint64
-	recoveryAbortedStart   uint64
-	recoveryAbortedEnd     uint64
-	recoveryAbortedValid   bool
-	notify                 chan struct{}
-	closed                 bool
-	fault                  error
 	maxStats               uint64
 	mappingCacheBytes      uint64
 	maxRelocationBytes     uint64
@@ -168,8 +179,11 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 	}
 	return &Store{
 		log: log, mapping: current, ids: ids, batches: batches, commits: commits,
-		limits: config.Batch, userAppender: log, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
-		statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
+		state: storeState{
+			limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
+			statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
+		},
+		userAppender:           log,
 		maxRelocationBytes:     config.Batch.MaxBatchBytes,
 		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
 		maintScheduler:         &MaintenanceScheduler{},
@@ -190,20 +204,20 @@ func (s *Store) Status(ctx context.Context, id model.BatchID) (BatchStatus, erro
 		return BatchStatus{}, err
 	}
 	defer s.endOperation()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	if s.state.closed {
 		return BatchStatus{}, base.ErrClosed
 	}
-	if batch, ok := s.open[id]; ok {
+	if batch, ok := s.state.open[id]; ok {
 		state, seq := batch.inner.State()
 		return BatchStatus{BatchID: id, State: publicBatchState(state), CommitSeq: seq}, nil
 	}
-	if status, ok := s.statuses[id]; ok {
+	if status, ok := s.state.statuses[id]; ok {
 		return status.status, nil
 	}
 	raw := uint64(id)
-	if s.recoveryAbortedValid && raw >= s.recoveryAbortedStart && raw < s.recoveryAbortedEnd {
+	if s.state.recoveryAbortedValid && raw >= s.state.recoveryAbortedStart && raw < s.state.recoveryAbortedEnd {
 		return BatchStatus{BatchID: id, State: BatchStateAborted}, nil
 	}
 	if raw < s.batches.IssuedHigh() {
@@ -224,44 +238,44 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		s.mu.Lock()
-		if s.closed || s.closing {
-			s.mu.Unlock()
+		s.state.mu.Lock()
+		if s.state.closed || s.state.closing {
+			s.state.mu.Unlock()
 			return nil, base.ErrClosed
 		}
 		if fault := s.operationFaultLocked(); fault != nil {
-			s.mu.Unlock()
+			s.state.mu.Unlock()
 			return nil, errors.Join(base.ErrReadOnly, fault)
 		}
 		capacityBlocked := !s.statusCapacityAvailableLocked()
-		if s.openCount < s.maxOpen && !capacityBlocked {
-			s.openCount++
-			s.mu.Unlock()
+		if s.state.openCount < s.state.maxOpen && !capacityBlocked {
+			s.state.openCount++
+			s.state.mu.Unlock()
 			raw, err := s.batches.Allocate(ctx)
 			if err != nil {
-				s.mu.Lock()
-				s.openCount--
+				s.state.mu.Lock()
+				s.state.openCount--
 				s.signalLocked()
-				s.mu.Unlock()
+				s.state.mu.Unlock()
 				return nil, err
 			}
-			inner, err := transaction.New(model.BatchID(raw), s.limits, s.userAppender, s.ids)
+			inner, err := transaction.New(model.BatchID(raw), s.state.limits, s.userAppender, s.ids)
 			if err != nil {
-				s.mu.Lock()
-				s.openCount--
+				s.state.mu.Lock()
+				s.state.openCount--
 				s.signalLocked()
-				s.mu.Unlock()
+				s.state.mu.Unlock()
 				return nil, err
 			}
 			batch := &Batch{store: s, inner: inner}
-			s.mu.Lock()
-			s.open[batch.ID()] = batch
-			s.batchEpoch.Add(1)
-			s.mu.Unlock()
+			s.state.mu.Lock()
+			s.state.open[batch.ID()] = batch
+			s.state.batchEpoch.Add(1)
+			s.state.mu.Unlock()
 			return batch, nil
 		}
-		notify := s.notify
-		s.mu.Unlock()
+		notify := s.state.notify
+		s.state.mu.Unlock()
 		if capacityBlocked {
 			if err := s.Checkpoint(ctx); err != nil {
 				return nil, err
@@ -291,9 +305,9 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		if err := ctx.Err(); err != nil {
 			return Record{}, err
 		}
-		s.mu.Lock()
-		closed, fault := s.closed, s.operationFaultLocked()
-		s.mu.Unlock()
+		s.state.mu.Lock()
+		closed, fault := s.state.closed, s.operationFaultLocked()
+		s.state.mu.Unlock()
 		if closed {
 			return Record{}, base.ErrClosed
 		}
@@ -323,7 +337,7 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		if !stillExists || current != addr {
 			continue
 		}
-		put, err := recordcodec.DecodePut(payload, s.limits.MaxValueSize)
+		put, err := recordcodec.DecodePut(payload, s.state.limits.MaxValueSize)
 		if err != nil || put.RecordID != id {
 			corrupt := errors.Join(base.ErrCorrupt, err)
 			s.setFault(corrupt)
@@ -334,28 +348,28 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 }
 
 func (s *Store) Close() error {
-	s.mu.Lock()
-	if s.closed || s.closing {
-		s.mu.Unlock()
+	s.state.mu.Lock()
+	if s.state.closed || s.state.closing {
+		s.state.mu.Unlock()
 		return base.ErrClosed
 	}
-	s.closing = true
+	s.state.closing = true
 	s.signalLocked()
-	s.mu.Unlock()
-	s.mu.Lock()
-	for s.activeOps != 0 {
-		notify := s.notify
-		s.mu.Unlock()
+	s.state.mu.Unlock()
+	s.state.mu.Lock()
+	for s.state.activeOps != 0 {
+		notify := s.state.notify
+		s.state.mu.Unlock()
 		<-notify
-		s.mu.Lock()
+		s.state.mu.Lock()
 	}
-	s.closed = true
-	open := make([]*Batch, 0, len(s.open))
-	for _, batch := range s.open {
+	s.state.closed = true
+	open := make([]*Batch, 0, len(s.state.open))
+	for _, batch := range s.state.open {
 		open = append(open, batch)
 	}
 	s.signalLocked()
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 	s.stopCheckpointWorker()
 	var result error
 	for _, batch := range open {
@@ -460,20 +474,20 @@ type checkpointWork struct {
 // corresponding frozen Mapping generation while commit admission is fenced.
 // Reads, record appends, and unrelated Batch construction remain concurrent.
 func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	s.state.mu.Lock()
+	if s.state.closed {
+		s.state.mu.Unlock()
 		return checkpointWork{}, base.ErrClosed
 	}
 	if fault := s.operationFaultLocked(); fault != nil {
-		s.mu.Unlock()
+		s.state.mu.Unlock()
 		return checkpointWork{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	if s.catalog == nil || s.mapStore == nil || s.maxStats == 0 {
-		s.mu.Unlock()
+		s.state.mu.Unlock()
 		return checkpointWork{}, base.ErrInvalidConfig
 	}
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 	// Drain potentially slow Begin/Abort metadata work before stopping Commit
 	// admission. Once held, this mutex keeps the open-Batch/allocator snapshot
 	// stable through the short durable cut and Mapping freeze.
@@ -483,19 +497,19 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 	}
 	defer fence.Release()
 	cut := fence.Cut
-	epoch := s.batchEpoch.Load()
-	s.mu.Lock()
+	epoch := s.state.batchEpoch.Load()
+	s.state.mu.Lock()
 	open, statusCut, err := s.openBatchIDsAtCut()
 	if err != nil {
-		s.mu.Unlock()
+		s.state.mu.Unlock()
 		s.setFault(err)
 		return checkpointWork{}, err
 	}
 	sort.Slice(open, func(i, j int) bool { return open[i] < open[j] })
 	reservedIDHigh, reservedBatchIDHigh := s.ids.DurableHigh(), s.batches.DurableHigh()
 	issuedBatchIDHigh := s.batches.IssuedHigh()
-	s.mu.Unlock()
-	if epoch != s.batchEpoch.Load() {
+	s.state.mu.Unlock()
+	if epoch != s.state.batchEpoch.Load() {
 		return checkpointWork{}, base.ErrConflict
 	}
 	frozen, err := s.mapping.Freeze(cut.CoveredCommitSeq)
@@ -560,13 +574,13 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 	}
 	s.gcStability.sample(installed, now)
 	s.completeCheckpointPressure(frozen.PressureGeneration())
-	s.mu.Lock()
-	if work.statusCut > s.terminalBase {
-		s.terminalBase = work.statusCut
+	s.state.mu.Lock()
+	if work.statusCut > s.state.terminalBase {
+		s.state.terminalBase = work.statusCut
 	}
-	s.recoveryAbortedValid = false
+	s.state.recoveryAbortedValid = false
 	s.signalLocked()
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 	return nil
 }
 
@@ -621,8 +635,8 @@ func containsDataSegment(manifest storecatalog.Manifest, id recordlog.SegmentID)
 // Store.open. Only genuinely non-terminal, non-committing batches belong in
 // the recovery snapshot.
 func (s *Store) openBatchIDsAtCut() ([]model.BatchID, uint64, error) {
-	open := make([]model.BatchID, 0, len(s.open))
-	for id, batch := range s.open {
+	open := make([]model.BatchID, 0, len(s.state.open))
+	for id, batch := range s.state.open {
 		state, _ := batch.inner.State()
 		switch state {
 		case transaction.StateOpen, transaction.StateFailed:
@@ -635,60 +649,60 @@ func (s *Store) openBatchIDsAtCut() ([]model.BatchID, uint64, error) {
 			return nil, 0, errors.Join(base.ErrCorrupt, errors.New("unknown batch state at checkpoint"))
 		}
 	}
-	return open, s.terminalTotal, nil
+	return open, s.state.terminalTotal, nil
 }
 
 func (s *Store) beginOperation() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed || s.closing {
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	if s.state.closed || s.state.closing {
 		return base.ErrClosed
 	}
-	s.activeOps++
+	s.state.activeOps++
 	return nil
 }
 
 func (s *Store) endOperation() {
-	s.mu.Lock()
-	if s.activeOps == 0 {
-		s.fault = errors.Join(base.ErrReadOnly, base.ErrCorrupt)
+	s.state.mu.Lock()
+	if s.state.activeOps == 0 {
+		s.state.fault = errors.Join(base.ErrReadOnly, base.ErrCorrupt)
 	} else {
-		s.activeOps--
+		s.state.activeOps--
 	}
 	s.signalLocked()
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 }
 
 func (s *Store) setFault(err error) {
-	s.mu.Lock()
-	if s.fault == nil {
-		s.fault = err
+	s.state.mu.Lock()
+	if s.state.fault == nil {
+		s.state.fault = err
 	}
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 }
 
 // operationFaultLocked returns the single fail-closed view used by public data
-// operations. The caller holds s.mu; Coordinator never acquires s.mu, so
+// operations. The caller holds s.state.mu; Coordinator never acquires s.state.mu, so
 // consulting its terminal state here does not introduce a lock cycle.
 func (s *Store) operationFaultLocked() error {
-	if s.fault != nil {
-		return s.fault
+	if s.state.fault != nil {
+		return s.state.fault
 	}
 	return s.commits.Fault()
 }
 
 func (s *Store) signalLocked() {
-	close(s.notify)
-	s.notify = make(chan struct{})
+	close(s.state.notify)
+	s.state.notify = make(chan struct{})
 }
 
 func (s *Store) releaseSlot() {
-	s.mu.Lock()
-	if s.openCount > 0 {
-		s.openCount--
+	s.state.mu.Lock()
+	if s.state.openCount > 0 {
+		s.state.openCount--
 	}
 	s.signalLocked()
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 }
 
 func (s *Store) acquireDataMaintenance(ctx context.Context) error {
@@ -786,16 +800,16 @@ func (b *Batch) Commit(ctx context.Context) (coordinator.Result, error) {
 }
 
 func (s *Store) submitCommit(ctx context.Context, batch *transaction.Batch) (coordinator.Receipt, error) {
-	s.mu.Lock()
-	if s.closed || s.closing {
-		s.mu.Unlock()
+	s.state.mu.Lock()
+	if s.state.closed || s.state.closing {
+		s.state.mu.Unlock()
 		return coordinator.Receipt{}, base.ErrClosed
 	}
 	if fault := s.operationFaultLocked(); fault != nil {
-		s.mu.Unlock()
+		s.state.mu.Unlock()
 		return coordinator.Receipt{}, errors.Join(base.ErrReadOnly, fault)
 	}
-	s.mu.Unlock()
+	s.state.mu.Unlock()
 	return s.commits.Submit(ctx, batch)
 }
 
@@ -807,9 +821,9 @@ func (b *Batch) Abort(ctx context.Context) error {
 		return err
 	}
 	defer b.store.endOperation()
-	b.store.mu.Lock()
-	closed, fault := b.store.closed || b.store.closing, b.store.operationFaultLocked()
-	b.store.mu.Unlock()
+	b.store.state.mu.Lock()
+	closed, fault := b.store.state.closed || b.store.state.closing, b.store.operationFaultLocked()
+	b.store.state.mu.Unlock()
 	if closed {
 		return base.ErrClosed
 	}
@@ -832,9 +846,9 @@ func withBatch[T any](b *Batch, run func() (T, error)) (T, error) {
 		return zero, err
 	}
 	defer b.store.endOperation()
-	b.store.mu.Lock()
-	closed, fault := b.store.closed, b.store.operationFaultLocked()
-	b.store.mu.Unlock()
+	b.store.state.mu.Lock()
+	closed, fault := b.store.state.closed, b.store.operationFaultLocked()
+	b.store.state.mu.Unlock()
 	if closed {
 		return zero, base.ErrClosed
 	}
@@ -863,7 +877,7 @@ func terminal(batch *transaction.Batch) bool {
 func (b *Batch) finish() {
 	b.done.Do(func() {
 		state, seq := b.inner.State()
-		b.store.mu.Lock()
+		b.store.state.mu.Lock()
 		if terminalState := publicBatchState(state); terminalState == BatchStateCommitted || terminalState == BatchStateAborted || terminalState == BatchStateCommitUnknown {
 			switch terminalState {
 			case BatchStateCommitted:
@@ -873,20 +887,20 @@ func (b *Batch) finish() {
 			case BatchStateCommitUnknown:
 				b.store.metrics.unknown.Add(1)
 			}
-			if b.store.terminalTotal == math.MaxUint64 {
-				b.store.fault = errors.Join(base.ErrReadOnly, base.ErrStatusCapacity)
+			if b.store.state.terminalTotal == math.MaxUint64 {
+				b.store.state.fault = errors.Join(base.ErrReadOnly, base.ErrStatusCapacity)
 			} else {
-				b.store.terminalTotal++
+				b.store.state.terminalTotal++
 				b.store.addStatusLocked(BatchStatus{BatchID: b.ID(), State: terminalState, CommitSeq: seq})
 			}
 		}
-		delete(b.store.open, b.ID())
-		b.store.batchEpoch.Add(1)
-		if b.store.openCount > 0 {
-			b.store.openCount--
+		delete(b.store.state.open, b.ID())
+		b.store.state.batchEpoch.Add(1)
+		if b.store.state.openCount > 0 {
+			b.store.state.openCount--
 		}
 		b.store.signalLocked()
-		b.store.mu.Unlock()
+		b.store.state.mu.Unlock()
 	})
 }
 

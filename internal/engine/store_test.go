@@ -290,7 +290,7 @@ func TestBatchStatusTracksOpenAndTerminalOutcomes(t *testing.T) {
 	if _, err := store.Status(context.Background(), model.BatchID(store.batches.IssuedHigh())); !errors.Is(err, base.ErrNotFound) {
 		t.Fatalf("future status err=%v", err)
 	}
-	delete(store.statuses, batch.ID())
+	delete(store.state.statuses, batch.ID())
 	if _, err := store.Status(context.Background(), batch.ID()); !errors.Is(err, base.ErrStatusExpired) {
 		t.Fatalf("expired status err=%v", err)
 	}

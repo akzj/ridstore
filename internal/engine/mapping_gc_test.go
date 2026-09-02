@@ -573,9 +573,9 @@ func TestCompactMappingAllowsCheckpointDuringRebuild(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("stale Mapping GC did not finish")
 	}
-	store.mu.Lock()
+	store.state.mu.Lock()
 	fault := store.operationFaultLocked()
-	store.mu.Unlock()
+	store.state.mu.Unlock()
 	if fault != nil {
 		t.Fatalf("optimistic conflict faulted store: %v", fault)
 	}

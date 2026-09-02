@@ -414,9 +414,9 @@ func TestCheckpointExcludesCommittedBatchWhoseCallerHasNotFinished(t *testing.T)
 	if state, _ := committed.inner.State(); state != transaction.StateCommitted {
 		t.Fatalf("committed batch state=%v", state)
 	}
-	store.mu.Lock()
-	_, stillTracked := store.open[committed.ID()]
-	store.mu.Unlock()
+	store.state.mu.Lock()
+	_, stillTracked := store.state.open[committed.ID()]
+	store.state.mu.Unlock()
 	if !stillTracked {
 		t.Fatal("test did not preserve the client-finish race window")
 	}

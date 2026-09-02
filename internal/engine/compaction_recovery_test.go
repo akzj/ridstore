@@ -65,7 +65,7 @@ func TestOpenResumesPublishedCompaction(t *testing.T) {
 		if err != nil || typ != recordcodec.RecordTypePut {
 			return err
 		}
-		put, err := recordcodec.DecodePut(payload, store.limits.MaxValueSize)
+		put, err := recordcodec.DecodePut(payload, store.state.limits.MaxValueSize)
 		if err != nil {
 			return err
 		}
@@ -239,7 +239,7 @@ func TestOpenReplaysDurableCompactionRelocationBeforeCheckpoint(t *testing.T) {
 		if err != nil || typ != recordcodec.RecordTypePut {
 			return err
 		}
-		put, err := recordcodec.DecodePut(payload, store.limits.MaxValueSize)
+		put, err := recordcodec.DecodePut(payload, store.state.limits.MaxValueSize)
 		if err != nil {
 			return err
 		}

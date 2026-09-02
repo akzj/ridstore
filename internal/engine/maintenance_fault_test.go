@@ -79,9 +79,9 @@ func TestCompactRetirementCASRejectsGenerationChangeAfterMarker(t *testing.T) {
 	if _, err := os.Stat(maintstate.Path(store.root)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("maintenance marker remains: %v", err)
 	}
-	store.mu.Lock()
+	store.state.mu.Lock()
 	fault := store.operationFaultLocked()
-	store.mu.Unlock()
+	store.state.mu.Unlock()
 	if fault != nil {
 		t.Fatalf("optimistic retirement conflict faulted Store: %v", fault)
 	}

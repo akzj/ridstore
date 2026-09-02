@@ -258,10 +258,10 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 		}
 		store.addStatusLocked(BatchStatus{BatchID: id, State: state, CommitSeq: status.CommitSeq})
 	}
-	store.terminalTotal = recovered.TerminalCount
-	store.recoveryAbortedStart = manifest.IssuedBatchIDHighAtCut
-	store.recoveryAbortedEnd = recovered.ReservedBatchIDHigh
-	store.recoveryAbortedValid = store.recoveryAbortedStart < store.recoveryAbortedEnd
+	store.state.terminalTotal = recovered.TerminalCount
+	store.state.recoveryAbortedStart = manifest.IssuedBatchIDHighAtCut
+	store.state.recoveryAbortedEnd = recovered.ReservedBatchIDHigh
+	store.state.recoveryAbortedValid = store.state.recoveryAbortedStart < store.state.recoveryAbortedEnd
 	store.root = root
 	store.maxStats = config.MaxSegmentStats
 	store.mappingCacheBytes = config.MappingCacheBytes
