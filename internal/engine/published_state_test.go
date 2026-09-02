@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
 func TestCreateAndOpenInitializePublishedState(t *testing.T) {
@@ -44,6 +47,29 @@ func TestRecordLogRotationPublishesState(t *testing.T) {
 		}
 	}
 	assertPublishedStateMatchesCatalog(t, store)
+}
+
+func TestPublishedStateSnapshotDoesNotWaitForPublisherLock(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	store, err := Create(context.Background(), root, testCreateConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	publisher := store.core.publisher
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+
+	done := make(chan storecatalog.Manifest, 1)
+	go func() { done <- store.catalogSnapshot() }()
+	select {
+	case snapshot := <-done:
+		if snapshot.Generation == 0 || snapshot.Generation != publisher.published.Load().Generation {
+			t.Fatalf("snapshot generation=%d", snapshot.Generation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PublishedState snapshot waited for publisher lock")
+	}
 }
 
 func assertPublishedStateMatchesCatalog(t *testing.T, store *Store) {

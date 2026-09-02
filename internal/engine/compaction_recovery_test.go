@@ -16,7 +16,7 @@ import (
 func TestOpenRollsBackUnpublishedCompaction(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
 	manifest := store.core.catalog.Snapshot()
-	reserved, ids, err := store.core.catalog.ReserveCompactionSegments(manifest.Generation, 1)
+	reserved, ids, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestOpenResumesPublishedCompaction(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
 	manifest := store.core.catalog.Snapshot()
 	input := findSummary(t, manifest.SealedDataSegments, source)
-	reserved, ids, err := store.core.catalog.ReserveCompactionSegments(manifest.Generation, 1)
+	reserved, ids, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestOpenResumesPublishedCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	latest := store.core.catalog.Snapshot()
-	if _, err := store.core.catalog.InstallCompactionOutputs(latest.Generation, outputs); err != nil {
+	if _, err := store.core.publisher.InstallCompactionOutputs(latest.Generation, outputs); err != nil {
 		t.Fatal(err)
 	}
 	state.Phase, state.Outputs = compactionstate.PhaseOutputsPublished, outputs
@@ -157,7 +157,7 @@ func TestOpenResumesPublishedCompactionWithDuplicatePendingRecordIDs(t *testing.
 	}
 	manifest := store.core.catalog.Snapshot()
 	input := findSummary(t, manifest.SealedDataSegments, source)
-	reserved, ids, err := store.core.catalog.ReserveCompactionSegments(manifest.Generation, 1)
+	reserved, ids, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestOpenReplaysDurableCompactionRelocationBeforeCheckpoint(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
 	manifest := store.core.catalog.Snapshot()
 	input := findSummary(t, manifest.SealedDataSegments, source)
-	reserved, ids, err := store.core.catalog.ReserveCompactionSegments(manifest.Generation, 1)
+	reserved, ids, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestOpenReleasesResourcesWhenCompactionResumeFails(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	manifest := store.core.catalog.Snapshot()
 	input := findSummary(t, manifest.SealedDataSegments, source)
-	reserved, ids, err := store.core.catalog.ReserveCompactionSegments(manifest.Generation, 1)
+	reserved, ids, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

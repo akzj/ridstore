@@ -50,8 +50,6 @@ func (p *PublishCoordinator) Snapshot() storecatalog.Manifest {
 }
 
 func (p *PublishCoordinator) PublishedState() *PublishedState {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	return clonePublishedState(p.published.Load())
 }
 
@@ -181,7 +179,9 @@ func clonePublishedState(state *PublishedState) *PublishedState {
 
 func (s *Store) catalogSnapshot() storecatalog.Manifest {
 	if s.core.publisher != nil {
-		return s.core.publisher.Snapshot()
+		if state := s.core.publisher.PublishedState(); state != nil {
+			return state.Manifest
+		}
 	}
 	return s.core.catalog.Snapshot()
 }

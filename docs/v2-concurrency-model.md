@@ -77,6 +77,9 @@ descriptors.
 
 Catalog serializes Manifest generations across durable install. This can delay another metadata transition such as a rare
 Segment rotation, but it does not lock Mapping lookup or RecordLog reads.
+The immutable `PublishedState` pointer is loaded without the publisher lock, so background planning and version checks do
+not wait for an unrelated Manifest fsync; stale snapshots remain safe because every installation validates its generation
+or complete compatible base.
 
 ## 5. Prohibited regressions
 
