@@ -422,7 +422,16 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
 
-	work, err := s.prepareCheckpoint(ctx)
+	var work checkpointWork
+	for attempts := 0; ; attempts++ {
+		work, err = s.prepareCheckpoint(ctx)
+		if !errors.Is(err, base.ErrConflict) || attempts >= 8 {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
