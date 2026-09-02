@@ -42,10 +42,11 @@ type SegmentRelocationResult struct {
 // authorization to unlink by itself: the eventual retire operation must
 // consume and revalidate it while holding the maintenance gate.
 type SegmentRetirementProof struct {
-	Source            recordlog.SegmentSummary
-	CatalogGeneration uint64
-	CoveredCommitSeq  model.CommitSeq
-	ReplayStart       recordlog.LogPos
+	Source             recordlog.SegmentSummary
+	CatalogGeneration  uint64
+	CoveredCommitSeq   model.CommitSeq
+	ReplayStart        recordlog.LogPos
+	ManifestGeneration uint64
 }
 
 type SegmentCompactionResult struct {
@@ -193,7 +194,11 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	defer s.releaseDataMaintenance()
 	rate := s.gcBytesPerSecond.Load()
 	selectCandidate := func() (SegmentCompactionCandidate, bool, error) {
-		manifest := s.catalog.Snapshot()
+		published := s.PublishedState()
+		if published == nil {
+			return SegmentCompactionCandidate{}, false, base.ErrInvalidConfig
+		}
+		manifest := published.Manifest
 		excluded, err := s.openBatchCompactionOutputReferences(manifest.SealedDataSegments)
 		if err != nil {
 			return SegmentCompactionCandidate{}, false, fmt.Errorf("collect open batch compaction-output references: %w", err)
@@ -250,7 +255,11 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	if len(inputs) == 0 || s.catalog == nil || s.maintenance == nil {
 		return result, base.ErrInvalidConfig
 	}
-	manifest := s.catalog.Snapshot()
+	published := s.PublishedState()
+	if published == nil {
+		return result, base.ErrInvalidConfig
+	}
+	manifest := published.Manifest
 	for _, input := range inputs {
 		if !containsSealedSegment(manifest, input) {
 			return result, recordlog.ErrSegmentMissing
@@ -956,7 +965,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 		}
 	}
 	return SegmentRetirementProof{
-		Source: manifest.SealedDataSegments[index], CatalogGeneration: manifest.Generation,
+		Source: manifest.SealedDataSegments[index], CatalogGeneration: manifest.Generation, ManifestGeneration: manifest.Generation,
 		CoveredCommitSeq: manifest.CoveredCommitSeq, ReplayStart: manifest.ReplayStart,
 	}, nil
 }
