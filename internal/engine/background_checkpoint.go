@@ -141,7 +141,7 @@ func (s *Store) takeCheckpointWaiters() []checkpointWaiter {
 }
 
 func (s *Store) periodicCheckpointNeeded() bool {
-	charged, _, _, _ := s.mapping.DeltaUsage()
+	charged, _, _, _ := s.core.mapping.DeltaUsage()
 	return charged != 0
 }
 

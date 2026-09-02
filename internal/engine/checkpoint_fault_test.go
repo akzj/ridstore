@@ -358,12 +358,12 @@ func TestCommitSyncFailureWithPartialRecordRecoversAsAborted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeCommit := store.log.Status().Watermarks.Written
+	beforeCommit := store.core.log.Status().Watermarks.Written
 	armed.Store(true)
 	if _, err := batch.Commit(context.Background()); !errors.Is(err, base.ErrCommitUnknown) {
 		t.Fatalf("commit err=%v", err)
 	}
-	afterCommit := store.log.Status().Watermarks.Written
+	afterCommit := store.core.log.Status().Watermarks.Written
 	if afterCommit.SegmentID != beforeCommit.SegmentID || afterCommit.Offset <= beforeCommit.Offset+8 {
 		t.Fatalf("before=%+v after=%+v", beforeCommit, afterCommit)
 	}
@@ -472,8 +472,8 @@ func TestCheckpointSupportsDataRotationAfterCut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := store.catalog.Snapshot()
-	for index := 0; index < 2048 && store.catalog.Snapshot().ActiveDataSegmentID == work.cut.ReplayStart.SegmentID; index++ {
+	before := store.core.catalog.Snapshot()
+	for index := 0; index < 2048 && store.core.catalog.Snapshot().ActiveDataSegmentID == work.cut.ReplayStart.SegmentID; index++ {
 		batch, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -485,14 +485,14 @@ func TestCheckpointSupportsDataRotationAfterCut(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rotated := store.catalog.Snapshot()
+	rotated := store.core.catalog.Snapshot()
 	if rotated.ActiveDataSegmentID == work.cut.ReplayStart.SegmentID {
 		t.Fatal("record log did not rotate after checkpoint cut")
 	}
 	if err := store.finishCheckpoint(context.Background(), work); err != nil {
 		t.Fatal(err)
 	}
-	after := store.catalog.Snapshot()
+	after := store.core.catalog.Snapshot()
 	if after.Generation != rotated.Generation+1 || after.MappingRoot == before.MappingRoot || after.CoveredCommitSeq != work.cut.CoveredCommitSeq ||
 		after.ReplayStart != work.cut.ReplayStart || after.ActiveDataSegmentID != rotated.ActiveDataSegmentID {
 		t.Fatalf("checkpoint did not publish across data rotation: before=%+v rotated=%+v after=%+v", before, rotated, after)

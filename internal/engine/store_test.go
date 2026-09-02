@@ -215,11 +215,11 @@ func TestGetCorruptionFailsStoreClosed(t *testing.T) {
 	if _, err := batch.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	addr, exists, err := store.mapping.Lookup(id)
+	addr, exists, err := store.core.mapping.Lookup(id)
 	if err != nil || !exists {
 		t.Fatalf("addr=%v exists=%v err=%v", addr, exists, err)
 	}
-	log := store.log.(*memoryLog)
+	log := store.core.log.(*memoryLog)
 	log.mu.Lock()
 	log.records[addr][0] ^= 0xff
 	log.mu.Unlock()
@@ -287,7 +287,7 @@ func TestBatchStatusTracksOpenAndTerminalOutcomes(t *testing.T) {
 	if err != nil || status.State != BatchStateAborted || status.CommitSeq != 0 {
 		t.Fatalf("aborted status=%+v err=%v", status, err)
 	}
-	if _, err := store.Status(context.Background(), model.BatchID(store.batches.IssuedHigh())); !errors.Is(err, base.ErrNotFound) {
+	if _, err := store.Status(context.Background(), model.BatchID(store.core.batches.IssuedHigh())); !errors.Is(err, base.ErrNotFound) {
 		t.Fatalf("future status err=%v", err)
 	}
 	delete(store.state.statuses, batch.ID())

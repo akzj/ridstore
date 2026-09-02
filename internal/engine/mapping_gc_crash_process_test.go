@@ -33,7 +33,7 @@ func TestMappingGCRecoveryAcrossProcessExit(t *testing.T) {
 			if err := store.Checkpoint(ctx); err != nil {
 				t.Fatal(err)
 			}
-			before := store.catalog.Snapshot()
+			before := store.core.catalog.Snapshot()
 			if err := store.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -56,7 +56,7 @@ func TestMappingGCRecoveryAcrossProcessExit(t *testing.T) {
 			if err != nil || string(record.Value) != "crash-safe" {
 				t.Fatalf("record=%+v err=%v", record, err)
 			}
-			after := reopened.catalog.Snapshot()
+			after := reopened.core.catalog.Snapshot()
 			if (phase == "staging" || phase == "marker") && after.ActiveMapSegmentID != before.ActiveMapSegmentID {
 				t.Fatalf("unpublished generation became visible: before=%d after=%d", before.ActiveMapSegmentID, after.ActiveMapSegmentID)
 			}

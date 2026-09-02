@@ -25,15 +25,15 @@ func TestCompactMarkerPublicationBoundary(t *testing.T) {
 	} {
 		t.Run(string(test.point), func(t *testing.T) {
 			store, source, id, _, _ := relocationFixture(t)
-			root := store.root
+			root := store.core.root
 			injected := errors.New("injected marker install failure")
-			store.maintenanceHook = func(got maintstate.FaultPoint) error {
+			store.maintenance.stateHook = func(got maintstate.FaultPoint) error {
 				if got == test.point {
 					return injected
 				}
 				return nil
 			}
-			_, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load())
+			_, err := store.compactSegmentLocked(context.Background(), source, store.maintenance.gcBytesPerSecond.Load())
 			if !errors.Is(err, injected) || errors.Is(err, base.ErrRecoveryRequired) != test.recoveryRequired {
 				t.Fatalf("compact err=%v recoveryRequired=%v", err, test.recoveryRequired)
 			}
@@ -48,7 +48,7 @@ func TestCompactMarkerPublicationBoundary(t *testing.T) {
 			if _, err := reopened.Get(context.Background(), id); err != nil {
 				t.Fatal(err)
 			}
-			if !containsSegmentID(reopened.catalog.Snapshot().SealedDataSegments, source) {
+			if !containsSegmentID(reopened.core.catalog.Snapshot().SealedDataSegments, source) {
 				t.Fatal("source retired before durable marker and Catalog transition")
 			}
 		})
@@ -58,16 +58,16 @@ func TestCompactMarkerPublicationBoundary(t *testing.T) {
 func TestCompactRetirementCASRejectsGenerationChangeAfterMarker(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	advanced := false
-	store.maintenanceHook = func(point maintstate.FaultPoint) error {
+	store.maintenance.stateHook = func(point maintstate.FaultPoint) error {
 		if point != maintstate.FaultBeforeJournalDirSync || advanced {
 			return nil
 		}
 		advanced = true
 		manifest := store.catalogSnapshot()
-		_, _, err := store.publisher.ReserveCompactionSegments(manifest.Generation, 1)
+		_, _, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
 		return err
 	}
-	if _, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrConflict) || errors.Is(err, base.ErrRecoveryRequired) {
+	if _, err := store.compactSegmentLocked(context.Background(), source, store.maintenance.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrConflict) || errors.Is(err, base.ErrRecoveryRequired) {
 		t.Fatalf("compact err=%v", err)
 	}
 	if !advanced {
@@ -76,7 +76,7 @@ func TestCompactRetirementCASRejectsGenerationChangeAfterMarker(t *testing.T) {
 	if !containsSegmentID(store.catalogSnapshot().SealedDataSegments, source) {
 		t.Fatal("stale proof retired source")
 	}
-	if _, err := os.Stat(maintstate.Path(store.root)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(maintstate.Path(store.core.root)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("maintenance marker remains: %v", err)
 	}
 	store.state.mu.Lock()
@@ -89,15 +89,15 @@ func TestCompactRetirementCASRejectsGenerationChangeAfterMarker(t *testing.T) {
 
 func TestCompactMarkerRemovalFailureRecovers(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
-	root := store.root
+	root := store.core.root
 	injected := errors.New("injected marker removal failure")
-	store.maintenanceHook = func(got maintstate.FaultPoint) error {
+	store.maintenance.stateHook = func(got maintstate.FaultPoint) error {
 		if got == maintstate.FaultBeforeMarkerRemove {
 			return injected
 		}
 		return nil
 	}
-	if _, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrRecoveryRequired) || !errors.Is(err, injected) {
+	if _, err := store.compactSegmentLocked(context.Background(), source, store.maintenance.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrRecoveryRequired) || !errors.Is(err, injected) {
 		t.Fatalf("compact err=%v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -108,7 +108,7 @@ func TestCompactMarkerRemovalFailureRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if containsSegmentID(reopened.catalog.Snapshot().SealedDataSegments, source) {
+	if containsSegmentID(reopened.core.catalog.Snapshot().SealedDataSegments, source) {
 		t.Fatal("retired source returned to Catalog")
 	}
 	if record, err := reopened.Get(context.Background(), id); err != nil || string(record.Value) != "source-value" {
@@ -145,7 +145,7 @@ func TestOpenRetriesEveryRetiredSegmentCleanupBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer reopened.Close()
-			if containsSegmentID(reopened.catalog.Snapshot().SealedDataSegments, source) {
+			if containsSegmentID(reopened.core.catalog.Snapshot().SealedDataSegments, source) {
 				t.Fatal("retired source returned to Catalog")
 			}
 			if record, err := reopened.Get(context.Background(), id); err != nil || string(record.Value) != "source-value" {
@@ -171,7 +171,7 @@ func TestOpenRetriesMaintenanceMarkerRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if containsSegmentID(reopened.catalog.Snapshot().SealedDataSegments, source) {
+	if containsSegmentID(reopened.core.catalog.Snapshot().SealedDataSegments, source) {
 		t.Fatal("retired source returned to Catalog")
 	}
 	if record, err := reopened.Get(context.Background(), id); err != nil || string(record.Value) != "source-value" {
@@ -186,13 +186,13 @@ func prepareCatalogRemovedRetirement(t *testing.T) (string, recordlog.SegmentID,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := maintstate.Install(store.root, retirementState(store, proof)); err != nil {
+	if err := maintstate.Install(store.core.root, retirementState(store, proof)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source); err != nil {
+	if _, err := store.core.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source); err != nil {
 		t.Fatal(err)
 	}
-	root := store.root
+	root := store.core.root
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}

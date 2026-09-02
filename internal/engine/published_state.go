@@ -164,8 +164,8 @@ func (p *PublishCoordinator) InstallDataRetire(expect uint64, update storecatalo
 }
 
 func (s *Store) PublishedState() *PublishedState {
-	if s != nil && s.publisher != nil {
-		return s.publisher.PublishedState()
+	if s != nil && s.core.publisher != nil {
+		return s.core.publisher.PublishedState()
 	}
 	return nil
 }
@@ -180,8 +180,8 @@ func clonePublishedState(state *PublishedState) *PublishedState {
 }
 
 func (s *Store) catalogSnapshot() storecatalog.Manifest {
-	if s.publisher != nil {
-		return s.publisher.Snapshot()
+	if s.core.publisher != nil {
+		return s.core.publisher.Snapshot()
 	}
-	return s.catalog.Snapshot()
+	return s.core.catalog.Snapshot()
 }

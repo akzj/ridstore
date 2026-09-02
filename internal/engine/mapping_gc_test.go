@@ -43,11 +43,11 @@ func TestCompactMappingSwitchesRuntimeAndSurvivesReopen(t *testing.T) {
 		}
 		want[uint64(id)] = value
 	}
-	before := store.catalog.Snapshot()
+	before := store.core.catalog.Snapshot()
 	if err := store.CompactMapping(ctx); err != nil {
 		t.Fatal(err)
 	}
-	after := store.catalog.Snapshot()
+	after := store.core.catalog.Snapshot()
 	if after.Generation <= before.Generation || after.CoveredCommitSeq != 40 ||
 		after.ActiveMapSegmentID < before.NextMapSegmentID || after.MappingRoot == before.MappingRoot {
 		t.Fatalf("before=%+v after=%+v", before, after)
@@ -74,7 +74,7 @@ func TestCompactMappingSwitchesRuntimeAndSurvivesReopen(t *testing.T) {
 	if err := store.CompactMapping(ctx); err != nil {
 		t.Fatal(err)
 	}
-	afterSecond := store.catalog.Snapshot()
+	afterSecond := store.core.catalog.Snapshot()
 	if afterSecond.ActiveMapSegmentID <= firstRewriteActive {
 		t.Fatalf("mapping segment ID was not advanced: first=%d second=%d", firstRewriteActive, afterSecond.ActiveMapSegmentID)
 	}
@@ -116,8 +116,8 @@ func TestCompactMappingSpaceAdmissionRejectsBeforeStaging(t *testing.T) {
 	}
 	defer store.Close()
 	id := createMappingGCRecord(t, ctx, store, "space-safe")
-	store.space = newSpaceGate(root, 1, time.Second, func(string) (uint64, error) { return 1, nil })
-	store.gcMinFreeBytes = 1
+	store.core.space = newSpaceGate(root, 1, time.Second, func(string) (uint64, error) { return 1, nil })
+	store.maintenance.gcMinFreeBytes = 1
 
 	if err := store.CompactMapping(ctx); !errors.Is(err, base.ErrInsufficientSpace) {
 		t.Fatalf("compact err=%v", err)
@@ -154,12 +154,12 @@ func TestCompactMappingAdmissionCountsLiveRecordInActiveSegment(t *testing.T) {
 	// remains the admission authority for the Mapping rewrite.
 	minimum := uint64(1)
 	free := uint64(config.HardLimits.SegmentSize) + minimum
-	store.space = newSpaceGate(root, 1, time.Second, func(string) (uint64, error) { return free, nil })
-	store.gcMinFreeBytes = minimum
+	store.core.space = newSpaceGate(root, 1, time.Second, func(string) (uint64, error) { return free, nil })
+	store.maintenance.gcMinFreeBytes = minimum
 	if err := store.CompactMapping(ctx); !errors.Is(err, base.ErrInsufficientSpace) {
 		t.Fatalf("compact err=%v", err)
 	}
-	manifest := store.catalog.Snapshot()
+	manifest := store.core.catalog.Snapshot()
 	if manifest.MappingEntryCount != 1 || len(manifest.SegmentStats) != 1 ||
 		manifest.SegmentStats[0].SegmentID != manifest.ActiveDataSegmentID || manifest.SegmentStats[0].LiveRecords != 1 {
 		t.Fatalf("entries=%d stats=%+v", manifest.MappingEntryCount, manifest.SegmentStats)
@@ -939,7 +939,7 @@ func createMultiFileMappingFixture(t *testing.T, ctx context.Context) (string, C
 	if err := store.Checkpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
-	manifest := store.catalog.Snapshot()
+	manifest := store.core.catalog.Snapshot()
 	if len(manifest.SealedMapSegments) == 0 {
 		t.Fatal("fixture did not create a multi-file Mapping generation")
 	}

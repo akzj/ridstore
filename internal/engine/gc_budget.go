@@ -37,11 +37,11 @@ type gcPacer struct {
 }
 
 func (s *Store) newGCPacer(rate uint64) gcPacer {
-	now := s.gcNow
+	now := s.maintenance.gcNow
 	if now == nil {
 		now = time.Now
 	}
-	wait := s.gcWait
+	wait := s.maintenance.gcWait
 	if wait == nil {
 		wait = waitContext
 	}
@@ -91,10 +91,10 @@ func (s *Store) reserveGCCopy(ctx context.Context, manifest storecatalog.Manifes
 }
 
 func (s *Store) reserveGCCopies(ctx context.Context, manifest storecatalog.Manifest, sources []recordlog.SegmentSummary) (*spaceReservation, error) {
-	if s.space == nil || s.gcMinFreeBytes == 0 {
+	if s.core.space == nil || s.maintenance.gcMinFreeBytes == 0 {
 		return nil, nil
 	}
-	if len(sources) == 0 || s.maxRelocationMutations == 0 || s.maxRelocationBytes == 0 {
+	if len(sources) == 0 || s.maintenance.maxRelocationMutations == 0 || s.maintenance.maxRelocationBytes == 0 {
 		return nil, base.ErrInvalidConfig
 	}
 	// One CommitGroup and one BatchID reserve Record per source Record is the
@@ -128,7 +128,7 @@ func (s *Store) reserveGCCopies(ctx context.Context, manifest storecatalog.Manif
 	if !ok {
 		return nil, base.ErrOverflow
 	}
-	reservation, err := s.space.reserveWithMinimum(ctx, estimate, s.gcMinFreeBytes, false)
+	reservation, err := s.core.space.reserveWithMinimum(ctx, estimate, s.maintenance.gcMinFreeBytes, false)
 	if errors.Is(err, base.ErrInsufficientSpace) {
 		s.metrics.gcSpaceRejections.Add(1)
 	}
@@ -136,7 +136,7 @@ func (s *Store) reserveGCCopies(ctx context.Context, manifest storecatalog.Manif
 }
 
 func (s *Store) reserveGCCheckpoint(ctx context.Context, manifest storecatalog.Manifest, entries uint64) (*spaceReservation, error) {
-	if s.space == nil || s.gcMinFreeBytes == 0 {
+	if s.core.space == nil || s.maintenance.gcMinFreeBytes == 0 {
 		return nil, nil
 	}
 	perEntry, ok := checkedGCMul(uint64(mapstore.MaxLevel)+1, uint64(mapstore.DenseNodeSize))
@@ -151,7 +151,7 @@ func (s *Store) reserveGCCheckpoint(ctx context.Context, manifest storecatalog.M
 	if !ok {
 		return nil, base.ErrOverflow
 	}
-	reservation, err := s.space.reserveWithMinimum(ctx, estimate, s.gcMinFreeBytes, false)
+	reservation, err := s.core.space.reserveWithMinimum(ctx, estimate, s.maintenance.gcMinFreeBytes, false)
 	if errors.Is(err, base.ErrInsufficientSpace) {
 		s.metrics.gcSpaceRejections.Add(1)
 	}
@@ -165,7 +165,7 @@ func (s *Store) reserveGCCheckpoint(ctx context.Context, manifest storecatalog.M
 // segment at its full configured size also covers headers, footers, and tail
 // slack without depending on the eventual sparse encoding.
 func (s *Store) reserveMappingGC(ctx context.Context, manifest storecatalog.Manifest, entries uint64) (*spaceReservation, error) {
-	if s.space == nil || s.gcMinFreeBytes == 0 {
+	if s.core.space == nil || s.maintenance.gcMinFreeBytes == 0 {
 		return nil, nil
 	}
 	nodes, ok := checkedGCMul(entries, uint64(mapstore.MaxLevel)+1)
@@ -192,7 +192,7 @@ func (s *Store) reserveMappingGC(ctx context.Context, manifest storecatalog.Mani
 	if !ok {
 		return nil, base.ErrOverflow
 	}
-	reservation, err := s.space.reserveWithMinimum(ctx, estimate, s.gcMinFreeBytes, false)
+	reservation, err := s.core.space.reserveWithMinimum(ctx, estimate, s.maintenance.gcMinFreeBytes, false)
 	if errors.Is(err, base.ErrInsufficientSpace) {
 		s.metrics.gcSpaceRejections.Add(1)
 	}

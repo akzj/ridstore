@@ -54,13 +54,13 @@ func (s *Store) CompactMapping(ctx context.Context) (err error) {
 	// Mapping rewrite is a low-priority COW phase. Serialize it with
 	// Checkpoint at the dispatcher boundary, but never use this gate to block
 	// foreground operations while the tree is rebuilt.
-	if s.maintScheduler == nil {
-		s.maintScheduler = &MaintenanceScheduler{}
+	if s.maintenance.scheduler == nil {
+		s.maintenance.scheduler = &MaintenanceScheduler{}
 	}
-	if err := s.maintScheduler.acquireMappingRewrite(ctx); err != nil {
+	if err := s.maintenance.scheduler.acquireMappingRewrite(ctx); err != nil {
 		return err
 	}
-	defer s.maintScheduler.releaseMappingRewrite()
+	defer s.maintenance.scheduler.releaseMappingRewrite()
 	return s.compactCheckpointMapping(ctx)
 }
 
@@ -68,22 +68,22 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if artifacts, err := maintstate.RecoveryArtifacts(s.root); err != nil {
+	if artifacts, err := maintstate.RecoveryArtifacts(s.core.root); err != nil {
 		return err
 	} else if artifacts {
 		return errors.Join(base.ErrRecoveryRequired, errors.New("data maintenance is active"))
 	}
-	if artifacts, err := compactionstate.RecoveryArtifacts(s.root); err != nil {
+	if artifacts, err := compactionstate.RecoveryArtifacts(s.core.root); err != nil {
 		return err
 	} else if artifacts {
 		return errors.Join(base.ErrRecoveryRequired, errors.New("data compaction is active"))
 	}
-	if artifacts, err := mapstore.RecoveryArtifacts(s.root); err != nil {
+	if artifacts, err := mapstore.RecoveryArtifacts(s.core.root); err != nil {
 		return err
 	} else if artifacts {
 		return errors.Join(base.ErrRecoveryRequired, errors.New("mapping rotation is active"))
 	}
-	if artifacts, err := mapgcstate.RecoveryArtifacts(s.root); err != nil {
+	if artifacts, err := mapgcstate.RecoveryArtifacts(s.core.root); err != nil {
 		return err
 	} else if artifacts {
 		return errors.Join(base.ErrRecoveryRequired, errors.New("mapping gc is active"))
@@ -99,7 +99,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return base.ErrInvalidConfig
 	}
 	manifest := published.Manifest.Clone()
-	view, err := s.mapping.CheckpointView()
+	view, err := s.core.mapping.CheckpointView()
 	if err != nil {
 		s.checkpoints.captureMu.Unlock()
 		return err
@@ -115,26 +115,26 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	}
 	spaceCommitted := false
 	defer func() { space.complete(spaceCommitted) }()
-	staging := mapgcstate.StagingRoot(s.root)
+	staging := mapgcstate.StagingRoot(s.core.root)
 	if err := os.Mkdir(staging, 0o700); err != nil {
 		return err
 	}
-	if err := syncEngineDirectory(s.root); err != nil {
-		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
+	if err := syncEngineDirectory(s.core.root); err != nil {
+		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root))
 	}
-	writer, err := mapstore.CreateGenerationWriter(staging, mapstore.StoreID(manifest.StoreUUID), uint32(manifest.HardLimits.SegmentSize), manifest.NextMapSegmentID, s.mapStoreHook)
+	writer, err := mapstore.CreateGenerationWriter(staging, mapstore.StoreID(manifest.StoreUUID), uint32(manifest.HardLimits.SegmentSize), manifest.NextMapSegmentID, s.maintenance.mapStoreHook)
 	if err != nil {
-		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
+		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root))
 	}
 	cleanupWriter := func(cause error) error {
-		cleanup := errors.Join(writer.Close(), discardMappingGCStaging(s.root))
+		cleanup := errors.Join(writer.Close(), discardMappingGCStaging(s.core.root))
 		if errors.Is(cause, mapping.ErrStalePlan) {
 			return s.mappingGCConflict(cause, cleanup)
 		}
 		return s.mappingGCPrepublishFailure(cause, cleanup)
 	}
 	rebuildStarted := time.Now()
-	builder, err := radix.NewRebuildBuilder(writer, manifest.CoveredCommitSeq, s.mappingCacheBytes)
+	builder, err := radix.NewRebuildBuilder(writer, manifest.CoveredCommitSeq, s.maintenance.mappingCacheBytes)
 	if err != nil {
 		return cleanupWriter(err)
 	}
@@ -180,7 +180,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	}
 	s.metrics.mappingGCVerifyNanos.Add(uint64(time.Since(verifyStarted)))
 	if err := writer.Close(); err != nil {
-		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.root))
+		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root))
 	}
 
 	// Publication and recovery-marker cleanup remain serialized with
@@ -194,13 +194,13 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		s.checkpoints.captureMu.Unlock()
 	}
 	latest := s.catalogSnapshot()
-	currentView, currentErr := s.mapping.CheckpointView()
+	currentView, currentErr := s.core.mapping.CheckpointView()
 	if currentErr != nil || currentView.Root() != latest.MappingRoot || currentView.Covered() != latest.CoveredCommitSeq {
 		unlockPublication()
 		if currentErr == nil {
 			currentErr = base.ErrCorrupt
 		}
-		return s.mappingGCPrepublishFailure(currentErr, discardMappingGCStaging(s.root))
+		return s.mappingGCPrepublishFailure(currentErr, discardMappingGCStaging(s.core.root))
 	}
 	oldSet := mappingGCFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot)
 	// Data-segment rotations advance the global Catalog generation without
@@ -210,7 +210,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
 		!manifestMatchesMappingSet(latest, oldSet) {
 		unlockPublication()
-		return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.root))
+		return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.core.root))
 	}
 	defer unlockPublication()
 	state := mapgcstate.State{
@@ -219,24 +219,24 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		Old: oldSet,
 		New: mapgcstate.FileSet{Sealed: generation.SealedSegments, Active: generation.ActiveSegment, Next: generation.NextSegment, Root: generation.Root},
 	}
-	if err := mapgcstate.Install(s.root, state, s.mappingGCHook); err != nil {
-		cleanupErr := discardMappingGCStaging(s.root)
+	if err := mapgcstate.Install(s.core.root, state, s.maintenance.mappingGCHook); err != nil {
+		cleanupErr := discardMappingGCStaging(s.core.root)
 		if cleanupErr == nil {
-			cleanupErr = mapgcstate.Remove(s.root, s.mappingGCHook)
+			cleanupErr = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
 		}
 		return s.mappingGCPrepublishFailure(err, cleanupErr)
 	}
 	rollback := func(cause error) error {
-		cleanupErr := mapstore.RollbackGeneration(s.root, staging, generation, s.mapStoreHook)
+		cleanupErr := mapstore.RollbackGeneration(s.core.root, staging, generation, s.maintenance.mapStoreHook)
 		if cleanupErr == nil {
-			cleanupErr = mapgcstate.Remove(s.root, s.mappingGCHook)
+			cleanupErr = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
 		}
 		return s.mappingGCPrepublishFailure(cause, cleanupErr)
 	}
-	if err := mapstore.PromoteGeneration(s.root, staging, generation, s.mapStoreHook); err != nil {
+	if err := mapstore.PromoteGeneration(s.core.root, staging, generation, s.maintenance.mapStoreHook); err != nil {
 		return rollback(err)
 	}
-	installed, err := s.publisher.InstallMappingRewrite(latest, storecatalog.MappingRewrite{
+	installed, err := s.core.publisher.InstallMappingRewrite(latest, storecatalog.MappingRewrite{
 		SealedSegments: mappingGCSummaries(generation.SealedSegments), ActiveSegment: generation.ActiveSegment,
 		NextSegment: generation.NextSegment, Root: generation.Root, Covered: generation.Covered,
 	})
@@ -245,39 +245,39 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return errors.Join(base.ErrReadOnly, err)
 	}
 
-	newStore, err := mapstore.OpenWithFaultHook(s.root, s.publisher, s.mapStoreHook)
+	newStore, err := mapstore.OpenWithFaultHook(s.core.root, s.core.publisher, s.maintenance.mapStoreHook)
 	if err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	newRoot, err := radix.Open(newStore, installed.MappingRoot, installed.CoveredCommitSeq, s.mappingCacheBytes)
-	if err != nil {
-		_ = newStore.Close()
-		s.setFault(err)
-		return errors.Join(base.ErrReadOnly, err)
-	}
-	drained, err := s.mapping.ReplaceCheckpointRoot(view, newRoot, newStore)
+	newRoot, err := radix.Open(newStore, installed.MappingRoot, installed.CoveredCommitSeq, s.maintenance.mappingCacheBytes)
 	if err != nil {
 		_ = newStore.Close()
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	oldStore := s.mapStore
-	s.mapStore = newStore
+	drained, err := s.core.mapping.ReplaceCheckpointRoot(view, newRoot, newStore)
+	if err != nil {
+		_ = newStore.Close()
+		s.setFault(err)
+		return errors.Join(base.ErrReadOnly, err)
+	}
+	oldStore := s.core.mapStore
+	s.core.mapStore = newStore
 	<-drained
 	if err := oldStore.Close(); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	if err := mapstore.RetireGeneration(s.root, generationFromState(state.Old, state.Covered), installed.Generation, s.mapStoreHook); err != nil {
+	if err := mapstore.RetireGeneration(s.core.root, generationFromState(state.Old, state.Covered), installed.Generation, s.maintenance.mapStoreHook); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	if err := mapstore.RemoveGenerationStaging(s.root, staging); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := mapstore.RemoveGenerationStaging(s.core.root, staging); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	if err := mapgcstate.Remove(s.root, s.mappingGCHook); err != nil {
+	if err := mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}

@@ -59,7 +59,7 @@ func (s *Store) Metrics() Metrics {
 	if s == nil {
 		return Metrics{}
 	}
-	commit := s.commits.Metrics()
+	commit := s.core.commits.Metrics()
 	result := Metrics{
 		CommitQueued: commit.CommitQueued, CommitGroups: commit.CommitGroups, GroupBatches: commit.GroupBatches,
 		Committed: s.metrics.committed.Load(), Aborted: s.metrics.aborted.Load(), Conflicts: commit.Conflicts,
@@ -84,24 +84,24 @@ func (s *Store) Metrics() Metrics {
 		GCSpaceRejections: s.metrics.gcSpaceRejections.Load(),
 		GCCommitRedirects: s.metrics.gcCommitRedirects.Load(), GCCommitRedirectWaitNanos: s.metrics.gcCommitRedirectWaitNanos.Load(),
 		GCCommitRedirectAdmissionNanos: s.metrics.gcCommitRedirectAdmissionNanos.Load(), GCOpenRefsRedirected: s.metrics.gcOpenRefsRedirected.Load(),
-		GCMinFreeBytes:                s.gcMinFreeBytes,
-		GCBytesPerSecond:              s.gcBytesPerSecond.Load(),
+		GCMinFreeBytes:                s.maintenance.gcMinFreeBytes,
+		GCBytesPerSecond:              s.maintenance.gcBytesPerSecond.Load(),
 		BackgroundCheckpointRequested: s.metrics.backgroundCheckpointRequested.Load(),
 		BackgroundCheckpointCompleted: s.metrics.backgroundCheckpointCompleted.Load(),
 		BackgroundCheckpointFailed:    s.metrics.backgroundCheckpointFailed.Load(),
 	}
-	if s.log != nil {
-		status := s.log.Status()
+	if s.core.log != nil {
+		status := s.core.log.Status()
 		result.RecordLogRotations = status.RotationCalls
 		result.RecordLogRotationNanos = status.RotationNanos
 		result.RecordLogRotationMaxNanos = status.RotationMaxNanos
 	}
-	if s.mapping != nil {
-		result.DeltaChargedBytes, result.DeltaReservedBytes, result.DeltaSoftLimitBytes, result.DeltaHardLimitBytes = s.mapping.DeltaUsage()
-		result.MappingCacheBytes = s.mapping.CacheBytes()
+	if s.core.mapping != nil {
+		result.DeltaChargedBytes, result.DeltaReservedBytes, result.DeltaSoftLimitBytes, result.DeltaHardLimitBytes = s.core.mapping.DeltaUsage()
+		result.MappingCacheBytes = s.core.mapping.CacheBytes()
 	}
-	if s.space != nil {
-		space := s.space.snapshot()
+	if s.core.space != nil {
+		space := s.core.space.snapshot()
 		result.DiskAvailableEstimateBytes = space.available
 		result.WriteStopFreeBytes = space.minimum
 		result.WriteStopRejections = space.rejections

@@ -23,7 +23,7 @@ func TestMaintenanceRecoveryAcrossProcessExit(t *testing.T) {
 	for _, phase := range []string{"marker", "catalog", "trash", "deleted"} {
 		t.Run(phase, func(t *testing.T) {
 			store, source, id, _, _ := relocationFixture(t)
-			root := store.root
+			root := store.core.root
 			if err := store.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -43,7 +43,7 @@ func TestMaintenanceRecoveryAcrossProcessExit(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer reopened.Close()
-			present := containsSegmentID(reopened.catalog.Snapshot().SealedDataSegments, source)
+			present := containsSegmentID(reopened.core.catalog.Snapshot().SealedDataSegments, source)
 			if present != (phase == "marker") {
 				t.Fatalf("source present=%v phase=%s", present, phase)
 			}
@@ -81,7 +81,7 @@ func TestMaintenanceCrashHelper(t *testing.T) {
 	if phase == "marker" {
 		os.Exit(0)
 	}
-	manifest, err := store.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source)
+	manifest, err := store.core.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source)
 	if err != nil {
 		t.Fatal(err)
 	}

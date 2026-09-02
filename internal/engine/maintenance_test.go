@@ -11,7 +11,7 @@ import (
 
 func TestOpenRollsBackPreparedRetirementWhenCatalogStillOwnsSource(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
-	root := store.root
+	root := store.core.root
 	proof, _, err := store.PrepareSegmentRetirement(context.Background(), source)
 	if err != nil {
 		t.Fatal(err)
@@ -27,7 +27,7 @@ func TestOpenRollsBackPreparedRetirementWhenCatalogStillOwnsSource(t *testing.T)
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if !containsSealedSegment(reopened.catalog.Snapshot(), proof.Source) {
+	if !containsSealedSegment(reopened.core.catalog.Snapshot(), proof.Source) {
 		t.Fatal("prepared retirement removed Catalog source")
 	}
 	if _, err := os.Stat(maintstate.Path(root)); !errors.Is(err, os.ErrNotExist) {
@@ -37,7 +37,7 @@ func TestOpenRollsBackPreparedRetirementWhenCatalogStillOwnsSource(t *testing.T)
 
 func TestOpenFinishesRetirementAfterDurableCatalogRemoval(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
-	root := store.root
+	root := store.core.root
 	proof, _, err := store.PrepareSegmentRetirement(context.Background(), source)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestOpenFinishesRetirementAfterDurableCatalogRemoval(t *testing.T) {
 	if err := maintstate.Install(root, retirementState(store, proof)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source); err != nil {
+	if _, err := store.core.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -56,7 +56,7 @@ func TestOpenFinishesRetirementAfterDurableCatalogRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if containsSealedSegment(reopened.catalog.Snapshot(), proof.Source) {
+	if containsSealedSegment(reopened.core.catalog.Snapshot(), proof.Source) {
 		t.Fatal("retired source returned to Catalog")
 	}
 	record, err := reopened.Get(context.Background(), id)
@@ -72,7 +72,7 @@ func TestRetirementRecoveryAllowsInterveningDataRotations(t *testing.T) {
 	for _, published := range []bool{false, true} {
 		t.Run(map[bool]string{false: "rollback", true: "finish"}[published], func(t *testing.T) {
 			store, source, id, _, _ := relocationFixture(t)
-			root := store.root
+			root := store.core.root
 			proof, _, err := store.PrepareSegmentRetirement(context.Background(), source)
 			if err != nil {
 				t.Fatal(err)
@@ -81,7 +81,7 @@ func TestRetirementRecoveryAllowsInterveningDataRotations(t *testing.T) {
 				t.Fatal(err)
 			}
 			if published {
-				if _, err := store.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source); err != nil {
+				if _, err := store.core.catalog.RemoveRecordLogSegment(proof.CatalogGeneration, proof.Source); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -95,7 +95,7 @@ func TestRetirementRecoveryAllowsInterveningDataRotations(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer reopened.Close()
-			if containsSealedSegment(reopened.catalog.Snapshot(), proof.Source) != !published {
+			if containsSealedSegment(reopened.core.catalog.Snapshot(), proof.Source) != !published {
 				t.Fatalf("published=%v source membership mismatch", published)
 			}
 			record, err := reopened.Get(context.Background(), id)
@@ -110,7 +110,7 @@ func TestRetirementRecoveryAllowsInterveningDataRotations(t *testing.T) {
 }
 
 func retirementState(store *Store, proof SegmentRetirementProof) maintstate.State {
-	manifest := store.catalog.Snapshot()
+	manifest := store.core.catalog.Snapshot()
 	return maintstate.State{
 		Operation: maintstate.DataRetire, StoreUUID: manifest.StoreUUID, LogID: manifest.RecordLogID,
 		BaseGeneration: proof.CatalogGeneration, CoveredCommitSeq: proof.CoveredCommitSeq,

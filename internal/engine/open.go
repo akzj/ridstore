@@ -239,17 +239,17 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return fail(err)
 	}
-	store.mapStore = physicalMapping
-	store.catalog = catalog
-	store.publisher = publisher
-	store.maintenance = log
+	store.core.mapStore = physicalMapping
+	store.core.catalog = catalog
+	store.core.publisher = publisher
+	store.core.compactionLog = log
 	if config.WriteStopFreeBytes != 0 {
-		store.space = newSpaceGate(root, config.WriteStopFreeBytes, config.SpaceCheckInterval, filesystemAvailable)
-		store.userAppender = &spaceAppender{next: log, gate: store.space}
+		store.core.space = newSpaceGate(root, config.WriteStopFreeBytes, config.SpaceCheckInterval, filesystemAvailable)
+		store.core.userAppender = &spaceAppender{next: log, gate: store.core.space}
 	}
-	store.maintenanceHook = hooks.maintenance
-	store.mapStoreHook = hooks.mapStore
-	store.mappingGCHook = hooks.mapGC
+	store.maintenance.stateHook = hooks.maintenance
+	store.maintenance.mapStoreHook = hooks.mapStore
+	store.maintenance.mappingGCHook = hooks.mapGC
 	for _, id := range recovered.StatusOrder {
 		status := recovered.Statuses[id]
 		state := BatchStateAborted
@@ -262,22 +262,22 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.state.recoveryAbortedStart = manifest.IssuedBatchIDHighAtCut
 	store.state.recoveryAbortedEnd = recovered.ReservedBatchIDHigh
 	store.state.recoveryAbortedValid = store.state.recoveryAbortedStart < store.state.recoveryAbortedEnd
-	store.root = root
-	store.maxStats = config.MaxSegmentStats
-	store.mappingCacheBytes = config.MappingCacheBytes
-	store.maxRelocationBytes = config.GCBatchBytes
-	store.maxRelocationMutations = min(store.maxRelocationMutations, config.GCBatchMutations)
-	store.gcMinFreeBytes = config.GCMinFreeBytes
-	store.gcBytesPerSecond.Store(config.GCBytesPerSecond)
-	store.gcNow = time.Now
-	store.gcWait = waitContext
+	store.core.root = root
+	store.maintenance.maxStats = config.MaxSegmentStats
+	store.maintenance.mappingCacheBytes = config.MappingCacheBytes
+	store.maintenance.maxRelocationBytes = config.GCBatchBytes
+	store.maintenance.maxRelocationMutations = min(store.maintenance.maxRelocationMutations, config.GCBatchMutations)
+	store.maintenance.gcMinFreeBytes = config.GCMinFreeBytes
+	store.maintenance.gcBytesPerSecond.Store(config.GCBytesPerSecond)
+	store.maintenance.gcNow = time.Now
+	store.maintenance.gcWait = waitContext
 	store.checkpoints.interval = config.CheckpointInterval
-	store.dirLock = dirLock
+	store.core.dirLock = dirLock
 	runtimeOwnsLock = true
-	store.identity = [16]byte(manifest.StoreUUID)
+	store.core.identity = [16]byte(manifest.StoreUUID)
 	initialPublished := catalog.Snapshot()
 	publisher.publish(initialPublished)
-	store.gcStability.sample(initialPublished, store.gcNow())
+	store.maintenance.gcStability.sample(initialPublished, store.maintenance.gcNow())
 	store.startCheckpointWorker()
 	if pendingCompaction != nil {
 		if err := store.resumeCompaction(ctx, *pendingCompaction); err != nil {

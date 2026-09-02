@@ -229,8 +229,8 @@ func TestCommitAdvancesCheckpointUnderDeltaHardPressure(t *testing.T) {
 	if _, err := second.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if store.mapping.CoveredCommitSeq() != 2 {
-		t.Fatalf("covered=%d", store.mapping.CoveredCommitSeq())
+	if store.core.mapping.CoveredCommitSeq() != 2 {
+		t.Fatalf("covered=%d", store.core.mapping.CoveredCommitSeq())
 	}
 	for id, want := range map[model.ID]string{firstID: "first", secondID: "second"} {
 		record, err := store.Get(context.Background(), id)
@@ -281,8 +281,8 @@ func TestDeltaSoftPressureSchedulesBackgroundCheckpoint(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	record, err := store.Get(context.Background(), id)
-	if err != nil || string(record.Value) != "value" || store.mapping.CoveredCommitSeq() != 1 {
-		t.Fatalf("record=%+v covered=%d err=%v", record, store.mapping.CoveredCommitSeq(), err)
+	if err != nil || string(record.Value) != "value" || store.core.mapping.CoveredCommitSeq() != 1 {
+		t.Fatalf("record=%+v covered=%d err=%v", record, store.core.mapping.CoveredCommitSeq(), err)
 	}
 }
 
@@ -363,7 +363,7 @@ func TestCheckpointPressureWaitHonorsCallerCancellation(t *testing.T) {
 	store.checkpoints.captureMu.Unlock()
 	locked = false
 	deadline := time.Now().Add(2 * time.Second)
-	for store.mapping.CoveredCommitSeq() == 0 {
+	for store.core.mapping.CoveredCommitSeq() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("shared checkpoint stopped after waiter cancellation")
 		}

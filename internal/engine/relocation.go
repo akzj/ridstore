@@ -99,7 +99,7 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 		return SegmentRelocationResult{}, err
 	}
 	defer s.releaseDataMaintenance()
-	rate := s.gcBytesPerSecond.Load()
+	rate := s.maintenance.gcBytesPerSecond.Load()
 	return s.relocateSegment(ctx, source, rate)
 }
 
@@ -125,7 +125,7 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
 	}
 	defer s.releaseDataMaintenance()
-	rate := s.gcBytesPerSecond.Load()
+	rate := s.maintenance.gcBytesPerSecond.Load()
 	relocated, err := s.relocateSegment(ctx, source, rate)
 	if err != nil {
 		return SegmentRetirementProof{}, relocated, err
@@ -156,7 +156,7 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		return SegmentCompactionResult{}, err
 	}
 	defer s.releaseDataMaintenance()
-	rate := s.gcBytesPerSecond.Load()
+	rate := s.maintenance.gcBytesPerSecond.Load()
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
 	manifest := s.catalogSnapshot()
@@ -192,7 +192,7 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 		return NextSegmentCompactionResult{}, false, err
 	}
 	defer s.releaseDataMaintenance()
-	rate := s.gcBytesPerSecond.Load()
+	rate := s.maintenance.gcBytesPerSecond.Load()
 	selectCandidate := func() (SegmentCompactionCandidate, bool, error) {
 		published := s.PublishedState()
 		if published == nil {
@@ -204,11 +204,11 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 			return SegmentCompactionCandidate{}, false, fmt.Errorf("collect open batch compaction-output references: %w", err)
 		}
 		now := time.Now()
-		if s.gcNow != nil {
-			now = s.gcNow()
+		if s.maintenance.gcNow != nil {
+			now = s.maintenance.gcNow()
 		}
 		return selectCompactionCandidate(manifest, policy, excluded, func(id recordlog.SegmentID) (gcStabilityView, bool) {
-			return s.gcStability.view(id, now, policy)
+			return s.maintenance.gcStability.view(id, now, policy)
 		})
 	}
 	// A durable checkpoint remains an exact scheduling snapshot until replaced.
@@ -252,7 +252,7 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 // segment throughout copying and CAS publication.
 func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.SegmentSummary, rate uint64) (SegmentCompactionResult, error) {
 	var result SegmentCompactionResult
-	if len(inputs) == 0 || s.catalog == nil || s.maintenance == nil {
+	if len(inputs) == 0 || s.core.catalog == nil || s.core.compactionLog == nil {
 		return result, base.ErrInvalidConfig
 	}
 	published := s.PublishedState()
@@ -283,13 +283,13 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	}
 	state := compactionstate.State{Phase: compactionstate.PhaseReserved, StoreUUID: reserved.StoreUUID,
 		LogID: reserved.RecordLogID, BaseGeneration: reserved.Generation, Inputs: append([]recordlog.SegmentSummary(nil), inputs...), OutputIDs: outputIDs}
-	if err := compactionstate.Install(s.root, state); err != nil {
+	if err := compactionstate.Install(s.core.root, state); err != nil {
 		return result, errors.Join(base.ErrRecoveryRequired, err)
 	}
 	rollbackUnpublished := func(writer *recordlog.CompactionWriter, cause error) error {
-		cleanupErr := errors.Join(writer.Abort(), s.maintenance.RemoveUnpublishedCompactionFiles(outputIDs))
+		cleanupErr := errors.Join(writer.Abort(), s.core.compactionLog.RemoveUnpublishedCompactionFiles(outputIDs))
 		if cleanupErr == nil {
-			cleanupErr = compactionstate.Remove(s.root)
+			cleanupErr = compactionstate.Remove(s.core.root)
 		}
 		if cleanupErr != nil {
 			return s.compactionFailure(errors.Join(cause, cleanupErr))
@@ -297,7 +297,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 		return cause
 	}
 
-	writer, err := s.maintenance.NewCompactionWriter(outputIDs)
+	writer, err := s.core.compactionLog.NewCompactionWriter(outputIDs)
 	if err != nil {
 		return result, rollbackUnpublished(nil, err)
 	}
@@ -306,7 +306,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	pendingOrigins := make(map[recordlog.VAddr]recordlog.VAddr, len(pending.refs))
 	var unpacedBytes uint64
 	paceCopy := func(force bool) error {
-		if unpacedBytes == 0 || !force && unpacedBytes < s.maxRelocationBytes {
+		if unpacedBytes == 0 || !force && unpacedBytes < s.maintenance.maxRelocationBytes {
 			return nil
 		}
 		waited, paceErr := copyPacer.pace(ctx, unpacedBytes)
@@ -317,7 +317,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 		return paceErr
 	}
 	for _, input := range inputs {
-		err = s.maintenance.ScanSegment(ctx, input.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
+		err = s.core.compactionLog.ScanSegment(ctx, input.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
 			result.Relocation.ScannedRecords++
 			typ, decodeErr := recordcodec.TypeOf(payload)
 			if decodeErr != nil {
@@ -331,7 +331,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 			if decodeErr != nil {
 				return errors.Join(base.ErrCorrupt, decodeErr)
 			}
-			current, exists, lookupErr := s.mapping.LookupRef(put.RecordID)
+			current, exists, lookupErr := s.core.mapping.LookupRef(put.RecordID)
 			if lookupErr != nil {
 				return lookupErr
 			}
@@ -387,12 +387,12 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 		if _, err = s.installCompactionOutputs(outputs); err != nil {
 			return result, s.compactionFailure(err)
 		}
-		if err = s.maintenance.RegisterCompactionOutputs(outputs); err != nil {
+		if err = s.core.compactionLog.RegisterCompactionOutputs(outputs); err != nil {
 			return result, s.compactionFailure(err)
 		}
 	}
 	state.Phase = compactionstate.PhaseOutputsPublished
-	if err = compactionstate.Update(s.root, state); err != nil {
+	if err = compactionstate.Update(s.core.root, state); err != nil {
 		return result, s.compactionFailure(err)
 	}
 
@@ -418,13 +418,13 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 		return result, s.compactionFailure(err)
 	}
 	state.Phase = compactionstate.PhaseInputsRetired
-	if err = compactionstate.Update(s.root, state); err != nil {
+	if err = compactionstate.Update(s.core.root, state); err != nil {
 		return result, s.compactionFailure(err)
 	}
-	if err = s.maintenance.FinalizeCompactionRetirement(ctx, inputs, installed.Generation); err != nil {
+	if err = s.core.compactionLog.FinalizeCompactionRetirement(ctx, inputs, installed.Generation); err != nil {
 		return result, s.compactionFailure(err)
 	}
-	if err = compactionstate.Remove(s.root); err != nil {
+	if err = compactionstate.Remove(s.core.root); err != nil {
 		return result, s.compactionFailure(err)
 	}
 	space.complete(true)
@@ -439,7 +439,7 @@ func (s *Store) reserveCompactionOutputIDs(inputs []recordlog.SegmentSummary, co
 				return storecatalog.Manifest{}, nil, recordlog.ErrSegmentMissing
 			}
 		}
-		installed, ids, err := s.publisher.ReserveCompactionSegments(current.Generation, count)
+		installed, ids, err := s.core.publisher.ReserveCompactionSegments(current.Generation, count)
 		if errors.Is(err, storecatalog.ErrConflict) {
 			continue
 		}
@@ -451,7 +451,7 @@ func (s *Store) reserveCompactionOutputIDs(inputs []recordlog.SegmentSummary, co
 func (s *Store) installCompactionOutputs(outputs []recordlog.SegmentSummary) (storecatalog.Manifest, error) {
 	for attempt := 0; attempt < 32; attempt++ {
 		current := s.catalogSnapshot()
-		installed, err := s.publisher.InstallCompactionOutputs(current.Generation, outputs)
+		installed, err := s.core.publisher.InstallCompactionOutputs(current.Generation, outputs)
 		if errors.Is(err, storecatalog.ErrConflict) {
 			continue
 		}
@@ -465,7 +465,7 @@ func (s *Store) installCompactionRetirement(inputs []recordlog.SegmentSummary, p
 	if err != nil {
 		return storecatalog.Manifest{}, err
 	}
-	installed, err := s.publisher.InstallDataCompaction(manifest.Generation, inputs, manifest.CoveredCommitSeq, manifest.ReplayStart)
+	installed, err := s.core.publisher.InstallDataCompaction(manifest.Generation, inputs, manifest.CoveredCommitSeq, manifest.ReplayStart)
 	if errors.Is(err, storecatalog.ErrConflict) {
 		err = errors.Join(base.ErrConflict, err)
 	}
@@ -484,8 +484,8 @@ func (s *Store) compactionFailure(err error) error {
 func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord, result *SegmentRelocationResult) error {
 	for len(copied) != 0 {
 		count, bytes := 0, uint64(0)
-		maxCount := min(len(copied), int(min(s.state.limits.MaxBatchMutations, s.maxRelocationMutations)))
-		maxBytes := min(s.state.limits.MaxBatchBytes, s.maxRelocationBytes)
+		maxCount := min(len(copied), int(min(s.state.limits.MaxBatchMutations, s.maintenance.maxRelocationMutations)))
+		maxBytes := min(s.state.limits.MaxBatchBytes, s.maintenance.maxRelocationBytes)
 		for count < maxCount && (count == 0 || copied[count].valueBytes <= maxBytes-bytes) {
 			bytes += copied[count].valueBytes
 			count++
@@ -499,7 +499,7 @@ func (s *Store) publishCopiedRecords(ctx context.Context, copied []copiedRecord,
 		for i, item := range batch {
 			changes[i] = mapping.Change{RecordID: item.id, ExpectedOldAddr: item.oldAddr, NewRef: item.newRef, Operation: mapping.OperationRelocate}
 		}
-		rawBatchID, err := s.batches.Allocate(ctx)
+		rawBatchID, err := s.core.batches.Allocate(ctx)
 		if err != nil {
 			return err
 		}
@@ -531,7 +531,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 	for _, source := range pendingOrigins {
 		pendingSources[source] = struct{}{}
 	}
-	capacity := int(min(s.state.limits.MaxBatchMutations, s.maxRelocationMutations))
+	capacity := int(min(s.state.limits.MaxBatchMutations, s.maintenance.maxRelocationMutations))
 	if capacity == 0 {
 		return base.ErrInvalidConfig
 	}
@@ -551,7 +551,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 		return nil
 	}
 	for _, output := range outputs {
-		if err := s.maintenance.ScanSegment(ctx, output.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
+		if err := s.core.compactionLog.ScanSegment(ctx, output.SegmentID, func(scanned recordlog.AppendResult, payload []byte) error {
 			typ, err := recordcodec.TypeOf(payload)
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
@@ -563,7 +563,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
 			}
-			current, exists, err := s.mapping.LookupRef(put.RecordID)
+			current, exists, err := s.core.mapping.LookupRef(put.RecordID)
 			if err != nil {
 				return err
 			}
@@ -592,7 +592,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 				return nil
 			}
 			if verifySourcePayload {
-				sourcePayload, readErr := s.log.Read(ctx, current.Addr)
+				sourcePayload, readErr := s.core.log.Read(ctx, current.Addr)
 				if readErr != nil {
 					return readErr
 				}
@@ -606,7 +606,7 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 				return nil
 			}
 			valueBytes := uint64(len(put.Value))
-			exceedsBytes := valueBytes > s.maxRelocationBytes || pendingBytes > s.maxRelocationBytes-valueBytes
+			exceedsBytes := valueBytes > s.maintenance.maxRelocationBytes || pendingBytes > s.maintenance.maxRelocationBytes-valueBytes
 			if len(pending) != 0 && (len(pending) == capacity || exceedsBytes) {
 				if err := flush(); err != nil {
 					return err
@@ -682,7 +682,7 @@ func (s *Store) rewriteOpenBatchCompactionRefs(ctx context.Context, batches []*B
 		return nil
 	}
 	waitStarted := time.Now()
-	installed, err := s.commits.InstallCommitRedirects(ctx, redirects)
+	installed, err := s.core.commits.InstallCommitRedirects(ctx, redirects)
 	if err != nil {
 		return err
 	}
@@ -772,8 +772,8 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		BaseGeneration: proof.ManifestGeneration, CoveredCommitSeq: proof.CoveredCommitSeq,
 		ReplayStart: manifest.ReplayStart, Source: proof.Source,
 	}
-	if err := maintstate.InstallWithFaultHook(s.root, state, s.maintenanceHook); err != nil {
-		_, markerVisible, loadErr := maintstate.Load(s.root)
+	if err := maintstate.InstallWithFaultHook(s.core.root, state, s.maintenance.stateHook); err != nil {
+		_, markerVisible, loadErr := maintstate.Load(s.core.root)
 		if loadErr != nil || markerVisible {
 			recoveryErr := errors.Join(base.ErrRecoveryRequired, err, loadErr)
 			s.setFault(recoveryErr)
@@ -781,7 +781,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		}
 		return result, err
 	}
-	installed, err := s.publisher.InstallDataRetire(proof.ManifestGeneration, storecatalog.DataRetire{
+	installed, err := s.core.publisher.InstallDataRetire(proof.ManifestGeneration, storecatalog.DataRetire{
 		Source: proof.Source, CoveredCommitSeq: proof.CoveredCommitSeq, ReplayStart: proof.ReplayStart,
 	})
 	if err != nil {
@@ -790,7 +790,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		}
 		current := s.catalogSnapshot()
 		if current.Generation >= manifest.Generation && containsSealedSegment(current, proof.Source) {
-			cleanupErr := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook)
+			cleanupErr := maintstate.RemoveWithFaultHook(s.core.root, s.maintenance.stateHook)
 			if cleanupErr == nil {
 				return result, err
 			}
@@ -802,12 +802,12 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		s.setFault(recoveryErr)
 		return result, recoveryErr
 	}
-	if err := s.maintenance.FinalizeCompactionRetirement(ctx, []recordlog.SegmentSummary{proof.Source}, installed.Generation); err != nil {
+	if err := s.core.compactionLog.FinalizeCompactionRetirement(ctx, []recordlog.SegmentSummary{proof.Source}, installed.Generation); err != nil {
 		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
 		s.setFault(recoveryErr)
 		return result, recoveryErr
 	}
-	if err := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook); err != nil {
+	if err := maintstate.RemoveWithFaultHook(s.core.root, s.maintenance.stateHook); err != nil {
 		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
 		s.setFault(recoveryErr)
 		return result, recoveryErr
@@ -938,7 +938,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 			return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("open batch references source segment"))
 		}
 	}
-	if commitFault := s.commits.Fault(); commitFault != nil {
+	if commitFault := s.core.commits.Fault(); commitFault != nil {
 		return SegmentRetirementProof{}, errors.Join(base.ErrReadOnly, commitFault)
 	}
 
@@ -958,7 +958,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 		return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("segment stats are not complete at checkpoint boundary"))
 	}
 	if scanMapping {
-		err := s.maintenance.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
+		err := s.core.compactionLog.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
 			typ, err := recordcodec.TypeOf(payload)
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
@@ -970,7 +970,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 			if err != nil {
 				return errors.Join(base.ErrCorrupt, err)
 			}
-			current, exists, err := s.mapping.Lookup(put.RecordID)
+			current, exists, err := s.core.mapping.Lookup(put.RecordID)
 			if err != nil {
 				return err
 			}
@@ -1011,10 +1011,10 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 	if fault != nil {
 		return SegmentRelocationResult{}, errors.Join(base.ErrReadOnly, fault)
 	}
-	if commitFault := s.commits.Fault(); commitFault != nil {
+	if commitFault := s.core.commits.Fault(); commitFault != nil {
 		return SegmentRelocationResult{}, errors.Join(base.ErrReadOnly, commitFault)
 	}
-	if s.catalog == nil || s.maintenance == nil || s.maxRelocationMutations == 0 {
+	if s.core.catalog == nil || s.core.compactionLog == nil || s.maintenance.maxRelocationMutations == 0 {
 		return SegmentRelocationResult{}, base.ErrInvalidConfig
 	}
 	manifest := s.catalogSnapshot()
@@ -1031,7 +1031,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 	defer space.complete(false)
 
 	var result SegmentRelocationResult
-	pending := make([]copiedRecord, 0, min(s.state.limits.MaxBatchMutations, s.maxRelocationMutations))
+	pending := make([]copiedRecord, 0, min(s.state.limits.MaxBatchMutations, s.maintenance.maxRelocationMutations))
 	var pendingBytes uint64
 	var pendingPhysical uint64
 	pacer := s.newGCPacer(rate)
@@ -1042,7 +1042,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		// Segment scan order is physical append order, while Mapping proposals
 		// require changes to be strictly ordered by RecordID.
 		sort.Slice(pending, func(i, j int) bool { return pending[i].id < pending[j].id })
-		rawBatchID, err := s.batches.Allocate(ctx)
+		rawBatchID, err := s.core.batches.Allocate(ctx)
 		if err != nil {
 			return err
 		}
@@ -1081,7 +1081,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		return nil
 	}
 
-	err = s.maintenance.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
+	err = s.core.compactionLog.ScanSegment(ctx, source, func(scanned recordlog.AppendResult, payload []byte) error {
 		result.ScannedRecords++
 		typ, err := recordcodec.TypeOf(payload)
 		if err != nil {
@@ -1095,7 +1095,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		if err != nil {
 			return errors.Join(base.ErrCorrupt, err)
 		}
-		current, exists, err := s.mapping.Lookup(put.RecordID)
+		current, exists, err := s.core.mapping.Lookup(put.RecordID)
 		if err != nil {
 			return err
 		}
@@ -1106,13 +1106,13 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 		valueBytes := uint64(len(put.Value))
 		exceeds := func(limit uint64) bool { return valueBytes > limit || pendingBytes > limit-valueBytes }
 		if len(pending) != 0 && (uint64(len(pending)) == s.state.limits.MaxBatchMutations ||
-			uint64(len(pending)) == s.maxRelocationMutations || exceeds(s.state.limits.MaxBatchBytes) ||
-			exceeds(s.maxRelocationBytes)) {
+			uint64(len(pending)) == s.maintenance.maxRelocationMutations || exceeds(s.state.limits.MaxBatchBytes) ||
+			exceeds(s.maintenance.maxRelocationBytes)) {
 			if err := flush(); err != nil {
 				return err
 			}
 		}
-		copied, err := s.log.Append(ctx, payload, false)
+		copied, err := s.core.log.Append(ctx, payload, false)
 		if err != nil {
 			return err
 		}
@@ -1157,7 +1157,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 // retrying the same durable BatchID and proposal after a checkpoint is safe.
 func (s *Store) relocateWithBudgetRetry(ctx context.Context, relocation coordinator.Relocation) (coordinator.RelocationResult, error) {
 	for {
-		result, err := s.commits.Relocate(ctx, relocation)
+		result, err := s.core.commits.Relocate(ctx, relocation)
 		if !errors.Is(err, mapping.ErrBudget) {
 			if err == nil && result.DeltaPressureGeneration() != 0 {
 				s.requestBackgroundCheckpoint(result.DeltaPressureGeneration())

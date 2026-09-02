@@ -66,7 +66,7 @@ func TestGCCopySpaceAdmissionUsesConservativeUpperBound(t *testing.T) {
 	want := uint64(50) + uint64(source.RecordCount)*(uint64(commitPhysical)+uint64(reservePhysical)) + 200
 	free := want + minimum
 	gate := newSpaceGate("test", 100, time.Second, func(string) (uint64, error) { return free, nil })
-	store := &Store{space: gate, gcMinFreeBytes: minimum, maxRelocationBytes: 1, maxRelocationMutations: 1}
+	store := &Store{core: storeCore{space: gate}, maintenance: maintenanceRuntime{gcMinFreeBytes: minimum, maxRelocationBytes: 1, maxRelocationMutations: 1}}
 	reservation, err := store.reserveGCCopy(context.Background(), manifest, source)
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +89,7 @@ func TestGCCheckpointSpaceAdmissionUsesDensePathUpperBound(t *testing.T) {
 	manifest := storecatalog.Manifest{HardLimits: storecatalog.HardLimits{SegmentSize: 100}}
 	want := uint64(2)*(uint64(mapstore.MaxLevel)+1)*uint64(mapstore.DenseNodeSize) + 100
 	gate := newSpaceGate("test", 100, time.Second, func(string) (uint64, error) { return want + minimum, nil })
-	store := &Store{space: gate, gcMinFreeBytes: minimum}
+	store := &Store{core: storeCore{space: gate}, maintenance: maintenanceRuntime{gcMinFreeBytes: minimum}}
 	reservation, err := store.reserveGCCheckpoint(context.Background(), manifest, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +117,7 @@ func TestMappingGCSpaceAdmissionUsesFullSegmentUpperBound(t *testing.T) {
 	want := uint64(12) * segmentSize
 	free := want + minimum
 	gate := newSpaceGate("test", 100, time.Second, func(string) (uint64, error) { return free, nil })
-	store := &Store{space: gate, gcMinFreeBytes: minimum}
+	store := &Store{core: storeCore{space: gate}, maintenance: maintenanceRuntime{gcMinFreeBytes: minimum}}
 	reservation, err := store.reserveMappingGC(context.Background(), manifest, 3)
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestMappingGCSpaceAdmissionUsesFullSegmentUpperBound(t *testing.T) {
 
 func TestGCSpaceAdmissionRejectsOverflow(t *testing.T) {
 	gate := newSpaceGate("test", 1, time.Second, func(string) (uint64, error) { return ^uint64(0), nil })
-	store := &Store{space: gate, gcMinFreeBytes: 1, maxRelocationBytes: 1, maxRelocationMutations: 1}
+	store := &Store{core: storeCore{space: gate}, maintenance: maintenanceRuntime{gcMinFreeBytes: 1, maxRelocationBytes: 1, maxRelocationMutations: 1}}
 	manifest := storecatalog.Manifest{HardLimits: storecatalog.HardLimits{SegmentSize: 100}}
 	source := recordlog.SegmentSummary{SegmentID: 1, ValidEnd: recordlog.SegmentHeaderSize, RecordCount: ^uint64(0)}
 	if _, err := store.reserveGCCopy(context.Background(), manifest, source); !errors.Is(err, base.ErrOverflow) {

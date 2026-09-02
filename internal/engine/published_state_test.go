@@ -30,8 +30,8 @@ func TestCreateAndOpenInitializePublishedState(t *testing.T) {
 
 func TestRecordLogRotationPublishesState(t *testing.T) {
 	store := newRelocationStore(t)
-	initial := store.catalog.Snapshot().ActiveDataSegmentID
-	for store.catalog.Snapshot().ActiveDataSegmentID == initial {
+	initial := store.core.catalog.Snapshot().ActiveDataSegmentID
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == initial {
 		batch, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -48,14 +48,14 @@ func TestRecordLogRotationPublishesState(t *testing.T) {
 
 func assertPublishedStateMatchesCatalog(t *testing.T, store *Store) {
 	t.Helper()
-	if store.publisher == nil {
+	if store.core.publisher == nil {
 		t.Fatal("PublishCoordinator was not initialized")
 	}
 	state := store.PublishedState()
 	if state == nil {
 		t.Fatal("PublishedState was not initialized")
 	}
-	manifest := store.catalog.Snapshot()
+	manifest := store.core.catalog.Snapshot()
 	if state.Generation != manifest.Generation || state.MappingRoot != manifest.MappingRoot || state.CoveredCommit != manifest.CoveredCommitSeq ||
 		!reflect.DeepEqual(state.Manifest, manifest) {
 		t.Fatalf("PublishedState does not match Catalog: state=%+v manifest=%+v", state, manifest)

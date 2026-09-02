@@ -107,24 +107,33 @@ type storeState struct {
 	recoveryAbortedValid bool
 }
 
-type Store struct {
-	state             storeState
-	mutationAdmission mutationAdmission
-	checkpoints       checkpointRuntime
+// storeCore contains the long-lived storage components assembled by Open.
+// Their internal synchronization remains owned by the respective component.
+type storeCore struct {
+	root          string
+	log           Log
+	compactionLog maintenanceLog
+	mapping       *mapping.Persistent
+	mapStore      *mapstore.Store
+	catalog       *storecatalog.Manager
+	publisher     *PublishCoordinator
+	ids           *idalloc.Allocator
+	batches       *idalloc.Allocator
+	commits       *coordinator.Coordinator
+	userAppender  transaction.Appender
+	space         *spaceGate
+	dirLock       *filelock.Lock
+	identity      [16]byte
+}
 
-	log                    Log
-	maintenance            maintenanceLog
-	maintenanceHook        maintstate.FaultHook
-	mapStoreHook           mapstore.FaultHook
-	mappingGCHook          mapgcstate.FaultHook
-	root                   string
-	mapping                *mapping.Persistent
-	mapStore               *mapstore.Store
-	catalog                *storecatalog.Manager
-	ids                    *idalloc.Allocator
-	batches                *idalloc.Allocator
-	commits                *coordinator.Coordinator
-	userAppender           transaction.Appender
+// maintenanceRuntime owns replaceable maintenance policy, fault injection,
+// scheduling, and stability state. It is separate from the durable components
+// in storeCore so background policy cannot be mistaken for persisted state.
+type maintenanceRuntime struct {
+	stateHook     maintstate.FaultHook
+	mapStoreHook  mapstore.FaultHook
+	mappingGCHook mapgcstate.FaultHook
+
 	maxStats               uint64
 	mappingCacheBytes      uint64
 	maxRelocationBytes     uint64
@@ -133,13 +142,17 @@ type Store struct {
 	gcBytesPerSecond       atomic.Uint64
 	gcNow                  func() time.Time
 	gcWait                 func(context.Context, time.Duration) error
-	dirLock                *filelock.Lock
-	identity               [16]byte
-	space                  *spaceGate
-	metrics                runtimeMetrics
 	gcStability            gcStability
-	maintScheduler         *MaintenanceScheduler
-	publisher              *PublishCoordinator
+	scheduler              *MaintenanceScheduler
+}
+
+type Store struct {
+	state             storeState
+	mutationAdmission mutationAdmission
+	checkpoints       checkpointRuntime
+	core              storeCore
+	maintenance       maintenanceRuntime
+	metrics           runtimeMetrics
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -149,7 +162,7 @@ func (s *Store) Identity() [16]byte {
 	if s == nil {
 		return [16]byte{}
 	}
-	return s.identity
+	return s.core.identity
 }
 
 // SetGCBytesPerSecond changes the copy-rate budget sampled by the next Data
@@ -164,7 +177,7 @@ func (s *Store) SetGCBytesPerSecond(rate uint64) error {
 		return err
 	}
 	defer s.endOperation()
-	s.gcBytesPerSecond.Store(rate)
+	s.maintenance.gcBytesPerSecond.Store(rate)
 	return nil
 }
 
@@ -178,15 +191,18 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 		return nil, err
 	}
 	return &Store{
-		log: log, mapping: current, ids: ids, batches: batches, commits: commits,
 		state: storeState{
 			limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
 			statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
 		},
-		userAppender:           log,
-		maxRelocationBytes:     config.Batch.MaxBatchBytes,
-		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
-		maintScheduler:         &MaintenanceScheduler{},
+		core: storeCore{
+			log: log, mapping: current, ids: ids, batches: batches, commits: commits, userAppender: log,
+		},
+		maintenance: maintenanceRuntime{
+			maxRelocationBytes:     config.Batch.MaxBatchBytes,
+			maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
+			scheduler:              &MaintenanceScheduler{},
+		},
 	}, nil
 }
 
@@ -220,7 +236,7 @@ func (s *Store) Status(ctx context.Context, id model.BatchID) (BatchStatus, erro
 	if s.state.recoveryAbortedValid && raw >= s.state.recoveryAbortedStart && raw < s.state.recoveryAbortedEnd {
 		return BatchStatus{BatchID: id, State: BatchStateAborted}, nil
 	}
-	if raw < s.batches.IssuedHigh() {
+	if raw < s.core.batches.IssuedHigh() {
 		return BatchStatus{}, base.ErrStatusExpired
 	}
 	return BatchStatus{}, base.ErrNotFound
@@ -251,7 +267,7 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		if s.state.openCount < s.state.maxOpen && !capacityBlocked {
 			s.state.openCount++
 			s.state.mu.Unlock()
-			raw, err := s.batches.Allocate(ctx)
+			raw, err := s.core.batches.Allocate(ctx)
 			if err != nil {
 				s.state.mu.Lock()
 				s.state.openCount--
@@ -259,7 +275,7 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 				s.state.mu.Unlock()
 				return nil, err
 			}
-			inner, err := transaction.New(model.BatchID(raw), s.state.limits, s.userAppender, s.ids)
+			inner, err := transaction.New(model.BatchID(raw), s.state.limits, s.core.userAppender, s.core.ids)
 			if err != nil {
 				s.state.mu.Lock()
 				s.state.openCount--
@@ -314,7 +330,7 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		if fault != nil {
 			return Record{}, errors.Join(base.ErrReadOnly, fault)
 		}
-		addr, exists, err := s.mapping.Lookup(id)
+		addr, exists, err := s.core.mapping.Lookup(id)
 		if err != nil {
 			s.setFault(err)
 			return Record{}, err
@@ -322,14 +338,14 @@ func (s *Store) Get(ctx context.Context, id model.ID) (Record, error) {
 		if !exists {
 			return Record{}, base.ErrNotFound
 		}
-		payload, err := s.log.Read(ctx, addr)
+		payload, err := s.core.log.Read(ctx, addr)
 		if err != nil {
 			if ctx.Err() == nil {
 				s.setFault(err)
 			}
 			return Record{}, err
 		}
-		current, stillExists, err := s.mapping.Lookup(id)
+		current, stillExists, err := s.core.mapping.Lookup(id)
 		if err != nil {
 			s.setFault(err)
 			return Record{}, err
@@ -379,13 +395,13 @@ func (s *Store) Close() error {
 			batch.finish()
 		}
 	}
-	result = errors.Join(result, s.commits.Close())
-	result = errors.Join(result, s.log.Close())
-	if s.mapStore != nil {
-		result = errors.Join(result, s.mapStore.Close())
+	result = errors.Join(result, s.core.commits.Close())
+	result = errors.Join(result, s.core.log.Close())
+	if s.core.mapStore != nil {
+		result = errors.Join(result, s.core.mapStore.Close())
 	}
-	if s.dirLock != nil {
-		result = errors.Join(result, s.dirLock.Close())
+	if s.core.dirLock != nil {
+		result = errors.Join(result, s.core.dirLock.Close())
 	}
 	return result
 }
@@ -445,11 +461,11 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 	if gcAdmission {
 		entries, err := work.frozen.EntryUpperBound()
 		if err != nil {
-			return errors.Join(err, s.mapping.AbortCheckpoint(work.frozen))
+			return errors.Join(err, s.core.mapping.AbortCheckpoint(work.frozen))
 		}
 		reservation, err = s.reserveGCCheckpoint(ctx, s.catalogSnapshot(), entries)
 		if err != nil {
-			return errors.Join(err, s.mapping.AbortCheckpoint(work.frozen))
+			return errors.Join(err, s.core.mapping.AbortCheckpoint(work.frozen))
 		}
 		defer reservation.complete(false)
 	}
@@ -483,7 +499,7 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 		s.state.mu.Unlock()
 		return checkpointWork{}, errors.Join(base.ErrReadOnly, fault)
 	}
-	if s.catalog == nil || s.mapStore == nil || s.maxStats == 0 {
+	if s.core.catalog == nil || s.core.mapStore == nil || s.maintenance.maxStats == 0 {
 		s.state.mu.Unlock()
 		return checkpointWork{}, base.ErrInvalidConfig
 	}
@@ -491,7 +507,7 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 	// Drain potentially slow Begin/Abort metadata work before stopping Commit
 	// admission. Once held, this mutex keeps the open-Batch/allocator snapshot
 	// stable through the short durable cut and Mapping freeze.
-	fence, err := s.commits.AcquireCheckpointFence(ctx)
+	fence, err := s.core.commits.AcquireCheckpointFence(ctx)
 	if err != nil {
 		return checkpointWork{}, err
 	}
@@ -506,13 +522,13 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 		return checkpointWork{}, err
 	}
 	sort.Slice(open, func(i, j int) bool { return open[i] < open[j] })
-	reservedIDHigh, reservedBatchIDHigh := s.ids.DurableHigh(), s.batches.DurableHigh()
-	issuedBatchIDHigh := s.batches.IssuedHigh()
+	reservedIDHigh, reservedBatchIDHigh := s.core.ids.DurableHigh(), s.core.batches.DurableHigh()
+	issuedBatchIDHigh := s.core.batches.IssuedHigh()
 	s.state.mu.Unlock()
 	if epoch != s.state.batchEpoch.Load() {
 		return checkpointWork{}, base.ErrConflict
 	}
-	frozen, err := s.mapping.Freeze(cut.CoveredCommitSeq)
+	frozen, err := s.core.mapping.Freeze(cut.CoveredCommitSeq)
 	if err != nil {
 		return checkpointWork{}, err
 	}
@@ -526,9 +542,9 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error {
 	frozen := work.frozen
 	abort := func(cause error) error {
-		return errors.Join(cause, s.mapping.AbortCheckpoint(frozen))
+		return errors.Join(cause, s.core.mapping.AbortCheckpoint(frozen))
 	}
-	candidate, err := s.mapping.BuildCheckpoint(frozen)
+	candidate, err := s.core.mapping.BuildCheckpoint(frozen)
 	if err != nil {
 		if errors.Is(err, mapstore.ErrPoisoned) || errors.Is(err, mapping.ErrCorrupt) {
 			s.setFault(err)
@@ -546,14 +562,14 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		s.setFault(err)
 		return abort(err)
 	}
-	stats, err := checkpointSegmentStats(candidate.LiveStats(), manifest, work.cut.ReplayStart, s.maxStats)
+	stats, err := checkpointSegmentStats(candidate.LiveStats(), manifest, work.cut.ReplayStart, s.maintenance.maxStats)
 	if err != nil {
 		if errors.Is(err, base.ErrCorrupt) {
 			s.setFault(err)
 		}
 		return abort(err)
 	}
-	installed, err := s.publisher.InstallCheckpoint(manifest, storecatalog.Checkpoint{
+	installed, err := s.core.publisher.InstallCheckpoint(manifest, storecatalog.Checkpoint{
 		MappingRoot: candidate.Root(), MappingEntryCount: mappingEntries, CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
 		ReservedIDHigh: work.reservedIDHigh, ReservedBatchIDHigh: work.reservedBatchIDHigh, IssuedBatchIDHighAtCut: work.issuedBatchIDHigh,
 		OpenBatchIDsAtCut: work.open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,
@@ -564,15 +580,15 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		}
 		return abort(err)
 	}
-	if err := s.mapping.InstallCheckpoint(candidate); err != nil {
+	if err := s.core.mapping.InstallCheckpoint(candidate); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
 	now := time.Now()
-	if s.gcNow != nil {
-		now = s.gcNow()
+	if s.maintenance.gcNow != nil {
+		now = s.maintenance.gcNow()
 	}
-	s.gcStability.sample(installed, now)
+	s.maintenance.gcStability.sample(installed, now)
 	s.completeCheckpointPressure(frozen.PressureGeneration())
 	s.state.mu.Lock()
 	if work.statusCut > s.state.terminalBase {
@@ -688,7 +704,7 @@ func (s *Store) operationFaultLocked() error {
 	if s.state.fault != nil {
 		return s.state.fault
 	}
-	return s.commits.Fault()
+	return s.core.commits.Fault()
 }
 
 func (s *Store) signalLocked() {
@@ -706,15 +722,15 @@ func (s *Store) releaseSlot() {
 }
 
 func (s *Store) acquireDataMaintenance(ctx context.Context) error {
-	if s.maintScheduler == nil {
-		s.maintScheduler = &MaintenanceScheduler{}
+	if s.maintenance.scheduler == nil {
+		s.maintenance.scheduler = &MaintenanceScheduler{}
 	}
-	return s.maintScheduler.acquireData(ctx)
+	return s.maintenance.scheduler.acquireData(ctx)
 }
 
 func (s *Store) releaseDataMaintenance() {
-	if s.maintScheduler != nil {
-		s.maintScheduler.releaseData()
+	if s.maintenance.scheduler != nil {
+		s.maintenance.scheduler.releaseData()
 	}
 }
 
@@ -810,7 +826,7 @@ func (s *Store) submitCommit(ctx context.Context, batch *transaction.Batch) (coo
 		return coordinator.Receipt{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	s.state.mu.Unlock()
-	return s.commits.Submit(ctx, batch)
+	return s.core.commits.Submit(ctx, batch)
 }
 
 func (b *Batch) Abort(ctx context.Context) error {

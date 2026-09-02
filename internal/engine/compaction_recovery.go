@@ -102,11 +102,11 @@ func (s *Store) resumeCompaction(ctx context.Context, state compactionstate.Stat
 		return err
 	}
 	state.Phase = compactionstate.PhaseInputsRetired
-	if err := compactionstate.Update(s.root, state); err != nil {
+	if err := compactionstate.Update(s.core.root, state); err != nil {
 		return err
 	}
-	if err := s.maintenance.FinalizeCompactionRetirement(ctx, state.Inputs, installed.Generation); err != nil {
+	if err := s.core.compactionLog.FinalizeCompactionRetirement(ctx, state.Inputs, installed.Generation); err != nil {
 		return err
 	}
-	return compactionstate.Remove(s.root)
+	return compactionstate.Remove(s.core.root)
 }

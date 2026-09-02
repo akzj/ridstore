@@ -33,7 +33,7 @@ func TestRelocateSegmentCopiesLivePutAndPreservesOrigin(t *testing.T) {
 	if err != nil || record.Addr == oldAddr || string(record.Value) != "source-value" {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
-	payload, err := store.log.Read(context.Background(), record.Addr)
+	payload, err := store.core.log.Read(context.Background(), record.Addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,15 +68,15 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	old, exists, err := store.mapping.LookupRef(id)
+	old, exists, err := store.core.mapping.LookupRef(id)
 	if err != nil || !exists {
 		t.Fatalf("old=%+v exists=%v err=%v", old, exists, err)
 	}
-	payload, err := store.log.Read(context.Background(), old.Addr)
+	payload, err := store.core.log.Read(context.Background(), old.Addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	copied, err := store.log.Append(context.Background(), payload, false)
+	copied, err := store.core.log.Append(context.Background(), payload, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rawBatchID, err := store.batches.Allocate(context.Background())
+	rawBatchID, err := store.core.batches.Allocate(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,14 +138,14 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("relocation did not resume after checkpoint")
 	}
-	if current, exists, err := store.mapping.LookupRef(id); err != nil || !exists || current != newRef {
+	if current, exists, err := store.core.mapping.LookupRef(id); err != nil || !exists || current != newRef {
 		t.Fatalf("current=%+v exists=%v err=%v", current, exists, err)
 	}
 }
 
 func TestRelocateSegmentReportsCommitSequenceRangeAcrossBatches(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
-	store.maxRelocationMutations = 1
+	store.maintenance.maxRelocationMutations = 1
 
 	result, err := store.RelocateSegment(context.Background(), source)
 	if err != nil {
@@ -161,9 +161,9 @@ func TestRelocateSegmentAccountsForRateLimitDelay(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	now := time.Unix(100, 0)
 	var waited time.Duration
-	store.gcBytesPerSecond.Store(1024)
-	store.gcNow = func() time.Time { return now }
-	store.gcWait = func(_ context.Context, delay time.Duration) error {
+	store.maintenance.gcBytesPerSecond.Store(1024)
+	store.maintenance.gcNow = func() time.Time { return now }
+	store.maintenance.gcWait = func(_ context.Context, delay time.Duration) error {
 		waited += delay
 		now = now.Add(delay)
 		return nil
@@ -179,15 +179,15 @@ func TestRelocateSegmentAccountsForRateLimitDelay(t *testing.T) {
 func TestRelocateSegmentCancellationDuringPacingReleasesSourcePin(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	now := time.Unix(100, 0)
-	store.gcBytesPerSecond.Store(1)
-	store.gcNow = func() time.Time { return now }
-	store.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
+	store.maintenance.gcBytesPerSecond.Store(1)
+	store.maintenance.gcNow = func() time.Time { return now }
+	store.maintenance.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
 	partial, err := store.RelocateSegment(context.Background(), source)
 	if !errors.Is(err, context.Canceled) || partial.Applied == 0 {
 		t.Fatalf("partial=%+v err=%v", partial, err)
 	}
-	store.gcBytesPerSecond.Store(^uint64(0))
-	store.gcWait = func(_ context.Context, delay time.Duration) error {
+	store.maintenance.gcBytesPerSecond.Store(^uint64(0))
+	store.maintenance.gcWait = func(_ context.Context, delay time.Duration) error {
 		now = now.Add(delay)
 		return nil
 	}
@@ -228,8 +228,8 @@ func TestRelocateSegmentOrdersChangesByRecordID(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	source := store.catalog.Snapshot().ActiveDataSegmentID
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	source := store.core.catalog.Snapshot().ActiveDataSegmentID
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -242,7 +242,7 @@ func TestRelocateSegmentOrdersChangesByRecordID(t *testing.T) {
 		}
 	}
 
-	store.maxRelocationBytes = 1
+	store.maintenance.maxRelocationBytes = 1
 	result, err := store.RelocateSegment(context.Background(), source)
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +271,7 @@ func TestPrepareSegmentRetirementCheckpointsAndProvesNoLiveMapping(t *testing.T)
 		proof.CoveredCommitSeq < relocated.LastCommitSeq || !proof.ReplayStart.Valid() {
 		t.Fatalf("proof=%+v relocated=%+v", proof, relocated)
 	}
-	manifest := store.catalog.Snapshot()
+	manifest := store.core.catalog.Snapshot()
 	if manifest.Generation != proof.CatalogGeneration || manifest.CoveredCommitSeq != proof.CoveredCommitSeq {
 		t.Fatalf("manifest=%+v proof=%+v", manifest, proof)
 	}
@@ -292,7 +292,7 @@ func TestPrepareSegmentRetirementRejectsOpenBatchReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := recordlog.SegmentID(1)
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -323,7 +323,7 @@ func TestCompactionRetirementRejectsStalePublishedGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := store.catalogSnapshot()
-	if _, _, err := store.publisher.ReserveCompactionSegments(manifest.Generation, 1); err != nil {
+	if _, _, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.installCompactionRetirement([]recordlog.SegmentSummary{proof.Source}, []SegmentRetirementProof{proof}); !errors.Is(err, base.ErrConflict) {
@@ -343,25 +343,25 @@ func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
 	if result.Proof.Source.SegmentID != source || result.Proof.CatalogGeneration == 0 {
 		t.Fatalf("result=%+v", result)
 	}
-	if containsSealedSegment(store.catalog.Snapshot(), result.Proof.Source) {
+	if containsSealedSegment(store.core.catalog.Snapshot(), result.Proof.Source) {
 		t.Fatal("retired source remains in Catalog")
 	}
-	if _, err := store.log.Read(context.Background(), oldAddr); !errors.Is(err, recordlog.ErrSegmentMissing) {
+	if _, err := store.core.log.Read(context.Background(), oldAddr); !errors.Is(err, recordlog.ErrSegmentMissing) {
 		t.Fatalf("old address read err=%v", err)
 	}
 	record, err := store.Get(context.Background(), id)
 	if err != nil || string(record.Value) != "source-value" || record.Addr == oldAddr {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
-	if !recordlog.IsCompactionSegment(record.Addr.SegmentID()) || record.Addr.SegmentID() == store.catalog.Snapshot().ActiveDataSegmentID {
-		t.Fatalf("GC copy was not isolated from user active segment: addr=%v active=%d", record.Addr, store.catalog.Snapshot().ActiveDataSegmentID)
+	if !recordlog.IsCompactionSegment(record.Addr.SegmentID()) || record.Addr.SegmentID() == store.core.catalog.Snapshot().ActiveDataSegmentID {
+		t.Fatalf("GC copy was not isolated from user active segment: addr=%v active=%d", record.Addr, store.core.catalog.Snapshot().ActiveDataSegmentID)
 	}
 }
 
 func TestCompactSegmentScansEachInputOnlyOnce(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
-	counted := &countingScanLog{maintenanceLog: store.maintenance, source: source}
-	store.maintenance = counted
+	counted := &countingScanLog{maintenanceLog: store.core.compactionLog, source: source}
+	store.core.compactionLog = counted
 	if _, err := store.CompactSegment(context.Background(), source); err != nil {
 		t.Fatal(err)
 	}
@@ -383,8 +383,8 @@ func TestCompactSegmentRedirectsOpenBatchReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := store.catalog.Snapshot().ActiveDataSegmentID
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	source := store.core.catalog.Snapshot().ActiveDataSegmentID
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -400,7 +400,7 @@ func TestCompactSegmentRedirectsOpenBatchReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compact err=%v", err)
 	}
-	if containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
+	if containsSegmentID(store.core.catalog.Snapshot().SealedDataSegments, source) {
 		t.Fatal("source referenced by open Batch was not retired")
 	}
 	if result.Relocation.CopiedRecords == 0 || result.Relocation.Skipped == 0 {
@@ -417,10 +417,10 @@ func TestCompactSegmentRedirectsOpenBatchReference(t *testing.T) {
 	if err != nil || string(record.Value) != "open-before-rotation" || record.Addr.SegmentID() == source || !recordlog.IsCompactionSegment(record.Addr.SegmentID()) {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
-	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
+	if found, err := compactionstate.RecoveryArtifacts(store.core.root); err != nil || found {
 		t.Fatalf("compaction marker found=%v err=%v", found, err)
 	}
-	root := store.root
+	root := store.core.root
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -445,8 +445,8 @@ func TestCompactSegmentRelocatesOpenBatchThatCommitsDuringCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := store.catalog.Snapshot().ActiveDataSegmentID
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	source := store.core.catalog.Snapshot().ActiveDataSegmentID
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -459,10 +459,10 @@ func TestCompactSegmentRelocatesOpenBatchThatCommitsDuringCopy(t *testing.T) {
 		}
 	}
 	blocked := &blockingProofLog{
-		maintenanceLog: store.maintenance, source: source,
+		maintenanceLog: store.core.compactionLog, source: source,
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
-	store.maintenance = blocked
+	store.core.compactionLog = blocked
 	type answer struct {
 		result SegmentCompactionResult
 		err    error
@@ -514,8 +514,8 @@ func TestCompactSegmentRedirectsDistinctPendingVersionsOfSameRecord(t *testing.T
 	if err := second.Put(context.Background(), id, []byte("pending-second")); err != nil {
 		t.Fatal(err)
 	}
-	source := store.catalog.Snapshot().ActiveDataSegmentID
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	source := store.core.catalog.Snapshot().ActiveDataSegmentID
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -569,8 +569,8 @@ func TestCompactSegmentRelocatesExactPendingVersionAfterConcurrentCommits(t *tes
 	if err := second.Put(context.Background(), id, []byte("pending-second")); err != nil {
 		t.Fatal(err)
 	}
-	source := store.catalog.Snapshot().ActiveDataSegmentID
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	source := store.core.catalog.Snapshot().ActiveDataSegmentID
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -583,10 +583,10 @@ func TestCompactSegmentRelocatesExactPendingVersionAfterConcurrentCommits(t *tes
 		}
 	}
 	blocked := &blockingSegmentVisitLog{
-		maintenanceLog: store.maintenance, source: source, target: id, value: []byte("committed"),
+		maintenanceLog: store.core.compactionLog, source: source, target: id, value: []byte("committed"),
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
-	store.maintenance = blocked
+	store.core.compactionLog = blocked
 	done := make(chan error, 1)
 	go func() {
 		_, err := store.CompactSegment(context.Background(), source)
@@ -618,7 +618,7 @@ func TestCompactNextSegmentSelectsAndRetiresOneCandidate(t *testing.T) {
 	if result.Candidate.Source.SegmentID != source || result.Compaction.Proof.Source.SegmentID != source {
 		t.Fatalf("result=%+v", result)
 	}
-	if containsSealedSegment(store.catalog.Snapshot(), result.Candidate.Source) {
+	if containsSealedSegment(store.core.catalog.Snapshot(), result.Candidate.Source) {
 		t.Fatal("selected source remains in Catalog")
 	}
 	if record, err := store.Get(context.Background(), id); err != nil || string(record.Value) != "source-value" {
@@ -636,10 +636,10 @@ func TestCompactNextSegmentReusesExistingCheckpointBeforeCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	blocked := &blockingProofLog{
-		maintenanceLog: store.maintenance, source: source,
+		maintenanceLog: store.core.compactionLog, source: source,
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
-	store.maintenance = blocked
+	store.core.compactionLog = blocked
 	store.checkpoints.captureMu.Lock()
 	checkpointHeld := true
 	released := false
@@ -679,9 +679,9 @@ func TestCompactNextSegmentReusesExistingCheckpointBeforeCopy(t *testing.T) {
 
 func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.T) {
 	store := newRelocationStore(t)
-	store.maxRelocationMutations = 1
+	store.maintenance.maxRelocationMutations = 1
 	bySegment := make(map[recordlog.SegmentID][]model.ID)
-	for store.catalog.Snapshot().ActiveDataSegmentID < 4 {
+	for store.core.catalog.Snapshot().ActiveDataSegmentID < 4 {
 		batch, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -728,7 +728,7 @@ func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.
 		uint64(result.Compaction.Relocation.LastCommitSeq-result.Compaction.Relocation.FirstCommitSeq)+1 != result.Compaction.Relocation.Applied {
 		t.Fatalf("compaction output was not published in bounded batches: %+v", result.Compaction.Relocation)
 	}
-	manifest := store.catalog.Snapshot()
+	manifest := store.core.catalog.Snapshot()
 	if containsSegmentID(manifest.SealedDataSegments, 1) || containsSegmentID(manifest.SealedDataSegments, 2) {
 		t.Fatal("adjacent inputs were not retired atomically")
 	}
@@ -742,14 +742,14 @@ func TestCompactNextSegmentRewritesAdjacentInputsIntoDedicatedOutput(t *testing.
 
 func TestCompactSegmentPacesBeforePublishingOutputs(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
-	store.maxRelocationBytes = 1
-	store.gcBytesPerSecond.Store(1)
+	store.maintenance.maxRelocationBytes = 1
+	store.maintenance.gcBytesPerSecond.Store(1)
 	now := time.Unix(100, 0)
-	store.gcNow = func() time.Time { return now }
+	store.maintenance.gcNow = func() time.Time { return now }
 	var waits int
-	store.gcWait = func(_ context.Context, delay time.Duration) error {
+	store.maintenance.gcWait = func(_ context.Context, delay time.Duration) error {
 		waits++
-		for _, segment := range store.catalog.Snapshot().SealedDataSegments {
+		for _, segment := range store.core.catalog.Snapshot().SealedDataSegments {
 			if recordlog.IsCompactionSegment(segment.SegmentID) {
 				t.Fatal("compaction output was published before copy pacing")
 			}
@@ -767,20 +767,20 @@ func TestCompactSegmentPacesBeforePublishingOutputs(t *testing.T) {
 
 func TestCompactSegmentCancellationBeforeOutputPublicationRollsBack(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
-	store.maxRelocationBytes = 1
-	store.gcBytesPerSecond.Store(1)
-	store.gcNow = func() time.Time { return time.Unix(100, 0) }
-	store.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
+	store.maintenance.maxRelocationBytes = 1
+	store.maintenance.gcBytesPerSecond.Store(1)
+	store.maintenance.gcNow = func() time.Time { return time.Unix(100, 0) }
+	store.maintenance.gcWait = func(context.Context, time.Duration) error { return context.Canceled }
 	if _, err := store.CompactSegment(context.Background(), source); !errors.Is(err, context.Canceled) {
 		t.Fatalf("compact err=%v", err)
 	}
 	if store.state.fault != nil {
 		t.Fatalf("recoverable cancellation faulted store: %v", store.state.fault)
 	}
-	if found, err := compactionstate.RecoveryArtifacts(store.root); err != nil || found {
+	if found, err := compactionstate.RecoveryArtifacts(store.core.root); err != nil || found {
 		t.Fatalf("compaction marker found=%v err=%v", found, err)
 	}
-	for _, segment := range store.catalog.Snapshot().SealedDataSegments {
+	for _, segment := range store.core.catalog.Snapshot().SealedDataSegments {
 		if recordlog.IsCompactionSegment(segment.SegmentID) {
 			t.Fatalf("unpublished output remains in Catalog: %d", segment.SegmentID)
 		}
@@ -797,7 +797,7 @@ func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
 	if err != nil || found || result.Candidate.Source.SegmentID != 0 || result.Compaction.Relocation.ScannedRecords != 0 {
 		t.Fatalf("result=%+v found=%v err=%v", result, found, err)
 	}
-	if !containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
+	if !containsSegmentID(store.core.catalog.Snapshot().SealedDataSegments, source) {
 		t.Fatal("policy-rejected source was retired")
 	}
 	if metrics := store.Metrics(); metrics.GCNoCandidate != 1 || metrics.GCStarted != 0 {
@@ -807,8 +807,8 @@ func TestCompactNextSegmentHonorsPolicy(t *testing.T) {
 
 func TestRelocateSegmentRejectsInsufficientCopySpaceWithoutMutation(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
-	store.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return 1, nil })
-	store.gcMinFreeBytes = 1
+	store.core.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return 1, nil })
+	store.maintenance.gcMinFreeBytes = 1
 	if _, err := store.RelocateSegment(context.Background(), source); !errors.Is(err, base.ErrInsufficientSpace) {
 		t.Fatalf("relocate err=%v", err)
 	}
@@ -823,7 +823,7 @@ func TestRelocateSegmentRejectsInsufficientCopySpaceWithoutMutation(t *testing.T
 
 func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
-	manifest := store.catalog.Snapshot()
+	manifest := store.core.catalog.Snapshot()
 	var summary recordlog.SegmentSummary
 	for _, candidate := range manifest.SealedDataSegments {
 		if candidate.SegmentID == source {
@@ -841,13 +841,13 @@ func TestCompactSegmentKeepsSourceWhenCheckpointSpaceIsInsufficient(t *testing.T
 	}
 	copyEstimate := uint64(summary.ValidEnd-recordlog.SegmentHeaderSize) +
 		uint64(summary.RecordCount)*(uint64(commitPhysical)+uint64(reservePhysical)) + 2*manifest.HardLimits.SegmentSize
-	store.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return copyEstimate + 1, nil })
-	store.gcMinFreeBytes = 1
-	result, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load())
+	store.core.space = newSpaceGate("test", 1, time.Hour, func(string) (uint64, error) { return copyEstimate + 1, nil })
+	store.maintenance.gcMinFreeBytes = 1
+	result, err := store.compactSegmentLocked(context.Background(), source, store.maintenance.gcBytesPerSecond.Load())
 	if !errors.Is(err, base.ErrInsufficientSpace) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if !containsSegmentID(store.catalog.Snapshot().SealedDataSegments, source) {
+	if !containsSegmentID(store.core.catalog.Snapshot().SealedDataSegments, source) {
 		t.Fatal("source retired after checkpoint admission failure")
 	}
 	record, getErr := store.Get(context.Background(), id)
@@ -873,7 +873,7 @@ func TestCompactNextSegmentRedirectsOpenBatchReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := recordlog.SegmentID(1)
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -905,14 +905,14 @@ func TestCompactNextSegmentRedirectsOpenBatchReferences(t *testing.T) {
 
 func TestConcurrentUserUpdateWinsOverSegmentRelocation(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
-	underlying := store.log
-	underlyingMaintenance := store.maintenance
+	underlying := store.core.log
+	underlyingMaintenance := store.core.compactionLog
 	blocked := &blockingCopyLog{
 		Log: underlying, maintenanceLog: underlyingMaintenance, target: id, value: []byte("source-value"),
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
-	store.log = blocked
-	store.maintenance = blocked
+	store.core.log = blocked
+	store.core.compactionLog = blocked
 
 	type relocationAnswer struct {
 		result SegmentRelocationResult
@@ -951,13 +951,13 @@ func TestConcurrentUserUpdateWinsOverSegmentRelocation(t *testing.T) {
 
 func TestCheckpointDoesNotWaitForRelocationCopy(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
-	underlying := store.log
+	underlying := store.core.log
 	blocked := &blockingCopyLog{
-		Log: underlying, maintenanceLog: store.maintenance, target: id, value: []byte("source-value"),
+		Log: underlying, maintenanceLog: store.core.compactionLog, target: id, value: []byte("source-value"),
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
-	store.log = blocked
-	store.maintenance = blocked
+	store.core.log = blocked
+	store.core.compactionLog = blocked
 	released := false
 	defer func() {
 		if !released {
@@ -999,10 +999,10 @@ func TestRetirementProofDoesNotBlockUserCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	blocked := &blockingProofLog{
-		maintenanceLog: store.maintenance, source: source,
+		maintenanceLog: store.core.compactionLog, source: source,
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
-	store.maintenance = blocked
+	store.core.compactionLog = blocked
 	released := false
 	defer func() {
 		if !released {
@@ -1052,10 +1052,10 @@ func TestRetirementProofDrainsInFlightBatchMutationBeforeScanning(t *testing.T) 
 		t.Fatal(err)
 	}
 	blocked := &blockingProofLog{
-		maintenanceLog: store.maintenance, source: source,
+		maintenanceLog: store.core.compactionLog, source: source,
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
-	store.maintenance = blocked
+	store.core.compactionLog = blocked
 	released := false
 	defer func() {
 		if !released {
@@ -1200,7 +1200,7 @@ func relocationFixture(t *testing.T) (*Store, recordlog.SegmentID, model.ID, rec
 		t.Fatal(err)
 	}
 	source := record.Addr.SegmentID()
-	for store.catalog.Snapshot().ActiveDataSegmentID == source {
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
 		filler, err := store.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
