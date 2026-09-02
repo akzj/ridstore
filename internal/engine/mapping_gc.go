@@ -193,7 +193,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		updateAtomicMax(&s.metrics.mappingGCMaxPublishNanos, duration)
 		s.checkpointMu.Unlock()
 	}
-	latest := s.catalog.Snapshot()
+	latest := s.catalogSnapshot()
 	currentView, currentErr := s.mapping.CheckpointView()
 	if currentErr != nil || currentView.Root() != latest.MappingRoot || currentView.Covered() != latest.CoveredCommitSeq {
 		unlockPublication()
@@ -203,7 +203,11 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return s.mappingGCPrepublishFailure(currentErr, discardMappingGCStaging(s.root))
 	}
 	oldSet := mappingGCFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot)
-	if latest.Generation != published.Generation || latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
+	// Data-segment rotations advance the global Catalog generation without
+	// invalidating this Mapping-only plan. Validate the independent Mapping
+	// dimensions here; InstallMappingRewrite performs the same append-only
+	// Data rebase check before durable publication.
+	if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
 		!manifestMatchesMappingSet(latest, oldSet) {
 		unlockPublication()
 		return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.root))
@@ -232,7 +236,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	if err := mapstore.PromoteGeneration(s.root, staging, generation, s.mapStoreHook); err != nil {
 		return rollback(err)
 	}
-	installed, err := s.catalog.InstallMappingRewrite(latest, storecatalog.MappingRewrite{
+	installed, err := s.publisher.InstallMappingRewrite(latest, storecatalog.MappingRewrite{
 		SealedSegments: mappingGCSummaries(generation.SealedSegments), ActiveSegment: generation.ActiveSegment,
 		NextSegment: generation.NextSegment, Root: generation.Root, Covered: generation.Covered,
 	})
@@ -241,7 +245,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return errors.Join(base.ErrReadOnly, err)
 	}
 
-	newStore, err := mapstore.OpenWithFaultHook(s.root, s.catalog, s.mapStoreHook)
+	newStore, err := mapstore.OpenWithFaultHook(s.root, s.publisher, s.mapStoreHook)
 	if err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
@@ -277,7 +281,6 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
-	s.publishState(installed)
 	spaceCommitted = true
 	return nil
 }

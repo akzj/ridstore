@@ -139,7 +139,7 @@ type Store struct {
 	checkpointPressurePending   atomic.Uint64
 	checkpointPressureCompleted atomic.Uint64
 	maintScheduler              *MaintenanceScheduler
-	published                   atomic.Pointer[PublishedState]
+	publisher                   *PublishCoordinator
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -444,7 +444,7 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 		if err != nil {
 			return errors.Join(err, s.mapping.AbortCheckpoint(work.frozen))
 		}
-		reservation, err = s.reserveGCCheckpoint(ctx, s.catalog.Snapshot(), entries)
+		reservation, err = s.reserveGCCheckpoint(ctx, s.catalogSnapshot(), entries)
 		if err != nil {
 			return errors.Join(err, s.mapping.AbortCheckpoint(work.frozen))
 		}
@@ -532,7 +532,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		}
 		return abort(err)
 	}
-	manifest := s.catalog.Snapshot()
+	manifest := s.catalogSnapshot()
 	if manifest.MappingRoot != candidate.BaseRoot() || manifest.CoveredCommitSeq != candidate.BaseCoveredCommitSeq() {
 		err := errors.Join(base.ErrCorrupt, errors.New("checkpoint Mapping base differs from Manifest"))
 		s.setFault(err)
@@ -550,7 +550,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		}
 		return abort(err)
 	}
-	installed, err := s.catalog.InstallCheckpoint(manifest, storecatalog.Checkpoint{
+	installed, err := s.publisher.InstallCheckpoint(manifest, storecatalog.Checkpoint{
 		MappingRoot: candidate.Root(), MappingEntryCount: mappingEntries, CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
 		ReservedIDHigh: work.reservedIDHigh, ReservedBatchIDHigh: work.reservedBatchIDHigh, IssuedBatchIDHighAtCut: work.issuedBatchIDHigh,
 		OpenBatchIDsAtCut: work.open, StatsCoveredCommitSeq: candidate.CoveredCommitSeq(), SegmentStats: stats,
@@ -571,7 +571,6 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 	}
 	s.gcStability.sample(installed, now)
 	s.completeCheckpointPressure(frozen.PressureGeneration())
-	s.publishState(installed)
 	s.mu.Lock()
 	if work.statusCut > s.terminalBase {
 		s.terminalBase = work.statusCut

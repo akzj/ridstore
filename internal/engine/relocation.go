@@ -159,7 +159,7 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	rate := s.gcBytesPerSecond.Load()
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
-	manifest := s.catalog.Snapshot()
+	manifest := s.catalogSnapshot()
 	index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool { return manifest.SealedDataSegments[i].SegmentID >= source })
 	if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source || recordlog.IsCompactionSegment(source) {
 		return SegmentCompactionResult{}, recordlog.ErrSegmentMissing
@@ -433,13 +433,13 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 
 func (s *Store) reserveCompactionOutputIDs(inputs []recordlog.SegmentSummary, count uint32) (storecatalog.Manifest, []recordlog.SegmentID, error) {
 	for attempt := 0; attempt < 32; attempt++ {
-		current := s.catalog.Snapshot()
+		current := s.catalogSnapshot()
 		for _, input := range inputs {
 			if !containsSealedSegment(current, input) {
 				return storecatalog.Manifest{}, nil, recordlog.ErrSegmentMissing
 			}
 		}
-		installed, ids, err := s.catalog.ReserveCompactionSegments(current.Generation, count)
+		installed, ids, err := s.publisher.ReserveCompactionSegments(current.Generation, count)
 		if errors.Is(err, storecatalog.ErrConflict) {
 			continue
 		}
@@ -450,8 +450,8 @@ func (s *Store) reserveCompactionOutputIDs(inputs []recordlog.SegmentSummary, co
 
 func (s *Store) installCompactionOutputs(outputs []recordlog.SegmentSummary) (storecatalog.Manifest, error) {
 	for attempt := 0; attempt < 32; attempt++ {
-		current := s.catalog.Snapshot()
-		installed, err := s.catalog.InstallCompactionOutputs(current.Generation, outputs)
+		current := s.catalogSnapshot()
+		installed, err := s.publisher.InstallCompactionOutputs(current.Generation, outputs)
 		if errors.Is(err, storecatalog.ErrConflict) {
 			continue
 		}
@@ -462,8 +462,8 @@ func (s *Store) installCompactionOutputs(outputs []recordlog.SegmentSummary) (st
 
 func (s *Store) installCompactionRetirement(inputs []recordlog.SegmentSummary) (storecatalog.Manifest, error) {
 	for attempt := 0; attempt < 32; attempt++ {
-		current := s.catalog.Snapshot()
-		installed, err := s.catalog.InstallDataCompaction(current.Generation, inputs, current.CoveredCommitSeq, current.ReplayStart)
+		current := s.catalogSnapshot()
+		installed, err := s.publisher.InstallDataCompaction(current.Generation, inputs, current.CoveredCommitSeq, current.ReplayStart)
 		if errors.Is(err, storecatalog.ErrConflict) {
 			continue
 		}
@@ -763,7 +763,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 	if err != nil {
 		return result, fmt.Errorf("prove retirement of segment %d: %w", source, err)
 	}
-	manifest := s.catalog.Snapshot()
+	manifest := s.catalogSnapshot()
 	if s.root == "" || manifest.Generation < proof.CatalogGeneration || manifest.RecordLogID == (recordlog.LogID{}) ||
 		manifest.CoveredCommitSeq < proof.CoveredCommitSeq || manifest.ReplayStart.Compare(proof.ReplayStart) < 0 ||
 		!containsSealedSegment(manifest, proof.Source) {
@@ -784,7 +784,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		return result, err
 	}
 	if err := s.maintenance.RetireSegment(ctx, source, manifest.Generation); err != nil {
-		current := s.catalog.Snapshot()
+		current := s.catalogSnapshot()
 		if current.Generation >= manifest.Generation && containsSealedSegment(current, proof.Source) {
 			cleanupErr := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook)
 			if cleanupErr == nil {
@@ -914,7 +914,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 		return SegmentRetirementProof{}, errors.Join(base.ErrReadOnly, commitFault)
 	}
 
-	manifest := s.catalog.Snapshot()
+	manifest := s.catalogSnapshot()
 	if manifest.CoveredCommitSeq < relocationEnd || manifest.StatsCoveredCommitSeq != manifest.CoveredCommitSeq {
 		err := errors.Join(base.ErrCorrupt, errors.New("checkpoint does not cover relocation"))
 		s.setFault(err)
@@ -989,7 +989,7 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 	if s.catalog == nil || s.maintenance == nil || s.maxRelocationMutations == 0 {
 		return SegmentRelocationResult{}, base.ErrInvalidConfig
 	}
-	manifest := s.catalog.Snapshot()
+	manifest := s.catalogSnapshot()
 	index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool {
 		return manifest.SealedDataSegments[i].SegmentID >= source
 	})

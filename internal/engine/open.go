@@ -162,14 +162,16 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err != nil {
 		return nil, err
 	}
-	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, catalog, hooks.recordLog)
+	publisher := newPublishCoordinator(catalog)
+	publisher.publish(catalog.Snapshot())
+	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, publisher, hooks.recordLog)
 	if err != nil {
 		return nil, err
 	}
 	failLog := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, log.Close())
 	}
-	physicalMapping, err := mapstore.OpenWithFaultHook(root, catalog, hooks.mapStore)
+	physicalMapping, err := mapstore.OpenWithFaultHook(root, publisher, hooks.mapStore)
 	if err != nil {
 		return failLog(err)
 	}
@@ -239,6 +241,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	}
 	store.mapStore = physicalMapping
 	store.catalog = catalog
+	store.publisher = publisher
 	store.maintenance = log
 	if config.WriteStopFreeBytes != 0 {
 		store.space = newSpaceGate(root, config.WriteStopFreeBytes, config.SpaceCheckInterval, filesystemAvailable)
@@ -272,7 +275,9 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.dirLock = dirLock
 	runtimeOwnsLock = true
 	store.identity = [16]byte(manifest.StoreUUID)
-	store.gcStability.sample(catalog.Snapshot(), store.gcNow())
+	initialPublished := catalog.Snapshot()
+	publisher.publish(initialPublished)
+	store.gcStability.sample(initialPublished, store.gcNow())
 	store.startCheckpointWorker()
 	if pendingCompaction != nil {
 		if err := store.resumeCompaction(ctx, *pendingCompaction); err != nil {

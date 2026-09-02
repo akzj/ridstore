@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -418,6 +419,62 @@ func TestCompactMappingAllowsCommitDuringRebuildAndPreservesDelta(t *testing.T) 
 	if err != nil || string(record.Value) != "during" {
 		t.Fatalf("reopened record=%+v err=%v", record, err)
 	}
+}
+
+func TestCompactMappingAllowsDataRotationDuringRebuild(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "store")
+	config := relocationConfig()
+	created, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createMappingGCRecord(t, ctx, created, "before")
+	if err := created.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+		if point == mapstore.FaultBeforeAppendWrite {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- store.CompactMapping(ctx) }()
+	<-entered
+
+	active := store.catalogSnapshot().ActiveDataSegmentID
+	for store.catalogSnapshot().ActiveDataSegmentID == active {
+		batch, err := store.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Create(ctx, bytes.Repeat([]byte{'x'}, 512)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := batch.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	if err := <-compactDone; err != nil {
+		t.Fatal(err)
+	}
+	assertPublishedStateMatchesCatalog(t, store)
 }
 
 func TestCompactMappingAllowsCheckpointDuringRebuild(t *testing.T) {

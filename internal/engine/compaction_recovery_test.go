@@ -109,6 +109,7 @@ func TestOpenResumesPublishedCompaction(t *testing.T) {
 	if containsSegmentID(reopened.catalog.Snapshot().SealedDataSegments, source) {
 		t.Fatal("source remains after recovery")
 	}
+	assertPublishedStateMatchesCatalog(t, reopened)
 	if _, err := os.Stat(compactionstate.Path(root)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("marker remains: %v", err)
 	}
