@@ -419,9 +419,10 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 			s.metrics.checkpointsFailed.Add(1)
 		}
 	}()
+	// Serialize only the short capture/freeze boundary. The expensive COW
+	// build, stats computation, and durable publication below run without the
+	// Store checkpoint mutex; Catalog generation checks reject stale plans.
 	s.checkpointMu.Lock()
-	defer s.checkpointMu.Unlock()
-
 	var work checkpointWork
 	for attempts := 0; ; attempts++ {
 		work, err = s.prepareCheckpoint(ctx)
@@ -432,6 +433,7 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 			return err
 		}
 	}
+	s.checkpointMu.Unlock()
 	if err != nil {
 		return err
 	}
