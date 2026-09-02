@@ -16,6 +16,7 @@ import (
 	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
+	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
@@ -589,6 +590,105 @@ func TestCompactMappingAllowsCheckpointDuringRebuild(t *testing.T) {
 	record, err := store.Get(ctx, id)
 	if err != nil || string(record.Value) != "during" {
 		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
+func TestCompactMappingAllowsCheckpointWhileOldReadersDrain(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	store, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	id := createMappingGCRecord(t, ctx, store, "stable")
+	if err := store.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := store.catalogSnapshot()
+	view, err := store.core.mapping.CheckpointView()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readerEntered := make(chan struct{})
+	releaseReader := make(chan struct{})
+	readerDone := make(chan error, 1)
+	go func() {
+		var once sync.Once
+		readerDone <- view.WalkRefs(ctx, func(model.ID, recordlog.RecordRef) error {
+			once.Do(func() {
+				close(readerEntered)
+				<-releaseReader
+			})
+			return nil
+		})
+	}()
+	select {
+	case <-readerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("old Mapping reader did not pin the checkpoint root")
+	}
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- store.CompactMapping(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		published := store.catalogSnapshot()
+		if published.Generation > before.Generation && published.MappingRoot != before.MappingRoot {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(releaseReader)
+			t.Fatal("Mapping rewrite was not published")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	deadline = time.Now().Add(time.Second)
+
+	// Publication precedes the old-reader drain. The capture lock must be
+	// available after the new Catalog generation and runtime root are installed.
+	for !store.checkpoints.captureMu.TryLock() {
+		if time.Now().After(deadline) {
+			close(releaseReader)
+			t.Fatal("checkpoint capture remained locked while old readers drained")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.checkpoints.captureMu.Unlock()
+
+	checkpointDone := make(chan error, 1)
+	go func() { checkpointDone <- store.Checkpoint(ctx) }()
+	select {
+	case err := <-checkpointDone:
+		if err != nil {
+			close(releaseReader)
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		close(releaseReader)
+		t.Fatal("Checkpoint blocked behind old Mapping reader drain")
+	}
+	select {
+	case err := <-compactDone:
+		close(releaseReader)
+		t.Fatalf("Mapping GC finished before the old reader was released: %v", err)
+	default:
+	}
+	close(releaseReader)
+	if err := <-readerDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-compactDone; err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(ctx, id)
+	if err != nil || string(record.Value) != "stable" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	if _, found, err := mapgcstate.Load(root); err != nil || found {
+		t.Fatalf("marker found=%v err=%v", found, err)
 	}
 }
 

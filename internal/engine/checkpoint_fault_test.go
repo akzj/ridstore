@@ -268,6 +268,82 @@ func TestBackgroundCheckpointPreservesPressureAfterFreeze(t *testing.T) {
 	}
 }
 
+func TestCheckpointRetriesConcurrentMaintenancePublication(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	created, err := Create(context.Background(), root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var armed, blocked atomic.Bool
+	store, err := open(context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+		if armed.Load() && point == mapstore.FaultBeforeAppendWrite && blocked.CompareAndSwap(false, true) {
+			close(started)
+			<-release
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	batch, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := batch.Create(context.Background(), []byte("survives retry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	armed.Store(true)
+	checkpointDone := make(chan error, 1)
+	go func() { checkpointDone <- store.Checkpoint(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Checkpoint build did not start")
+	}
+	manifest := store.catalogSnapshot()
+	reserved, _, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case err := <-checkpointDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Checkpoint did not rebuild after Catalog conflict")
+	}
+	after := store.catalogSnapshot()
+	if after.Generation <= reserved.Generation || after.CompactionSegmentFloor != reserved.CompactionSegmentFloor || after.CoveredCommitSeq != 1 {
+		t.Fatalf("reserved=%+v after=%+v", reserved, after)
+	}
+	store.state.mu.Lock()
+	fault := store.operationFaultLocked()
+	store.state.mu.Unlock()
+	if fault != nil {
+		t.Fatalf("optimistic checkpoint conflict faulted store: %v", fault)
+	}
+	record, err := store.Get(context.Background(), id)
+	if err != nil || string(record.Value) != "survives retry" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
 func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	root, config := prepareCheckpointStore(t)
 	injected := errors.New("injected recordlog sync failure")

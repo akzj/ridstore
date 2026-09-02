@@ -183,11 +183,17 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root))
 	}
 
-	// Publication and recovery-marker cleanup remain serialized with
-	// checkpoints. The long rebuild and verification above do not.
+	// Durable publication and the runtime owner switch remain serialized with
+	// checkpoints. Once both point at the new generation, draining readers and
+	// removing the old physical files no longer need the capture lock.
 	s.checkpoints.captureMu.Lock()
 	publishStarted := time.Now()
+	publicationLocked := true
 	unlockPublication := func() {
+		if !publicationLocked {
+			return
+		}
+		publicationLocked = false
 		duration := uint64(time.Since(publishStarted))
 		s.metrics.mappingGCPublishNanos.Add(duration)
 		updateAtomicMax(&s.metrics.mappingGCMaxPublishNanos, duration)
@@ -264,6 +270,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	}
 	oldStore := s.core.mapStore
 	s.core.mapStore = newStore
+	unlockPublication()
 	<-drained
 	if err := oldStore.Close(); err != nil {
 		s.setFault(err)

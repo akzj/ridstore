@@ -441,39 +441,48 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 	}()
 	// Serialize only the short capture/freeze boundary. The expensive COW
 	// build, stats computation, and durable publication below run without the
-	// Store checkpoint mutex; Catalog generation checks reject stale plans.
-	s.checkpoints.captureMu.Lock()
-	var work checkpointWork
-	for attempts := 0; ; attempts++ {
-		work, err = s.prepareCheckpoint(ctx)
-		if !errors.Is(err, base.ErrConflict) || attempts >= 8 {
-			break
+	// Store checkpoint mutex. A concurrent maintenance publication may make a
+	// candidate stale; abort that frozen plan and rebuild from the new published
+	// generation instead of treating the optimistic conflict as store damage.
+	for publishAttempts := 0; ; publishAttempts++ {
+		s.checkpoints.captureMu.Lock()
+		var work checkpointWork
+		for captureAttempts := 0; ; captureAttempts++ {
+			work, err = s.prepareCheckpoint(ctx)
+			if !errors.Is(err, base.ErrConflict) || captureAttempts >= 8 {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				s.checkpoints.captureMu.Unlock()
+				return err
+			}
+		}
+		s.checkpoints.captureMu.Unlock()
+		if err != nil {
+			return err
+		}
+		var reservation *spaceReservation
+		if gcAdmission {
+			entries, entryErr := work.frozen.EntryUpperBound()
+			if entryErr != nil {
+				return errors.Join(entryErr, s.core.mapping.AbortCheckpoint(work.frozen))
+			}
+			reservation, err = s.reserveGCCheckpoint(ctx, s.catalogSnapshot(), entries)
+			if err != nil {
+				return errors.Join(err, s.core.mapping.AbortCheckpoint(work.frozen))
+			}
+		}
+		err = s.finishCheckpoint(ctx, work)
+		if reservation != nil {
+			reservation.complete(err == nil)
+		}
+		if !errors.Is(err, storecatalog.ErrConflict) || publishAttempts >= 8 {
+			return err
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
-	s.checkpoints.captureMu.Unlock()
-	if err != nil {
-		return err
-	}
-	var reservation *spaceReservation
-	if gcAdmission {
-		entries, err := work.frozen.EntryUpperBound()
-		if err != nil {
-			return errors.Join(err, s.core.mapping.AbortCheckpoint(work.frozen))
-		}
-		reservation, err = s.reserveGCCheckpoint(ctx, s.catalogSnapshot(), entries)
-		if err != nil {
-			return errors.Join(err, s.core.mapping.AbortCheckpoint(work.frozen))
-		}
-		defer reservation.complete(false)
-	}
-	err = s.finishCheckpoint(ctx, work)
-	if err == nil && reservation != nil {
-		reservation.complete(true)
-	}
-	return err
 }
 
 type checkpointWork struct {

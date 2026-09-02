@@ -31,15 +31,16 @@ Checkpoint / GC
 
 | Primitive | Scope | May cross disk I/O | Blocks |
 |---|---|---:|---|
-| `Store.mu` | lifecycle, fault, open/status bookkeeping | no | brief entry/exit bookkeeping only |
-| `batchSnapshotMu` | Begin/Abort versus checkpoint recovery metadata snapshot | ID reservation during Begin may append | Begin/Abort/checkpoint snapshot; not Get/Put/Commit I/O |
-| `mutationFence` | drains `Record append -> Batch mutation visible` before retirement | read side covers one Put append | Put-like calls only; write side is released before Segment scan |
-| `checkpointMu` | serializes the Checkpoint worker with Mapping-GC Root publication | yes | maintenance only; data-plane callers wait by generation |
-| `maintenanceMu` | serializes Data/Mapping maintenance | yes | maintenance callers only |
-| `activeOps` + `closing` | Close admission and drain | no lock is held while draining | new operations after Close begins |
+| `storeState.mu` | lifecycle, fault, open/status registry and recovery snapshot | no | brief state transitions; allocator I/O occurs after unlock |
+| `mutationAdmission.mu` | drains `Record append -> Batch mutation visible` before retirement proof | yes; read side covers one Put append | Put-like calls only; write side is released before Segment scan |
+| `checkpointRuntime.captureMu` | Checkpoint cut/freeze; Mapping-GC durable publish plus runtime Root owner switch | yes, only for Mapping-GC publication | Checkpoint capture and Mapping-GC publication, never foreground data I/O |
+| `checkpointRuntime.requestMu` | checkpoint waiters and worker stop state | no | request enqueue/dequeue only |
+| `MaintenanceScheduler` slots | one Data maintenance and one Mapping rewrite | no | same-class background work; the two classes may overlap |
+| `PublishCoordinator.mu` | all durable Catalog generation transitions and PublishedState update | yes | metadata publishers and Segment rotation, not reads or non-rotating writes |
+| `activeOps` + `closing` under `storeState.mu` | Close admission and drain | no lock is held while draining | new operations after Close begins |
 
-`Close` never owns `checkpointMu` or `maintenanceMu` while waiting for `activeOps`; the Checkpoint worker remains alive
-until admitted waiters finish, then Close stops it before closing storage files.
+`Close` does not own the checkpoint capture lock or a maintenance slot while waiting for `activeOps`; the Checkpoint
+worker remains alive until admitted waiters finish, then Close stops it before closing storage files.
 
 ## 3. Coordinator and Mapping
 
@@ -53,6 +54,12 @@ Commit completion, but maintenance copy requests are ordered behind user request
 `Persistent.mu` protects Delta/root pointers and epoch validation. Root reads increment an atomic owner reference while
 holding only its read side, then perform Radix I/O with no Mapping lock. Root replacement is a short pointer switch; old
 MapStore close and retirement wait on the returned reader-drain channel outside the Mapping lock.
+
+Checkpoint COW construction is optimistic. If Data maintenance or Mapping rewrite advances an incompatible Catalog
+dimension before publication, the worker aborts the frozen plan and rebuilds from the new published generation. Only
+exhausted retries or non-conflict failures reach the fail-closed path. Mapping GC similarly holds the capture lock through
+durable Catalog publication and the runtime Root/MapStore switch, then releases it before waiting for old readers and
+retiring the old generation.
 
 ## 4. Physical stores
 

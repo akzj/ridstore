@@ -29,20 +29,30 @@ current logical Mapping
 
 ## 3. 并发切面
 
-维护串行顺序为：
+运行时协调顺序为：
 
 ```text
-maintenanceMu -> checkpointMu
+Mapping rewrite scheduler slot
+  -> checkpoint capture lock (capture or final publish only)
+  -> PublishCoordinator (durable Catalog generation)
 ```
 
-Mapping GC 持有 `maintenanceMu` 和 `checkpointMu` 直到运行时切换完成，这两把锁只排斥其他维护与
-Checkpoint，不阻塞数据面。初始 Coordinator admission fence 建立 durable cut、捕获 Batch/allocator
-元数据并冻结 Delta，随后立即释放；正常 checkpoint 在允许新 Commit 进入下一层 active Delta 的情况下
-安装 immutable Root。全量 Root 遍历、generation 构建和校验均不持有 admission fence。
+Mapping GC 的 scheduler slot 只阻止另一轮 Mapping rewrite；Data maintenance 可以并行构建，最终由
+PublishCoordinator 的 generation 校验合并或拒绝过期结果。初始 Coordinator admission fence 建立 durable
+cut、捕获 Batch/allocator 元数据并冻结 Delta，随后立即释放；正常 checkpoint 在允许新 Commit 进入下一层
+active Delta 的情况下安装 immutable Root。全量 Root 遍历、generation 构建和校验均不持有 admission fence
+或 checkpoint capture lock。
+
+最终阶段在 capture lock 内依次安装 recovery marker、提升新 generation、durable publish Catalog，并切换
+运行时 Root 与 MapStore owner。完成这两个可见性切面后立即释放 capture lock；旧 reader drain、旧 Store
+close、旧 generation retire、staging/marker cleanup 均在锁外执行。marker 恢复协议允许 cleanup 期间新的
+Checkpoint 推进 Catalog generation，但 Mapping file-set 必须保持为已发布的新集合。
 
 重建期间的新 Commit 留在 active Delta。GC 发布物理等价的新 Root 时不再暂停 Commit；Mapping epoch
 使跨切换的 resolve 重试，Root owner reader ref 使旧文件延迟到旧 reader 清零后关闭。这样
-O(live IDs) 遍历、promotion、Manifest fsync 和旧文件 retirement 都不会形成 Store 级服务停顿。
+O(live IDs) 遍历、promotion、Manifest fsync 和旧文件 retirement 都不会形成 Store 级数据面停顿；其中
+promotion、Manifest fsync 与 runtime owner switch 仍会短暂推迟另一轮 Checkpoint capture，reader drain 与
+retirement 不会。
 
 ## 4. 有界全量重建
 
