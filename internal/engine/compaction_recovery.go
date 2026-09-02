@@ -97,8 +97,7 @@ func (s *Store) resumeCompaction(ctx context.Context, state compactionstate.Stat
 	if err != nil {
 		return err
 	}
-	_ = proofs
-	installed, err := s.installCompactionRetirement(state.Inputs)
+	installed, err := s.installCompactionRetirement(state.Inputs, proofs)
 	if err != nil {
 		return err
 	}

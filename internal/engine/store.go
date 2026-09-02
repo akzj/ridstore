@@ -32,7 +32,6 @@ type Log interface {
 
 type maintenanceLog interface {
 	ScanSegment(context.Context, recordlog.SegmentID, func(recordlog.AppendResult, []byte) error) error
-	RetireSegment(context.Context, recordlog.SegmentID, uint64) error
 	NewCompactionWriter([]recordlog.SegmentID) (*recordlog.CompactionWriter, error)
 	RegisterCompactionOutputs([]recordlog.SegmentSummary) error
 	RemoveUnpublishedCompactionFiles([]recordlog.SegmentID) error

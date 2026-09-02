@@ -55,6 +55,38 @@ func TestCompactMarkerPublicationBoundary(t *testing.T) {
 	}
 }
 
+func TestCompactRetirementCASRejectsGenerationChangeAfterMarker(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	advanced := false
+	store.maintenanceHook = func(point maintstate.FaultPoint) error {
+		if point != maintstate.FaultBeforeJournalDirSync || advanced {
+			return nil
+		}
+		advanced = true
+		manifest := store.catalogSnapshot()
+		_, _, err := store.publisher.ReserveCompactionSegments(manifest.Generation, 1)
+		return err
+	}
+	if _, err := store.compactSegmentLocked(context.Background(), source, store.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrConflict) || errors.Is(err, base.ErrRecoveryRequired) {
+		t.Fatalf("compact err=%v", err)
+	}
+	if !advanced {
+		t.Fatal("Catalog generation did not advance")
+	}
+	if !containsSegmentID(store.catalogSnapshot().SealedDataSegments, source) {
+		t.Fatal("stale proof retired source")
+	}
+	if _, err := os.Stat(maintstate.Path(store.root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("maintenance marker remains: %v", err)
+	}
+	store.mu.Lock()
+	fault := store.operationFaultLocked()
+	store.mu.Unlock()
+	if fault != nil {
+		t.Fatalf("optimistic retirement conflict faulted Store: %v", fault)
+	}
+}
+
 func TestCompactMarkerRemovalFailureRecovers(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
 	root := store.root

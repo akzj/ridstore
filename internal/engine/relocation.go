@@ -413,7 +413,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	if len(proofs) != 0 {
 		result.Proof = proofs[0]
 	}
-	installed, err := s.installCompactionRetirement(inputs)
+	installed, err := s.installCompactionRetirement(inputs, proofs)
 	if err != nil {
 		return result, s.compactionFailure(err)
 	}
@@ -460,16 +460,16 @@ func (s *Store) installCompactionOutputs(outputs []recordlog.SegmentSummary) (st
 	return storecatalog.Manifest{}, base.ErrConflict
 }
 
-func (s *Store) installCompactionRetirement(inputs []recordlog.SegmentSummary) (storecatalog.Manifest, error) {
-	for attempt := 0; attempt < 32; attempt++ {
-		current := s.catalogSnapshot()
-		installed, err := s.publisher.InstallDataCompaction(current.Generation, inputs, current.CoveredCommitSeq, current.ReplayStart)
-		if errors.Is(err, storecatalog.ErrConflict) {
-			continue
-		}
-		return installed, err
+func (s *Store) installCompactionRetirement(inputs []recordlog.SegmentSummary, proofs []SegmentRetirementProof) (storecatalog.Manifest, error) {
+	manifest, err := s.validateRetirementProofs(inputs, proofs)
+	if err != nil {
+		return storecatalog.Manifest{}, err
 	}
-	return storecatalog.Manifest{}, base.ErrConflict
+	installed, err := s.publisher.InstallDataCompaction(manifest.Generation, inputs, manifest.CoveredCommitSeq, manifest.ReplayStart)
+	if errors.Is(err, storecatalog.ErrConflict) {
+		err = errors.Join(base.ErrConflict, err)
+	}
+	return installed, err
 }
 
 func (s *Store) compactionFailure(err error) error {
@@ -763,15 +763,13 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 	if err != nil {
 		return result, fmt.Errorf("prove retirement of segment %d: %w", source, err)
 	}
-	manifest := s.catalogSnapshot()
-	if s.root == "" || manifest.Generation < proof.CatalogGeneration || manifest.RecordLogID == (recordlog.LogID{}) ||
-		manifest.CoveredCommitSeq < proof.CoveredCommitSeq || manifest.ReplayStart.Compare(proof.ReplayStart) < 0 ||
-		!containsSealedSegment(manifest, proof.Source) {
-		return result, fmt.Errorf("retirement proof generation=%d current=%d: %w", proof.CatalogGeneration, manifest.Generation, base.ErrInvalidConfig)
+	manifest, err := s.validateRetirementProofs([]recordlog.SegmentSummary{proof.Source}, []SegmentRetirementProof{proof})
+	if err != nil {
+		return result, err
 	}
 	state := maintstate.State{
 		Operation: maintstate.DataRetire, StoreUUID: manifest.StoreUUID, LogID: manifest.RecordLogID,
-		BaseGeneration: manifest.Generation, CoveredCommitSeq: manifest.CoveredCommitSeq,
+		BaseGeneration: proof.ManifestGeneration, CoveredCommitSeq: proof.CoveredCommitSeq,
 		ReplayStart: manifest.ReplayStart, Source: proof.Source,
 	}
 	if err := maintstate.InstallWithFaultHook(s.root, state, s.maintenanceHook); err != nil {
@@ -783,7 +781,13 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		}
 		return result, err
 	}
-	if err := s.maintenance.RetireSegment(ctx, source, manifest.Generation); err != nil {
+	installed, err := s.publisher.InstallDataRetire(proof.ManifestGeneration, storecatalog.DataRetire{
+		Source: proof.Source, CoveredCommitSeq: proof.CoveredCommitSeq, ReplayStart: proof.ReplayStart,
+	})
+	if err != nil {
+		if errors.Is(err, storecatalog.ErrConflict) {
+			err = errors.Join(base.ErrConflict, err)
+		}
 		current := s.catalogSnapshot()
 		if current.Generation >= manifest.Generation && containsSealedSegment(current, proof.Source) {
 			cleanupErr := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook)
@@ -798,12 +802,36 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		s.setFault(recoveryErr)
 		return result, recoveryErr
 	}
+	if err := s.maintenance.FinalizeCompactionRetirement(ctx, []recordlog.SegmentSummary{proof.Source}, installed.Generation); err != nil {
+		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
+		s.setFault(recoveryErr)
+		return result, recoveryErr
+	}
 	if err := maintstate.RemoveWithFaultHook(s.root, s.maintenanceHook); err != nil {
 		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
 		s.setFault(recoveryErr)
 		return result, recoveryErr
 	}
 	return result, nil
+}
+
+func (s *Store) validateRetirementProofs(inputs []recordlog.SegmentSummary, proofs []SegmentRetirementProof) (storecatalog.Manifest, error) {
+	if len(inputs) == 0 || len(inputs) != len(proofs) {
+		return storecatalog.Manifest{}, base.ErrInvalidConfig
+	}
+	published := s.PublishedState()
+	if published == nil {
+		return storecatalog.Manifest{}, base.ErrInvalidConfig
+	}
+	manifest := published.Manifest
+	for index, proof := range proofs {
+		if proof.Source != inputs[index] || proof.ManifestGeneration == 0 || proof.CatalogGeneration != proof.ManifestGeneration ||
+			proof.ManifestGeneration != published.Generation || proof.CoveredCommitSeq != manifest.CoveredCommitSeq ||
+			proof.ReplayStart != manifest.ReplayStart || !containsSealedSegment(manifest, proof.Source) {
+			return storecatalog.Manifest{}, fmt.Errorf("retirement proof generation=%d published=%d: %w", proof.ManifestGeneration, published.Generation, base.ErrConflict)
+		}
+	}
+	return manifest, nil
 }
 
 // checkpointAndProveRetirement retries only when a concurrent post-cut update

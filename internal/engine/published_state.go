@@ -140,7 +140,23 @@ func (p *PublishCoordinator) InstallCompactionOutputs(expect uint64, outputs []r
 func (p *PublishCoordinator) InstallDataCompaction(expect uint64, inputs []storecatalog.DataSegmentSummary, covered model.CommitSeq, replayStart recordlog.LogPos) (storecatalog.Manifest, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if state := p.published.Load(); state == nil || state.Generation != expect {
+		return storecatalog.Manifest{}, storecatalog.ErrConflict
+	}
 	installed, err := p.catalog.InstallDataCompaction(expect, inputs, covered, replayStart)
+	if err == nil {
+		p.publish(installed)
+	}
+	return installed, err
+}
+
+func (p *PublishCoordinator) InstallDataRetire(expect uint64, update storecatalog.DataRetire) (storecatalog.Manifest, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if state := p.published.Load(); state == nil || state.Generation != expect {
+		return storecatalog.Manifest{}, storecatalog.ErrConflict
+	}
+	installed, err := p.catalog.InstallDataRetire(expect, update)
 	if err == nil {
 		p.publish(installed)
 	}

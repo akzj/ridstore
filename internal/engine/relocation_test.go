@@ -316,6 +316,24 @@ func TestPrepareSegmentRetirementRejectsOpenBatchReference(t *testing.T) {
 	}
 }
 
+func TestCompactionRetirementRejectsStalePublishedGeneration(t *testing.T) {
+	store, source, _, _, _ := relocationFixture(t)
+	proof, _, err := store.PrepareSegmentRetirement(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := store.catalogSnapshot()
+	if _, _, err := store.publisher.ReserveCompactionSegments(manifest.Generation, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.installCompactionRetirement([]recordlog.SegmentSummary{proof.Source}, []SegmentRetirementProof{proof}); !errors.Is(err, base.ErrConflict) {
+		t.Fatalf("retire with stale proof err=%v", err)
+	}
+	if !containsSealedSegment(store.catalogSnapshot(), proof.Source) {
+		t.Fatal("stale proof retired source")
+	}
+}
+
 func TestCompactSegmentRetiresSourceAndKeepsRecordsReadable(t *testing.T) {
 	store, source, id, oldAddr, _ := relocationFixture(t)
 	result, err := store.CompactSegment(context.Background(), source)
