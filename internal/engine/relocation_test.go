@@ -662,7 +662,7 @@ func TestCompactNextSegmentReusesExistingCheckpointBeforeCopy(t *testing.T) {
 	}()
 	select {
 	case <-blocked.reached:
-		// Copy started while checkpointMu was unavailable, proving selection
+		// Copy started while the checkpoint capture lock was unavailable, proving selection
 		// reused the already durable checkpoint.
 	case <-time.After(time.Second):
 		t.Fatal("compaction attempted a redundant selection checkpoint")

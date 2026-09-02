@@ -89,9 +89,9 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return errors.Join(base.ErrRecoveryRequired, errors.New("mapping gc is active"))
 	}
 
-	// Capture a self-consistent immutable Root, then release checkpointMu for
-	// the complete rebuild. A concurrent checkpoint may advance this Root; the
-	// publication phase detects that as a normal optimistic conflict.
+	// Capture a self-consistent immutable Root, then release the checkpoint
+	// capture lock for the complete rebuild. A concurrent checkpoint may advance
+	// this Root; the publication phase detects that as a normal optimistic conflict.
 	s.checkpoints.captureMu.Lock()
 	published := s.PublishedState()
 	if published == nil {

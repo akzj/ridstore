@@ -698,8 +698,8 @@ func (s *Store) setFault(err error) {
 }
 
 // operationFaultLocked returns the single fail-closed view used by public data
-// operations. The caller holds s.state.mu; Coordinator never acquires s.state.mu, so
-// consulting its terminal state here does not introduce a lock cycle.
+// operations. The caller holds state.mu; Coordinator never acquires state.mu,
+// so consulting its terminal state here does not introduce a lock cycle.
 func (s *Store) operationFaultLocked() error {
 	if s.state.fault != nil {
 		return s.state.fault
