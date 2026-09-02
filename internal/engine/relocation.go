@@ -631,17 +631,17 @@ func (s *Store) snapshotOpenBatchCompactionRefs(inputs []recordlog.SegmentSummar
 	for _, input := range inputs {
 		inputIDs[input.SegmentID] = struct{}{}
 	}
-	s.mutationFence.Lock()
+	s.mutationAdmission.writeLock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		s.mutationFence.Unlock()
+		s.mutationAdmission.writeUnlock()
 		return openBatchCompactionRefs{}, base.ErrClosed
 	}
 	if s.fault != nil {
 		fault := s.fault
 		s.mu.Unlock()
-		s.mutationFence.Unlock()
+		s.mutationAdmission.writeUnlock()
 		return openBatchCompactionRefs{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	open := make([]*Batch, 0, len(s.open))
@@ -654,7 +654,7 @@ func (s *Store) snapshotOpenBatchCompactionRefs(inputs []recordlog.SegmentSummar
 	// Once drained, later Put records can only enter the active Segment. Release
 	// the global fence before inspecting individual Batches so the scan cost is
 	// never added to foreground Put latency.
-	s.mutationFence.Unlock()
+	s.mutationAdmission.writeUnlock()
 	result := openBatchCompactionRefs{refs: make(map[recordlog.VAddr]recordlog.RecordRef)}
 	for _, batch := range open {
 		referenced := false
@@ -914,17 +914,17 @@ func (s *Store) proveCompactionRetirement(source recordlog.SegmentID, relocation
 }
 
 func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq, scanMapping bool) (SegmentRetirementProof, error) {
-	s.mutationFence.Lock()
+	s.mutationAdmission.writeLock()
 	s.mu.Lock()
 	closed, fault := s.closed, s.fault
 	if closed {
 		s.mu.Unlock()
-		s.mutationFence.Unlock()
+		s.mutationAdmission.writeUnlock()
 		return SegmentRetirementProof{}, base.ErrClosed
 	}
 	if fault != nil {
 		s.mu.Unlock()
-		s.mutationFence.Unlock()
+		s.mutationAdmission.writeUnlock()
 		return SegmentRetirementProof{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	open := make([]*Batch, 0, len(s.open))
@@ -932,7 +932,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 		open = append(open, batch)
 	}
 	s.mu.Unlock()
-	s.mutationFence.Unlock()
+	s.mutationAdmission.writeUnlock()
 	for _, batch := range open {
 		if batch.inner.ReferencesSegment(source) {
 			return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("open batch references source segment"))

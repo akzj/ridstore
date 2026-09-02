@@ -92,23 +92,23 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	// Capture a self-consistent immutable Root, then release checkpointMu for
 	// the complete rebuild. A concurrent checkpoint may advance this Root; the
 	// publication phase detects that as a normal optimistic conflict.
-	s.checkpointMu.Lock()
+	s.checkpoints.captureMu.Lock()
 	published := s.PublishedState()
 	if published == nil {
-		s.checkpointMu.Unlock()
+		s.checkpoints.captureMu.Unlock()
 		return base.ErrInvalidConfig
 	}
 	manifest := published.Manifest.Clone()
 	view, err := s.mapping.CheckpointView()
 	if err != nil {
-		s.checkpointMu.Unlock()
+		s.checkpoints.captureMu.Unlock()
 		return err
 	}
 	if view.Root() != manifest.MappingRoot || view.Covered() != manifest.CoveredCommitSeq {
-		s.checkpointMu.Unlock()
+		s.checkpoints.captureMu.Unlock()
 		return base.ErrCorrupt
 	}
-	s.checkpointMu.Unlock()
+	s.checkpoints.captureMu.Unlock()
 	space, err := s.reserveMappingGC(ctx, manifest, manifest.MappingEntryCount)
 	if err != nil {
 		return err
@@ -185,13 +185,13 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 
 	// Publication and recovery-marker cleanup remain serialized with
 	// checkpoints. The long rebuild and verification above do not.
-	s.checkpointMu.Lock()
+	s.checkpoints.captureMu.Lock()
 	publishStarted := time.Now()
 	unlockPublication := func() {
 		duration := uint64(time.Since(publishStarted))
 		s.metrics.mappingGCPublishNanos.Add(duration)
 		updateAtomicMax(&s.metrics.mappingGCMaxPublishNanos, duration)
-		s.checkpointMu.Unlock()
+		s.checkpoints.captureMu.Unlock()
 	}
 	latest := s.catalogSnapshot()
 	currentView, currentErr := s.mapping.CheckpointView()

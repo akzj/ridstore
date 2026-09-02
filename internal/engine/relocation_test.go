@@ -89,11 +89,11 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store.checkpointMu.Lock()
+	store.checkpoints.captureMu.Lock()
 	locked := true
 	defer func() {
 		if locked {
-			store.checkpointMu.Unlock()
+			store.checkpoints.captureMu.Unlock()
 		}
 	}()
 	filler, err := store.Begin(context.Background())
@@ -117,9 +117,9 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		store.checkpointRequestMu.Lock()
-		waiting := len(store.checkpointWaiters) != 0
-		store.checkpointRequestMu.Unlock()
+		store.checkpoints.requestMu.Lock()
+		waiting := len(store.checkpoints.waiters) != 0
+		store.checkpoints.requestMu.Unlock()
 		if waiting {
 			break
 		}
@@ -128,7 +128,7 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	store.checkpointMu.Unlock()
+	store.checkpoints.captureMu.Unlock()
 	locked = false
 	select {
 	case err := <-done:
@@ -640,7 +640,7 @@ func TestCompactNextSegmentReusesExistingCheckpointBeforeCopy(t *testing.T) {
 		reached: make(chan struct{}), release: make(chan struct{}),
 	}
 	store.maintenance = blocked
-	store.checkpointMu.Lock()
+	store.checkpoints.captureMu.Lock()
 	checkpointHeld := true
 	released := false
 	defer func() {
@@ -648,7 +648,7 @@ func TestCompactNextSegmentReusesExistingCheckpointBeforeCopy(t *testing.T) {
 			close(blocked.release)
 		}
 		if checkpointHeld {
-			store.checkpointMu.Unlock()
+			store.checkpoints.captureMu.Unlock()
 		}
 	}()
 	type answer struct {
@@ -669,7 +669,7 @@ func TestCompactNextSegmentReusesExistingCheckpointBeforeCopy(t *testing.T) {
 	}
 	close(blocked.release)
 	released = true
-	store.checkpointMu.Unlock()
+	store.checkpoints.captureMu.Unlock()
 	checkpointHeld = false
 	got := <-done
 	if got.err != nil || !got.found {
@@ -1066,7 +1066,7 @@ func TestRetirementProofDrainsInFlightBatchMutationBeforeScanning(t *testing.T) 
 	// This models the interval after a Put Record append and before its final
 	// Batch mutation becomes visible. Retirement must drain that interval before
 	// it may inspect open-Batch references or scan the source.
-	store.mutationFence.RLock()
+	store.mutationAdmission.readLock()
 	proofDone := make(chan error, 1)
 	go func() {
 		_, err := store.proveSegmentRetirement(context.Background(), source, relocated.LastCommitSeq)
@@ -1074,11 +1074,11 @@ func TestRetirementProofDrainsInFlightBatchMutationBeforeScanning(t *testing.T) 
 	}()
 	select {
 	case <-blocked.reached:
-		store.mutationFence.RUnlock()
+		store.mutationAdmission.readUnlock()
 		t.Fatal("retirement scan crossed an in-flight Batch mutation")
 	case <-time.After(20 * time.Millisecond):
 	}
-	store.mutationFence.RUnlock()
+	store.mutationAdmission.readUnlock()
 	select {
 	case <-blocked.reached:
 	case <-time.After(time.Second):

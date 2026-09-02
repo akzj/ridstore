@@ -333,11 +333,11 @@ func TestCheckpointPressureWaitHonorsCallerCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	store.checkpointMu.Lock()
+	store.checkpoints.captureMu.Lock()
 	locked := true
 	defer func() {
 		if locked {
-			store.checkpointMu.Unlock()
+			store.checkpoints.captureMu.Unlock()
 		}
 	}()
 	batch, err := store.Begin(context.Background())
@@ -360,7 +360,7 @@ func TestCheckpointPressureWaitHonorsCallerCancellation(t *testing.T) {
 	if err := store.awaitCheckpointPressure(ctx, receipt.DeltaPressureGeneration(), false); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("wait err=%v", err)
 	}
-	store.checkpointMu.Unlock()
+	store.checkpoints.captureMu.Unlock()
 	locked = false
 	deadline := time.Now().Add(2 * time.Second)
 	for store.mapping.CoveredCommitSeq() == 0 {
@@ -381,11 +381,11 @@ func TestCheckpointPressureWaitersShareOneGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	store.checkpointMu.Lock()
+	store.checkpoints.captureMu.Lock()
 	locked := true
 	defer func() {
 		if locked {
-			store.checkpointMu.Unlock()
+			store.checkpoints.captureMu.Unlock()
 		}
 	}()
 	batch, err := store.Begin(context.Background())
@@ -423,9 +423,9 @@ func TestCheckpointPressureWaitersShareOneGeneration(t *testing.T) {
 	}
 	deadline = time.Now().Add(2 * time.Second)
 	for {
-		store.checkpointRequestMu.Lock()
-		queued := len(store.checkpointWaiters)
-		store.checkpointRequestMu.Unlock()
+		store.checkpoints.requestMu.Lock()
+		queued := len(store.checkpoints.waiters)
+		store.checkpoints.requestMu.Unlock()
 		if queued == waiterCount {
 			break
 		}
@@ -434,7 +434,7 @@ func TestCheckpointPressureWaitersShareOneGeneration(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	store.checkpointMu.Unlock()
+	store.checkpoints.captureMu.Unlock()
 	locked = false
 	for index := 0; index < waiterCount; index++ {
 		select {
@@ -494,11 +494,11 @@ func TestCheckpointPressureGenerationDeduplicatesLateRequest(t *testing.T) {
 	if err := store.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if completed := store.checkpointPressureCompleted.Load(); completed < first {
+	if completed := store.checkpoints.pressureCompleted.Load(); completed < first {
 		t.Fatalf("completed generation=%d first=%d", completed, first)
 	}
 	store.requestBackgroundCheckpoint(first)
-	if pending, completed := store.checkpointPressurePending.Load(), store.checkpointPressureCompleted.Load(); pending > completed {
+	if pending, completed := store.checkpoints.pressurePending.Load(), store.checkpoints.pressureCompleted.Load(); pending > completed {
 		t.Fatalf("late request was not deduplicated: pending=%d completed=%d", pending, completed)
 	}
 	if requested := store.Metrics().BackgroundCheckpointRequested; requested != 0 {
@@ -510,7 +510,7 @@ func TestCheckpointPressureGenerationDeduplicatesLateRequest(t *testing.T) {
 		t.Fatalf("new active Delta generation=%d first=%d", second, first)
 	}
 	store.requestBackgroundCheckpoint(second)
-	if pending, completed := store.checkpointPressurePending.Load(), store.checkpointPressureCompleted.Load(); pending != second || pending <= completed {
+	if pending, completed := store.checkpoints.pressurePending.Load(), store.checkpoints.pressureCompleted.Load(); pending != second || pending <= completed {
 		t.Fatalf("new pressure was lost: pending=%d completed=%d second=%d", pending, completed, second)
 	}
 }
@@ -531,11 +531,11 @@ func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
 		}
 	}()
 
-	store.checkpointMu.Lock()
+	store.checkpoints.captureMu.Lock()
 	locked := true
 	defer func() {
 		if locked {
-			store.checkpointMu.Unlock()
+			store.checkpoints.captureMu.Unlock()
 		}
 	}()
 	commit := func(value string) {
@@ -553,7 +553,7 @@ func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
 	commit("first")
 
 	deadline := time.Now().Add(2 * time.Second)
-	for len(store.checkpointRequests) != 0 {
+	for len(store.checkpoints.requests) != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("background worker did not consume the first wake")
 		}
@@ -564,7 +564,7 @@ func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
 		t.Fatalf("same Delta generation queued %d checkpoint requests", requested)
 	}
 
-	store.checkpointMu.Unlock()
+	store.checkpoints.captureMu.Unlock()
 	locked = false
 	deadline = time.Now().Add(2 * time.Second)
 	for store.Metrics().BackgroundCheckpointCompleted == 0 {
@@ -663,7 +663,7 @@ func TestCloseStopsBackgroundCheckpointBeforeClosingStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-store.checkpointDone:
+	case <-store.checkpoints.done:
 	default:
 		t.Fatal("background checkpoint worker still running after Close")
 	}
@@ -733,17 +733,17 @@ func TestCloseDoesNotWaitForCheckpointMutex(t *testing.T) {
 	// the Store closing. Close must drain active operations without owning the
 	// same mutex they may still need, otherwise the lifecycle protocol can
 	// deadlock permanently.
-	store.checkpointMu.Lock()
+	store.checkpoints.captureMu.Lock()
 	done := make(chan error, 1)
 	go func() { done <- store.Close() }()
 	select {
 	case err := <-done:
-		store.checkpointMu.Unlock()
+		store.checkpoints.captureMu.Unlock()
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		store.checkpointMu.Unlock()
+		store.checkpoints.captureMu.Unlock()
 		t.Fatal("Close waited for checkpoint mutex")
 	}
 }

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,34 +17,55 @@ type checkpointWaiter struct {
 	result      chan error
 }
 
+// checkpointRuntime owns checkpoint capture serialization, worker lifecycle,
+// waiter coalescing, and Delta-pressure generations. Keeping these fields
+// together makes their lock ownership explicit without changing the existing
+// Store-level checkpoint protocol.
+type checkpointRuntime struct {
+	captureMu sync.Mutex
+
+	requests chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+
+	requestMu     sync.Mutex
+	waiters       []checkpointWaiter
+	workerStopped bool
+	interval      time.Duration
+
+	pressurePending   atomic.Uint64
+	pressureCompleted atomic.Uint64
+}
+
 func (s *Store) startCheckpointWorker() {
-	s.checkpointRequests = make(chan struct{}, 1)
-	s.checkpointStop = make(chan struct{})
-	s.checkpointDone = make(chan struct{})
-	s.checkpointRequestMu.Lock()
-	s.checkpointWorkerStopped = false
-	s.checkpointRequestMu.Unlock()
+	s.checkpoints.requests = make(chan struct{}, 1)
+	s.checkpoints.stop = make(chan struct{})
+	s.checkpoints.done = make(chan struct{})
+	s.checkpoints.requestMu.Lock()
+	s.checkpoints.workerStopped = false
+	s.checkpoints.requestMu.Unlock()
 	go s.runCheckpointWorker()
 }
 
 func (s *Store) wakeCheckpointWorker() {
 	select {
-	case s.checkpointRequests <- struct{}{}:
+	case s.checkpoints.requests <- struct{}{}:
 	default:
 	}
 }
 
 func (s *Store) requestBackgroundCheckpoint(generation uint64) {
-	if s == nil || s.checkpointRequests == nil || generation == 0 {
+	if s == nil || s.checkpoints.requests == nil || generation == 0 {
 		return
 	}
-	if generation <= s.checkpointPressureCompleted.Load() {
+	if generation <= s.checkpoints.pressureCompleted.Load() {
 		return
 	}
-	if !advanceAtomic(&s.checkpointPressurePending, generation) {
+	if !advanceAtomic(&s.checkpoints.pressurePending, generation) {
 		return
 	}
-	if generation <= s.checkpointPressureCompleted.Load() {
+	if generation <= s.checkpoints.pressureCompleted.Load() {
 		return
 	}
 	s.metrics.backgroundCheckpointRequested.Add(1)
@@ -57,24 +79,24 @@ func (s *Store) requestCheckpoint(ctx context.Context, generation uint64, force,
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if generation != 0 && generation <= s.checkpointPressureCompleted.Load() {
+	if generation != 0 && generation <= s.checkpoints.pressureCompleted.Load() {
 		return nil
 	}
 	waiter := checkpointWaiter{
 		generation: generation, force: force, gcAdmission: gcAdmission,
 		result: make(chan error, 1),
 	}
-	s.checkpointRequestMu.Lock()
-	if s.checkpointWorkerStopped {
-		s.checkpointRequestMu.Unlock()
+	s.checkpoints.requestMu.Lock()
+	if s.checkpoints.workerStopped {
+		s.checkpoints.requestMu.Unlock()
 		return base.ErrClosed
 	}
-	if generation != 0 && generation <= s.checkpointPressureCompleted.Load() {
-		s.checkpointRequestMu.Unlock()
+	if generation != 0 && generation <= s.checkpoints.pressureCompleted.Load() {
+		s.checkpoints.requestMu.Unlock()
 		return nil
 	}
-	s.checkpointWaiters = append(s.checkpointWaiters, waiter)
-	s.checkpointRequestMu.Unlock()
+	s.checkpoints.waiters = append(s.checkpoints.waiters, waiter)
+	s.checkpoints.requestMu.Unlock()
 	s.wakeCheckpointWorker()
 	select {
 	case err := <-waiter.result:
@@ -98,7 +120,7 @@ func (s *Store) completeCheckpointPressure(generation uint64) {
 	if s == nil || generation == 0 {
 		return
 	}
-	advanceAtomic(&s.checkpointPressureCompleted, generation)
+	advanceAtomic(&s.checkpoints.pressureCompleted, generation)
 }
 
 func advanceAtomic(value *atomic.Uint64, candidate uint64) bool {
@@ -111,10 +133,10 @@ func advanceAtomic(value *atomic.Uint64, candidate uint64) bool {
 }
 
 func (s *Store) takeCheckpointWaiters() []checkpointWaiter {
-	s.checkpointRequestMu.Lock()
-	waiters := s.checkpointWaiters
-	s.checkpointWaiters = nil
-	s.checkpointRequestMu.Unlock()
+	s.checkpoints.requestMu.Lock()
+	waiters := s.checkpoints.waiters
+	s.checkpoints.waiters = nil
+	s.checkpoints.requestMu.Unlock()
 	return waiters
 }
 
@@ -125,8 +147,8 @@ func (s *Store) periodicCheckpointNeeded() bool {
 
 func (s *Store) runCheckpointCycle(periodic bool) {
 	waiters := s.takeCheckpointWaiters()
-	completed := s.checkpointPressureCompleted.Load()
-	pending := s.checkpointPressurePending.Load()
+	completed := s.checkpoints.pressureCompleted.Load()
+	pending := s.checkpoints.pressurePending.Load()
 	pressure := pending > completed
 	needed := pressure || (periodic && s.periodicCheckpointNeeded())
 	gcAdmission := false
@@ -178,24 +200,24 @@ func (s *Store) runCheckpointCycle(periodic bool) {
 }
 
 func (s *Store) runCheckpointWorker() {
-	timer := time.NewTicker(s.checkpointInterval)
+	timer := time.NewTicker(s.checkpoints.interval)
 	defer func() {
 		timer.Stop()
-		s.checkpointRequestMu.Lock()
-		s.checkpointWorkerStopped = true
-		waiters := s.checkpointWaiters
-		s.checkpointWaiters = nil
-		s.checkpointRequestMu.Unlock()
+		s.checkpoints.requestMu.Lock()
+		s.checkpoints.workerStopped = true
+		waiters := s.checkpoints.waiters
+		s.checkpoints.waiters = nil
+		s.checkpoints.requestMu.Unlock()
 		for _, waiter := range waiters {
 			waiter.result <- base.ErrClosed
 		}
-		close(s.checkpointDone)
+		close(s.checkpoints.done)
 	}()
 	for {
 		select {
-		case <-s.checkpointStop:
+		case <-s.checkpoints.stop:
 			return
-		case <-s.checkpointRequests:
+		case <-s.checkpoints.requests:
 			s.runCheckpointCycle(false)
 		case <-timer.C:
 			s.runCheckpointCycle(true)
@@ -204,9 +226,9 @@ func (s *Store) runCheckpointWorker() {
 }
 
 func (s *Store) stopCheckpointWorker() {
-	if s == nil || s.checkpointStop == nil {
+	if s == nil || s.checkpoints.stop == nil {
 		return
 	}
-	s.checkpointStopOnce.Do(func() { close(s.checkpointStop) })
-	<-s.checkpointDone
+	s.checkpoints.stopOnce.Do(func() { close(s.checkpoints.stop) })
+	<-s.checkpoints.done
 }

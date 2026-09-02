@@ -77,68 +77,58 @@ type statusOrderEntry struct {
 }
 
 type Store struct {
-	mu            sync.Mutex
-	mutationFence sync.RWMutex // compatibility alias for tests
-	checkpointMu  sync.Mutex
-	activeOps     uint64
-	closing       bool
+	mu                sync.Mutex
+	mutationAdmission mutationAdmission
+	checkpoints       checkpointRuntime
+	activeOps         uint64
+	closing           bool
 
-	log                         Log
-	maintenance                 maintenanceLog
-	maintenanceHook             maintstate.FaultHook
-	mapStoreHook                mapstore.FaultHook
-	mappingGCHook               mapgcstate.FaultHook
-	root                        string
-	mapping                     *mapping.Persistent
-	mapStore                    *mapstore.Store
-	catalog                     *storecatalog.Manager
-	ids                         *idalloc.Allocator
-	batches                     *idalloc.Allocator
-	commits                     *coordinator.Coordinator
-	limits                      transaction.Limits
-	userAppender                transaction.Appender
-	maxOpen                     int
-	open                        map[model.BatchID]*Batch
-	statuses                    map[model.BatchID]statusEntry
-	statusOrder                 []statusOrderEntry
-	statusOrderHead             int
-	statusSerial                uint64
-	statusRetention             uint64
-	terminalTotal               uint64
-	terminalBase                uint64
-	openCount                   int
-	batchEpoch                  atomic.Uint64
-	recoveryAbortedStart        uint64
-	recoveryAbortedEnd          uint64
-	recoveryAbortedValid        bool
-	notify                      chan struct{}
-	closed                      bool
-	fault                       error
-	maxStats                    uint64
-	mappingCacheBytes           uint64
-	maxRelocationBytes          uint64
-	maxRelocationMutations      uint64
-	gcMinFreeBytes              uint64
-	gcBytesPerSecond            atomic.Uint64
-	gcNow                       func() time.Time
-	gcWait                      func(context.Context, time.Duration) error
-	dirLock                     *filelock.Lock
-	identity                    [16]byte
-	space                       *spaceGate
-	metrics                     runtimeMetrics
-	gcStability                 gcStability
-	checkpointRequests          chan struct{}
-	checkpointStop              chan struct{}
-	checkpointDone              chan struct{}
-	checkpointStopOnce          sync.Once
-	checkpointRequestMu         sync.Mutex
-	checkpointWaiters           []checkpointWaiter
-	checkpointWorkerStopped     bool
-	checkpointInterval          time.Duration
-	checkpointPressurePending   atomic.Uint64
-	checkpointPressureCompleted atomic.Uint64
-	maintScheduler              *MaintenanceScheduler
-	publisher                   *PublishCoordinator
+	log                    Log
+	maintenance            maintenanceLog
+	maintenanceHook        maintstate.FaultHook
+	mapStoreHook           mapstore.FaultHook
+	mappingGCHook          mapgcstate.FaultHook
+	root                   string
+	mapping                *mapping.Persistent
+	mapStore               *mapstore.Store
+	catalog                *storecatalog.Manager
+	ids                    *idalloc.Allocator
+	batches                *idalloc.Allocator
+	commits                *coordinator.Coordinator
+	limits                 transaction.Limits
+	userAppender           transaction.Appender
+	maxOpen                int
+	open                   map[model.BatchID]*Batch
+	statuses               map[model.BatchID]statusEntry
+	statusOrder            []statusOrderEntry
+	statusOrderHead        int
+	statusSerial           uint64
+	statusRetention        uint64
+	terminalTotal          uint64
+	terminalBase           uint64
+	openCount              int
+	batchEpoch             atomic.Uint64
+	recoveryAbortedStart   uint64
+	recoveryAbortedEnd     uint64
+	recoveryAbortedValid   bool
+	notify                 chan struct{}
+	closed                 bool
+	fault                  error
+	maxStats               uint64
+	mappingCacheBytes      uint64
+	maxRelocationBytes     uint64
+	maxRelocationMutations uint64
+	gcMinFreeBytes         uint64
+	gcBytesPerSecond       atomic.Uint64
+	gcNow                  func() time.Time
+	gcWait                 func(context.Context, time.Duration) error
+	dirLock                *filelock.Lock
+	identity               [16]byte
+	space                  *spaceGate
+	metrics                runtimeMetrics
+	gcStability            gcStability
+	maintScheduler         *MaintenanceScheduler
+	publisher              *PublishCoordinator
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -422,7 +412,7 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 	// Serialize only the short capture/freeze boundary. The expensive COW
 	// build, stats computation, and durable publication below run without the
 	// Store checkpoint mutex; Catalog generation checks reject stale plans.
-	s.checkpointMu.Lock()
+	s.checkpoints.captureMu.Lock()
 	var work checkpointWork
 	for attempts := 0; ; attempts++ {
 		work, err = s.prepareCheckpoint(ctx)
@@ -433,7 +423,7 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 			return err
 		}
 	}
-	s.checkpointMu.Unlock()
+	s.checkpoints.captureMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -859,8 +849,8 @@ func withBatchMutation[T any](b *Batch, run func() (T, error)) (T, error) {
 		// Put-like operations append a Record before publishing the final
 		// mutation into the Batch. Retirement briefly takes the write side to
 		// drain this interval before snapshotting source references.
-		b.store.mutationFence.RLock()
-		defer b.store.mutationFence.RUnlock()
+		b.store.mutationAdmission.readLock()
+		defer b.store.mutationAdmission.readUnlock()
 		return run()
 	})
 }

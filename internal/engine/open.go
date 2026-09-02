@@ -271,7 +271,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.gcBytesPerSecond.Store(config.GCBytesPerSecond)
 	store.gcNow = time.Now
 	store.gcWait = waitContext
-	store.checkpointInterval = config.CheckpointInterval
+	store.checkpoints.interval = config.CheckpointInterval
 	store.dirLock = dirLock
 	runtimeOwnsLock = true
 	store.identity = [16]byte(manifest.StoreUUID)
