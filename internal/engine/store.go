@@ -78,12 +78,11 @@ type statusOrderEntry struct {
 }
 
 type Store struct {
-	mu              sync.Mutex
-	batchSnapshotMu sync.Mutex
-	mutationFence   sync.RWMutex
-	checkpointMu    sync.Mutex
-	activeOps       uint64
-	closing         bool
+	mu            sync.Mutex
+	mutationFence sync.RWMutex
+	checkpointMu  sync.Mutex
+	activeOps     uint64
+	closing       bool
 
 	log                         Log
 	maintenance                 maintenanceLog
@@ -109,6 +108,7 @@ type Store struct {
 	terminalTotal               uint64
 	terminalBase                uint64
 	openCount                   int
+	batchEpoch                  atomic.Uint64
 	recoveryAbortedStart        uint64
 	recoveryAbortedEnd          uint64
 	recoveryAbortedValid        bool
@@ -247,10 +247,8 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 		if s.openCount < s.maxOpen && !capacityBlocked {
 			s.openCount++
 			s.mu.Unlock()
-			s.batchSnapshotMu.Lock()
 			raw, err := s.batches.Allocate(ctx)
 			if err != nil {
-				s.batchSnapshotMu.Unlock()
 				s.mu.Lock()
 				s.openCount--
 				s.signalLocked()
@@ -259,7 +257,6 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 			}
 			inner, err := transaction.New(model.BatchID(raw), s.limits, s.userAppender, s.ids)
 			if err != nil {
-				s.batchSnapshotMu.Unlock()
 				s.mu.Lock()
 				s.openCount--
 				s.signalLocked()
@@ -269,8 +266,8 @@ func (s *Store) Begin(ctx context.Context) (*Batch, error) {
 			batch := &Batch{store: s, inner: inner}
 			s.mu.Lock()
 			s.open[batch.ID()] = batch
+			s.batchEpoch.Add(1)
 			s.mu.Unlock()
-			s.batchSnapshotMu.Unlock()
 			return batch, nil
 		}
 		notify := s.notify
@@ -479,14 +476,13 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 	// Drain potentially slow Begin/Abort metadata work before stopping Commit
 	// admission. Once held, this mutex keeps the open-Batch/allocator snapshot
 	// stable through the short durable cut and Mapping freeze.
-	s.batchSnapshotMu.Lock()
-	defer s.batchSnapshotMu.Unlock()
 	fence, err := s.commits.AcquireCheckpointFence(ctx)
 	if err != nil {
 		return checkpointWork{}, err
 	}
 	defer fence.Release()
 	cut := fence.Cut
+	epoch := s.batchEpoch.Load()
 	s.mu.Lock()
 	open, statusCut, err := s.openBatchIDsAtCut()
 	if err != nil {
@@ -498,6 +494,9 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 	reservedIDHigh, reservedBatchIDHigh := s.ids.DurableHigh(), s.batches.DurableHigh()
 	issuedBatchIDHigh := s.batches.IssuedHigh()
 	s.mu.Unlock()
+	if epoch != s.batchEpoch.Load() {
+		return checkpointWork{}, base.ErrConflict
+	}
 	frozen, err := s.mapping.Freeze(cut.CoveredCommitSeq)
 	if err != nil {
 		return checkpointWork{}, err
@@ -807,8 +806,6 @@ func (b *Batch) Abort(ctx context.Context) error {
 		return err
 	}
 	defer b.store.endOperation()
-	b.store.batchSnapshotMu.Lock()
-	defer b.store.batchSnapshotMu.Unlock()
 	b.store.mu.Lock()
 	closed, fault := b.store.closed || b.store.closing, b.store.operationFaultLocked()
 	b.store.mu.Unlock()
@@ -883,6 +880,7 @@ func (b *Batch) finish() {
 			}
 		}
 		delete(b.store.open, b.ID())
+		b.store.batchEpoch.Add(1)
 		if b.store.openCount > 0 {
 			b.store.openCount--
 		}
