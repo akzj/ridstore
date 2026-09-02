@@ -139,6 +139,7 @@ type Store struct {
 	checkpointPressurePending   atomic.Uint64
 	checkpointPressureCompleted atomic.Uint64
 	maintScheduler              *MaintenanceScheduler
+	published                   atomic.Pointer[PublishedState]
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -570,6 +571,7 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 	}
 	s.gcStability.sample(installed, now)
 	s.completeCheckpointPressure(frozen.PressureGeneration())
+	s.publishState(installed)
 	s.mu.Lock()
 	if work.statusCut > s.terminalBase {
 		s.terminalBase = work.statusCut
