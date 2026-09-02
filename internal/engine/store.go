@@ -79,7 +79,7 @@ type statusOrderEntry struct {
 
 type Store struct {
 	mu            sync.Mutex
-	mutationFence sync.RWMutex
+	mutationFence sync.RWMutex // compatibility alias for tests
 	checkpointMu  sync.Mutex
 	activeOps     uint64
 	closing       bool
