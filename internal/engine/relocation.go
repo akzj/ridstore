@@ -94,8 +94,10 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 	}
 	defer s.endOperation()
 
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
+	if err := s.acquireDataMaintenance(ctx); err != nil {
+		return SegmentRelocationResult{}, err
+	}
+	defer s.releaseDataMaintenance()
 	rate := s.gcBytesPerSecond.Load()
 	return s.relocateSegment(ctx, source, rate)
 }
@@ -118,8 +120,10 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	}
 	defer s.endOperation()
 
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
+	if err := s.acquireDataMaintenance(ctx); err != nil {
+		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
+	}
+	defer s.releaseDataMaintenance()
 	rate := s.gcBytesPerSecond.Load()
 	relocated, err := s.relocateSegment(ctx, source, rate)
 	if err != nil {
@@ -147,8 +151,10 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		return SegmentCompactionResult{}, err
 	}
 	defer s.endOperation()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
+	if err := s.acquireDataMaintenance(ctx); err != nil {
+		return SegmentCompactionResult{}, err
+	}
+	defer s.releaseDataMaintenance()
 	rate := s.gcBytesPerSecond.Load()
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
@@ -181,8 +187,10 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 		return NextSegmentCompactionResult{}, false, err
 	}
 	defer s.endOperation()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
+	if err := s.acquireDataMaintenance(ctx); err != nil {
+		return NextSegmentCompactionResult{}, false, err
+	}
+	defer s.releaseDataMaintenance()
 	rate := s.gcBytesPerSecond.Load()
 	selectCandidate := func() (SegmentCompactionCandidate, bool, error) {
 		manifest := s.catalog.Snapshot()
@@ -732,7 +740,8 @@ func (s *Store) recordCompactionMetrics(started time.Time, result SegmentCompact
 	}
 }
 
-// compactSegmentLocked requires maintenanceMu.
+// compactSegmentLocked is called while the scheduler owns the data
+// maintenance slot.
 func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentCompactionResult, error) {
 
 	relocated, err := s.relocateSegment(ctx, source, rate)
@@ -952,7 +961,7 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 	}, nil
 }
 
-// relocateSegment requires maintenanceMu. Keeping orchestration ownership at
+// relocateSegment requires the scheduler's data maintenance slot. Keeping orchestration ownership at
 // Store lets a later complete GC operation compose relocation, checkpoint and
 // retirement without recursively acquiring the maintenance lock.
 func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentRelocationResult, error) {

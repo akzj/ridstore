@@ -82,7 +82,6 @@ type Store struct {
 	batchSnapshotMu sync.Mutex
 	mutationFence   sync.RWMutex
 	checkpointMu    sync.Mutex
-	maintenanceMu   sync.Mutex
 	activeOps       uint64
 	closing         bool
 
@@ -139,6 +138,7 @@ type Store struct {
 	checkpointInterval          time.Duration
 	checkpointPressurePending   atomic.Uint64
 	checkpointPressureCompleted atomic.Uint64
+	maintScheduler              *MaintenanceScheduler
 }
 
 // Identity returns the persistent identity of this store. It is stable across
@@ -182,6 +182,7 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 		statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
 		maxRelocationBytes:     config.Batch.MaxBatchBytes,
 		maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
+		maintScheduler:         &MaintenanceScheduler{},
 	}, nil
 }
 
@@ -688,6 +689,19 @@ func (s *Store) releaseSlot() {
 	}
 	s.signalLocked()
 	s.mu.Unlock()
+}
+
+func (s *Store) acquireDataMaintenance(ctx context.Context) error {
+	if s.maintScheduler == nil {
+		s.maintScheduler = &MaintenanceScheduler{}
+	}
+	return s.maintScheduler.acquireData(ctx)
+}
+
+func (s *Store) releaseDataMaintenance() {
+	if s.maintScheduler != nil {
+		s.maintScheduler.releaseData()
+	}
 }
 
 type Batch struct {

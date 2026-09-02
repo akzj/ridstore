@@ -48,11 +48,19 @@ func (s *Store) CompactMapping(ctx context.Context) (err error) {
 			s.metrics.mappingGCFailed.Add(1)
 		}
 	}()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
 	if err := s.checkpoint(ctx, false); err != nil {
 		return err
 	}
+	// Mapping rewrite is a low-priority COW phase. Serialize it with
+	// Checkpoint at the dispatcher boundary, but never use this gate to block
+	// foreground operations while the tree is rebuilt.
+	if s.maintScheduler == nil {
+		s.maintScheduler = &MaintenanceScheduler{}
+	}
+	if err := s.maintScheduler.acquireMappingRewrite(ctx); err != nil {
+		return err
+	}
+	defer s.maintScheduler.releaseMappingRewrite()
 	return s.compactCheckpointMapping(ctx)
 }
 
