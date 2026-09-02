@@ -93,7 +93,12 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	// the complete rebuild. A concurrent checkpoint may advance this Root; the
 	// publication phase detects that as a normal optimistic conflict.
 	s.checkpointMu.Lock()
-	manifest := s.catalog.Snapshot()
+	published := s.PublishedState()
+	if published == nil {
+		s.checkpointMu.Unlock()
+		return base.ErrInvalidConfig
+	}
+	manifest := published.Manifest.Clone()
 	view, err := s.mapping.CheckpointView()
 	if err != nil {
 		s.checkpointMu.Unlock()
@@ -198,7 +203,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		return s.mappingGCPrepublishFailure(currentErr, discardMappingGCStaging(s.root))
 	}
 	oldSet := mappingGCFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot)
-	if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
+	if latest.Generation != published.Generation || latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
 		!manifestMatchesMappingSet(latest, oldSet) {
 		unlockPublication()
 		return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.root))
@@ -272,6 +277,7 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
+	s.publishState(installed)
 	spaceCommitted = true
 	return nil
 }
