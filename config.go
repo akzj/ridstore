@@ -35,11 +35,15 @@ type RuntimeConfig struct {
 	CommitQueueCapacity int
 	MaxGroupBatches     int
 	MaxGroupPayload     uint64
-	MappingCacheBytes   uint64
-	CheckpointSortBytes uint64
-	MaxSegmentStats     uint64
-	DeltaSoftLimitBytes uint64
-	DeltaHardLimitBytes uint64
+	// GroupCommitDelay bounds commit coalescing. Zero selects the default;
+	// DisableGroupCommitDelay retains opportunistic, non-blocking batching.
+	GroupCommitDelay        time.Duration
+	DisableGroupCommitDelay bool
+	MappingCacheBytes       uint64
+	CheckpointSortBytes     uint64
+	MaxSegmentStats         uint64
+	DeltaSoftLimitBytes     uint64
+	DeltaHardLimitBytes     uint64
 	// StatusRetention bounds retained/replayed user Batch outcomes and must be
 	// at least HardLimits.MaxOpenBatches.
 	StatusRetention uint64
@@ -138,6 +142,11 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	if c.MaxGroupPayload == 0 {
 		c.MaxGroupPayload = 64 * mib
 	}
+	if c.DisableGroupCommitDelay {
+		c.GroupCommitDelay = 0
+	} else if c.GroupCommitDelay == 0 {
+		c.GroupCommitDelay = 50 * time.Microsecond
+	}
 	if c.MappingCacheBytes == 0 {
 		c.MappingCacheBytes = 256 * mib
 	}
@@ -167,7 +176,7 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	}
 	return engine.OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: c.MaxQueuedBytes, QueueCapacity: c.AppendQueueCapacity, BufferBytes: c.AppendBufferBytes, BufferRecords: c.AppendBufferRecords},
-		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload},
+		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload, GroupCommitDelay: c.GroupCommitDelay},
 		MappingCacheBytes: c.MappingCacheBytes, CheckpointSortBytes: c.CheckpointSortBytes,
 		MaxSegmentStats: c.MaxSegmentStats, DeltaSoftLimitBytes: c.DeltaSoftLimitBytes,
 		DeltaHardLimitBytes: c.DeltaHardLimitBytes, StatusRetention: c.StatusRetention,

@@ -25,6 +25,10 @@ type Config struct {
 	QueueCapacity   int
 	MaxGroupBatches int
 	MaxGroupPayload uint64
+	// GroupCommitDelay is the maximum time the coordinator waits after the
+	// first request for more commits to share one durable append. Barriers end
+	// the wait immediately. Zero preserves opportunistic, non-blocking batching.
+	GroupCommitDelay time.Duration
 }
 
 type Result struct {
@@ -183,7 +187,8 @@ func New(next model.CommitSeq, log Appender, current mapping.Index, config Confi
 
 func ValidateConfig(config Config) error {
 	if config.QueueCapacity <= 0 || config.MaxGroupBatches <= 0 ||
-		config.MaxGroupPayload < uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize) {
+		config.MaxGroupPayload < uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize) ||
+		config.GroupCommitDelay < 0 {
 		return base.ErrInvalidConfig
 	}
 	return nil
@@ -513,47 +518,82 @@ func (c *Coordinator) run() {
 			c.rejectInvalid(first, errors.Join(base.ErrBatchTooLarge, err))
 			continue
 		}
+		var timer *time.Timer
+		var deadline <-chan time.Time
+		if c.config.GroupCommitDelay > 0 && c.config.MaxGroupBatches > 1 {
+			timer = time.NewTimer(c.config.GroupCommitDelay)
+			deadline = timer.C
+		}
 		for len(group) < c.config.MaxGroupBatches {
-			select {
-			case next, ok := <-c.requests:
-				if !ok {
-					c.process(group)
-					return
-				}
-				if next.barrier != nil || next.redirect != nil {
-					c.process(group)
-					if next.redirect != nil {
-						c.processRedirect(next.redirect)
-					} else {
-						c.processCheckpoint(next)
-					}
-					group = nil
-					break
-				}
-				nextBytes, sizeErr := requestDescriptorSize(next)
-				if sizeErr != nil || uint64(recordcodec.CommitGroupHeadSize)+nextBytes > c.config.MaxGroupPayload {
-					c.rejectInvalid(next, errors.Join(base.ErrBatchTooLarge, sizeErr))
-					continue
-				}
-				if bytes > c.config.MaxGroupPayload-nextBytes {
-					c.process(group)
-					group = []request{next}
-					bytes = uint64(recordcodec.CommitGroupHeadSize) + nextBytes
-					continue
-				}
-				group = append(group, next)
-				bytes += nextBytes
-			default:
+			next, ok, available := receiveUntil(c.requests, deadline)
+			if !available {
 				c.process(group)
 				group = nil
+				break
 			}
+			if !ok {
+				c.process(group)
+				stopTimer(timer)
+				return
+			}
+			if next.barrier != nil || next.redirect != nil {
+				c.process(group)
+				if next.redirect != nil {
+					c.processRedirect(next.redirect)
+				} else {
+					c.processCheckpoint(next)
+				}
+				group = nil
+				break
+			}
+			nextBytes, sizeErr := requestDescriptorSize(next)
+			if sizeErr != nil || uint64(recordcodec.CommitGroupHeadSize)+nextBytes > c.config.MaxGroupPayload {
+				c.rejectInvalid(next, errors.Join(base.ErrBatchTooLarge, sizeErr))
+				continue
+			}
+			if bytes > c.config.MaxGroupPayload-nextBytes {
+				c.process(group)
+				group = []request{next}
+				bytes = uint64(recordcodec.CommitGroupHeadSize) + nextBytes
+				continue
+			}
+			group = append(group, next)
+			bytes += nextBytes
 			if group == nil {
 				break
 			}
 		}
+		stopTimer(timer)
 		if len(group) != 0 {
 			c.process(group)
 		}
+	}
+}
+
+// receiveUntil retains the old non-blocking drain when deadline is nil. With
+// a deadline it gives concurrently arriving commits a bounded opportunity to
+// share one fsync. Control requests use the same channel and therefore wake
+// the collector immediately.
+func receiveUntil(requests <-chan request, deadline <-chan time.Time) (request, bool, bool) {
+	if deadline == nil {
+		select {
+		case next, ok := <-requests:
+			return next, ok, true
+		default:
+			return request{}, true, false
+		}
+	}
+	select {
+	case next, ok := <-requests:
+		return next, ok, true
+	case <-deadline:
+		return request{}, true, false
+	}
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer != nil {
+		timer.Stop()
 	}
 }
 

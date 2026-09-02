@@ -338,3 +338,18 @@ func testCreateConfig(dir string) CreateConfig {
 		},
 	}
 }
+
+func TestGroupCommitDelayDefaultsAndCanBeDisabled(t *testing.T) {
+	defaults := (RuntimeConfig{}).engineConfig()
+	if defaults.Commit.GroupCommitDelay != 50*time.Microsecond {
+		t.Fatalf("default group commit delay=%v", defaults.Commit.GroupCommitDelay)
+	}
+	disabled := (RuntimeConfig{DisableGroupCommitDelay: true}).engineConfig()
+	if disabled.Commit.GroupCommitDelay != 0 {
+		t.Fatalf("disabled group commit delay=%v", disabled.Commit.GroupCommitDelay)
+	}
+	explicit := (RuntimeConfig{GroupCommitDelay: 125 * time.Microsecond}).engineConfig()
+	if explicit.Commit.GroupCommitDelay != 125*time.Microsecond {
+		t.Fatalf("explicit group commit delay=%v", explicit.Commit.GroupCommitDelay)
+	}
+}

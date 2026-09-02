@@ -165,6 +165,22 @@ func newCoordinator(t *testing.T, log *fakeLog, current mapping.Index) *Coordina
 	return c
 }
 
+func newCoordinatorWithDelay(t *testing.T, log *fakeLog, current mapping.Index, delay time.Duration) *Coordinator {
+	t.Helper()
+	c, err := New(current.CoveredCommitSeq()+1, log, current, Config{
+		QueueCapacity: 16, MaxGroupBatches: 8, MaxGroupPayload: 1 << 20, GroupCommitDelay: delay,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil && !errors.Is(err, base.ErrClosed) {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return c
+}
+
 type coordinatorNodeStore struct{}
 
 func (coordinatorNodeStore) Read(model.MapAddr) (mapstore.Node, error) {
@@ -216,6 +232,73 @@ func TestCommitWritesDurableDescriptorBeforeMappingPublish(t *testing.T) {
 	groups := log.snapshotGroups()
 	if len(groups) != 1 || len(groups[0].Descriptors) != 1 || groups[0].Descriptors[0].BatchID != 7 || groups[0].Descriptors[0].CommitSeq != 1 {
 		t.Fatalf("groups=%+v", groups)
+	}
+}
+
+func TestGroupCommitDelayCoalescesConcurrentSubmissions(t *testing.T) {
+	log := &fakeLog{}
+	current := mapping.NewEmpty()
+	c := newCoordinatorWithDelay(t, log, current, time.Second)
+	first := newBatch(t, 7, log)
+	second := newBatch(t, 8, log)
+	if err := first.Put(context.Background(), 3, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Put(context.Background(), 4, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	firstReceipt, err := c.Submit(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReceipt, err := c.Submit(context.Background(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstReceipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondReceipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	groups := log.snapshotGroups()
+	if len(groups) != 1 || len(groups[0].Descriptors) != 2 {
+		t.Fatalf("groups=%+v", groups)
+	}
+}
+
+func TestCheckpointBarrierEndsGroupCommitDelay(t *testing.T) {
+	log := &fakeLog{}
+	current := mapping.NewEmpty()
+	c := newCoordinatorWithDelay(t, log, current, time.Second)
+	batch := newBatch(t, 7, log)
+	if err := batch.Put(context.Background(), 3, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := c.Submit(context.Background(), batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	fence, err := c.AcquireCheckpointFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.Release()
+	if _, err := receipt.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	records, checkpoints := log.snapshotRecords()
+	if len(records) != 3 || records[1] != recordcodec.RecordTypeCommitGroup || records[2] != recordcodec.RecordTypeCheckpoint || len(checkpoints) != 1 {
+		t.Fatalf("records=%v checkpoints=%+v", records, checkpoints)
+	}
+}
+
+func TestNegativeGroupCommitDelayIsInvalid(t *testing.T) {
+	config := Config{QueueCapacity: 1, MaxGroupBatches: 1, MaxGroupPayload: 1 << 20, GroupCommitDelay: -time.Nanosecond}
+	if !errors.Is(ValidateConfig(config), base.ErrInvalidConfig) {
+		t.Fatalf("ValidateConfig(%+v) should reject a negative delay", config)
 	}
 }
 

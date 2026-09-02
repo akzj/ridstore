@@ -87,7 +87,27 @@ func BenchmarkDurableHotOverwrite(b *testing.B) {
 func BenchmarkDurableMaintenanceInterference(b *testing.B) {
 	for _, maintenance := range []string{"none", "checkpoint", "mapping-compact"} {
 		b.Run(maintenance, func(b *testing.B) {
-			runDurableMaintenanceInterference(b, maintenance, false)
+			runDurableMaintenanceInterference(b, maintenance, false, 0, false)
+		})
+	}
+}
+
+// BenchmarkDurableGroupCommitDelay compares bounded commit coalescing against
+// the legacy opportunistic drain. Run all sub-benchmarks in one invocation so
+// they see comparable filesystem and host conditions.
+func BenchmarkDurableGroupCommitDelay(b *testing.B) {
+	for _, candidate := range []struct {
+		name     string
+		delay    time.Duration
+		disabled bool
+	}{
+		{name: "disabled", disabled: true},
+		{name: "50us", delay: 50 * time.Microsecond},
+		{name: "100us", delay: 100 * time.Microsecond},
+		{name: "200us", delay: 200 * time.Microsecond},
+	} {
+		b.Run(candidate.name, func(b *testing.B) {
+			runDurableMaintenanceInterference(b, "none", false, candidate.delay, candidate.disabled)
 		})
 	}
 }
@@ -98,14 +118,14 @@ func BenchmarkDurableMaintenanceInterference(b *testing.B) {
 func BenchmarkDurableDataCompactionInterference(b *testing.B) {
 	for _, maintenance := range []string{"none", "data-compact"} {
 		b.Run(maintenance, func(b *testing.B) {
-			runDurableMaintenanceInterference(b, maintenance, true)
+			runDurableMaintenanceInterference(b, maintenance, true, 0, false)
 		})
 	}
 }
 
-func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepareDataCompaction bool) {
+func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepareDataCompaction bool, groupCommitDelay time.Duration, disableGroupCommitDelay bool) {
 	b.Helper()
-	store, dir := openMaintenanceBenchmarkStore(b)
+	store, dir := openMaintenanceBenchmarkStore(b, groupCommitDelay, disableGroupCommitDelay)
 	ids := seedMaintenanceBenchmark(b, store, 2800, 256)
 	value := make([]byte, 256)
 	var pending *Batch
@@ -187,6 +207,10 @@ func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepare
 	reportLatencyDistribution(b, "commit", commitLatency[:completed])
 	b.ReportMetric(float64(maintenanceCount.Load()), "maintenance-ops")
 	metrics := store.Metrics()
+	b.ReportMetric(float64(metrics.CommitGroups), "commit-groups")
+	if metrics.CommitGroups != 0 {
+		b.ReportMetric(float64(metrics.GroupBatches)/float64(metrics.CommitGroups), "batches/commit-group")
+	}
 	b.ReportMetric(float64(metrics.GCCompleted), "gc-completed")
 	b.ReportMetric(float64(metrics.GCCommitRedirects), "gc-redirects")
 	b.ReportMetric(float64(metrics.GCOpenRefsRedirected), "gc-redirected-refs")
@@ -288,7 +312,7 @@ func reportLatencyDistribution(b *testing.B, operation string, samples []int64) 
 	b.ReportMetric(float64(samples[len(samples)-1]), operation+"-max-ns")
 }
 
-func openMaintenanceBenchmarkStore(b *testing.B) (*Store, string) {
+func openMaintenanceBenchmarkStore(b *testing.B, groupCommitDelay time.Duration, disableGroupCommitDelay bool) (*Store, string) {
 	b.Helper()
 	dir := filepath.Join(b.TempDir(), "store")
 	config := CreateConfig{
@@ -301,7 +325,8 @@ func openMaintenanceBenchmarkStore(b *testing.B) (*Store, string) {
 		Runtime: RuntimeConfig{
 			MaxQueuedBytes: 64 << 20, AppendQueueCapacity: 4096, AppendBufferBytes: 8 << 20,
 			AppendBufferRecords: 4096, CommitQueueCapacity: 4096, MaxGroupBatches: 64,
-			MaxGroupPayload: 256 << 10, MappingCacheBytes: 64 << 20,
+			MaxGroupPayload: 256 << 10, GroupCommitDelay: groupCommitDelay, DisableGroupCommitDelay: disableGroupCommitDelay,
+			MappingCacheBytes:   64 << 20,
 			CheckpointSortBytes: 64 << 20, MaxSegmentStats: 1 << 16,
 			DeltaSoftLimitBytes: 64 << 20, DeltaHardLimitBytes: 128 << 20,
 			StatusRetention: 1 << 16, WriteStopFreeBytes: 1, SpaceCheckInterval: time.Second,
