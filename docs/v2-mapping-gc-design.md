@@ -1,6 +1,6 @@
 # ridstore v2 Mapping GC
 
-状态：G1-G5 implemented
+状态：Implemented v2 contract
 
 ## 1. 目标与边界
 
@@ -33,16 +33,19 @@ current logical Mapping
 运行时协调顺序为：
 
 ```text
-Mapping rewrite scheduler slot
-  -> checkpoint capture lock (capture or final publish only)
-  -> PublishCoordinator (durable Catalog generation)
+Survey (automatic policy only)
+  -> Checkpoint dependency
+  -> Copy
+  -> Publish
+  -> Cleanup
 ```
 
-Mapping GC 的 scheduler slot 只阻止另一轮 Mapping rewrite；Data maintenance 可以并行构建，最终由
-PublishCoordinator 的 generation 校验合并或拒绝过期结果。初始 Coordinator admission fence 建立 durable
-cut、捕获 Batch/allocator 元数据并冻结 Delta，随后立即释放；正常 checkpoint 在允许新 Commit 进入下一层
-active Delta 的情况下安装 immutable Root。全量 Root 遍历、generation 构建和校验均不持有 admission fence
-或 checkpoint capture lock。
+Maintenance Scheduler 合并同类 Mapping GC 请求，并按阶段分配 `heavyIO`、`mappingWriter` 和
+`recoveryProtocol` 资源。Checkpoint 优先级高于 Segment GC 和 Mapping GC；Mapping 的 Copy 阶段不占用
+`mappingWriter`，因此后续 Checkpoint 可以推进并使重建计划过期。最终由 PublishCoordinator 的 generation
+校验接受或拒绝结果，不合并过期 Root。初始 Checkpoint dependency 建立 durable cut、捕获 Batch/allocator
+元数据并冻结 Delta；正常 Checkpoint 在允许新 Commit 进入下一层 active Delta 的情况下安装 immutable Root。
+全量 Root 遍历、generation 构建和校验均不持有 admission fence 或 checkpoint capture lock。
 
 最终阶段在 capture lock 内依次安装 recovery marker、提升新 generation、durable publish Catalog，并切换
 运行时 Root 与 MapStore owner。完成这两个可见性切面后立即释放 capture lock；旧 reader drain、旧 Store
@@ -140,18 +143,3 @@ marker remove。每个边界验证原始错误保留、当前 Store fail closed�
 
 子进程退出至少覆盖：marker-only、部分新文件已提升、Manifest 已发布但旧文件尚在、部分旧文件进 trash、
 trash 已删除但 marker 尚在。成功后必须通过 v2 Offline Verify，且所有 ID/Value 与 GC 前一致。
-
-## 9. 实现阶段
-
-1. **G1 streaming rebuild（已实现）**：Radix 有界流式 builder 与独立 GenerationWriter；
-2. **G2 catalog transaction（已实现）**：Mapping file-set 原子替换及字段不变性测试；
-3. **G3 durable recovery（已实现）**：独立 marker、staging promotion、old/new Catalog 判定、发布前回滚、
-   发布后新 Root 验证、旧文件 retirement、fresh-open 幂等收敛及 Verify 门禁；
-4. **G4 runtime switch（已实现）**：Engine 固定锁序、同一独占 cut 下的 checkpoint + rebuild、
-   `Persistent.ReplaceCheckpointRoot`、旧 owner 关闭后 retirement，以及公开 `CompactMapping(ctx)`；
-5. **G5 evidence（已实现）**：generation header/node/footer/sync、marker、promotion、Manifest rewrite、
-   rollback、retirement 和 marker cleanup 的 runtime fault matrix；rollback 自身失败保留恢复证据；多文件
-   partial promote/retire；staging build、marker-only、Catalog published、old files in trash、trash deleted 五个
-   process-exit 恢复点；race、Offline Verify、重复 GC 与物理空间收敛测试。
-
-自动触发只消费精确 survey 的缓存结果，不改变本节的 durable marker、publication 或 recovery 协议。

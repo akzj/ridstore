@@ -1,6 +1,6 @@
 # Metrics Export
 
-状态：Phase 5 operational adapter v1
+状态：v2 operational contract
 
 ## 1. 边界
 

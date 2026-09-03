@@ -1,6 +1,6 @@
 # ridstore v2 Record Protocol
 
-状态：Draft for Review
+状态：Implemented v2 contract
 
 Ridstore Protocol 位于 Public API/Coordinator 与通用 RecordLog 之间。每个协议消息是一个完整的
 RecordLog payload；RecordLog 不解析本协议。

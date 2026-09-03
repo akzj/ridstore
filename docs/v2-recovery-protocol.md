@@ -1,6 +1,6 @@
 # ridstore v2 Recovery Protocol
 
-状态：Draft for Review
+状态：Implemented v2 contract
 
 本文只定义 v2 的权威状态、恢复顺序和崩溃判定。它不兼容 Format v1。
 

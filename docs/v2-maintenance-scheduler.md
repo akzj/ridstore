@@ -26,7 +26,8 @@ another worker.
 | Segment compact | Prove | retained recoveryProtocol | retry Checkpoint if stats stale, else Retire |
 | Segment compact | Retire | heavyIO + retained recoveryProtocol | durable retirement, Done |
 | Mapping survey | Start | heavyIO | Done |
-| Mapping GC | Start | recoveryProtocol | depend on Checkpoint |
+| Mapping GC (automatic) | Start/Survey | heavyIO | stop below policy thresholds, otherwise depend on Checkpoint |
+| Mapping GC (explicit) | Start | recoveryProtocol | retain recoveryProtocol, depend on Checkpoint |
 | Mapping GC | Copy | heavyIO + recoveryProtocol | Publish |
 | Mapping GC | Publish | mappingWriter + recoveryProtocol | Cleanup |
 | Mapping GC | Cleanup | recoveryProtocol | Done |

@@ -138,15 +138,3 @@ output seal + fsync
 顺序重扫，并按 `GCBatchBytes` / `GCBatchMutations` 生成有界 relocation batch；正常执行与恢复都不在
 内存中保留整组 live-record 索引。高位 output 地址的持久化先后由 Catalog membership 与完整 Record
 身份校验证明，不能使用面向普通 append Segment 的 VAddr 数值顺序判断。
-
-## 8. 实施阶段
-
-1. 定义 RecordRef，并升级 Commit mutation codec；
-2. 将 Mapping、Radix leaf、Checkpoint builder 和 replay 切换到 RecordRef；
-3. 更新 MapStore node format、golden/fuzz/verify；
-4. 在 Mapping publication 中维护实时 SegmentStats；
-5. Checkpoint 直接冻结统计代际，删除普通路径的 Record Header 随机读取；
-6. 增加 death velocity/stable rounds 调度状态；
-7. 实现多输入、独立输出的在线 Segment Compaction。
-
-每个阶段必须保持 crash/reopen、CommitUnknown、Checkpoint fault matrix 和 GC retirement 测试通过。

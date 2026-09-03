@@ -96,7 +96,7 @@ Group admission 不能持有一部分 reservation 等待另一部分：按 queue
 
 若 Checkpoint 持续失败，新的 Commit 在 hard limit 前停止，Get、Abort、Recovery、Checkpoint retry 和 Close 仍可运行；错误与最长等待时间必须可观测。
 
-Batch Status 使用独立预算。运行时最多保留 `StatusRetention` 个已解决近期状态；更老已分配 BatchID 返回 `ErrStatusExpired`。`CommitUnknown` 不进入逐出队列，Store 在重新 Open 前也不会越过它建立新 Checkpoint。replay window 中 terminal Commit/Relocation/Abort 达到 75% 时请求 Checkpoint；`Begin` 为所有 Open Batch 预留最坏一个 terminal slot，到达硬上限后 Context-aware 等待 Checkpoint。Data GC 的内部 Relocation 同样预留 slot；若它在持有维护串行锁时到达上限，则返回 `ErrStatusCapacity`、安全撤销本轮 cleaning journal 并请求 Checkpoint，调用者可重试，不允许等待自身形成死锁。
+Batch Status 使用独立预算。运行时最多保留 `StatusRetention` 个已解决近期状态；更老已分配 BatchID 返回 `ErrStatusExpired`。`CommitUnknown` 不进入逐出队列，Store 在重新 Open 前也不会越过它建立新 Checkpoint。replay window 中 terminal Commit/Relocation/Abort 达到 75% 时请求 Checkpoint；`Begin` 为所有 Open Batch 预留最坏一个 terminal slot，到达硬上限后 Context-aware 等待 Checkpoint。Data GC 的内部 Relocation 同样预留 slot；到达上限时，Segment worker 保留 Scheduler 分配的 `recoveryProtocol` 资源并声明高优先级 Checkpoint dependency，Checkpoint 完成后再恢复原阶段。worker 不持有 Store 级维护锁等待自身，也不绕过容量门禁。
 
 Checkpoint 在 log barrier **之前**捕获 terminal 完成计数。已计数的终态要么已完成所需 append，要么是无需 terminal Frame 的确定性失败，随后 barrier 会覆盖它的全部恢复影响；并发较晚完成的终态即使物理 Frame 落在 barrier 前，也被保守计入下一 replay window。Manifest 安装完成后只释放该快照覆盖的容量，因此 crash recovery 的 terminal 去重表始终受同一上限约束。
 

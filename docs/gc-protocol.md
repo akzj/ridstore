@@ -1,6 +1,6 @@
 # ridstore v2 GC 与空间回收协议
 
-状态：M5 implementation contract
+状态：Implemented v2 contract
 
 ## 1. 目标与边界
 
@@ -15,7 +15,7 @@ Data GC 回收：
 
 GC 不理解 Page、Blob、TTL、Stream 或业务生命周期。唯一逻辑存活依据是当前 Mapping。
 
-Mapping 文件的不可达 Node 回收由 Mapping GC 负责，见 `mapping-design.md`。
+Mapping 文件的不可达 Node 回收由 [Mapping GC](v2-mapping-gc-design.md) 负责。
 
 ## 2. Segment 生命周期
 
@@ -49,7 +49,7 @@ Segment 同时满足以下条件才可进入 Cleaning：
 - 不是当前故障诊断保留文件；
 - 预估 dead ratio 达到阈值或磁盘压力要求强制清理。
 
-候选估算使用 `segment-stats-design.md` 定义的 checkpoint exact live bytes：
+候选估算使用 [RecordRef 与实时 SegmentStats](v2-record-ref-live-stats.md) 定义的 checkpoint exact live bytes：
 
 ```text
 reclaimableBytes = reclaimablePhysicalBytes - ExactLiveBytesAtCut

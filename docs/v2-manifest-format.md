@@ -1,6 +1,6 @@
 # ridstore v2 Manifest
 
-状态：Draft for Review
+状态：Implemented v2 contract
 
 Manifest 是 v2 唯一的 durable catalog。不存在 RecordLog Manifest、Mapping Manifest 和 GC Manifest
 三份镜像状态；所有文件集和 checkpoint 状态通过同一个 generation 原子安装。

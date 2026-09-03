@@ -1,6 +1,6 @@
 # ridstore v2 API 与一致性契约
 
-状态：Development contract v2
+状态：Implemented v2 contract
 
 ## 1. 边界
 
@@ -11,8 +11,8 @@ uint64 ID -> variable-length bytes
 ```
 
 它提供原子 Batch、durable commit、单 Record 读取和稳定 ID，不提供业务 Revision、MVCC、自动读集、
-Serializable 隔离或跨多次 Get 的 Snapshot。根包公开 API 已在 M6 直接切换到 v2 Engine；旧
-[api-contract.md](api-contract.md) 仅是 Format v1 历史记录，代码中不存在 Revision adapter 或双运行时。
+Serializable 隔离或跨多次 Get 的 Snapshot。根包公开 API 直接使用 v2 Engine；代码中不存在
+Revision adapter、旧格式兼容层或双运行时。
 
 ## 2. 内部唯一事实
 
@@ -185,7 +185,7 @@ relocation CAS、Checkpoint coverage 或 source retirement proof。
 
 `SetGCBytesPerSecond(rate)` 只修改后续 Data Compact 的复制速率。`rate == 0` 返回
 `ErrInvalidConfig`；已经运行的 Compact 使用开始时的速率快照，调用方通过取消该次 Context 停止它。
-时间窗、容量水位和调用频率属于外部 maintenance scheduler，不进入 Store 的持久化状态。
+时间窗、容量水位和调用频率属于运行时 Maintenance Scheduler 策略，不进入 Store 的持久化状态。
 
 ## 12. 离线 Verify
 
@@ -198,14 +198,19 @@ physical files、checkpoint Mapping、semantic replay、exact join 的顺序验�
 ## 13. Mapping 物理重写
 
 根包公开 `CompactMapping(ctx)` 作为显式维护入口。它以
-`maintenanceMu -> checkpointMu` 串行同类维护，使用短 Coordinator admission fence 推进完整 Checkpoint，再把全部可达
-`ID -> VAddr` 流式复制到新 Mapping generation。新 Manifest durable 后，Engine 原子替换
+typed Mapping GC worker 提交给 Maintenance Scheduler。显式请求直接声明 Checkpoint 依赖；自动请求先执行
+Survey，通过策略门槛后再声明该依赖。随后按 `Copy -> Publish -> Cleanup` 推进各阶段；`heavyIO`、
+`mappingWriter` 和 `recoveryProtocol` 由 Scheduler
+按阶段独占分配，worker 不自行获取全局维护锁。Checkpoint 具有更高优先级，Copy 期间允许新的 Checkpoint 推进；
+PublishCoordinator 通过 generation 校验拒绝过期的重建结果。
+
+Mapping GC 把全部可达 `ID -> VAddr` 流式复制到新 Mapping generation。新 Manifest durable 后，Engine 原子替换
 Persistent root 与物理 owner；旧 reader 清零、旧 owner 关闭后才允许 retirement。重建、Manifest fsync 和
 reader drain 均不持有 Store 全局数据面锁。该操作不改变 Value、VAddr、
 CoveredCommitSeq、ReplayStart、allocator high、Batch Status 或 SegmentStats。
 
-第一版不自动调度 Mapping GC。显式入口的 syscall fault、process-exit、Offline Verify、重复 GC 与
-空间收敛证据已经闭合；自动触发阈值和限速属于后续策略层。
+自动维护启用且未设置 `DisableMappingGC` 时，Scheduler 周期性运行 generation-bound Survey；只有可回收字节、
+可回收比例和 cooldown 同时达到配置门槛才启动重写。显式入口不受这些自动策略门槛限制。
 
 ## 14. 离线 Backup / Restore
 

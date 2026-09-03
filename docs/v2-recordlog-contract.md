@@ -302,4 +302,4 @@ RecordLog 不独立持久化一份配置；这些硬限制来自唯一 Manifest�
 - `internal/recordlog/*_test.go`：golden、边界、corruption、Reader Pin、group commit、process crash 和 fuzz。
 
 本契约已经接入 v2 Store、Coordinator、Checkpoint、Data GC、Offline Verify 与 Backup/Restore
-主路径。当前分支不存在 Format v1 runtime、兼容 adapter 或双写路径；历史 v1 文档只作为设计演化记录。
+主路径。当前代码不存在 Format v1 runtime、兼容 adapter 或双写路径；历史设计演化通过 Git 追溯。

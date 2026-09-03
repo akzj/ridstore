@@ -2,15 +2,15 @@
 
 状态：已实现的 v2 当前架构；production audit 持续进行
 
-范围：`v2` 分支的当前架构与持续审计约束。本文不承诺兼容 Format v1，也不允许通过兼容层延续旧实现。
+范围：当前唯一运行时架构与持续审计约束。本文不承诺兼容 Format v1，也不允许通过兼容层延续旧实现。
 
-## 1. 为什么建立 v2 分支
+## 1. 为什么只保留一条 v2 路径
 
 ridstore v2 只保留一条从业务协议到通用 RecordLog 的追加路径，避免两套物理顺序、两套 Segment
 生命周期和长期兼容代码。
 
-v2 分支采用重新组装而不是渐进兼容：保留已经证明正确的产品边界与安全不变量，从一个通用
-RecordLog 向上构建 ridstore。旧代码只在契约完整吻合时原样复用，否则重写或删除。
+当前实现保留已经证明正确的产品边界与安全不变量，从一个通用 RecordLog 向上构建 ridstore。
+仓库不再维护迁移期的双运行时、兼容 adapter 或旧物理路径。
 
 ## 2. 开发原则
 
@@ -259,17 +259,17 @@ uint32 SegmentID | aligned byte offset 的高 29 bit | 3-bit size tag
 - LogPos 不带 size tag，不能与 VAddr 共用编码器；
 - tag 与 Record Header PhysicalSize 不一致视为损坏。
 
-Format v1 不兼容不是 v2 分支的约束。v2 Open 必须明确拒绝 v1 数据目录，后续如有需要再开发
+Format v1 兼容不是当前运行时的约束。Open 必须明确拒绝 v1 数据目录，后续如有需要再开发
 独立离线迁移工具，生产路径不包含双格式兼容分支。
 
 ## 11. 不做的事情
 
-- 不在 v2 分支继续维护旧 appendlog；
+- 不维护旧 appendlog；
 - 不用 adapter 让新 Coordinator 同时支持旧、新 Log；
 - 不保留 FrameSeq，除非 Recovery 证明 VAddr 顺序无法表达必要约束；
 - 不把 Mapping、事务、GC 或业务 codec 放入 RecordLog；
 - 不以代码复用率作为架构质量指标；
-- 不在总体协议冻结前开始批量搬运旧代码。
+- 不引入仅为迁移旧实现而存在的临时生产路径。
 
 ## 12. 持续 Review 门禁
 
