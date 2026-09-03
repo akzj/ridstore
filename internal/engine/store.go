@@ -148,6 +148,13 @@ type maintenanceRuntime struct {
 	autoSegmentRunning     atomic.Bool
 	autoMappingRunning     atomic.Bool
 	lastMappingGCUnixNano  atomic.Int64
+	mappingUsage           atomic.Pointer[mappingUsage]
+	mappingSurveyRunning   atomic.Bool
+}
+
+type mappingUsage struct {
+	generation, physicalBytes, reachableBytes uint64
+	root                                      model.MapAddr
 }
 
 type Store struct {
@@ -575,6 +582,19 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		s.setFault(err)
 		return abort(err)
 	}
+	var nextUsage *mappingUsage
+	if usage := s.maintenance.mappingUsage.Load(); usage != nil && usage.root == manifest.MappingRoot {
+		reachable, usageErr := candidate.ReachableBytes(usage.reachableBytes)
+		if usageErr != nil {
+			s.setFault(usageErr)
+			return abort(usageErr)
+		}
+		physical, usageErr := s.core.mapStore.PhysicalBytes()
+		if usageErr != nil {
+			return abort(usageErr)
+		}
+		nextUsage = &mappingUsage{root: candidate.Root(), physicalBytes: physical, reachableBytes: reachable}
+	}
 	stats, err := checkpointSegmentStats(candidate.LiveStats(), manifest, work.cut.ReplayStart, s.maintenance.maxStats)
 	if err != nil {
 		if errors.Is(err, base.ErrCorrupt) {
@@ -596,6 +616,13 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 	if err := s.core.mapping.InstallCheckpoint(candidate); err != nil {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
+	}
+	if nextUsage != nil {
+		nextUsage.generation = installed.Generation
+		s.maintenance.mappingUsage.Store(nextUsage)
+		s.metrics.mappingSurveyGeneration.Store(installed.Generation)
+		s.metrics.mappingSurveyPhysicalBytes.Store(nextUsage.physicalBytes)
+		s.metrics.mappingSurveyReachableBytes.Store(nextUsage.reachableBytes)
 	}
 	now := time.Now()
 	if s.maintenance.gcNow != nil {

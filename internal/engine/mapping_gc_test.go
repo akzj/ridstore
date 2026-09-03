@@ -1110,6 +1110,30 @@ func TestCompactMappingReclaimsUnreachableCheckpointNodes(t *testing.T) {
 	if survey.MappingSurveyGeneration == 0 || survey.MappingSurveyReachableBytes >= survey.MappingSurveyPhysicalBytes {
 		t.Fatalf("invalid survey: %+v", survey)
 	}
+	update, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := update.Put(ctx, ids[0], []byte{5}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := update.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	incremental := store.maintenance.mappingUsage.Load()
+	if incremental == nil || incremental.generation != store.PublishedState().Generation {
+		t.Fatalf("checkpoint did not advance Mapping usage: %+v", incremental)
+	}
+	exact, err := store.surveyMappingUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incremental.physicalBytes != exact.physicalBytes || incremental.reachableBytes != exact.reachableBytes {
+		t.Fatalf("incremental usage=%+v exact=%+v", incremental, exact)
+	}
 	if err := store.CompactMapping(ctx); err != nil {
 		t.Fatal(err)
 	}

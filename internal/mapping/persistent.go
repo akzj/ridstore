@@ -407,6 +407,19 @@ func (c CheckpointCandidate) EntryCount(base uint64) (uint64, error) {
 	return remaining + c.entryDelta.Added, nil
 }
 
+// ReachableBytes applies the exact node replacements performed by this COW
+// build to a surveyed base Root.
+func (c CheckpointCandidate) ReachableBytes(base uint64) (uint64, error) {
+	if c.checkpoint == nil || c.tree == nil || c.entryDelta.ReachableBytesRemoved > base {
+		return 0, ErrCorrupt
+	}
+	remaining := base - c.entryDelta.ReachableBytesRemoved
+	if c.entryDelta.ReachableBytesAdded > math.MaxUint64-remaining {
+		return 0, ErrCorrupt
+	}
+	return remaining + c.entryDelta.ReachableBytesAdded, nil
+}
+
 func (c CheckpointCandidate) Lookup(id model.ID) (recordlog.VAddr, bool, error) {
 	ref, exists, err := c.LookupRef(id)
 	return ref.Addr, exists, err

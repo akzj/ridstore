@@ -270,6 +270,21 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}
+	reachableBytes, err := newRoot.ReachableBytes(context.Background())
+	if err != nil {
+		_ = newStore.Close()
+		s.setFault(err)
+		return errors.Join(base.ErrReadOnly, err)
+	}
+	physicalBytes, err := newStore.PhysicalBytes()
+	if err != nil || reachableBytes > physicalBytes {
+		_ = newStore.Close()
+		if err == nil {
+			err = base.ErrCorrupt
+		}
+		s.setFault(err)
+		return errors.Join(base.ErrReadOnly, err)
+	}
 	drained, err := s.core.mapping.ReplaceCheckpointRoot(view, newRoot, newStore)
 	if err != nil {
 		_ = newStore.Close()
@@ -278,6 +293,10 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	}
 	oldStore := s.core.mapStore
 	s.core.mapStore = newStore
+	s.maintenance.mappingUsage.Store(&mappingUsage{generation: installed.Generation, root: installed.MappingRoot, physicalBytes: physicalBytes, reachableBytes: reachableBytes})
+	s.metrics.mappingSurveyGeneration.Store(installed.Generation)
+	s.metrics.mappingSurveyPhysicalBytes.Store(physicalBytes)
+	s.metrics.mappingSurveyReachableBytes.Store(reachableBytes)
 	unlockPublication()
 	<-drained
 	if err := oldStore.Close(); err != nil {

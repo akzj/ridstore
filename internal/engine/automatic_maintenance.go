@@ -56,10 +56,22 @@ func (s *Store) mappingGCNeeded(ctx context.Context, config MaintenanceConfig) (
 	if last != 0 && s.maintenanceNow().Sub(time.Unix(0, last)) < config.MappingMinInterval {
 		return false, nil
 	}
-	var needed bool
+	usage, err := s.surveyMappingUsage(ctx)
+	if err != nil {
+		return false, err
+	}
+	garbage := usage.physicalBytes - usage.reachableBytes
+	ratio := uint32(0)
+	if usage.physicalBytes != 0 {
+		ratio = uint32(garbage * uint64(compactionRatioScale) / usage.physicalBytes)
+	}
+	return garbage >= config.MappingMinReclaimableBytes && ratio >= config.MappingMinReclaimableRatioBasis, nil
+}
+
+func (s *Store) surveyMappingUsage(ctx context.Context) (*mappingUsage, error) {
 	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
 		key: "mapping-survey", priority: maintenancePriorityMapping,
-		resources: maintenanceHeavyIO, preemptible: true,
+		resources: maintenanceHeavyIO | maintenanceRecoveryProtocol, preemptible: true,
 		run: func(runCtx context.Context) error {
 			published := s.PublishedState()
 			if published == nil {
@@ -90,19 +102,36 @@ func (s *Store) mappingGCNeeded(ctx context.Context, config MaintenanceConfig) (
 			if reachable > report.PhysicalBytes {
 				return base.ErrCorrupt
 			}
-			garbage := report.PhysicalBytes - reachable
-			ratio := uint32(0)
-			if report.PhysicalBytes != 0 {
-				ratio = uint32(garbage * uint64(compactionRatioScale) / report.PhysicalBytes)
-			}
+			usage := &mappingUsage{generation: published.Generation, root: published.MappingRoot, physicalBytes: report.PhysicalBytes, reachableBytes: reachable}
+			s.maintenance.mappingUsage.Store(usage)
 			s.metrics.mappingSurveyPhysicalBytes.Store(report.PhysicalBytes)
 			s.metrics.mappingSurveyReachableBytes.Store(reachable)
 			s.metrics.mappingSurveyGeneration.Store(published.Generation)
-			needed = garbage >= config.MappingMinReclaimableBytes && ratio >= config.MappingMinReclaimableRatioBasis
 			return nil
 		},
 	})
-	return needed, err
+	if err != nil {
+		return nil, err
+	}
+	usage := s.maintenance.mappingUsage.Load()
+	if usage == nil {
+		return nil, base.ErrConflict
+	}
+	return usage, nil
+}
+
+func (s *Store) startMappingUsageSurvey() {
+	if !s.maintenance.mappingSurveyRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.maintenance.mappingSurveyRunning.Store(false)
+		if err := s.beginOperation(); err != nil {
+			return
+		}
+		defer s.endOperation()
+		_, _ = s.surveyMappingUsage(context.Background())
+	}()
 }
 
 func (s *Store) maintenanceNow() time.Time {

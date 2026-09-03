@@ -307,8 +307,12 @@ func TestBuildSortedReportsExactEntryDeltaWithoutExtraWalk(t *testing.T) {
 	var delta EntryDelta
 	var err error
 	tree, delta, err = tree.BuildSortedWithEntryDelta(1, []Mutation{{ID: 1, Ref: testDataRef(t, a)}, {ID: 2, Ref: testDataRef(t, b)}})
-	if err != nil || delta != (EntryDelta{Added: 2}) {
+	if err != nil || delta.Added != 2 || delta.Removed != 0 || delta.ReachableBytesAdded == 0 || delta.ReachableBytesRemoved != 0 {
 		t.Fatalf("first delta=%+v err=%v", delta, err)
+	}
+	firstBytes, err := tree.ReachableBytes(context.Background())
+	if err != nil || firstBytes != delta.ReachableBytesAdded {
+		t.Fatalf("first reachable=%d delta=%+v err=%v", firstBytes, delta, err)
 	}
 	tree, delta, err = tree.BuildSortedWithEntryDelta(2, []Mutation{
 		{ID: 1, Ref: testDataRef(t, c)}, // replacement
@@ -316,8 +320,12 @@ func TestBuildSortedReportsExactEntryDeltaWithoutExtraWalk(t *testing.T) {
 		{ID: 3, Ref: testDataRef(t, a)}, // creation
 		{ID: 4},                         // absent deletion
 	})
-	if err != nil || delta != (EntryDelta{Added: 1, Removed: 1}) {
+	if err != nil || delta.Added != 1 || delta.Removed != 1 || delta.ReachableBytesAdded == 0 || delta.ReachableBytesRemoved == 0 {
 		t.Fatalf("second delta=%+v err=%v", delta, err)
+	}
+	secondBytes, sizeErr := tree.ReachableBytes(context.Background())
+	if sizeErr != nil || firstBytes-delta.ReachableBytesRemoved+delta.ReachableBytesAdded != secondBytes {
+		t.Fatalf("second reachable=%d first=%d delta=%+v err=%v", secondBytes, firstBytes, delta, sizeErr)
 	}
 	seen := 0
 	if err := tree.Walk(context.Background(), func(model.ID, recordlog.VAddr) error {

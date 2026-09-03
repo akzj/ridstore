@@ -299,6 +299,9 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 			return nil, errors.Join(base.ErrRecoveryRequired, err, store.Close())
 		}
 	}
+	if store.maintenance.config.Enabled && !store.maintenance.config.DisableMappingGC {
+		store.startMappingUsageSurvey()
+	}
 	return store, nil
 }
 

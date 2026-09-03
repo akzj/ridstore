@@ -343,6 +343,30 @@ func (s *Store) Sync() error {
 	return nil
 }
 
+// PhysicalBytes returns the exact bytes in the currently owned Mapping file
+// set. writerMu makes the snapshot stable across append and rotation.
+func (s *Store) PhysicalBytes() (uint64, error) {
+	if s == nil {
+		return 0, ErrInvalid
+	}
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0, ErrClosed
+	}
+	total := uint64(s.active.summary.ValidEnd)
+	for _, segment := range s.sealed {
+		bytes := uint64(segment.summary.ValidEnd) + uint64(SegmentFooterSize)
+		if total > math.MaxUint64-bytes {
+			return 0, ErrInvalid
+		}
+		total += bytes
+	}
+	return total, nil
+}
+
 func (s *Store) Read(addr model.MapAddr) (Node, error) {
 	s.mu.Lock()
 	if s.closed {

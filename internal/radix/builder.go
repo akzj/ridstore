@@ -1,6 +1,7 @@
 package radix
 
 import (
+	"math"
 	"sort"
 
 	"github.com/akzj/ridstore/internal/mapstore"
@@ -16,8 +17,17 @@ type Mutation struct {
 // EntryDelta describes the logical cardinality change produced by a build.
 // Replacements and relocations do not change either counter.
 type EntryDelta struct {
-	Added   uint64
-	Removed uint64
+	Added, Removed                             uint64
+	ReachableBytesAdded, ReachableBytesRemoved uint64
+}
+
+func (d *EntryDelta) addReachable(added, removed uint64) error {
+	if d.ReachableBytesAdded > math.MaxUint64-added || d.ReachableBytesRemoved > math.MaxUint64-removed {
+		return ErrInvalid
+	}
+	d.ReachableBytesAdded += added
+	d.ReachableBytesRemoved += removed
+	return nil
 }
 
 type childChange struct {
@@ -58,8 +68,8 @@ func (t *Tree) BuildSortedWithEntryDelta(covered model.CommitSeq, ordered []Muta
 		return tree, EntryDelta{}, err
 	}
 
-	builder := streamingBuilder{tree: t, covered: covered, root: t.root}
 	var delta EntryDelta
+	builder := streamingBuilder{tree: t, covered: covered, root: t.root, delta: &delta}
 	for start := 0; start < len(ordered); {
 		prefix := nodePrefix(ordered[start].ID, 0)
 		end := start + 1
@@ -70,7 +80,7 @@ func (t *Tree) BuildSortedWithEntryDelta(covered model.CommitSeq, ordered []Muta
 		if err != nil {
 			return nil, EntryDelta{}, err
 		}
-		refs, err := t.oldRefs(oldAddr, prefix)
+		refs, oldBytes, err := t.oldRefs(oldAddr, prefix)
 		if err != nil {
 			return nil, EntryDelta{}, err
 		}
@@ -90,6 +100,14 @@ func (t *Tree) BuildSortedWithEntryDelta(covered model.CommitSeq, ordered []Muta
 			return nil, EntryDelta{}, err
 		}
 		if newAddr != oldAddr {
+			added, sizeErr := nodeBuildBytes(0, refs)
+			if sizeErr != nil {
+				return nil, EntryDelta{}, sizeErr
+			}
+			removed := oldBytes
+			if sizeErr := delta.addReachable(added, removed); sizeErr != nil {
+				return nil, EntryDelta{}, sizeErr
+			}
 			if err := builder.push(0, childChange{prefix: prefix, addr: newAddr}); err != nil {
 				return nil, EntryDelta{}, err
 			}
@@ -125,29 +143,31 @@ func (t *Tree) writeChangedLeaf(prefix uint64, covered model.CommitSeq, before, 
 	return t.writer.AppendLeaf(prefix, covered, after)
 }
 
-func (t *Tree) oldRefs(addr model.MapAddr, prefix uint64) ([mapstore.NodeSlots]recordlog.RecordRef, error) {
+func (t *Tree) oldRefs(addr model.MapAddr, prefix uint64) ([mapstore.NodeSlots]recordlog.RecordRef, uint64, error) {
 	if addr == 0 {
-		return [mapstore.NodeSlots]recordlog.RecordRef{}, nil
+		return [mapstore.NodeSlots]recordlog.RecordRef{}, 0, nil
 	}
 	node, err := t.load(addr, 0, prefix, false, false)
 	if err != nil {
-		return [mapstore.NodeSlots]recordlog.RecordRef{}, err
+		return [mapstore.NodeSlots]recordlog.RecordRef{}, 0, err
 	}
-	return node.Refs(), nil
+	return node.Refs(), uint64(node.PhysicalSize()), nil
 }
 
 type nodeAccumulator struct {
-	active  bool
-	prefix  uint64
-	oldAddr model.MapAddr
-	before  [mapstore.NodeSlots]uint64
-	slots   [mapstore.NodeSlots]uint64
+	active   bool
+	prefix   uint64
+	oldAddr  model.MapAddr
+	oldBytes uint64
+	before   [mapstore.NodeSlots]uint64
+	slots    [mapstore.NodeSlots]uint64
 }
 
 type streamingBuilder struct {
 	tree    *Tree
 	covered model.CommitSeq
 	root    model.MapAddr
+	delta   *EntryDelta
 	levels  [mapstore.MaxLevel + 1]nodeAccumulator
 }
 
@@ -168,11 +188,11 @@ func (b *streamingBuilder) push(childLevel uint8, change childChange) error {
 		if err != nil {
 			return err
 		}
-		slots, err := b.tree.oldSlots(oldAddr, level, prefix)
+		slots, oldBytes, err := b.tree.oldSlots(oldAddr, level, prefix)
 		if err != nil {
 			return err
 		}
-		*current = nodeAccumulator{active: true, prefix: prefix, oldAddr: oldAddr, before: slots, slots: slots}
+		*current = nodeAccumulator{active: true, prefix: prefix, oldAddr: oldAddr, oldBytes: oldBytes, before: slots, slots: slots}
 	}
 	current.slots[uint16(change.prefix&0x1ff)] = uint64(change.addr)
 	return nil
@@ -183,7 +203,7 @@ func (b *streamingBuilder) flush(level uint8) error {
 	if !current.active {
 		return nil
 	}
-	prefix, oldAddr := current.prefix, current.oldAddr
+	prefix, oldAddr, oldBytes := current.prefix, current.oldAddr, current.oldBytes
 	before, slots := current.before, current.slots
 	*current = nodeAccumulator{}
 	newAddr, err := b.tree.writeChangedNode(level, prefix, b.covered, before, slots, oldAddr)
@@ -193,6 +213,15 @@ func (b *streamingBuilder) flush(level uint8) error {
 	if newAddr == oldAddr {
 		return nil
 	}
+	if b.delta != nil {
+		added, err := nodeBuildBytes(level, slots)
+		if err != nil {
+			return err
+		}
+		if err := b.delta.addReachable(added, oldBytes); err != nil {
+			return err
+		}
+	}
 	if level == mapstore.MaxLevel {
 		if prefix != 0 {
 			return ErrCorrupt
@@ -201,6 +230,21 @@ func (b *streamingBuilder) flush(level uint8) error {
 		return nil
 	}
 	return b.push(level, childChange{prefix: prefix, addr: newAddr})
+}
+
+func nodeBuildBytes[T comparable](level uint8, values [mapstore.NodeSlots]T) (uint64, error) {
+	var zero T
+	count := uint16(0)
+	for _, value := range values {
+		if value != zero {
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, nil
+	}
+	size, err := mapstore.EncodedNodeSize(level, count)
+	return uint64(size), err
 }
 
 func (t *Tree) writeChangedNode(level uint8, prefix uint64, covered model.CommitSeq, before, after [mapstore.NodeSlots]uint64, old model.MapAddr) (model.MapAddr, error) {
@@ -223,15 +267,15 @@ func (t *Tree) writeChangedNode(level uint8, prefix uint64, covered model.Commit
 	return t.writer.Append(level, prefix, covered, after)
 }
 
-func (t *Tree) oldSlots(addr model.MapAddr, level uint8, prefix uint64) ([mapstore.NodeSlots]uint64, error) {
+func (t *Tree) oldSlots(addr model.MapAddr, level uint8, prefix uint64) ([mapstore.NodeSlots]uint64, uint64, error) {
 	if addr == 0 {
-		return [mapstore.NodeSlots]uint64{}, nil
+		return [mapstore.NodeSlots]uint64{}, 0, nil
 	}
 	node, err := t.load(addr, level, prefix, level == mapstore.MaxLevel, false)
 	if err != nil {
-		return [mapstore.NodeSlots]uint64{}, err
+		return [mapstore.NodeSlots]uint64{}, 0, err
 	}
-	return node.Slots(), nil
+	return node.Slots(), uint64(node.PhysicalSize()), nil
 }
 
 func (t *Tree) nodeAddress(level uint8, prefix uint64) (model.MapAddr, error) {
