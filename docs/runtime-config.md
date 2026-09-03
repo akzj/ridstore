@@ -49,7 +49,7 @@ runtime 包含 RecordLog queue/buffer、Commit group、Mapping cache、Checkpoin
 Segment GC 要求至少回收 `SegmentSize/4` 且 25%，稳定 2 轮、年龄 1m、最多 4 个相邻输入；Mapping GC
 要求精确不可达 bytes 至少一个 `SegmentSize` 且占物理 Mapping bytes 的 50%，成功后 cooldown 10m。
 两类 GC 可分别禁用；显式 `CompactNextSegment` / `CompactMapping` 不受自动开关影响。
-Open 后以低优先级异步建立 generation-bound 的 Mapping physical/reachable byte 基线；后续 Checkpoint
+启用自动 Mapping GC 后，Open 以低优先级异步建立 generation-bound 的 Mapping physical/reachable byte 基线；后续 Checkpoint
 利用 COW builder 已访问的旧/新 Node encoded size 做精确增量，并在 Root 不匹配时丢弃缓存、重新 survey。
 
 这些是可运行的安全起点，不是性能承诺；基准可以改变后续默认值，但持久化 hard limits 的改变必须遵守 Open 兼容规则。

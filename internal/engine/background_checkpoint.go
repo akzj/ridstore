@@ -234,7 +234,13 @@ func (s *Store) runCheckpointTimer() {
 }
 
 func (s *Store) stopCheckpointWorker() {
-	if s == nil || s.checkpoints.stop == nil {
+	if s == nil {
+		return
+	}
+	if s.checkpoints.stop == nil {
+		if s.maintenance.scheduler != nil {
+			s.maintenance.scheduler.Close()
+		}
 		return
 	}
 	s.checkpoints.stopOnce.Do(func() { close(s.checkpoints.stop) })

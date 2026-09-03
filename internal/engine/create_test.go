@@ -69,6 +69,13 @@ func TestCreateNormalizesAutomaticMaintenanceAgainstSegmentSize(t *testing.T) {
 		maintenance.SegmentPolicy.MinReclaimableRatioBasis != 2_500 || maintenance.MappingMinReclaimableRatioBasis != 5_000 {
 		t.Fatalf("maintenance=%+v", maintenance)
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.Metrics().MappingSurveyGeneration == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("initial asynchronous Mapping survey did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestAutomaticMaintenanceSubmitsSegmentWorker(t *testing.T) {
