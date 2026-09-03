@@ -95,10 +95,11 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 	}
 	defer s.endOperation()
 
-	if err := s.acquireDataMaintenance(ctx); err != nil {
+	release, err := s.acquireDataMaintenance(ctx)
+	if err != nil {
 		return SegmentRelocationResult{}, err
 	}
-	defer s.releaseDataMaintenance()
+	defer release()
 	rate := s.maintenance.gcBytesPerSecond.Load()
 	return s.relocateSegment(ctx, source, rate)
 }
@@ -121,10 +122,11 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	}
 	defer s.endOperation()
 
-	if err := s.acquireDataMaintenance(ctx); err != nil {
+	release, err := s.acquireDataMaintenance(ctx)
+	if err != nil {
 		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
 	}
-	defer s.releaseDataMaintenance()
+	defer release()
 	rate := s.maintenance.gcBytesPerSecond.Load()
 	relocated, err := s.relocateSegment(ctx, source, rate)
 	if err != nil {
@@ -152,10 +154,11 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		return SegmentCompactionResult{}, err
 	}
 	defer s.endOperation()
-	if err := s.acquireDataMaintenance(ctx); err != nil {
+	release, err := s.acquireDataMaintenance(ctx)
+	if err != nil {
 		return SegmentCompactionResult{}, err
 	}
-	defer s.releaseDataMaintenance()
+	defer release()
 	rate := s.maintenance.gcBytesPerSecond.Load()
 	s.metrics.gcStarted.Add(1)
 	started := time.Now()
@@ -188,10 +191,11 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 		return NextSegmentCompactionResult{}, false, err
 	}
 	defer s.endOperation()
-	if err := s.acquireDataMaintenance(ctx); err != nil {
+	release, err := s.acquireDataMaintenance(ctx)
+	if err != nil {
 		return NextSegmentCompactionResult{}, false, err
 	}
-	defer s.releaseDataMaintenance()
+	defer release()
 	rate := s.maintenance.gcBytesPerSecond.Load()
 	selectCandidate := func() (SegmentCompactionCandidate, bool, error) {
 		published := s.PublishedState()

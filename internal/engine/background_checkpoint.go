@@ -24,7 +24,6 @@ type checkpointWaiter struct {
 type checkpointRuntime struct {
 	captureMu sync.Mutex
 
-	requests chan struct{}
 	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
@@ -36,27 +35,34 @@ type checkpointRuntime struct {
 
 	pressurePending   atomic.Uint64
 	pressureCompleted atomic.Uint64
+	periodicPending   atomic.Bool
 }
 
 func (s *Store) startCheckpointWorker() {
-	s.checkpoints.requests = make(chan struct{}, 1)
 	s.checkpoints.stop = make(chan struct{})
 	s.checkpoints.done = make(chan struct{})
 	s.checkpoints.requestMu.Lock()
 	s.checkpoints.workerStopped = false
 	s.checkpoints.requestMu.Unlock()
-	go s.runCheckpointWorker()
+	go s.runCheckpointTimer()
 }
 
 func (s *Store) wakeCheckpointWorker() {
-	select {
-	case s.checkpoints.requests <- struct{}{}:
-	default:
+	if s.maintenance.scheduler == nil {
+		return
 	}
+	_ = s.maintenance.scheduler.submitBackground(maintenanceJobSpec{
+		key: "checkpoint", priority: maintenancePriorityCheckpoint,
+		resources: maintenanceHeavyIO | maintenanceMappingWriter, rerunOnActive: true,
+		run: func(ctx context.Context) error {
+			s.runCheckpointCycle(ctx, s.checkpoints.periodicPending.Swap(false))
+			return nil
+		},
+	})
 }
 
 func (s *Store) requestBackgroundCheckpoint(generation uint64) {
-	if s == nil || s.checkpoints.requests == nil || generation == 0 {
+	if s == nil || s.maintenance.scheduler == nil || generation == 0 {
 		return
 	}
 	if generation <= s.checkpoints.pressureCompleted.Load() {
@@ -145,7 +151,7 @@ func (s *Store) periodicCheckpointNeeded() bool {
 	return charged != 0
 }
 
-func (s *Store) runCheckpointCycle(periodic bool) {
+func (s *Store) runCheckpointCycle(ctx context.Context, periodic bool) {
 	waiters := s.takeCheckpointWaiters()
 	completed := s.checkpoints.pressureCompleted.Load()
 	pending := s.checkpoints.pressurePending.Load()
@@ -165,7 +171,7 @@ func (s *Store) runCheckpointCycle(periodic bool) {
 	if !needed {
 		return
 	}
-	err := s.executeCheckpoint(context.Background(), gcAdmission)
+	err := s.executeCheckpoint(ctx, gcAdmission)
 	if err != nil && gcAdmission {
 		// GC admission failure (most notably insufficient copy headroom) is
 		// recoverable and must not prevent an ordinary pressure checkpoint.
@@ -179,7 +185,7 @@ func (s *Store) runCheckpointCycle(periodic bool) {
 		}
 		active = normal
 		if pressure || periodic || len(active) != 0 {
-			err = s.executeCheckpoint(context.Background(), false)
+			err = s.executeCheckpoint(ctx, false)
 		} else {
 			return
 		}
@@ -191,7 +197,7 @@ func (s *Store) runCheckpointCycle(periodic bool) {
 			s.metrics.backgroundCheckpointFailed.Add(1)
 		}
 	}
-	if err != nil && (pressure || periodic) && !errors.Is(err, base.ErrClosed) {
+	if err != nil && (pressure || periodic) && !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) {
 		s.setFault(err)
 	}
 	for _, waiter := range active {
@@ -199,28 +205,19 @@ func (s *Store) runCheckpointCycle(periodic bool) {
 	}
 }
 
-func (s *Store) runCheckpointWorker() {
+func (s *Store) runCheckpointTimer() {
 	timer := time.NewTicker(s.checkpoints.interval)
 	defer func() {
 		timer.Stop()
-		s.checkpoints.requestMu.Lock()
-		s.checkpoints.workerStopped = true
-		waiters := s.checkpoints.waiters
-		s.checkpoints.waiters = nil
-		s.checkpoints.requestMu.Unlock()
-		for _, waiter := range waiters {
-			waiter.result <- base.ErrClosed
-		}
 		close(s.checkpoints.done)
 	}()
 	for {
 		select {
 		case <-s.checkpoints.stop:
 			return
-		case <-s.checkpoints.requests:
-			s.runCheckpointCycle(false)
 		case <-timer.C:
-			s.runCheckpointCycle(true)
+			s.checkpoints.periodicPending.Store(true)
+			s.wakeCheckpointWorker()
 		}
 	}
 }
@@ -231,4 +228,15 @@ func (s *Store) stopCheckpointWorker() {
 	}
 	s.checkpoints.stopOnce.Do(func() { close(s.checkpoints.stop) })
 	<-s.checkpoints.done
+	s.checkpoints.requestMu.Lock()
+	s.checkpoints.workerStopped = true
+	waiters := s.checkpoints.waiters
+	s.checkpoints.waiters = nil
+	s.checkpoints.requestMu.Unlock()
+	if s.maintenance.scheduler != nil {
+		s.maintenance.scheduler.Close()
+	}
+	for _, waiter := range waiters {
+		waiter.result <- base.ErrClosed
+	}
 }

@@ -553,9 +553,9 @@ func TestBackgroundCheckpointCoalescesSameDeltaGeneration(t *testing.T) {
 	commit("first")
 
 	deadline := time.Now().Add(2 * time.Second)
-	for len(store.checkpoints.requests) != 0 {
+	for store.Metrics().CheckpointsStarted == 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("background worker did not consume the first wake")
+			t.Fatal("scheduler did not start the first checkpoint")
 		}
 		time.Sleep(time.Millisecond)
 	}

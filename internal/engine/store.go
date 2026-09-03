@@ -201,7 +201,7 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 		maintenance: maintenanceRuntime{
 			maxRelocationBytes:     config.Batch.MaxBatchBytes,
 			maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
-			scheduler:              &MaintenanceScheduler{},
+			scheduler:              newMaintenanceScheduler(),
 		},
 	}, nil
 }
@@ -730,17 +730,11 @@ func (s *Store) releaseSlot() {
 	s.state.mu.Unlock()
 }
 
-func (s *Store) acquireDataMaintenance(ctx context.Context) error {
+func (s *Store) acquireDataMaintenance(ctx context.Context) (func(), error) {
 	if s.maintenance.scheduler == nil {
-		s.maintenance.scheduler = &MaintenanceScheduler{}
+		return nil, base.ErrInvalidConfig
 	}
-	return s.maintenance.scheduler.acquireData(ctx)
-}
-
-func (s *Store) releaseDataMaintenance() {
-	if s.maintenance.scheduler != nil {
-		s.maintenance.scheduler.releaseData()
-	}
+	return s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceRecoveryProtocol)
 }
 
 type Batch struct {

@@ -51,17 +51,19 @@ func (s *Store) CompactMapping(ctx context.Context) (err error) {
 	if err := s.checkpoint(ctx, false); err != nil {
 		return err
 	}
-	// Mapping rewrite is a low-priority COW phase. Serialize it with
-	// Checkpoint at the dispatcher boundary, but never use this gate to block
-	// foreground operations while the tree is rebuilt.
+	// Mapping rewrite is a low-priority COW phase. It holds recoveryProtocol so
+	// no other marker-producing GC can overlap, but deliberately does not hold
+	// mappingWriter while rebuilding: Checkpoint may advance and make this plan
+	// stale, which the publication validation handles as a normal conflict.
 	if s.maintenance.scheduler == nil {
-		s.maintenance.scheduler = &MaintenanceScheduler{}
+		return base.ErrInvalidConfig
 	}
-	if err := s.maintenance.scheduler.acquireMappingRewrite(ctx); err != nil {
-		return err
-	}
-	defer s.maintenance.scheduler.releaseMappingRewrite()
-	return s.compactCheckpointMapping(ctx)
+	return s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
+		key: "mapping-gc", priority: maintenancePriorityMapping,
+		resources:   maintenanceRecoveryProtocol,
+		preemptible: true,
+		run:         func(runCtx context.Context) error { return s.compactCheckpointMapping(runCtx) },
+	})
 }
 
 func (s *Store) compactCheckpointMapping(ctx context.Context) error {
