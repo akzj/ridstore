@@ -412,7 +412,9 @@ func (s *Store) shutdown() error {
 }
 
 // Checkpoint installs one atomic Mapping, replay-cut, allocator, open-batch,
-// and exact sealed-segment statistics generation.
+// and exact sealed-segment statistics generation. Optimistic publication
+// conflicts release maintenance resources and retry with a capped delay until
+// publication succeeds or ctx is canceled.
 func (s *Store) Checkpoint(ctx context.Context) error {
 	ctx, end, err := s.beginOperation(ctx)
 	if err != nil {

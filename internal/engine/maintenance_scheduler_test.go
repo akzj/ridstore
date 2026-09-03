@@ -252,6 +252,62 @@ func TestMaintenanceSchedulerRecordsPhaseTimingAndRetry(t *testing.T) {
 	}
 }
 
+func TestMaintenanceSchedulerRetryStopsWhenCallerCancels(t *testing.T) {
+	started := make(chan struct{})
+	var calls atomic.Uint64
+	factory := fakeMaintenanceFactory{newWorker: func(maintenanceRequest) maintenanceWorker {
+		return &fakeMaintenanceWorker{
+			resources: func(maintenancePhase) maintenanceResource { return maintenanceMappingWriter },
+			run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+				if calls.Add(1) == 1 {
+					close(started)
+				}
+				return maintenanceTransition{next: maintenancePhaseStart, retryAfter: time.Second}
+			},
+		}
+	}}
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
+	defer scheduler.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceCheckpointRequest})
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		metrics := scheduler.metrics()
+		if metrics.queued == 0 && metrics.running == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retry job did not drain after cancellation: %+v", metrics)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCheckpointConflictRetryDelayIsCapped(t *testing.T) {
+	for _, test := range []struct {
+		attempt uint8
+		want    time.Duration
+	}{
+		{attempt: 0, want: time.Millisecond},
+		{attempt: 3, want: 8 * time.Millisecond},
+		{attempt: 6, want: 64 * time.Millisecond},
+		{attempt: 255, want: 64 * time.Millisecond},
+	} {
+		if got := checkpointConflictRetryDelay(test.attempt); got != test.want {
+			t.Fatalf("attempt=%d delay=%v want=%v", test.attempt, got, test.want)
+		}
+	}
+}
+
 func TestMaintenanceSchedulerRejectsInvalidTransition(t *testing.T) {
 	factory := fakeMaintenanceFactory{newWorker: func(maintenanceRequest) maintenanceWorker {
 		return &fakeMaintenanceWorker{

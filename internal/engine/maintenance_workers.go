@@ -44,7 +44,7 @@ func (*checkpointMaintenanceWorker) Resources(maintenancePhase) maintenanceResou
 func (w *checkpointMaintenanceWorker) Run(ctx context.Context, _ maintenancePhase, _ maintenanceResult) maintenanceTransition {
 	err := w.store.runCheckpointCycle(ctx, w.request.periodic, w.request.force, w.request.gcAdmission, w.request.generation)
 	if checkpointConflict(err) {
-		delay := time.Millisecond << min(w.conflictAttempts, uint8(6))
+		delay := checkpointConflictRetryDelay(w.conflictAttempts)
 		if w.conflictAttempts < 7 {
 			w.conflictAttempts++
 		}
@@ -55,6 +55,10 @@ func (w *checkpointMaintenanceWorker) Run(ctx context.Context, _ maintenancePhas
 
 func checkpointConflict(err error) bool {
 	return errors.Is(err, base.ErrConflict) || errors.Is(err, storecatalog.ErrConflict)
+}
+
+func checkpointConflictRetryDelay(attempt uint8) time.Duration {
+	return time.Millisecond << min(attempt, uint8(6))
 }
 
 type segmentMaintenanceWorker struct {

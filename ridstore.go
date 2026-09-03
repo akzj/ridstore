@@ -213,6 +213,10 @@ func (s *Store) Status(ctx context.Context, id BatchID) (BatchStatus, error) {
 	return BatchStatus{BatchID: status.BatchID, State: state, CommitSeq: status.CommitSeq}, nil
 }
 
+// Checkpoint durably installs one consistent Mapping and recovery cut.
+// Optimistic publication conflicts are retried with a capped delay until the
+// operation succeeds or ctx is canceled; callers that require a bounded wait
+// should provide a deadline.
 func (s *Store) Checkpoint(ctx context.Context) error {
 	if s == nil || s.inner == nil {
 		return base.ErrClosed
