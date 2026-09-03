@@ -201,9 +201,8 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		updateAtomicMax(&s.metrics.mappingGCMaxPublishNanos, duration)
 		s.checkpoints.captureMu.Unlock()
 	}
-	latest := s.catalogSnapshot()
 	currentView, currentErr := s.core.mapping.CheckpointView()
-	if currentErr != nil || currentView.Root() != latest.MappingRoot || currentView.Covered() != latest.CoveredCommitSeq {
+	if currentErr != nil || currentView.Root() != manifest.MappingRoot || currentView.Covered() != manifest.CoveredCommitSeq {
 		unlockPublication()
 		if currentErr == nil {
 			currentErr = base.ErrCorrupt
@@ -215,25 +214,9 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 	// invalidating this Mapping-only plan. Validate the independent Mapping
 	// dimensions here; InstallMappingRewrite performs the same append-only
 	// Data rebase check before durable publication.
-	if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
-		!manifestMatchesMappingSet(latest, oldSet) {
-		unlockPublication()
-		return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.core.root))
-	}
 	defer unlockPublication()
-	state := mapgcstate.State{
-		StoreID: [16]byte(latest.StoreUUID), BaseGeneration: latest.Generation,
-		SegmentSize: uint32(latest.HardLimits.SegmentSize), Covered: latest.CoveredCommitSeq,
-		Old: oldSet,
-		New: mapgcstate.FileSet{Sealed: generation.SealedSegments, Active: generation.ActiveSegment, Next: generation.NextSegment, Root: generation.Root},
-	}
-	if err := mapgcstate.Install(s.core.root, state, s.maintenance.mappingGCHook); err != nil {
-		cleanupErr := discardMappingGCStaging(s.core.root)
-		if cleanupErr == nil {
-			cleanupErr = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
-		}
-		return s.mappingGCPrepublishFailure(err, cleanupErr)
-	}
+	var state mapgcstate.State
+	prepared := false
 	rollback := func(cause error) error {
 		cleanupErr := mapstore.RollbackGeneration(s.core.root, staging, generation, s.maintenance.mapStoreHook)
 		if cleanupErr == nil {
@@ -241,14 +224,37 @@ func (s *Store) compactCheckpointMapping(ctx context.Context) error {
 		}
 		return s.mappingGCPrepublishFailure(cause, cleanupErr)
 	}
-	if err := mapstore.PromoteGeneration(s.core.root, staging, generation, s.maintenance.mapStoreHook); err != nil {
-		return rollback(err)
-	}
-	installed, err := s.core.publisher.InstallMappingRewrite(latest, storecatalog.MappingRewrite{
+	installed, err := s.core.publisher.PrepareAndInstallMappingRewrite(func(latest storecatalog.Manifest) error {
+		if latest.CoveredCommitSeq != manifest.CoveredCommitSeq || latest.MappingEntryCount != manifest.MappingEntryCount ||
+			!manifestMatchesMappingSet(latest, oldSet) {
+			return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.core.root))
+		}
+		state = mapgcstate.State{
+			StoreID: [16]byte(latest.StoreUUID), BaseGeneration: latest.Generation,
+			SegmentSize: uint32(latest.HardLimits.SegmentSize), Covered: latest.CoveredCommitSeq,
+			Old: oldSet,
+			New: mapgcstate.FileSet{Sealed: generation.SealedSegments, Active: generation.ActiveSegment, Next: generation.NextSegment, Root: generation.Root},
+		}
+		if installErr := mapgcstate.Install(s.core.root, state, s.maintenance.mappingGCHook); installErr != nil {
+			cleanupErr := discardMappingGCStaging(s.core.root)
+			if cleanupErr == nil {
+				cleanupErr = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
+			}
+			return s.mappingGCPrepublishFailure(installErr, cleanupErr)
+		}
+		if promoteErr := mapstore.PromoteGeneration(s.core.root, staging, generation, s.maintenance.mapStoreHook); promoteErr != nil {
+			return rollback(promoteErr)
+		}
+		prepared = true
+		return nil
+	}, storecatalog.MappingRewrite{
 		SealedSegments: mappingGCSummaries(generation.SealedSegments), ActiveSegment: generation.ActiveSegment,
 		NextSegment: generation.NextSegment, Root: generation.Root, Covered: generation.Covered,
 	})
 	if err != nil {
+		if !prepared {
+			return err
+		}
 		s.setFault(err)
 		return errors.Join(base.ErrReadOnly, err)
 	}

@@ -115,6 +115,27 @@ func (p *PublishCoordinator) InstallMappingRewrite(base storecatalog.Manifest, u
 	return installed, err
 }
 
+// PrepareAndInstallMappingRewrite serializes the marker/promotion boundary
+// with every other Catalog publisher. prepare runs after observing the exact
+// base generation that InstallMappingRewrite will consume; it must contain
+// only the bounded durable preparation, never the COW rebuild.
+func (p *PublishCoordinator) PrepareAndInstallMappingRewrite(
+	prepare func(storecatalog.Manifest) error,
+	update storecatalog.MappingRewrite,
+) (storecatalog.Manifest, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	base := p.catalog.Snapshot()
+	if err := prepare(base); err != nil {
+		return storecatalog.Manifest{}, err
+	}
+	installed, err := p.catalog.InstallMappingRewrite(base, update)
+	if err == nil {
+		p.publish(installed)
+	}
+	return installed, err
+}
+
 func (p *PublishCoordinator) ReserveCompactionSegments(expect uint64, count uint32) (storecatalog.Manifest, []recordlog.SegmentID, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

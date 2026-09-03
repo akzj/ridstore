@@ -151,6 +151,9 @@ func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepare
 	close(startMaintenance)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
+			if ctx.Err() != nil {
+				continue
+			}
 			id := ids[(nextID.Add(1)-1)%uint64(len(ids))]
 			getStarted := time.Now()
 			_, err := store.Get(ctx, id)
@@ -158,13 +161,13 @@ func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepare
 			if err != nil {
 				firstErr.set(err)
 				cancel()
-				return
+				continue
 			}
 			batch, err := store.Begin(ctx)
 			if err != nil {
 				firstErr.set(err)
 				cancel()
-				return
+				continue
 			}
 			putStarted := time.Now()
 			err = batch.Put(ctx, id, value)
@@ -172,7 +175,7 @@ func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepare
 			if err != nil {
 				firstErr.set(err)
 				cancel()
-				return
+				continue
 			}
 			commitStarted := time.Now()
 			_, err = batch.Commit(ctx)
@@ -180,7 +183,7 @@ func runDurableMaintenanceInterference(b *testing.B, maintenance string, prepare
 			if err != nil {
 				firstErr.set(err)
 				cancel()
-				return
+				continue
 			}
 			index := sampleIndex.Add(1) - 1
 			getLatency[index] = getElapsed.Nanoseconds()
