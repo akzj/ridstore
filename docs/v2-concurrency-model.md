@@ -66,8 +66,9 @@ holding only its read side, then perform Radix I/O with no Mapping lock. Root re
 MapStore close and retirement wait on the returned reader-drain channel outside the Mapping lock.
 
 Checkpoint COW construction is optimistic. If Data maintenance or Mapping rewrite advances an incompatible Catalog
-dimension before publication, the worker aborts the frozen plan and rebuilds from the new published generation. Only
-exhausted retries or non-conflict failures reach the fail-closed path. Mapping GC similarly holds the capture lock through
+dimension before publication, the worker aborts the frozen plan, releases `mappingWriter`, and lets the Scheduler retry
+with bounded exponential backoff. Generation conflicts are scheduling events and never enter the fail-closed path;
+non-conflict publication failures retain the existing fail-closed semantics. Mapping GC similarly holds the capture lock through
 durable Catalog publication and the runtime Root/MapStore switch, then releases it before waiting for old readers and
 retiring the old generation.
 
@@ -91,7 +92,28 @@ The immutable `PublishedState` pointer is loaded without the publisher lock, so 
 not wait for an unrelated Manifest fsync; stale snapshots remain safe because every installation validates its generation
 or complete compatible base.
 
-## 5. Prohibited regressions
+## 5. Versioning and RCU boundary
+
+The durable Catalog keeps one global `Generation`. Individual mutations use
+field-level compatibility predicates such as `checkpointBaseCompatible` to
+permit a safe rebase over append-only Data rotation without introducing
+multiple independently authoritative generations. This is the current
+dimension separation: it is validation logic, not additional persisted
+version counters.
+
+Do not add Mapping/Data/Recovery generation fields until conflict metrics show
+that compatible Catalog churn causes material rebuild waste. Persisted
+sub-generations enlarge the crash-state matrix and can recreate the dual-owner
+problem the global Catalog generation prevents. New compatibility should first
+be expressed and fault-tested as a predicate over one immutable Manifest.
+
+Runtime RCU is already used where it is safe: `PublishedState` is an atomic
+immutable snapshot, Mapping Root owners and physical Segment readers use pins,
+and retirement waits outside publication locks. RCU cannot replace the
+Coordinator fence or durable marker/Catalog transitions because those establish
+cross-file persistence order rather than memory lifetime.
+
+## 6. Prohibited regressions
 
 - no Store-wide read/write mutex around Get, Put, Commit, Checkpoint or GC;
 - no Mapping lock across Radix disk reads, full-tree walks or fsync;

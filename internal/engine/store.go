@@ -441,54 +441,64 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 		updateAtomicMax(&s.metrics.checkpointMaxDurationNanos, duration)
 		if err == nil {
 			s.metrics.checkpointsCompleted.Add(1)
-		} else {
+		} else if !checkpointConflict(err) {
 			s.metrics.checkpointsFailed.Add(1)
 		}
 	}()
 	// Serialize only the short capture/freeze boundary. The expensive COW
 	// build, stats computation, and durable publication below run without the
 	// Store checkpoint mutex. A concurrent maintenance publication may make a
-	// candidate stale; abort that frozen plan and rebuild from the new published
-	// generation instead of treating the optimistic conflict as store damage.
-	for publishAttempts := 0; ; publishAttempts++ {
-		s.checkpoints.captureMu.Lock()
-		var work checkpointWork
-		for captureAttempts := 0; ; captureAttempts++ {
-			work, err = s.prepareCheckpoint(ctx)
-			if !errors.Is(err, base.ErrConflict) || captureAttempts >= 8 {
-				break
-			}
-			if err := ctx.Err(); err != nil {
-				s.checkpoints.captureMu.Unlock()
-				return err
-			}
+	// candidate stale; abort that frozen plan and let the scheduler retry with
+	// backoff instead of monopolizing mappingWriter with repeated COW builds.
+	captureWaitStarted := time.Now()
+	s.checkpoints.captureMu.Lock()
+	captureWait := uint64(time.Since(captureWaitStarted))
+	s.metrics.checkpointCaptureWaitNanos.Add(captureWait)
+	updateAtomicMax(&s.metrics.checkpointMaxCaptureWaitNanos, captureWait)
+	captureStarted := time.Now()
+	var work checkpointWork
+	for captureAttempts := 0; ; captureAttempts++ {
+		work, err = s.prepareCheckpoint(ctx)
+		if errors.Is(err, base.ErrConflict) {
+			s.metrics.checkpointCaptureConflicts.Add(1)
 		}
-		s.checkpoints.captureMu.Unlock()
-		if err != nil {
-			return err
-		}
-		var reservation *spaceReservation
-		if gcAdmission {
-			entries, entryErr := work.frozen.EntryUpperBound()
-			if entryErr != nil {
-				return errors.Join(entryErr, s.core.mapping.AbortCheckpoint(work.frozen))
-			}
-			reservation, err = s.reserveGCCheckpoint(ctx, s.catalogSnapshot(), entries)
-			if err != nil {
-				return errors.Join(err, s.core.mapping.AbortCheckpoint(work.frozen))
-			}
-		}
-		err = s.finishCheckpoint(ctx, work)
-		if reservation != nil {
-			reservation.complete(err == nil)
-		}
-		if !errors.Is(err, storecatalog.ErrConflict) || publishAttempts >= 8 {
-			return err
+		if !errors.Is(err, base.ErrConflict) || captureAttempts >= 8 {
+			break
 		}
 		if err := ctx.Err(); err != nil {
+			captureDuration := uint64(time.Since(captureStarted))
+			s.metrics.checkpointCaptureNanos.Add(captureDuration)
+			updateAtomicMax(&s.metrics.checkpointMaxCaptureNanos, captureDuration)
+			s.checkpoints.captureMu.Unlock()
 			return err
 		}
 	}
+	captureDuration := uint64(time.Since(captureStarted))
+	s.metrics.checkpointCaptureNanos.Add(captureDuration)
+	updateAtomicMax(&s.metrics.checkpointMaxCaptureNanos, captureDuration)
+	s.checkpoints.captureMu.Unlock()
+	if err != nil {
+		return err
+	}
+	var reservation *spaceReservation
+	if gcAdmission {
+		entries, entryErr := work.frozen.EntryUpperBound()
+		if entryErr != nil {
+			return errors.Join(entryErr, s.core.mapping.AbortCheckpoint(work.frozen))
+		}
+		reservation, err = s.reserveGCCheckpoint(ctx, s.catalogSnapshot(), entries)
+		if err != nil {
+			return errors.Join(err, s.core.mapping.AbortCheckpoint(work.frozen))
+		}
+	}
+	err = s.finishCheckpoint(ctx, work)
+	if reservation != nil {
+		reservation.complete(err == nil)
+	}
+	if errors.Is(err, storecatalog.ErrConflict) {
+		s.metrics.checkpointPublishConflicts.Add(1)
+	}
+	return err
 }
 
 type checkpointWork struct {
@@ -552,6 +562,15 @@ func (s *Store) prepareCheckpoint(ctx context.Context) (checkpointWork, error) {
 
 func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error {
 	frozen := work.frozen
+	buildStarted := time.Now()
+	buildRecorded := false
+	defer func() {
+		if !buildRecorded {
+			duration := uint64(time.Since(buildStarted))
+			s.metrics.checkpointBuildNanos.Add(duration)
+			updateAtomicMax(&s.metrics.checkpointMaxBuildNanos, duration)
+		}
+	}()
 	abort := func(cause error) error {
 		return errors.Join(cause, s.core.mapping.AbortCheckpoint(frozen))
 	}
@@ -593,6 +612,16 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		}
 		return abort(err)
 	}
+	buildDuration := uint64(time.Since(buildStarted))
+	s.metrics.checkpointBuildNanos.Add(buildDuration)
+	updateAtomicMax(&s.metrics.checkpointMaxBuildNanos, buildDuration)
+	buildRecorded = true
+	publishStarted := time.Now()
+	defer func() {
+		duration := uint64(time.Since(publishStarted))
+		s.metrics.checkpointPublishNanos.Add(duration)
+		updateAtomicMax(&s.metrics.checkpointMaxPublishNanos, duration)
+	}()
 	installed, err := s.core.publisher.InstallCheckpoint(manifest, storecatalog.Checkpoint{
 		MappingRoot: candidate.Root(), MappingEntryCount: mappingEntries, CoveredCommitSeq: candidate.CoveredCommitSeq(), ReplayStart: work.cut.ReplayStart,
 		ReservedIDHigh: work.reservedIDHigh, ReservedBatchIDHigh: work.reservedBatchIDHigh, IssuedBatchIDHighAtCut: work.issuedBatchIDHigh,

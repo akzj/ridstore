@@ -12,6 +12,11 @@ type Metrics struct {
 	CheckpointFenceHeldNanos, CheckpointFenceMaxHeldNanos                               uint64
 	CheckpointsStarted, CheckpointsCompleted, CheckpointsFailed                         uint64
 	CheckpointDurationNanos, CheckpointMaxDurationNanos                                 uint64
+	CheckpointCaptureWaitNanos, CheckpointMaxCaptureWaitNanos                           uint64
+	CheckpointCaptureNanos, CheckpointMaxCaptureNanos                                   uint64
+	CheckpointBuildNanos, CheckpointMaxBuildNanos                                       uint64
+	CheckpointPublishNanos, CheckpointMaxPublishNanos                                   uint64
+	CheckpointCaptureConflicts, CheckpointPublishConflicts                              uint64
 	RecordLogRotations, RecordLogRotationNanos, RecordLogRotationMaxNanos               uint64
 	MappingGCStarted, MappingGCCompleted, MappingGCFailed, MappingGCConflicts           uint64
 	MappingGCDurationNanos, MappingGCMaxDurationNanos                                   uint64
@@ -38,6 +43,9 @@ type Metrics struct {
 	MaintenanceAutomaticFailed                                                          uint64
 	MaintenanceRequested, MaintenanceCoalesced, MaintenanceCompleted, MaintenanceFailed uint64
 	MaintenancePreemptions, MaintenanceQueued, MaintenanceRunning                       uint64
+	MaintenanceQueueWaitNanos, MaintenanceMaxQueueWaitNanos                             uint64
+	MaintenanceRunNanos, MaintenanceMaxRunNanos                                         uint64
+	MaintenanceRetries, MaintenanceInvariantViolations                                  uint64
 }
 
 type MetricKind uint8
@@ -47,7 +55,7 @@ const (
 	MetricGauge
 )
 
-const MetricSampleCount = 74
+const MetricSampleCount = 90
 
 type MetricSample struct {
 	Name  string
@@ -77,6 +85,16 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_checkpoints_failed_total", MetricCounter, m.CheckpointsFailed},
 		MetricSample{"ridstore_checkpoint_duration_nanoseconds_total", MetricCounter, m.CheckpointDurationNanos},
 		MetricSample{"ridstore_checkpoint_max_duration_nanoseconds", MetricGauge, m.CheckpointMaxDurationNanos},
+		MetricSample{"ridstore_checkpoint_capture_wait_nanoseconds_total", MetricCounter, m.CheckpointCaptureWaitNanos},
+		MetricSample{"ridstore_checkpoint_max_capture_wait_nanoseconds", MetricGauge, m.CheckpointMaxCaptureWaitNanos},
+		MetricSample{"ridstore_checkpoint_capture_nanoseconds_total", MetricCounter, m.CheckpointCaptureNanos},
+		MetricSample{"ridstore_checkpoint_max_capture_nanoseconds", MetricGauge, m.CheckpointMaxCaptureNanos},
+		MetricSample{"ridstore_checkpoint_build_nanoseconds_total", MetricCounter, m.CheckpointBuildNanos},
+		MetricSample{"ridstore_checkpoint_max_build_nanoseconds", MetricGauge, m.CheckpointMaxBuildNanos},
+		MetricSample{"ridstore_checkpoint_publish_nanoseconds_total", MetricCounter, m.CheckpointPublishNanos},
+		MetricSample{"ridstore_checkpoint_max_publish_nanoseconds", MetricGauge, m.CheckpointMaxPublishNanos},
+		MetricSample{"ridstore_checkpoint_capture_conflicts_total", MetricCounter, m.CheckpointCaptureConflicts},
+		MetricSample{"ridstore_checkpoint_publish_conflicts_total", MetricCounter, m.CheckpointPublishConflicts},
 		MetricSample{"ridstore_record_log_rotations_total", MetricCounter, m.RecordLogRotations},
 		MetricSample{"ridstore_record_log_rotation_nanoseconds_total", MetricCounter, m.RecordLogRotationNanos},
 		MetricSample{"ridstore_record_log_rotation_max_nanoseconds", MetricGauge, m.RecordLogRotationMaxNanos},
@@ -131,5 +149,11 @@ func (m Metrics) AppendMetricSamples(dst []MetricSample) []MetricSample {
 		MetricSample{"ridstore_maintenance_preemptions_total", MetricCounter, m.MaintenancePreemptions},
 		MetricSample{"ridstore_maintenance_queued", MetricGauge, m.MaintenanceQueued},
 		MetricSample{"ridstore_maintenance_running", MetricGauge, m.MaintenanceRunning},
+		MetricSample{"ridstore_maintenance_queue_wait_nanoseconds_total", MetricCounter, m.MaintenanceQueueWaitNanos},
+		MetricSample{"ridstore_maintenance_max_queue_wait_nanoseconds", MetricGauge, m.MaintenanceMaxQueueWaitNanos},
+		MetricSample{"ridstore_maintenance_run_nanoseconds_total", MetricCounter, m.MaintenanceRunNanos},
+		MetricSample{"ridstore_maintenance_max_run_nanoseconds", MetricGauge, m.MaintenanceMaxRunNanos},
+		MetricSample{"ridstore_maintenance_retries_total", MetricCounter, m.MaintenanceRetries},
+		MetricSample{"ridstore_maintenance_invariant_violations_total", MetricCounter, m.MaintenanceInvariantViolations},
 	)
 }

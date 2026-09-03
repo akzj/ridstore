@@ -124,11 +124,12 @@ func (s *Store) runCheckpointCycle(ctx context.Context, periodic, forced, depend
 	if pressure {
 		if err == nil {
 			s.metrics.backgroundCheckpointCompleted.Add(1)
-		} else {
+		} else if !checkpointConflict(err) {
 			s.metrics.backgroundCheckpointFailed.Add(1)
 		}
 	}
-	if err != nil && (pressure || periodic) && !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) {
+	if err != nil && (pressure || periodic) && !checkpointConflict(err) &&
+		!errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) {
 		s.setFault(err)
 	}
 	if admissionErr != nil {

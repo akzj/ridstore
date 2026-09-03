@@ -11,6 +11,11 @@ type Metrics struct {
 	CheckpointFenceHeldNanos, CheckpointFenceMaxHeldNanos                               uint64
 	CheckpointsStarted, CheckpointsCompleted, CheckpointsFailed                         uint64
 	CheckpointDurationNanos, CheckpointMaxDurationNanos                                 uint64
+	CheckpointCaptureWaitNanos, CheckpointMaxCaptureWaitNanos                           uint64
+	CheckpointCaptureNanos, CheckpointMaxCaptureNanos                                   uint64
+	CheckpointBuildNanos, CheckpointMaxBuildNanos                                       uint64
+	CheckpointPublishNanos, CheckpointMaxPublishNanos                                   uint64
+	CheckpointCaptureConflicts, CheckpointPublishConflicts                              uint64
 	RecordLogRotations, RecordLogRotationNanos, RecordLogRotationMaxNanos               uint64
 	MappingGCStarted, MappingGCCompleted, MappingGCFailed, MappingGCConflicts           uint64
 	MappingGCDurationNanos, MappingGCMaxDurationNanos                                   uint64
@@ -37,6 +42,9 @@ type Metrics struct {
 	MaintenanceAutomaticFailed                                                          uint64
 	MaintenanceRequested, MaintenanceCoalesced, MaintenanceCompleted, MaintenanceFailed uint64
 	MaintenancePreemptions, MaintenanceQueued, MaintenanceRunning                       uint64
+	MaintenanceQueueWaitNanos, MaintenanceMaxQueueWaitNanos                             uint64
+	MaintenanceRunNanos, MaintenanceMaxRunNanos                                         uint64
+	MaintenanceRetries, MaintenanceInvariantViolations                                  uint64
 }
 
 type runtimeMetrics struct {
@@ -55,6 +63,11 @@ type runtimeMetrics struct {
 	maintenanceAutomaticFailed                                                       atomic.Uint64
 	checkpointsStarted, checkpointsCompleted, checkpointsFailed                      atomic.Uint64
 	checkpointDurationNanos, checkpointMaxDurationNanos                              atomic.Uint64
+	checkpointCaptureWaitNanos, checkpointMaxCaptureWaitNanos                        atomic.Uint64
+	checkpointCaptureNanos, checkpointMaxCaptureNanos                                atomic.Uint64
+	checkpointBuildNanos, checkpointMaxBuildNanos                                    atomic.Uint64
+	checkpointPublishNanos, checkpointMaxPublishNanos                                atomic.Uint64
+	checkpointCaptureConflicts, checkpointPublishConflicts                           atomic.Uint64
 	mappingGCStarted, mappingGCCompleted, mappingGCFailed, mappingGCConflicts        atomic.Uint64
 	mappingGCDurationNanos, mappingGCMaxDurationNanos                                atomic.Uint64
 	mappingGCRebuildNanos, mappingGCVerifyNanos                                      atomic.Uint64
@@ -76,7 +89,12 @@ func (s *Store) Metrics() Metrics {
 		CheckpointsStarted: s.metrics.checkpointsStarted.Load(), CheckpointsCompleted: s.metrics.checkpointsCompleted.Load(),
 		CheckpointsFailed: s.metrics.checkpointsFailed.Load(), CheckpointDurationNanos: s.metrics.checkpointDurationNanos.Load(),
 		CheckpointMaxDurationNanos: s.metrics.checkpointMaxDurationNanos.Load(),
-		MappingGCStarted:           s.metrics.mappingGCStarted.Load(), MappingGCCompleted: s.metrics.mappingGCCompleted.Load(),
+		CheckpointCaptureWaitNanos: s.metrics.checkpointCaptureWaitNanos.Load(), CheckpointMaxCaptureWaitNanos: s.metrics.checkpointMaxCaptureWaitNanos.Load(),
+		CheckpointCaptureNanos: s.metrics.checkpointCaptureNanos.Load(), CheckpointMaxCaptureNanos: s.metrics.checkpointMaxCaptureNanos.Load(),
+		CheckpointBuildNanos: s.metrics.checkpointBuildNanos.Load(), CheckpointMaxBuildNanos: s.metrics.checkpointMaxBuildNanos.Load(),
+		CheckpointPublishNanos: s.metrics.checkpointPublishNanos.Load(), CheckpointMaxPublishNanos: s.metrics.checkpointMaxPublishNanos.Load(),
+		CheckpointCaptureConflicts: s.metrics.checkpointCaptureConflicts.Load(), CheckpointPublishConflicts: s.metrics.checkpointPublishConflicts.Load(),
+		MappingGCStarted: s.metrics.mappingGCStarted.Load(), MappingGCCompleted: s.metrics.mappingGCCompleted.Load(),
 		MappingGCFailed: s.metrics.mappingGCFailed.Load(), MappingGCConflicts: s.metrics.mappingGCConflicts.Load(),
 		MappingGCDurationNanos:    s.metrics.mappingGCDurationNanos.Load(),
 		MappingGCMaxDurationNanos: s.metrics.mappingGCMaxDurationNanos.Load(), MappingGCRebuildNanos: s.metrics.mappingGCRebuildNanos.Load(),
@@ -110,6 +128,9 @@ func (s *Store) Metrics() Metrics {
 	result.MaintenanceRequested, result.MaintenanceCoalesced = scheduler.requested, scheduler.coalesced
 	result.MaintenanceCompleted, result.MaintenanceFailed = scheduler.completed, scheduler.failed
 	result.MaintenancePreemptions, result.MaintenanceQueued, result.MaintenanceRunning = scheduler.preemptions, scheduler.queued, scheduler.running
+	result.MaintenanceQueueWaitNanos, result.MaintenanceMaxQueueWaitNanos = scheduler.queueWaitNanos, scheduler.maxQueueWaitNanos
+	result.MaintenanceRunNanos, result.MaintenanceMaxRunNanos = scheduler.runNanos, scheduler.maxRunNanos
+	result.MaintenanceRetries, result.MaintenanceInvariantViolations = scheduler.retries, scheduler.invariantViolations
 	if s.core.mapping != nil {
 		result.DeltaChargedBytes, result.DeltaReservedBytes, result.DeltaSoftLimitBytes, result.DeltaHardLimitBytes = s.core.mapping.DeltaUsage()
 		result.MappingCacheBytes = s.core.mapping.CacheBytes()

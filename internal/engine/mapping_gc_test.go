@@ -107,6 +107,48 @@ func TestCompactMappingSwitchesRuntimeAndSurvivesReopen(t *testing.T) {
 	}
 }
 
+func TestCompactMappingPromotesGenerationOutsideCaptureLock(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	created, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createMappingGCRecord(t, ctx, created, "promotion-outside-capture")
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	observed := make(chan bool, 1)
+	var store *Store
+	var checked atomic.Bool
+	store, err = open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+		if point == mapstore.FaultBeforeGCPromoteSync && checked.CompareAndSwap(false, true) {
+			acquired := store.checkpoints.captureMu.TryLock()
+			if acquired {
+				store.checkpoints.captureMu.Unlock()
+			}
+			observed <- acquired
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CompactMapping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case acquired := <-observed:
+		if !acquired {
+			t.Fatal("Mapping generation promotion held checkpoint capture lock")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Mapping generation promotion was not observed")
+	}
+}
+
 func TestCompactMappingSpaceAdmissionRejectsBeforeStaging(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "store")

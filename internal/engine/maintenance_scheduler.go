@@ -115,6 +115,7 @@ type maintenanceJob struct {
 	key            string
 	priority       maintenancePriority
 	phase          maintenancePhase
+	queuedAt       time.Time
 	worker         maintenanceWorker
 	waiters        map[uint64]maintenanceWaiter
 	nextWaiters    map[uint64]maintenanceWaiter
@@ -143,6 +144,7 @@ type maintenanceCancel struct{ jobID, waiterID uint64 }
 type maintenanceDone struct {
 	jobID      uint64
 	transition maintenanceTransition
+	runNanos   uint64
 }
 type maintenanceRetry struct{ jobID uint64 }
 type maintenanceScheduleConfig struct {
@@ -167,6 +169,9 @@ type MaintenanceScheduler struct {
 	once                                                 sync.Once
 	requested, coalesced, completed, failed, preemptions atomic.Uint64
 	queued, running                                      atomic.Uint64
+	queueWaitNanos, maxQueueWaitNanos                    atomic.Uint64
+	runNanos, maxRunNanos                                atomic.Uint64
+	retries, invariantViolations                         atomic.Uint64
 }
 
 func newMaintenanceScheduler(parent context.Context, factory maintenanceWorkerFactory) *MaintenanceScheduler {
@@ -306,6 +311,10 @@ func (m *MaintenanceScheduler) run() {
 			delete(byKey, job.key)
 		}
 	}
+	queueJob := func(job *maintenanceJob) {
+		job.queuedAt = time.Now()
+		pending = append(pending, job)
+	}
 	var enqueue func(maintenanceRequest, uint64) (*maintenanceJob, error)
 	enqueue = func(request maintenanceRequest, dependent uint64) (*maintenanceJob, error) {
 		key, priority, rerun, _, err := maintenanceRequestPolicy(request)
@@ -337,7 +346,7 @@ func (m *MaintenanceScheduler) run() {
 			if key != "" {
 				byKey[key] = job
 			}
-			pending = append(pending, job)
+			queueJob(job)
 		}
 		if running && rerun {
 			job.runAgain = true
@@ -385,6 +394,12 @@ func (m *MaintenanceScheduler) run() {
 			}
 			job := pending[best]
 			pending = append(pending[:best], pending[best+1:]...)
+			if !job.queuedAt.IsZero() {
+				waited := uint64(time.Since(job.queuedAt))
+				m.queueWaitNanos.Add(waited)
+				updateAtomicMax(&m.maxQueueWaitNanos, waited)
+				job.queuedAt = time.Time{}
+			}
 			need := job.worker.Resources(job.phase) &^ job.held
 			leased |= need
 			job.runningResources = need
@@ -396,9 +411,10 @@ func (m *MaintenanceScheduler) run() {
 			m.queued.Store(uint64(len(pending)))
 			m.running.Store(uint64(len(active)))
 			go func(jobID uint64, worker maintenanceWorker) {
+				started := time.Now()
 				transition := worker.Run(ctx, phase, dependency)
 				select {
-				case m.doneCh <- maintenanceDone{jobID: jobID, transition: transition}:
+				case m.doneCh <- maintenanceDone{jobID: jobID, transition: transition, runNanos: uint64(time.Since(started))}:
 				case <-m.closedCh:
 				}
 			}(job.id, job.worker)
@@ -421,7 +437,7 @@ func (m *MaintenanceScheduler) run() {
 				}
 				sequence++
 				dependent.sequence = sequence
-				pending = append(pending, dependent)
+				queueJob(dependent)
 			}
 		}
 		if completion.err == nil {
@@ -520,11 +536,15 @@ func (m *MaintenanceScheduler) run() {
 			delete(active, job.id)
 			job.cancel()
 			job.cancel = nil
+			m.runNanos.Add(done.runNanos)
+			updateAtomicMax(&m.maxRunNanos, done.runNanos)
+			owned := job.held | job.runningResources
 			leased &^= job.runningResources
 			job.runningResources = 0
 			transition := done.transition
-			if transition.retain&^(job.held|job.worker.Resources(job.phase)) != 0 {
-				transition.err = errors.Join(base.ErrInvalidConfig, errors.New("worker retained an unowned maintenance resource"))
+			if invariantErr := validateMaintenanceTransition(transition, owned); invariantErr != nil {
+				m.invariantViolations.Add(1)
+				transition = maintenanceTransition{done: true, err: invariantErr}
 			}
 			leased &^= job.held &^ transition.retain
 			job.held = transition.retain
@@ -533,7 +553,7 @@ func (m *MaintenanceScheduler) run() {
 				job.preempted = false
 				sequence++
 				job.sequence = sequence
-				pending = append(pending, job)
+				queueJob(job)
 				dispatch()
 				continue
 			}
@@ -565,7 +585,7 @@ func (m *MaintenanceScheduler) run() {
 					job.dependencyResult = maintenanceResult{}
 					sequence++
 					job.sequence = sequence
-					pending = append(pending, job)
+					queueJob(job)
 				} else {
 					removeJob(job)
 				}
@@ -582,6 +602,7 @@ func (m *MaintenanceScheduler) run() {
 				sequence++
 				job.sequence = sequence
 				if transition.retryAfter > 0 {
+					m.retries.Add(1)
 					time.AfterFunc(transition.retryAfter, func() {
 						select {
 						case m.retryCh <- maintenanceRetry{jobID: job.id}:
@@ -589,7 +610,7 @@ func (m *MaintenanceScheduler) run() {
 						}
 					})
 				} else {
-					pending = append(pending, job)
+					queueJob(job)
 				}
 			}
 			dispatch()
@@ -597,7 +618,7 @@ func (m *MaintenanceScheduler) run() {
 			if job := jobs[retry.jobID]; job != nil && active[job.id] == nil && !job.waiting {
 				sequence++
 				job.sequence = sequence
-				pending = append(pending, job)
+				queueJob(job)
 				dispatch()
 			}
 		case <-shutdownC:
@@ -655,13 +676,50 @@ func (w *failedDependencyWorker) Run(context.Context, maintenancePhase, maintena
 	return maintenanceTransition{done: true, err: w.err}
 }
 
-type maintenanceSchedulerMetrics struct{ requested, coalesced, completed, failed, preemptions, queued, running uint64 }
+type maintenanceSchedulerMetrics struct {
+	requested, coalesced, completed, failed, preemptions, queued, running uint64
+	queueWaitNanos, maxQueueWaitNanos, runNanos, maxRunNanos              uint64
+	retries, invariantViolations                                          uint64
+}
 
 func (m *MaintenanceScheduler) metrics() maintenanceSchedulerMetrics {
 	if m == nil {
 		return maintenanceSchedulerMetrics{}
 	}
-	return maintenanceSchedulerMetrics{requested: m.requested.Load(), coalesced: m.coalesced.Load(), completed: m.completed.Load(), failed: m.failed.Load(), preemptions: m.preemptions.Load(), queued: m.queued.Load(), running: m.running.Load()}
+	return maintenanceSchedulerMetrics{
+		requested: m.requested.Load(), coalesced: m.coalesced.Load(), completed: m.completed.Load(), failed: m.failed.Load(),
+		preemptions: m.preemptions.Load(), queued: m.queued.Load(), running: m.running.Load(),
+		queueWaitNanos: m.queueWaitNanos.Load(), maxQueueWaitNanos: m.maxQueueWaitNanos.Load(),
+		runNanos: m.runNanos.Load(), maxRunNanos: m.maxRunNanos.Load(),
+		retries: m.retries.Load(), invariantViolations: m.invariantViolations.Load(),
+	}
+}
+
+func validateMaintenanceTransition(transition maintenanceTransition, owned maintenanceResource) error {
+	if transition.retain&^owned != 0 {
+		return errors.Join(base.ErrInvalidConfig, errors.New("worker retained an unowned maintenance resource"))
+	}
+	if transition.done {
+		if transition.dependency != nil || transition.next != 0 || transition.retain != 0 || transition.retryAfter != 0 {
+			return errors.Join(base.ErrInvalidConfig, errors.New("completed maintenance transition contains continuation state"))
+		}
+		return nil
+	}
+	if transition.err != nil {
+		return errors.Join(base.ErrInvalidConfig, errors.New("non-terminal maintenance transition contains an error"))
+	}
+	if transition.next < maintenancePhaseStart || transition.next > maintenancePhaseCleanup {
+		return errors.Join(base.ErrInvalidConfig, errors.New("maintenance transition has invalid next phase"))
+	}
+	if transition.dependency != nil && transition.retryAfter != 0 {
+		return errors.Join(base.ErrInvalidConfig, errors.New("maintenance transition combines dependency and retry delay"))
+	}
+	if transition.dependency != nil {
+		if _, _, _, _, err := maintenanceRequestPolicy(*transition.dependency); err != nil {
+			return errors.Join(base.ErrInvalidConfig, errors.New("maintenance transition has invalid dependency"))
+		}
+	}
+	return nil
 }
 
 func removeMaintenanceJob(jobs []*maintenanceJob, id uint64) []*maintenanceJob {

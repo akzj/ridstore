@@ -226,3 +226,47 @@ func TestMaintenanceSchedulerCloseCancelsAndRejects(t *testing.T) {
 		t.Fatalf("late err=%v", err)
 	}
 }
+
+func TestMaintenanceSchedulerRecordsPhaseTimingAndRetry(t *testing.T) {
+	var calls atomic.Uint64
+	factory := fakeMaintenanceFactory{newWorker: func(maintenanceRequest) maintenanceWorker {
+		return &fakeMaintenanceWorker{
+			resources: func(maintenancePhase) maintenanceResource { return maintenanceMappingWriter },
+			run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+				if calls.Add(1) == 1 {
+					return maintenanceTransition{next: maintenancePhaseStart, retryAfter: time.Millisecond}
+				}
+				return maintenanceTransition{done: true}
+			},
+		}
+	}}
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
+	defer scheduler.Close()
+	if _, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceCheckpointRequest}); err != nil {
+		t.Fatal(err)
+	}
+	metrics := scheduler.metrics()
+	if metrics.retries != 1 || metrics.queueWaitNanos == 0 || metrics.maxQueueWaitNanos == 0 ||
+		metrics.runNanos == 0 || metrics.maxRunNanos == 0 || metrics.invariantViolations != 0 {
+		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestMaintenanceSchedulerRejectsInvalidTransition(t *testing.T) {
+	factory := fakeMaintenanceFactory{newWorker: func(maintenanceRequest) maintenanceWorker {
+		return &fakeMaintenanceWorker{
+			resources: func(maintenancePhase) maintenanceResource { return maintenanceHeavyIO },
+			run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+				return maintenanceTransition{done: true, next: maintenancePhaseCopy}
+			},
+		}
+	}}
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
+	defer scheduler.Close()
+	if _, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceMappingSurveyRequest}); !errors.Is(err, base.ErrInvalidConfig) {
+		t.Fatalf("err=%v", err)
+	}
+	if violations := scheduler.metrics().invariantViolations; violations != 1 {
+		t.Fatalf("invariant violations=%d", violations)
+	}
+}

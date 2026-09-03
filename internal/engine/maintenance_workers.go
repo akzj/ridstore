@@ -10,6 +10,7 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/recordlog"
+	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
 // NewMaintenanceWorker is the only production factory for scheduler-owned
@@ -31,8 +32,9 @@ func (s *Store) NewMaintenanceWorker(request maintenanceRequest) (maintenanceWor
 }
 
 type checkpointMaintenanceWorker struct {
-	store   *Store
-	request maintenanceRequest
+	store            *Store
+	request          maintenanceRequest
+	conflictAttempts uint8
 }
 
 func (*checkpointMaintenanceWorker) Resources(maintenancePhase) maintenanceResource {
@@ -41,7 +43,18 @@ func (*checkpointMaintenanceWorker) Resources(maintenancePhase) maintenanceResou
 
 func (w *checkpointMaintenanceWorker) Run(ctx context.Context, _ maintenancePhase, _ maintenanceResult) maintenanceTransition {
 	err := w.store.runCheckpointCycle(ctx, w.request.periodic, w.request.force, w.request.gcAdmission, w.request.generation)
+	if checkpointConflict(err) {
+		delay := time.Millisecond << min(w.conflictAttempts, uint8(6))
+		if w.conflictAttempts < 7 {
+			w.conflictAttempts++
+		}
+		return maintenanceTransition{next: maintenancePhaseStart, retryAfter: delay}
+	}
 	return maintenanceTransition{done: true, err: err}
+}
+
+func checkpointConflict(err error) bool {
+	return errors.Is(err, base.ErrConflict) || errors.Is(err, storecatalog.ErrConflict)
 }
 
 type segmentMaintenanceWorker struct {
@@ -318,7 +331,7 @@ func (w *mappingGCMaintenanceWorker) Run(ctx context.Context, phase maintenanceP
 		}
 		return maintenanceTransition{next: maintenancePhasePublish, retain: maintenanceRecoveryProtocol}
 	case maintenancePhasePublish:
-		if err := w.store.publishMappingGC(w.work); err != nil {
+		if err := w.store.publishMappingGC(ctx, w.work); err != nil {
 			if w.request.automatic && !expectedAutomaticMaintenanceError(err) {
 				w.store.metrics.maintenanceAutomaticFailed.Add(1)
 			}

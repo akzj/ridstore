@@ -103,6 +103,11 @@ func (s *Store) Metrics() Metrics {
 		CheckpointFenceHeldNanos: current.CheckpointFenceHeldNanos, CheckpointFenceMaxHeldNanos: current.CheckpointFenceMaxHeldNanos,
 		CheckpointsStarted: current.CheckpointsStarted, CheckpointsCompleted: current.CheckpointsCompleted, CheckpointsFailed: current.CheckpointsFailed,
 		CheckpointDurationNanos: current.CheckpointDurationNanos, CheckpointMaxDurationNanos: current.CheckpointMaxDurationNanos,
+		CheckpointCaptureWaitNanos: current.CheckpointCaptureWaitNanos, CheckpointMaxCaptureWaitNanos: current.CheckpointMaxCaptureWaitNanos,
+		CheckpointCaptureNanos: current.CheckpointCaptureNanos, CheckpointMaxCaptureNanos: current.CheckpointMaxCaptureNanos,
+		CheckpointBuildNanos: current.CheckpointBuildNanos, CheckpointMaxBuildNanos: current.CheckpointMaxBuildNanos,
+		CheckpointPublishNanos: current.CheckpointPublishNanos, CheckpointMaxPublishNanos: current.CheckpointMaxPublishNanos,
+		CheckpointCaptureConflicts: current.CheckpointCaptureConflicts, CheckpointPublishConflicts: current.CheckpointPublishConflicts,
 		RecordLogRotations: current.RecordLogRotations, RecordLogRotationNanos: current.RecordLogRotationNanos,
 		RecordLogRotationMaxNanos: current.RecordLogRotationMaxNanos,
 		MappingGCStarted:          current.MappingGCStarted, MappingGCCompleted: current.MappingGCCompleted, MappingGCFailed: current.MappingGCFailed,
@@ -132,6 +137,9 @@ func (s *Store) Metrics() Metrics {
 		MaintenanceRequested: current.MaintenanceRequested, MaintenanceCoalesced: current.MaintenanceCoalesced,
 		MaintenanceCompleted: current.MaintenanceCompleted, MaintenanceFailed: current.MaintenanceFailed,
 		MaintenancePreemptions: current.MaintenancePreemptions, MaintenanceQueued: current.MaintenanceQueued, MaintenanceRunning: current.MaintenanceRunning,
+		MaintenanceQueueWaitNanos: current.MaintenanceQueueWaitNanos, MaintenanceMaxQueueWaitNanos: current.MaintenanceMaxQueueWaitNanos,
+		MaintenanceRunNanos: current.MaintenanceRunNanos, MaintenanceMaxRunNanos: current.MaintenanceMaxRunNanos,
+		MaintenanceRetries: current.MaintenanceRetries, MaintenanceInvariantViolations: current.MaintenanceInvariantViolations,
 	}
 }
 

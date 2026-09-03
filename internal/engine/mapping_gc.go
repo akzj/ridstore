@@ -65,6 +65,8 @@ type mappingGCWork struct {
 	view       mapping.CheckpointView
 	generation mapstore.Generation
 	newTree    *radix.Tree
+	reachable  uint64
+	physical   uint64
 	staging    string
 	space      *spaceReservation
 	state      mapgcstate.State
@@ -178,6 +180,10 @@ func (s *Store) prepareMappingGC(ctx context.Context) (work *mappingGCWork, err 
 		}
 		return cleanupWriter(err)
 	}
+	work.reachable, err = work.newTree.ReachableBytes(ctx)
+	if err != nil {
+		return cleanupWriter(err)
+	}
 	s.metrics.mappingGCVerifyNanos.Add(uint64(time.Since(verifyStarted)))
 	if err = writer.Close(); err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root)))
@@ -185,102 +191,125 @@ func (s *Store) prepareMappingGC(ctx context.Context) (work *mappingGCWork, err 
 	return work, nil
 }
 
-func (s *Store) publishMappingGC(work *mappingGCWork) (err error) {
+func (s *Store) publishMappingGC(ctx context.Context, work *mappingGCWork) (err error) {
 	if work == nil {
 		return base.ErrInvalidConfig
 	}
 	fail := func(cause error) error { work.space.complete(false); return cause }
-	s.checkpoints.captureMu.Lock()
-	publishStarted := time.Now()
-	defer func() {
-		duration := uint64(time.Since(publishStarted))
-		s.metrics.mappingGCPublishNanos.Add(duration)
-		updateAtomicMax(&s.metrics.mappingGCMaxPublishNanos, duration)
-		s.checkpoints.captureMu.Unlock()
-	}()
-	currentView, err := s.core.mapping.CheckpointView()
-	if err != nil || currentView.Root() != work.manifest.MappingRoot || currentView.Covered() != work.manifest.CoveredCommitSeq {
-		if err == nil {
-			err = base.ErrCorrupt
-		}
-		return fail(s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root)))
-	}
 	oldSet := mappingGCFileSet(work.manifest.SealedMapSegments, work.manifest.ActiveMapSegmentID, work.manifest.NextMapSegmentID, work.manifest.MappingRoot)
-	prepared := false
-	rollback := func(cause error) error {
+	rollback := func() error {
 		cleanup := mapstore.RollbackGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook)
 		if cleanup == nil {
 			cleanup = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
 		}
-		return s.mappingGCPrepublishFailure(cause, cleanup)
+		return cleanup
 	}
-	installed, err := s.core.publisher.PrepareAndInstallMappingRewrite(func(latest storecatalog.Manifest) error {
-		if latest.CoveredCommitSeq != work.manifest.CoveredCommitSeq || latest.MappingEntryCount != work.manifest.MappingEntryCount || !manifestMatchesMappingSet(latest, oldSet) {
-			return s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.core.root))
+	latest := s.catalogSnapshot()
+	if latest.CoveredCommitSeq != work.manifest.CoveredCommitSeq || latest.MappingEntryCount != work.manifest.MappingEntryCount ||
+		!manifestMatchesMappingSet(latest, oldSet) {
+		return fail(s.mappingGCConflict(mapping.ErrStalePlan, discardMappingGCStaging(s.core.root)))
+	}
+	work.state = mapgcstate.State{StoreID: [16]byte(latest.StoreUUID), BaseGeneration: latest.Generation,
+		SegmentSize: uint32(latest.HardLimits.SegmentSize), Covered: latest.CoveredCommitSeq, Old: oldSet,
+		New: mapgcstate.FileSet{Sealed: work.generation.SealedSegments, Active: work.generation.ActiveSegment,
+			Next: work.generation.NextSegment, Root: work.generation.Root}}
+	if err := mapgcstate.Install(s.core.root, work.state, s.maintenance.mappingGCHook); err != nil {
+		cleanup := discardMappingGCStaging(s.core.root)
+		if cleanup == nil {
+			cleanup = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
 		}
-		work.state = mapgcstate.State{StoreID: [16]byte(latest.StoreUUID), BaseGeneration: latest.Generation,
-			SegmentSize: uint32(latest.HardLimits.SegmentSize), Covered: latest.CoveredCommitSeq, Old: oldSet,
-			New: mapgcstate.FileSet{Sealed: work.generation.SealedSegments, Active: work.generation.ActiveSegment, Next: work.generation.NextSegment, Root: work.generation.Root}}
-		if installErr := mapgcstate.Install(s.core.root, work.state, s.maintenance.mappingGCHook); installErr != nil {
-			cleanup := discardMappingGCStaging(s.core.root)
-			if cleanup == nil {
-				cleanup = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
-			}
-			return s.mappingGCPrepublishFailure(installErr, cleanup)
+		return fail(s.mappingGCPrepublishFailure(err, cleanup))
+	}
+	if err := mapstore.PromoteGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook); err != nil {
+		return fail(s.mappingGCPrepublishFailure(err, rollback()))
+	}
+	preflightStarted := time.Now()
+	snapshot := snapshotFromState(work.state.BaseGeneration, work.state.StoreID, work.state.SegmentSize, work.state.Covered, work.state.New)
+	reader, report, err := mapstore.OpenVerifiedGeneration(ctx, s.core.root, snapshot)
+	if err == nil {
+		var tree *radix.Tree
+		tree, err = radix.OpenReadOnly(reader, work.generation.Root, work.generation.Covered, s.maintenance.mappingCacheBytes)
+		if err == nil {
+			err = tree.Walk(ctx, func(model.ID, recordlog.VAddr) error { return nil })
 		}
-		if promoteErr := mapstore.PromoteGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook); promoteErr != nil {
-			return rollback(promoteErr)
-		}
-		prepared = true
-		return nil
-	}, storecatalog.MappingRewrite{SealedSegments: mappingGCSummaries(work.generation.SealedSegments), ActiveSegment: work.generation.ActiveSegment,
-		NextSegment: work.generation.NextSegment, Root: work.generation.Root, Covered: work.generation.Covered})
-	if err != nil {
-		if !prepared {
-			return fail(err)
-		}
-		s.setFault(err)
-		return fail(errors.Join(base.ErrReadOnly, err))
 	}
-	newStore, err := mapstore.OpenWithFaultHook(s.core.root, s.core.publisher, s.maintenance.mapStoreHook)
-	if err != nil {
-		s.setFault(err)
-		return fail(errors.Join(base.ErrReadOnly, err))
+	if reader != nil {
+		err = errors.Join(err, reader.Close())
 	}
-	newRoot, err := radix.Open(newStore, installed.MappingRoot, installed.CoveredCommitSeq, s.maintenance.mappingCacheBytes)
-	if err != nil {
-		_ = newStore.Close()
-		s.setFault(err)
-		return fail(errors.Join(base.ErrReadOnly, err))
-	}
-	reachableBytes, err := newRoot.ReachableBytes(context.Background())
-	if err != nil {
-		_ = newStore.Close()
-		s.setFault(err)
-		return fail(errors.Join(base.ErrReadOnly, err))
-	}
-	physicalBytes, err := newStore.PhysicalBytes()
-	if err != nil || reachableBytes > physicalBytes {
-		_ = newStore.Close()
+	s.metrics.mappingGCVerifyNanos.Add(uint64(time.Since(preflightStarted)))
+	if err != nil || work.reachable > report.PhysicalBytes {
 		if err == nil {
 			err = base.ErrCorrupt
 		}
-		s.setFault(err)
-		return fail(errors.Join(base.ErrReadOnly, err))
+		return fail(s.mappingGCPrepublishFailure(err, rollback()))
 	}
-	work.drained, err = s.core.mapping.ReplaceCheckpointRoot(work.view, newRoot, newStore)
-	if err != nil {
-		_ = newStore.Close()
-		s.setFault(err)
-		return fail(errors.Join(base.ErrReadOnly, err))
+	work.physical = report.PhysicalBytes
+
+	publisherCalled := false
+	commitErr := func() error {
+		s.checkpoints.captureMu.Lock()
+		publishStarted := time.Now()
+		defer func() {
+			s.checkpoints.captureMu.Unlock()
+		}()
+		defer func() {
+			duration := uint64(time.Since(publishStarted))
+			s.metrics.mappingGCPublishNanos.Add(duration)
+			updateAtomicMax(&s.metrics.mappingGCMaxPublishNanos, duration)
+		}()
+		currentView, err := s.core.mapping.CheckpointView()
+		if err != nil {
+			return err
+		}
+		if currentView.Root() != work.manifest.MappingRoot || currentView.Covered() != work.manifest.CoveredCommitSeq {
+			return mapping.ErrStalePlan
+		}
+		publisherCalled = true
+		installed, err := s.core.publisher.PrepareAndInstallMappingRewrite(func(latest storecatalog.Manifest) error {
+			if latest.CoveredCommitSeq != work.manifest.CoveredCommitSeq || latest.MappingEntryCount != work.manifest.MappingEntryCount ||
+				!manifestMatchesMappingSet(latest, oldSet) {
+				return mapping.ErrStalePlan
+			}
+			return nil
+		}, storecatalog.MappingRewrite{SealedSegments: mappingGCSummaries(work.generation.SealedSegments), ActiveSegment: work.generation.ActiveSegment,
+			NextSegment: work.generation.NextSegment, Root: work.generation.Root, Covered: work.generation.Covered})
+		if err != nil {
+			return err
+		}
+		newStore, err := mapstore.OpenWithFaultHook(s.core.root, s.core.publisher, s.maintenance.mapStoreHook)
+		if err != nil {
+			return err
+		}
+		newRoot, err := radix.Open(newStore, installed.MappingRoot, installed.CoveredCommitSeq, s.maintenance.mappingCacheBytes)
+		if err != nil {
+			_ = newStore.Close()
+			return err
+		}
+		work.drained, err = s.core.mapping.ReplaceCheckpointRoot(work.view, newRoot, newStore)
+		if err != nil {
+			_ = newStore.Close()
+			return err
+		}
+		work.oldStore, work.installed = s.core.mapStore, installed
+		s.core.mapStore = newStore
+		s.maintenance.mappingUsage.Store(&mappingUsage{generation: installed.Generation, root: installed.MappingRoot,
+			physicalBytes: work.physical, reachableBytes: work.reachable})
+		s.metrics.mappingSurveyGeneration.Store(installed.Generation)
+		s.metrics.mappingSurveyPhysicalBytes.Store(work.physical)
+		s.metrics.mappingSurveyReachableBytes.Store(work.reachable)
+		return nil
+	}()
+	if commitErr == nil {
+		return nil
 	}
-	work.oldStore, work.installed = s.core.mapStore, installed
-	s.core.mapStore = newStore
-	s.maintenance.mappingUsage.Store(&mappingUsage{generation: installed.Generation, root: installed.MappingRoot, physicalBytes: physicalBytes, reachableBytes: reachableBytes})
-	s.metrics.mappingSurveyGeneration.Store(installed.Generation)
-	s.metrics.mappingSurveyPhysicalBytes.Store(physicalBytes)
-	s.metrics.mappingSurveyReachableBytes.Store(reachableBytes)
-	return nil
+	if errors.Is(commitErr, mapping.ErrStalePlan) {
+		return fail(s.mappingGCConflict(commitErr, rollback()))
+	}
+	if !publisherCalled {
+		return fail(s.mappingGCPrepublishFailure(commitErr, rollback()))
+	}
+	s.setFault(commitErr)
+	return fail(errors.Join(base.ErrReadOnly, commitErr))
 }
 
 func (s *Store) cleanupMappingGC(work *mappingGCWork) error {

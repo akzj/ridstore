@@ -238,7 +238,10 @@ func TestCheckpointMetricsRecordCompletedOperation(t *testing.T) {
 	}
 	metrics := store.Metrics()
 	if metrics.CheckpointsStarted != 1 || metrics.CheckpointsCompleted != 1 || metrics.CheckpointsFailed != 0 ||
-		metrics.CheckpointDurationNanos == 0 || metrics.CheckpointMaxDurationNanos == 0 || metrics.CheckpointFences != 1 {
+		metrics.CheckpointDurationNanos == 0 || metrics.CheckpointMaxDurationNanos == 0 || metrics.CheckpointFences != 1 ||
+		metrics.CheckpointCaptureNanos == 0 || metrics.CheckpointMaxCaptureNanos == 0 ||
+		metrics.CheckpointBuildNanos == 0 || metrics.CheckpointMaxBuildNanos == 0 ||
+		metrics.CheckpointPublishNanos == 0 || metrics.CheckpointMaxPublishNanos == 0 {
 		t.Fatalf("checkpoint metrics=%+v", metrics)
 	}
 }

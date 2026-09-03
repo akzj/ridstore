@@ -46,3 +46,25 @@ Publication remains durable-before-visible. Scheduler ownership changes when
 a phase may run; it does not weaken Catalog generation validation, Mapping
 root validation, mutation draining, reader pins, open-Batch redirects, or
 retirement proofs.
+
+## Fairness and backpressure policy
+
+Checkpoint priority is absolute because Delta hard-pressure and GC proof
+dependencies require bounded progress. Mapping jobs must not age above
+Checkpoint: doing so can delay the operation that releases their own
+dependency. Automatic Checkpoint, Segment GC, Mapping GC, and survey requests
+use stable coalescing keys, so timer bursts do not grow the queue.
+
+Explicit Segment requests are intentionally independent and remain attached to
+caller contexts; cancellation removes their waiter and cancels otherwise
+unowned work. The Scheduler currently does not impose a second arbitrary queue
+limit or priority aging policy. Such a limit would require a new public
+overload error and could reject the Checkpoint needed to relieve pressure.
+
+`MaintenanceQueueWaitNanos`, `MaintenanceMaxQueueWaitNanos`,
+`MaintenanceRunNanos`, `MaintenanceMaxRunNanos`, retries, preemptions, queued,
+and running are the admission evidence. Add bounded explicit-request admission
+only if soak tests show sustained queue growth or queue wait materially above
+phase runtime; add lower-priority aging only if Mapping work starves while the
+Checkpoint queue is already converging. Neither condition is assumed from
+architecture alone.
