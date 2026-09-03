@@ -71,6 +71,32 @@ func TestCreateNormalizesAutomaticMaintenanceAgainstSegmentSize(t *testing.T) {
 	}
 }
 
+func TestAutomaticMaintenanceSubmitsSegmentWorker(t *testing.T) {
+	config := testCreateConfig()
+	config.Runtime.Maintenance = MaintenanceConfig{
+		Enabled: true, Interval: time.Hour, DisableMappingGC: true,
+		SegmentPolicy: CompactionPolicy{MinReclaimableBytes: ^uint64(0)},
+	}
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	before := store.Metrics().MaintenanceRequested
+	store.scheduleAutomaticMaintenance()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.maintenance.autoSegmentRunning.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("automatic Segment worker did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	after := store.Metrics()
+	if after.MaintenanceRequested <= before || after.MaintenanceFailed != 0 || after.MaintenanceAutomaticFailed != 0 {
+		t.Fatalf("metrics before=%d after=%+v", before, after)
+	}
+}
+
 func TestOpenRejectsIncompleteInitializationAndCreateResumes(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()

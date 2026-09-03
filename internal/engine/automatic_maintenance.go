@@ -28,7 +28,7 @@ func (s *Store) scheduleAutomaticMaintenance() {
 			defer s.maintenance.autoMappingRunning.Store(false)
 			needed, err := s.mappingGCNeeded(context.Background(), config)
 			if err != nil {
-				if !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, mapstore.ErrRecoveryRequired) {
+				if !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, base.ErrConflict) && !errors.Is(err, mapstore.ErrRecoveryRequired) {
 					s.metrics.maintenanceAutomaticFailed.Add(1)
 				}
 				return
