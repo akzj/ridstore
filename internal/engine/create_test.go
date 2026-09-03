@@ -716,9 +716,9 @@ func TestCloseStopsBackgroundCheckpointBeforeClosingStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-store.checkpoints.done:
+	case <-store.Done():
 	default:
-		t.Fatal("background checkpoint worker still running after Close")
+		t.Fatal("Store goroutines still running after Close")
 	}
 	reopened, err := Open(context.Background(), root, config.Runtime)
 	if err != nil {
@@ -798,6 +798,49 @@ func TestCloseDoesNotWaitForCheckpointMutex(t *testing.T) {
 	case <-time.After(time.Second):
 		store.checkpoints.captureMu.Unlock()
 		t.Fatal("Close waited for checkpoint mutex")
+	}
+}
+
+func TestCloseCancelsBlockedOperationAndClosesDone(t *testing.T) {
+	config := testCreateConfig()
+	config.HardLimits.MaxOpenBatches = 1
+	config.Runtime.StatusRetention = 1
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Begin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, beginErr := store.Begin(context.Background())
+		blocked <- beginErr
+	}()
+	select {
+	case err := <-blocked:
+		t.Fatalf("Begin was not blocked: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := store.CloseContext(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, base.ErrClosed) {
+			t.Fatalf("blocked Begin err=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Begin did not observe Store cancellation")
+	}
+	select {
+	case <-store.Done():
+	default:
+		t.Fatal("Done remained open after CloseContext returned")
 	}
 }
 

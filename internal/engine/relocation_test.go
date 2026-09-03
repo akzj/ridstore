@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1041,63 +1042,101 @@ func TestRetirementProofDoesNotBlockUserCommit(t *testing.T) {
 	}
 }
 
-func TestRetirementProofDrainsInFlightBatchMutationBeforeScanning(t *testing.T) {
-	store, source, _, _, _ := relocationFixture(t)
-	relocated, err := store.RelocateSegment(context.Background(), source)
+func TestOpenBatchSnapshotWaitsForBatchLocalAppendPublication(t *testing.T) {
+	store := newRelocationStore(t)
+	seed, err := store.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.checkpoint(context.Background(), true); err != nil {
+	id, err := seed.Create(context.Background(), []byte("seed"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	blocked := &blockingProofLog{
-		maintenanceLog: store.core.compactionLog, source: source,
-		reached: make(chan struct{}), release: make(chan struct{}),
+	if _, err := seed.Commit(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	store.core.compactionLog = blocked
-	released := false
-	defer func() {
-		if !released {
-			close(blocked.release)
-		}
-	}()
 
-	// This models the interval after a Put Record append and before its final
-	// Batch mutation becomes visible. Retirement must drain that interval before
-	// it may inspect open-Batch references or scan the source.
-	store.mutationAdmission.readLock()
-	proofDone := make(chan error, 1)
+	value := []byte("pending-before-rotation")
+	blocked := &blockingCopyLog{
+		Log: store.core.log, target: id, value: value,
+		reached: make(chan struct{}), release: make(chan struct{}), appended: make(chan recordlog.AppendResult, 1),
+	}
+	store.core.userAppender = blocked
+	pending, err := store.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	putDone := make(chan error, 1)
+	go func() { putDone <- pending.Put(context.Background(), id, value) }()
+	<-blocked.reached
+	appended := <-blocked.appended
+
+	// New Batches use the normal appender. Fill until the Segment containing
+	// the blocked Put is sealed, so it becomes a valid compaction input.
+	store.core.userAppender = store.core.log
+	source := appended.Addr.SegmentID()
+	for store.core.catalog.Snapshot().ActiveDataSegmentID == source {
+		filler, beginErr := store.Begin(context.Background())
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if _, createErr := filler.Create(context.Background(), bytes.Repeat([]byte{'x'}, 512)); createErr != nil {
+			t.Fatal(createErr)
+		}
+		if _, commitErr := filler.Commit(context.Background()); commitErr != nil {
+			t.Fatal(commitErr)
+		}
+	}
+	manifest := store.core.catalog.Snapshot()
+	index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool {
+		return manifest.SealedDataSegments[i].SegmentID >= source
+	})
+	if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source {
+		t.Fatalf("source segment %d was not sealed", source)
+	}
+
+	snapshotDone := make(chan struct {
+		refs openBatchCompactionRefs
+		err  error
+	}, 1)
 	go func() {
-		_, err := store.proveSegmentRetirement(context.Background(), source, relocated.LastCommitSeq)
-		proofDone <- err
+		refs, snapshotErr := store.snapshotOpenBatchCompactionRefs([]recordlog.SegmentSummary{manifest.SealedDataSegments[index]})
+		snapshotDone <- struct {
+			refs openBatchCompactionRefs
+			err  error
+		}{refs: refs, err: snapshotErr}
 	}()
 	select {
-	case <-blocked.reached:
-		store.mutationAdmission.readUnlock()
-		t.Fatal("retirement scan crossed an in-flight Batch mutation")
+	case result := <-snapshotDone:
+		t.Fatalf("snapshot crossed append-before-publication window: %+v", result)
 	case <-time.After(20 * time.Millisecond):
 	}
-	store.mutationAdmission.readUnlock()
-	select {
-	case <-blocked.reached:
-	case <-time.After(time.Second):
-		t.Fatal("retirement did not resume after Batch mutation drained")
-	}
 	close(blocked.release)
-	released = true
-	if err := <-proofDone; err != nil {
+	if err := <-putDone; err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case result := <-snapshotDone:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if got := result.refs.refs[appended.Addr]; got.Addr != appended.Addr {
+			t.Fatalf("pending ref=%+v want addr=%v", got, appended.Addr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not resume after Batch mutation publication")
 	}
 }
 
 type blockingCopyLog struct {
 	Log
 	maintenanceLog
-	target  model.ID
-	value   []byte
-	reached chan struct{}
-	release chan struct{}
-	once    sync.Once
+	target   model.ID
+	value    []byte
+	reached  chan struct{}
+	release  chan struct{}
+	appended chan recordlog.AppendResult
+	once     sync.Once
 }
 
 type blockingProofLog struct {
@@ -1171,6 +1210,9 @@ func (l *blockingCopyLog) Append(ctx context.Context, payload []byte, syncWrite 
 	put, decodeErr := recordcodec.DecodePut(payload, 1<<20)
 	if decodeErr == nil && put.RecordID == l.target && bytes.Equal(put.Value, l.value) {
 		l.once.Do(func() {
+			if l.appended != nil {
+				l.appended <- result
+			}
 			close(l.reached)
 			<-l.release
 		})

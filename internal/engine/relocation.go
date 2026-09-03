@@ -90,10 +90,11 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 	if source == 0 {
 		return SegmentRelocationResult{}, base.ErrInvalidConfig
 	}
-	if err := s.beginOperation(); err != nil {
+	ctx, end, err := s.beginOperation(ctx)
+	if err != nil {
 		return SegmentRelocationResult{}, err
 	}
-	defer s.endOperation()
+	defer end()
 
 	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentRelocateRequest, source: source})
 	return result.relocation, err
@@ -112,10 +113,11 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	if source == 0 {
 		return SegmentRetirementProof{}, SegmentRelocationResult{}, base.ErrInvalidConfig
 	}
-	if err := s.beginOperation(); err != nil {
+	ctx, end, err := s.beginOperation(ctx)
+	if err != nil {
 		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
 	}
-	defer s.endOperation()
+	defer end()
 
 	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentPrepareRequest, source: source})
 	return result.proof, result.relocation, err
@@ -135,10 +137,11 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 	if source == 0 {
 		return SegmentCompactionResult{}, base.ErrInvalidConfig
 	}
-	if err := s.beginOperation(); err != nil {
+	ctx, end, err := s.beginOperation(ctx)
+	if err != nil {
 		return SegmentCompactionResult{}, err
 	}
-	defer s.endOperation()
+	defer end()
 	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentCompactRequest, source: source})
 	return result.compaction, err
 }
@@ -158,10 +161,11 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 	if policy.MinReclaimableRatioBasis > compactionRatioScale {
 		return NextSegmentCompactionResult{}, false, base.ErrInvalidConfig
 	}
-	if err := s.beginOperation(); err != nil {
+	ctx, end, err := s.beginOperation(ctx)
+	if err != nil {
 		return NextSegmentCompactionResult{}, false, err
 	}
-	defer s.endOperation()
+	defer end()
 	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentNextRequest, policy: policy})
 	if result.found {
 		result.next.Compaction = result.compaction
@@ -575,24 +579,18 @@ func (s *Store) publishCompactionOutputs(ctx context.Context, inputs, outputs []
 }
 
 // snapshotOpenBatchCompactionRefs captures the only unpublished addresses that
-// can still enter Mapping for sealed inputs. Put-like operations are drained so
-// a Record append cannot be observed without its final Batch mutation.
+// can still enter Mapping for sealed inputs. Each Batch serializes its append
+// and final mutation installation under its own mutex. Once an input is sealed,
+// later Put records can only enter the new active Segment.
 func (s *Store) snapshotOpenBatchCompactionRefs(inputs []recordlog.SegmentSummary) (openBatchCompactionRefs, error) {
 	inputIDs := make(map[recordlog.SegmentID]struct{}, len(inputs))
 	for _, input := range inputs {
 		inputIDs[input.SegmentID] = struct{}{}
 	}
-	s.mutationAdmission.writeLock()
 	s.state.mu.Lock()
-	if s.state.closed {
-		s.state.mu.Unlock()
-		s.mutationAdmission.writeUnlock()
-		return openBatchCompactionRefs{}, base.ErrClosed
-	}
 	if s.state.fault != nil {
 		fault := s.state.fault
 		s.state.mu.Unlock()
-		s.mutationAdmission.writeUnlock()
 		return openBatchCompactionRefs{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	open := make([]*Batch, 0, len(s.state.open))
@@ -600,12 +598,6 @@ func (s *Store) snapshotOpenBatchCompactionRefs(inputs []recordlog.SegmentSummar
 		open = append(open, batch)
 	}
 	s.state.mu.Unlock()
-	// Taking the write side above drains Put-like operations that may have
-	// appended to a now-sealed input but not yet installed their Batch mutation.
-	// Once drained, later Put records can only enter the active Segment. Release
-	// the global fence before inspecting individual Batches so the scan cost is
-	// never added to foreground Put latency.
-	s.mutationAdmission.writeUnlock()
 	result := openBatchCompactionRefs{refs: make(map[recordlog.VAddr]recordlog.RecordRef)}
 	for _, batch := range open {
 		referenced := false
@@ -837,10 +829,6 @@ func (s *Store) openBatchCompactionOutputReferences(sealed []recordlog.SegmentSu
 		return nil, nil
 	}
 	s.state.mu.Lock()
-	if s.state.closed {
-		s.state.mu.Unlock()
-		return nil, base.ErrClosed
-	}
 	if s.state.fault != nil {
 		s.state.mu.Unlock()
 		return nil, errors.Join(base.ErrReadOnly, s.state.fault)
@@ -883,17 +871,10 @@ func (s *Store) proveCompactionRetirement(source recordlog.SegmentID, relocation
 }
 
 func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source recordlog.SegmentID, relocationEnd model.CommitSeq, scanMapping bool) (SegmentRetirementProof, error) {
-	s.mutationAdmission.writeLock()
 	s.state.mu.Lock()
-	closed, fault := s.state.closed, s.state.fault
-	if closed {
-		s.state.mu.Unlock()
-		s.mutationAdmission.writeUnlock()
-		return SegmentRetirementProof{}, base.ErrClosed
-	}
+	fault := s.state.fault
 	if fault != nil {
 		s.state.mu.Unlock()
-		s.mutationAdmission.writeUnlock()
 		return SegmentRetirementProof{}, errors.Join(base.ErrReadOnly, fault)
 	}
 	open := make([]*Batch, 0, len(s.state.open))
@@ -901,7 +882,6 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 		open = append(open, batch)
 	}
 	s.state.mu.Unlock()
-	s.mutationAdmission.writeUnlock()
 	for _, batch := range open {
 		if batch.inner.ReferencesSegment(source) {
 			return SegmentRetirementProof{}, errors.Join(base.ErrConflict, errors.New("open batch references source segment"))
@@ -972,11 +952,8 @@ func (s *Store) proveSegmentRetirementAtCheckpoint(ctx context.Context, source r
 // retirement without recursively acquiring the maintenance lock.
 func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentRelocationResult, error) {
 	s.state.mu.Lock()
-	closed, fault := s.state.closed, s.state.fault
+	fault := s.state.fault
 	s.state.mu.Unlock()
-	if closed {
-		return SegmentRelocationResult{}, base.ErrClosed
-	}
 	if fault != nil {
 		return SegmentRelocationResult{}, errors.Join(base.ErrReadOnly, fault)
 	}

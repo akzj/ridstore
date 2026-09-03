@@ -268,6 +268,26 @@ func (s *Store) Close() error {
 	return s.inner.Close()
 }
 
+// CloseContext starts Store shutdown and waits for every owned goroutine and
+// resource to finish. If ctx expires, shutdown continues in the background;
+// callers can wait again or observe Done.
+func (s *Store) CloseContext(ctx context.Context) error {
+	if s == nil || s.inner == nil {
+		return base.ErrClosed
+	}
+	return s.inner.CloseContext(ctx)
+}
+
+// Done is closed after Store shutdown has fully completed.
+func (s *Store) Done() <-chan struct{} {
+	if s == nil || s.inner == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return s.inner.Done()
+}
+
 func (s *Store) token(addr recordlog.VAddr) VersionToken {
 	return VersionToken{store: s.identity, addr: uint64(addr)}
 }

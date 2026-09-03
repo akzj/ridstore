@@ -11,6 +11,11 @@ worker and is the only component allowed to:
 - start periodic Checkpoint and automatic GC work;
 - drain all workers during `Store.Close`.
 
+The Scheduler context is derived from the Store lifecycle context. Shutdown is
+requested by cancellation; `Done()` is the read-only completion signal. The
+Scheduler owns its queue and worker cancellation state, so Store shutdown never
+mutates those fields directly.
+
 Workers receive `(phase, dependencyResult)` and return a transition. They do
 not receive the Scheduler and cannot acquire a resource or synchronously call
 another worker.

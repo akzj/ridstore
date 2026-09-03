@@ -76,6 +76,23 @@ func TestPublicV2LifecycleAndTokenAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestPublicCloseContextPublishesDone(t *testing.T) {
+	store, err := Create(context.Background(), testCreateConfig(filepath.Join(t.TempDir(), "store")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := store.CloseContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.Done():
+	default:
+		t.Fatal("Done remained open after CloseContext returned")
+	}
+}
+
 func TestPublicOfflineVerify(t *testing.T) {
 	ctx := context.Background()
 	config := testCreateConfig(filepath.Join(t.TempDir(), "store"))

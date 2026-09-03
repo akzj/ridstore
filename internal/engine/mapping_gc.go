@@ -30,10 +30,11 @@ func (s *Store) CompactMapping(ctx context.Context) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.beginOperation(); err != nil {
+	ctx, end, err := s.beginOperation(ctx)
+	if err != nil {
 		return err
 	}
-	defer s.endOperation()
+	defer end()
 	started := time.Now()
 	s.metrics.mappingGCStarted.Add(1)
 	defer func() {

@@ -26,10 +26,11 @@ func (s *Store) scheduleAutomaticMaintenance() {
 }
 
 func (s *Store) mappingGCNeeded(ctx context.Context, config MaintenanceConfig) (bool, error) {
-	if err := s.beginOperation(); err != nil {
+	ctx, end, err := s.beginOperation(ctx)
+	if err != nil {
 		return false, err
 	}
-	defer s.endOperation()
+	defer end()
 	last := s.maintenance.lastMappingGCUnixNano.Load()
 	if last != 0 && s.maintenanceNow().Sub(time.Unix(0, last)) < config.MappingMinInterval {
 		return false, nil

@@ -102,14 +102,15 @@ soft pressure 不阻塞 Commit。`Receipt` 携带 admission 时的 advisory sign
 generation 后重试。用户 Commit、Relocation、显式 API、周期触发共享同一 worker；调用者不直接构建
 Checkpoint。Coordinator barrier 保证 cut 覆盖它之前已 admission 的 Commit。
 
-worker 使用内部 `context.Background()`，不把一个等待者的取消传播给共享任务；调用者 Context 只取消
-自己的等待。自动 pressure/periodic Checkpoint 失败时记录 failed counter 并将 Store fail closed，避免
-收敛失败被静默吞掉。`Close` 先拒绝新操作并等待已进入的 waiter 完成，再停止 worker，最后关闭
-Coordinator 和底层文件。Close 在 drain 时不占有 `checkpointMu` 或 maintenance 锁。
+worker context 派生自 Store lifecycle context，而不是某个请求 waiter；单个调用者取消只取消自己的等待，
+Store shutdown 才会取消共享 worker。自动 pressure/periodic Checkpoint 失败时记录 failed counter 并将 Store
+fail closed，避免收敛失败被静默吞掉。`CloseContext` 先拒绝新操作、取消 lifecycle context 并停止 Scheduler，
+再通过只读完成 channel 等待 operation drain，最后关闭 Coordinator 和底层文件。Close 在等待期间不持有
+checkpoint capture lock 或 maintenance resource。
 
 Batch 在步骤 2–4 仍是 Open，因此 Checkpoint 可以把它记入 open-batch cut；它后续的 Commit Record 位于
-该 cut 之后。Close 与 Commit 通过 Batch 状态机、Coordinator queue ownership 和 Close drain 协调，不能
-依赖 Commit 长时间持有 Store lifecycle RLock。
+该 cut 之后。Close 与 Commit 通过 Batch 状态机、Coordinator queue ownership、短生命周期 admission 和
+channel-based drain 协调；生命周期锁不跨 queue、I/O 或完成等待。
 
 多个 pressure caller 可以同时请求 Checkpoint；唯一 worker 保证实际构建串行，`checkpointMu` 继续隔离
 Mapping GC 的 Root publication 临界区。每个 pressure receipt

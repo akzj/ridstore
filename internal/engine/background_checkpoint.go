@@ -18,9 +18,6 @@ import (
 type checkpointRuntime struct {
 	captureMu sync.Mutex
 
-	done     chan struct{}
-	stopOnce sync.Once
-
 	interval time.Duration
 
 	pressurePending   atomic.Uint64
@@ -28,7 +25,6 @@ type checkpointRuntime struct {
 }
 
 func (s *Store) startCheckpointWorker() {
-	s.checkpoints.done = make(chan struct{})
 	if err := s.maintenance.scheduler.Configure(s.checkpoints.interval, s.maintenance.config); err != nil {
 		s.setFault(err)
 	}
@@ -142,15 +138,8 @@ func (s *Store) runCheckpointCycle(ctx context.Context, periodic, forced, depend
 }
 
 func (s *Store) stopCheckpointWorker() {
-	if s == nil {
+	if s == nil || s.maintenance.scheduler == nil {
 		return
 	}
-	s.checkpoints.stopOnce.Do(func() {
-		if s.maintenance.scheduler != nil {
-			s.maintenance.scheduler.Close()
-		}
-		if s.checkpoints.done != nil {
-			close(s.checkpoints.done)
-		}
-	})
+	s.maintenance.scheduler.Close()
 }

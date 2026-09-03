@@ -222,3 +222,13 @@ Restore 只接受严格白名单、size/SHA-256 全匹配且可通过 v2 Exact V
 `RENAME_NOREPLACE` 原子发布到不存在的目标。两者的 verification budget 可显式配置，零值使用 Verify
 默认值。Restore 按字节保留 StoreUUID/RecordLogID，因此是灾难恢复而不是 Clone；原目录和任一恢复目录
 不得同时作为 writer。非 Linux 平台在无法提供原子 no-replace directory rename 时返回 `ErrUnsupported`。
+
+## 15. 生命周期与关闭
+
+`CloseContext(ctx)` 只负责发起一次 Store shutdown 并等待结果。Store 首先拒绝新操作并取消统一 root
+context；Maintenance Scheduler 随后停止接收请求、取消 worker 并关闭自身 `Done` 信号。已进入 durable
+队列的 Coordinator/RecordLog 请求必须完成或返回确定错误，不能被直接丢弃。全部前台操作退出后，Store
+按依赖顺序关闭 Coordinator、RecordLog、Mapping 和目录 lease，最后关闭 `Store.Done()`。
+
+调用方 context 超时只终止本次等待，后台 shutdown 仍继续；调用方可以再次调用 `CloseContext`，或读取
+`Done()` 等待最终完成。生命周期锁只保护 admission 与计数，不跨 I/O、goroutine 等待或资源释放。

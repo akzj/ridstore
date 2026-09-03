@@ -48,7 +48,7 @@ func TestMaintenanceSchedulerPriorityAndFIFO(t *testing.T) {
 			return maintenanceTransition{done: true}
 		}}
 	}}
-	scheduler := newMaintenanceScheduler(factory)
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
 	defer scheduler.Close()
 	if err := scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceSegmentRelocateRequest, source: 1}); err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestMaintenanceSchedulerCoalescesAndRerunsActiveCheckpoint(t *testing.T) {
 			return maintenanceTransition{done: true}
 		}}
 	}}
-	scheduler := newMaintenanceScheduler(factory)
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
 	defer scheduler.Close()
 	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceCheckpointRequest})
 	<-started
@@ -128,7 +128,7 @@ func TestMaintenanceSchedulerDependencyReleasesPhaseResourcesAndResumes(t *testi
 			return maintenanceTransition{done: true}
 		}}
 	}}
-	scheduler := newMaintenanceScheduler(factory)
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
 	defer scheduler.Close()
 	if _, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceSegmentCompactRequest, source: 9}); err != nil {
 		t.Fatal(err)
@@ -159,7 +159,7 @@ func TestMaintenanceSchedulerCheckpointRunsDuringSegmentCopy(t *testing.T) {
 			return maintenanceTransition{done: true}
 		}}
 	}}
-	scheduler := newMaintenanceScheduler(factory)
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
 	defer scheduler.Close()
 	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceSegmentCompactRequest, source: 7})
 	<-copyStarted
@@ -184,7 +184,7 @@ func TestMaintenanceSchedulerWaiterCancellationDoesNotCancelBackgroundJob(t *tes
 			return maintenanceTransition{done: true}
 		}}
 	}}
-	scheduler := newMaintenanceScheduler(factory)
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
 	defer scheduler.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -211,7 +211,7 @@ func TestMaintenanceSchedulerCloseCancelsAndRejects(t *testing.T) {
 			return maintenanceTransition{done: true, err: ctx.Err()}
 		}}
 	}}
-	scheduler := newMaintenanceScheduler(factory)
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
 	done := make(chan error, 1)
 	go func() {
 		_, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceMappingSurveyRequest})

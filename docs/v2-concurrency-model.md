@@ -31,15 +31,17 @@ Checkpoint / GC
 
 | Primitive | Scope | May cross disk I/O | Blocks |
 |---|---|---:|---|
-| `storeState.mu` | lifecycle, fault, open/status registry and recovery snapshot | no | brief state transitions; allocator I/O occurs after unlock |
-| `mutationAdmission.mu` | drains `Record append -> Batch mutation visible` before retirement proof | yes; read side covers one Put append | Put-like calls only; write side is released before Segment scan |
+| `storeLifecycle.mu` | operation admission and active-operation count | no | one constant-time state transition at API entry/exit |
+| `storeState.mu` | fault, open/status registry and recovery snapshot | no | brief state transitions; allocator I/O occurs after unlock |
+| `transaction.Batch.mu` | one Batch's state and `Record append -> mutation visible` interval | yes, for that Batch's Put append | only concurrent calls on the same Batch; never unrelated foreground traffic |
 | `checkpointRuntime.captureMu` | Checkpoint cut/freeze; Mapping-GC durable publish plus runtime Root owner switch | yes, only for Mapping-GC publication | Checkpoint capture and Mapping-GC publication, never foreground data I/O |
 | `MaintenanceScheduler` actor | typed request queue, priority/FIFO, coalescing, dependencies, phase transitions, timers, cancellation and atomic resource grants | no | maintenance workers only; never foreground Get/Put/Commit |
 | `PublishCoordinator.mu` | all durable Catalog generation transitions and PublishedState update | yes | metadata publishers and Segment rotation, not reads or non-rotating writes |
-| `activeOps` + `closing` under `storeState.mu` | Close admission and drain | no lock is held while draining | new operations after Close begins |
+| lifecycle root context + `drained`/`done` channels | Close cancellation, operation drain and shutdown completion | no lock is held while waiting | new operations after Close begins |
 
-`Close` does not own the checkpoint capture lock or a maintenance slot while waiting for `activeOps`; the Checkpoint
-timer remains alive until admitted operations drain, then Close cancels and drains Scheduler workers before closing storage files.
+`CloseContext` atomically rejects new operations, cancels the Store root context, stops and drains Scheduler workers, then
+waits on the lifecycle `drained` channel before closing durable components. `Done` is closed only after all owned goroutines
+and resources have exited. A caller deadline stops only that caller's wait; shutdown continues under the single lifecycle owner.
 
 Scheduler resources are `heavyIO`, `mappingWriter`, and `recoveryProtocol`. Checkpoint has highest priority and acquires
 `mappingWriter`; it deliberately does not wait behind a long, non-preemptible Segment copy. Segment GC holds `recoveryProtocol`, acquires `heavyIO` only for copy/publish/retire phases, and
@@ -93,7 +95,7 @@ or complete compatible base.
 
 - no Store-wide read/write mutex around Get, Put, Commit, Checkpoint or GC;
 - no Mapping lock across Radix disk reads, full-tree walks or fsync;
-- no lifecycle lock held while Close waits for active operations;
-- no retirement proof before draining in-flight Put-to-Batch publication;
+- no lifecycle lock held while Close waits for active operations or goroutines;
+- no Store-global admission lock around Put; sealed-input checks and each Batch mutex must close the append-to-mutation gap;
 - no old Mapping file close before its reader count reaches zero;
 - no Segment scan, GC pacing, Mapping rebuild, Manifest publish or reader drain inside a Store data-plane lock.

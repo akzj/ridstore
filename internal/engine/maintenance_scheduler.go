@@ -155,24 +155,31 @@ type maintenanceScheduleConfig struct {
 // phase transitions, dependencies, resources, cancellation and shutdown.
 // Worker code has no reference back to the scheduler.
 type MaintenanceScheduler struct {
+	ctx                                                  context.Context
+	cancel                                               context.CancelFunc
 	factory                                              maintenanceWorkerFactory
 	submitCh                                             chan maintenanceSubmit
 	cancelCh                                             chan maintenanceCancel
 	doneCh                                               chan maintenanceDone
 	retryCh                                              chan maintenanceRetry
 	configureCh                                          chan maintenanceScheduleConfig
-	closeCh, closedCh                                    chan struct{}
+	closedCh                                             chan struct{}
 	once                                                 sync.Once
 	requested, coalesced, completed, failed, preemptions atomic.Uint64
 	queued, running                                      atomic.Uint64
 }
 
-func newMaintenanceScheduler(factory maintenanceWorkerFactory) *MaintenanceScheduler {
+func newMaintenanceScheduler(parent context.Context, factory maintenanceWorkerFactory) *MaintenanceScheduler {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	m := &MaintenanceScheduler{
+		ctx: ctx, cancel: cancel,
 		factory:  factory,
 		submitCh: make(chan maintenanceSubmit), cancelCh: make(chan maintenanceCancel),
 		doneCh: make(chan maintenanceDone), retryCh: make(chan maintenanceRetry), configureCh: make(chan maintenanceScheduleConfig),
-		closeCh: make(chan struct{}), closedCh: make(chan struct{}),
+		closedCh: make(chan struct{}),
 	}
 	go m.run()
 	return m
@@ -245,9 +252,11 @@ func (m *MaintenanceScheduler) Close() {
 	if m == nil {
 		return
 	}
-	m.once.Do(func() { close(m.closeCh) })
+	m.once.Do(m.cancel)
 	<-m.closedCh
 }
+
+func (m *MaintenanceScheduler) Done() <-chan struct{} { return m.closedCh }
 
 func maintenanceRequestPolicy(request maintenanceRequest) (string, maintenancePriority, bool, bool, error) {
 	switch request.kind {
@@ -279,6 +288,7 @@ func (m *MaintenanceScheduler) run() {
 	byKey := make(map[string]*maintenanceJob)
 	var leased maintenanceResource
 	closing := false
+	shutdownC := m.ctx.Done()
 	var checkpointTimer, maintenanceTimer *time.Ticker
 	var checkpointC, maintenanceC <-chan time.Time
 	var automaticPolicy MaintenanceConfig
@@ -378,7 +388,7 @@ func (m *MaintenanceScheduler) run() {
 			need := job.worker.Resources(job.phase) &^ job.held
 			leased |= need
 			job.runningResources = need
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(m.ctx)
 			ctx = context.WithValue(ctx, maintenanceWorkerContextKey{}, true)
 			job.cancel = cancel
 			active[job.id] = job
@@ -590,7 +600,8 @@ func (m *MaintenanceScheduler) run() {
 				pending = append(pending, job)
 				dispatch()
 			}
-		case <-m.closeCh:
+		case <-shutdownC:
+			shutdownC = nil
 			closing = true
 			if checkpointTimer != nil {
 				checkpointTimer.Stop()
