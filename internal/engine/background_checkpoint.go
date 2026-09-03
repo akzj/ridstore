@@ -53,7 +53,7 @@ func (s *Store) wakeCheckpointWorker() {
 	}
 	_ = s.maintenance.scheduler.submitBackground(maintenanceJobSpec{
 		key: "checkpoint", priority: maintenancePriorityCheckpoint,
-		resources: maintenanceHeavyIO | maintenanceMappingWriter, rerunOnActive: true,
+		resources: maintenanceMappingWriter, rerunOnActive: true,
 		run: func(ctx context.Context) error {
 			s.runCheckpointCycle(ctx, s.checkpoints.periodicPending.Swap(false))
 			return nil

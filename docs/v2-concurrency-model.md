@@ -42,8 +42,8 @@ Checkpoint / GC
 `Close` does not own the checkpoint capture lock or a maintenance slot while waiting for `activeOps`; the Checkpoint
 timer remains alive until admitted operations drain, then Close cancels and drains Scheduler workers before closing storage files.
 
-Scheduler resources are `heavyIO`, `mappingWriter`, and `recoveryProtocol`. Checkpoint has highest priority and atomically
-acquires `heavyIO|mappingWriter`. Segment GC holds `recoveryProtocol`, acquires `heavyIO` only for copy/retire phases, and
+Scheduler resources are `heavyIO`, `mappingWriter`, and `recoveryProtocol`. Checkpoint has highest priority and acquires
+`mappingWriter`; it deliberately does not wait behind a long, non-preemptible Segment copy. Segment GC holds `recoveryProtocol`, acquires `heavyIO` only for copy/retire phases, and
 releases it before synchronously requesting Checkpoint. Mapping rebuild holds `recoveryProtocol`; its long COW scan does
 not hold `mappingWriter`, so Checkpoint can advance concurrently and the Mapping result is rejected/retried if stale.
 
