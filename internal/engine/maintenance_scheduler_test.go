@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,248 +11,218 @@ import (
 	"github.com/akzj/ridstore/internal/base"
 )
 
+type fakeMaintenanceFactory struct {
+	newWorker func(maintenanceRequest) maintenanceWorker
+}
+
+func (f fakeMaintenanceFactory) NewMaintenanceWorker(r maintenanceRequest) (maintenanceWorker, error) {
+	if f.newWorker == nil {
+		return nil, base.ErrInvalidConfig
+	}
+	return f.newWorker(r), nil
+}
+
+type fakeMaintenanceWorker struct {
+	resources func(maintenancePhase) maintenanceResource
+	run       func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition
+}
+
+func (w *fakeMaintenanceWorker) Resources(p maintenancePhase) maintenanceResource {
+	return w.resources(p)
+}
+func (w *fakeMaintenanceWorker) Run(ctx context.Context, p maintenancePhase, r maintenanceResult) maintenanceTransition {
+	return w.run(ctx, p, r)
+}
+
 func TestMaintenanceSchedulerPriorityAndFIFO(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
+	blockStarted, release := make(chan struct{}), make(chan struct{})
+	order := make(chan maintenanceRequestKind, 3)
+	factory := fakeMaintenanceFactory{newWorker: func(r maintenanceRequest) maintenanceWorker {
+		return &fakeMaintenanceWorker{resources: func(maintenancePhase) maintenanceResource { return maintenanceHeavyIO }, run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+			if r.source == 1 {
+				close(blockStarted)
+				<-release
+			} else {
+				order <- r.kind
+			}
+			return maintenanceTransition{done: true}
+		}}
+	}}
+	scheduler := newMaintenanceScheduler(factory)
 	defer scheduler.Close()
-	release, err := scheduler.acquire(context.Background(), maintenancePrioritySegment, maintenanceHeavyIO)
-	if err != nil {
+	if err := scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceSegmentRelocateRequest, source: 1}); err != nil {
 		t.Fatal(err)
 	}
-	order := make(chan string, 3)
-	run := func(name string, priority maintenancePriority) {
-		if err := scheduler.submitBackground(maintenanceJobSpec{
-			key: name, priority: priority, resources: maintenanceHeavyIO,
-			run: func(context.Context) error {
-				order <- name
-				return nil
-			},
-		}); err != nil {
-			t.Fatal(err)
+	<-blockStarted
+	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceMappingSurveyRequest})
+	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceMappingGCRequest})
+	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceCheckpointRequest})
+	close(release)
+	got := []maintenanceRequestKind{<-order, <-order, <-order}
+	want := []maintenanceRequestKind{maintenanceCheckpointRequest, maintenanceMappingSurveyRequest, maintenanceMappingGCRequest}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order=%v want=%v", got, want)
 		}
 	}
-	run("low-1", maintenancePriorityMapping)
-	run("low-2", maintenancePriorityMapping)
-	run("high", maintenancePriorityCheckpoint)
-	release()
-	got := make([]string, 0, 3)
-	for range 3 {
-		got = append(got, <-order)
-	}
-	if want := []string{"high", "low-1", "low-2"}; !equalStrings(got, want) {
-		t.Fatalf("order = %v, want %v", got, want)
-	}
 }
 
-func TestMaintenanceSchedulerCoalescesWaiters(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
-	defer scheduler.Close()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	finished := make(chan struct{})
+func TestMaintenanceSchedulerCoalescesAndRerunsActiveCheckpoint(t *testing.T) {
+	started, release, second := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var calls atomic.Uint64
-	spec := maintenanceJobSpec{key: "checkpoint", priority: maintenancePriorityCheckpoint, resources: maintenanceHeavyIO,
-		run: func(context.Context) error {
+	factory := fakeMaintenanceFactory{newWorker: func(maintenanceRequest) maintenanceWorker {
+		return &fakeMaintenanceWorker{resources: func(maintenancePhase) maintenanceResource { return maintenanceMappingWriter }, run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
 			if calls.Add(1) == 1 {
 				close(started)
+				<-release
+			} else {
+				close(second)
 			}
+			return maintenanceTransition{done: true}
+		}}
+	}}
+	scheduler := newMaintenanceScheduler(factory)
+	defer scheduler.Close()
+	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceCheckpointRequest})
+	<-started
+	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceCheckpointRequest})
+	close(release)
+	select {
+	case <-second:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint was not rerun")
+	}
+	if scheduler.metrics().coalesced != 1 {
+		t.Fatalf("coalesced=%d", scheduler.metrics().coalesced)
+	}
+}
+
+func TestMaintenanceSchedulerDependencyReleasesPhaseResourcesAndResumes(t *testing.T) {
+	var mu sync.Mutex
+	order := make([]string, 0, 3)
+	factory := fakeMaintenanceFactory{newWorker: func(r maintenanceRequest) maintenanceWorker {
+		if r.kind == maintenanceCheckpointRequest {
+			return &fakeMaintenanceWorker{resources: func(maintenancePhase) maintenanceResource { return maintenanceMappingWriter }, run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+				mu.Lock()
+				order = append(order, "checkpoint")
+				mu.Unlock()
+				return maintenanceTransition{done: true, result: maintenanceResult{found: true}}
+			}}
+		}
+		return &fakeMaintenanceWorker{resources: func(p maintenancePhase) maintenanceResource {
+			if p == maintenancePhaseStart {
+				return maintenanceHeavyIO | maintenanceRecoveryProtocol
+			}
+			return maintenanceRecoveryProtocol
+		}, run: func(_ context.Context, p maintenancePhase, dependency maintenanceResult) maintenanceTransition {
+			mu.Lock()
+			defer mu.Unlock()
+			if p == maintenancePhaseStart {
+				order = append(order, "copy")
+				return maintenanceTransition{next: maintenancePhaseProve, retain: maintenanceRecoveryProtocol, dependency: &maintenanceRequest{kind: maintenanceCheckpointRequest}}
+			}
+			if !dependency.found {
+				return maintenanceTransition{done: true, err: errors.New("missing dependency result")}
+			}
+			order = append(order, "prove")
+			return maintenanceTransition{done: true}
+		}}
+	}}
+	scheduler := newMaintenanceScheduler(factory)
+	defer scheduler.Close()
+	if _, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceSegmentCompactRequest, source: 9}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"copy", "checkpoint", "prove"}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("order=%v want=%v", order, want)
+		}
+	}
+}
+
+func TestMaintenanceSchedulerCheckpointRunsDuringSegmentCopy(t *testing.T) {
+	copyStarted, releaseCopy := make(chan struct{}), make(chan struct{})
+	checkpointRan := make(chan struct{})
+	factory := fakeMaintenanceFactory{newWorker: func(r maintenanceRequest) maintenanceWorker {
+		if r.kind == maintenanceCheckpointRequest {
+			return &fakeMaintenanceWorker{resources: func(maintenancePhase) maintenanceResource { return maintenanceMappingWriter }, run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+				close(checkpointRan)
+				return maintenanceTransition{done: true}
+			}}
+		}
+		return &fakeMaintenanceWorker{resources: func(maintenancePhase) maintenanceResource { return maintenanceHeavyIO | maintenanceRecoveryProtocol }, run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+			close(copyStarted)
+			<-releaseCopy
+			return maintenanceTransition{done: true}
+		}}
+	}}
+	scheduler := newMaintenanceScheduler(factory)
+	defer scheduler.Close()
+	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceSegmentCompactRequest, source: 7})
+	<-copyStarted
+	if _, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceCheckpointRequest}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-checkpointRan:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint waited behind segment copy")
+	}
+	close(releaseCopy)
+}
+
+func TestMaintenanceSchedulerWaiterCancellationDoesNotCancelBackgroundJob(t *testing.T) {
+	started, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	factory := fakeMaintenanceFactory{newWorker: func(maintenanceRequest) maintenanceWorker {
+		return &fakeMaintenanceWorker{resources: func(maintenancePhase) maintenanceResource { return maintenanceHeavyIO }, run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+			close(started)
 			<-release
 			close(finished)
-			return nil
+			return maintenanceTransition{done: true}
 		}}
-	first := make(chan error, 1)
-	go func() { first <- scheduler.submit(context.Background(), spec) }()
-	<-started
-	if err := scheduler.submitBackground(spec); err != nil {
-		t.Fatal(err)
-	}
-	close(release)
-	if err := <-first; err != nil {
-		t.Fatal(err)
-	}
-	<-finished
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("calls = %d, want 1", got)
-	}
-}
-
-func TestMaintenanceSchedulerWaiterCancellationDoesNotCancelSharedJob(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
+	}}
+	scheduler := newMaintenanceScheduler(factory)
 	defer scheduler.Close()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	spec := maintenanceJobSpec{key: "shared", priority: maintenancePrioritySegment, resources: maintenanceHeavyIO,
-		run: func(context.Context) error { close(started); <-release; return nil }}
 	ctx, cancel := context.WithCancel(context.Background())
-	first := make(chan error, 1)
-	go func() { first <- scheduler.submit(ctx, spec) }()
-	<-started
-	if err := scheduler.submitBackground(spec); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	if err := <-first; !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled waiter error = %v", err)
-	}
-	close(release)
-}
-
-func TestMaintenanceSchedulerGrantsResourcesAtomically(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
-	defer scheduler.Close()
-	releaseHeavy, err := scheduler.acquire(context.Background(), maintenancePrioritySegment, maintenanceHeavyIO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	releaseWriter, err := scheduler.acquire(context.Background(), maintenancePrioritySegment, maintenanceMappingWriter)
-	if err != nil {
-		t.Fatal(err)
-	}
-	acquired := make(chan struct{}, 1)
-	releaseBoth := make(chan struct{})
-	if err := scheduler.submitBackground(maintenanceJobSpec{
-		key: "both", priority: maintenancePriorityCheckpoint, resources: maintenanceHeavyIO | maintenanceMappingWriter,
-		run: func(context.Context) error { acquired <- struct{}{}; <-releaseBoth; return nil },
-	}); err != nil {
-		t.Fatal(err)
-	}
-	releaseHeavy()
-	select {
-	case <-acquired:
-		close(releaseBoth)
-		t.Fatal("multi-resource lease granted while mappingWriter remained held")
-	case <-time.After(10 * time.Millisecond):
-	}
-	releaseWriter()
-	select {
-	case <-acquired:
-		close(releaseBoth)
-	case <-time.After(time.Second):
-		t.Fatal("multi-resource lease was not granted")
-	}
-}
-
-func TestMaintenanceSchedulerCloseCancelsAndDrains(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
-	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- scheduler.submit(context.Background(), maintenanceJobSpec{
-			key: "running", priority: maintenancePriorityMapping, resources: maintenanceHeavyIO,
-			run: func(ctx context.Context) error { close(started); <-ctx.Done(); return ctx.Err() },
-		})
+		_, err := scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceMappingSurveyRequest})
+		done <- err
+	}()
+	<-started
+	_ = scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceMappingSurveyRequest})
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	close(release)
+	<-finished
+}
+
+func TestMaintenanceSchedulerCloseCancelsAndRejects(t *testing.T) {
+	started := make(chan struct{})
+	factory := fakeMaintenanceFactory{newWorker: func(maintenanceRequest) maintenanceWorker {
+		return &fakeMaintenanceWorker{resources: func(maintenancePhase) maintenanceResource { return maintenanceHeavyIO }, run: func(ctx context.Context, _ maintenancePhase, _ maintenanceResult) maintenanceTransition {
+			close(started)
+			<-ctx.Done()
+			return maintenanceTransition{done: true, err: ctx.Err()}
+		}}
+	}}
+	scheduler := newMaintenanceScheduler(factory)
+	done := make(chan error, 1)
+	go func() {
+		_, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceMappingSurveyRequest})
+		done <- err
 	}()
 	<-started
 	scheduler.Close()
 	if err := <-done; !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) {
-		t.Fatalf("running job error = %v", err)
+		t.Fatalf("err=%v", err)
 	}
-	if err := scheduler.submit(context.Background(), maintenanceJobSpec{key: "late", run: func(context.Context) error { return nil }}); !errors.Is(err, base.ErrClosed) {
-		t.Fatalf("late submit error = %v", err)
+	if _, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceCheckpointRequest}); !errors.Is(err, base.ErrClosed) {
+		t.Fatalf("late err=%v", err)
 	}
-}
-
-// A Segment worker holds only recoveryProtocol while requesting Checkpoint's
-// heavyIO+mappingWriter resources. This is the lock-ordering invariant that
-// prevents the old nested maintenance deadlock.
-func TestMaintenanceSchedulerSegmentCanWaitForCheckpoint(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
-	defer scheduler.Close()
-	err := scheduler.submit(context.Background(), maintenanceJobSpec{
-		key: "segment", priority: maintenancePrioritySegment, resources: maintenanceRecoveryProtocol,
-		run: func(context.Context) error {
-			return scheduler.submit(context.Background(), maintenanceJobSpec{
-				key: "checkpoint", priority: maintenancePriorityCheckpoint,
-				resources: maintenanceHeavyIO | maintenanceMappingWriter,
-				run:       func(context.Context) error { return nil },
-			})
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestMaintenanceSchedulerPreemptsAndRequeuesSpeculativeJob(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
-	defer scheduler.Close()
-	firstStarted := make(chan struct{})
-	secondStarted := make(chan struct{})
-	var calls atomic.Uint64
-	lowDone := make(chan error, 1)
-	go func() {
-		lowDone <- scheduler.submit(context.Background(), maintenanceJobSpec{
-			key: "survey", priority: maintenancePriorityMapping, resources: maintenanceHeavyIO, preemptible: true,
-			run: func(ctx context.Context) error {
-				if calls.Add(1) == 1 {
-					close(firstStarted)
-					<-ctx.Done()
-					return ctx.Err()
-				}
-				close(secondStarted)
-				return nil
-			},
-		})
-	}()
-	<-firstStarted
-	highRan := make(chan struct{})
-	if err := scheduler.submit(context.Background(), maintenanceJobSpec{
-		key: "checkpoint", priority: maintenancePriorityCheckpoint, resources: maintenanceHeavyIO,
-		run: func(context.Context) error { close(highRan); return nil },
-	}); err != nil {
-		t.Fatal(err)
-	}
-	<-highRan
-	<-secondStarted
-	if err := <-lowDone; err != nil {
-		t.Fatal(err)
-	}
-	if scheduler.metrics().preemptions != 1 {
-		t.Fatalf("preemptions = %d", scheduler.metrics().preemptions)
-	}
-}
-
-func TestMaintenanceSchedulerRerunsActiveCheckpointRequest(t *testing.T) {
-	scheduler := newMaintenanceScheduler()
-	defer scheduler.Close()
-	firstStarted := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	secondDone := make(chan struct{})
-	var calls atomic.Uint64
-	spec := maintenanceJobSpec{
-		key: "checkpoint", priority: maintenancePriorityCheckpoint, resources: maintenanceHeavyIO, rerunOnActive: true,
-		run: func(context.Context) error {
-			if calls.Add(1) == 1 {
-				close(firstStarted)
-				<-releaseFirst
-			} else {
-				close(secondDone)
-			}
-			return nil
-		},
-	}
-	if err := scheduler.submitBackground(spec); err != nil {
-		t.Fatal(err)
-	}
-	<-firstStarted
-	if err := scheduler.submitBackground(spec); err != nil {
-		t.Fatal(err)
-	}
-	close(releaseFirst)
-	select {
-	case <-secondDone:
-	case <-time.After(time.Second):
-		t.Fatal("active checkpoint request was not rerun")
-	}
-}
-
-func equalStrings(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
 }

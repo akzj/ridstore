@@ -23,6 +23,7 @@
 16. [v2 Backup / Restore](v2-backup-restore-design.md)：离线全量 artifact、精确文件集与原子发布协议。
 17. [v2 Durable Benchmark Harness](benchmark.md)：可归档的 ridstore/raw-fsync 基线与跨引擎待办边界。
 18. [v2 RecordRef 与实时 SegmentStats](v2-record-ref-live-stats.md)：Mapping 精确物理长度、实时死亡速度与多 Segment Compaction 基础。
+19. [v2 Maintenance Scheduler](v2-maintenance-scheduler.md)：typed worker、phase transition、资源与依赖所有权。
 
 阶段 Review：
 

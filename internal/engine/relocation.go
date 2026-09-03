@@ -95,21 +95,8 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 	}
 	defer s.endOperation()
 
-	var result SegmentRelocationResult
-	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
-		key: s.maintenance.scheduler.uniqueKey("segment-relocate"), priority: maintenancePrioritySegment,
-		resources: maintenanceRecoveryProtocol,
-		run: func(runCtx context.Context) error {
-			heavyRelease, err := s.maintenance.scheduler.acquire(runCtx, maintenancePrioritySegment, maintenanceHeavyIO)
-			if err != nil {
-				return err
-			}
-			defer heavyRelease()
-			result, err = s.relocateSegment(runCtx, source, s.maintenance.gcBytesPerSecond.Load())
-			return err
-		},
-	})
-	return result, err
+	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentRelocateRequest, source: source})
+	return result.relocation, err
 }
 
 // PrepareSegmentRetirement relocates current live records, checkpoints every
@@ -130,26 +117,8 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	}
 	defer s.endOperation()
 
-	var proof SegmentRetirementProof
-	var relocated SegmentRelocationResult
-	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
-		key: s.maintenance.scheduler.uniqueKey("segment-prepare"), priority: maintenancePrioritySegment,
-		resources: maintenanceRecoveryProtocol,
-		run: func(runCtx context.Context) error {
-			heavyRelease, err := s.maintenance.scheduler.acquire(runCtx, maintenancePrioritySegment, maintenanceHeavyIO)
-			if err != nil {
-				return err
-			}
-			relocated, err = s.relocateSegment(runCtx, source, s.maintenance.gcBytesPerSecond.Load())
-			heavyRelease()
-			if err != nil {
-				return err
-			}
-			proof, err = s.checkpointAndProveRetirement(runCtx, source, relocated.LastCommitSeq)
-			return err
-		},
-	})
-	return proof, relocated, err
+	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentPrepareRequest, source: source})
+	return result.proof, result.relocation, err
 }
 
 // CompactSegment executes the complete logical and physical retirement under
@@ -170,25 +139,8 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		return SegmentCompactionResult{}, err
 	}
 	defer s.endOperation()
-	var result SegmentCompactionResult
-	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
-		key: s.maintenance.scheduler.uniqueKey("segment-compact"), priority: maintenancePrioritySegment,
-		resources: maintenanceRecoveryProtocol,
-		run: func(runCtx context.Context) error {
-			s.metrics.gcStarted.Add(1)
-			started := time.Now()
-			manifest := s.catalogSnapshot()
-			index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool { return manifest.SealedDataSegments[i].SegmentID >= source })
-			if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source || recordlog.IsCompactionSegment(source) {
-				return recordlog.ErrSegmentMissing
-			}
-			var runErr error
-			result, runErr = s.compactSegmentsLocked(runCtx, []recordlog.SegmentSummary{manifest.SealedDataSegments[index]}, s.maintenance.gcBytesPerSecond.Load())
-			s.recordCompactionMetrics(started, result, runErr)
-			return runErr
-		},
-	})
-	return result, err
+	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentCompactRequest, source: source})
+	return result.compaction, err
 }
 
 // CompactNextSegment checkpoints current Mapping state, selects at most one
@@ -210,124 +162,60 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 		return NextSegmentCompactionResult{}, false, err
 	}
 	defer s.endOperation()
-	var result NextSegmentCompactionResult
-	var found bool
-	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
-		key: s.maintenance.scheduler.uniqueKey("segment-next"), priority: maintenancePrioritySegment,
-		resources: maintenanceRecoveryProtocol,
-		run: func(runCtx context.Context) error {
-			var runErr error
-			result, found, runErr = s.compactNextSegmentScheduled(runCtx, policy)
-			return runErr
-		},
-	})
-	return result, found, err
-}
-
-func (s *Store) compactNextSegmentScheduled(ctx context.Context, policy CompactionPolicy) (NextSegmentCompactionResult, bool, error) {
-	rate := s.maintenance.gcBytesPerSecond.Load()
-	selectCandidate := func() (SegmentCompactionCandidate, bool, error) {
-		published := s.PublishedState()
-		if published == nil {
-			return SegmentCompactionCandidate{}, false, base.ErrInvalidConfig
-		}
-		manifest := published.Manifest
-		excluded, err := s.openBatchCompactionOutputReferences(manifest.SealedDataSegments)
-		if err != nil {
-			return SegmentCompactionCandidate{}, false, fmt.Errorf("collect open batch compaction-output references: %w", err)
-		}
-		now := time.Now()
-		if s.maintenance.gcNow != nil {
-			now = s.maintenance.gcNow()
-		}
-		return selectCompactionCandidate(manifest, policy, excluded, func(id recordlog.SegmentID) (gcStabilityView, bool) {
-			return s.maintenance.gcStability.view(id, now, policy)
-		})
+	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceSegmentNextRequest, policy: policy})
+	if result.found {
+		result.next.Compaction = result.compaction
 	}
-	// A durable checkpoint remains an exact scheduling snapshot until replaced.
-	// Try it first so a successful GC normally pays only the post-relocation
-	// checkpoint. Refresh only when no existing candidate is usable.
-	candidate, found, err := selectCandidate()
-	if err != nil {
-		if errors.Is(err, base.ErrCorrupt) {
-			s.setFault(err)
-		}
-		return NextSegmentCompactionResult{}, false, err
-	}
-	if !found {
-		if err := s.checkpoint(ctx, true); err != nil {
-			return NextSegmentCompactionResult{}, false, fmt.Errorf("checkpoint before candidate selection: %w", err)
-		}
-		candidate, found, err = selectCandidate()
-		if err != nil {
-			if errors.Is(err, base.ErrCorrupt) {
-				s.setFault(err)
-			}
-			return NextSegmentCompactionResult{}, false, err
-		}
-	}
-	if !found {
-		s.metrics.gcNoCandidate.Add(1)
-		return NextSegmentCompactionResult{}, false, nil
-	}
-	s.metrics.gcStarted.Add(1)
-	started := time.Now()
-	compaction, err := s.compactSegmentsLocked(ctx, candidate.Sources, rate)
-	s.recordCompactionMetrics(started, compaction, err)
-	if err != nil {
-		err = fmt.Errorf("compact segment %d: %w", candidate.Source.SegmentID, err)
-	}
-	return NextSegmentCompactionResult{Candidate: candidate, Compaction: compaction}, true, err
+	return result.next, result.found, err
 }
 
 // compactSegmentsLocked rewrites a bounded adjacent run into immutable
 // high-namespace output segments. User appends continue on the normal active
 // segment throughout copying and CAS publication.
-func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.SegmentSummary, rate uint64) (SegmentCompactionResult, error) {
-	var result SegmentCompactionResult
+type segmentCompactionWork struct {
+	result         SegmentCompactionResult
+	state          compactionstate.State
+	space          *spaceReservation
+	pendingOrigins map[recordlog.VAddr]recordlog.VAddr
+}
+
+func (s *Store) compactSegmentsCopy(ctx context.Context, inputs []recordlog.SegmentSummary, rate uint64) (*segmentCompactionWork, error) {
+	work := &segmentCompactionWork{}
+	result := &work.result
 	if len(inputs) == 0 || s.core.catalog == nil || s.core.compactionLog == nil {
-		return result, base.ErrInvalidConfig
+		return work, base.ErrInvalidConfig
 	}
-	heavyRelease, err := s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
-	if err != nil {
-		return result, err
-	}
-	heavyHeld := true
-	defer func() {
-		if heavyHeld {
-			heavyRelease()
-		}
-	}()
 	published := s.PublishedState()
 	if published == nil {
-		return result, base.ErrInvalidConfig
+		return work, base.ErrInvalidConfig
 	}
 	manifest := published.Manifest
 	for _, input := range inputs {
 		if !containsSealedSegment(manifest, input) {
-			return result, recordlog.ErrSegmentMissing
+			return work, recordlog.ErrSegmentMissing
 		}
 	}
 	pending, err := s.snapshotOpenBatchCompactionRefs(inputs)
 	if err != nil {
-		return result, err
+		return work, err
 	}
 	space, err := s.reserveGCCopies(ctx, manifest, inputs)
 	if err != nil {
-		return result, err
+		return work, err
 	}
-	defer space.complete(false)
+	work.space = space
+	fail := func(err error) (*segmentCompactionWork, error) { space.complete(false); return work, err }
 
 	// One output slot per input is a strict upper bound: repacking only live
 	// records cannot require more segments than their original sealed inputs.
 	reserved, outputIDs, err := s.reserveCompactionOutputIDs(inputs, uint32(len(inputs)))
 	if err != nil {
-		return result, err
+		return fail(err)
 	}
 	state := compactionstate.State{Phase: compactionstate.PhaseReserved, StoreUUID: reserved.StoreUUID,
 		LogID: reserved.RecordLogID, BaseGeneration: reserved.Generation, Inputs: append([]recordlog.SegmentSummary(nil), inputs...), OutputIDs: outputIDs}
 	if err := compactionstate.Install(s.core.root, state); err != nil {
-		return result, errors.Join(base.ErrRecoveryRequired, err)
+		return fail(errors.Join(base.ErrRecoveryRequired, err))
 	}
 	rollbackUnpublished := func(writer *recordlog.CompactionWriter, cause error) error {
 		cleanupErr := errors.Join(writer.Abort(), s.core.compactionLog.RemoveUnpublishedCompactionFiles(outputIDs))
@@ -342,7 +230,7 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 
 	writer, err := s.core.compactionLog.NewCompactionWriter(outputIDs)
 	if err != nil {
-		return result, rollbackUnpublished(nil, err)
+		return fail(rollbackUnpublished(nil, err))
 	}
 	copyPacer := s.newGCPacer(rate)
 	redirects := make(map[recordlog.VAddr]recordlog.RecordRef, len(pending.refs))
@@ -414,71 +302,84 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 			return paceCopy(false)
 		})
 		if err != nil {
-			return result, rollbackUnpublished(writer, err)
+			return fail(rollbackUnpublished(writer, err))
 		}
 	}
 	if err = paceCopy(true); err != nil {
-		return result, rollbackUnpublished(writer, err)
+		return fail(rollbackUnpublished(writer, err))
 	}
 	outputs, err := writer.Finish()
 	if err != nil {
-		return result, rollbackUnpublished(writer, err)
+		return fail(rollbackUnpublished(writer, err))
 	}
 	state.Outputs = outputs
 	result.Outputs = append([]recordlog.SegmentSummary(nil), outputs...)
 	if len(outputs) != 0 {
 		if _, err = s.installCompactionOutputs(outputs); err != nil {
-			return result, s.compactionFailure(err)
+			return fail(s.compactionFailure(err))
 		}
 		if err = s.core.compactionLog.RegisterCompactionOutputs(outputs); err != nil {
-			return result, s.compactionFailure(err)
+			return fail(s.compactionFailure(err))
 		}
 	}
 	state.Phase = compactionstate.PhaseOutputsPublished
 	if err = compactionstate.Update(s.core.root, state); err != nil {
-		return result, s.compactionFailure(err)
+		return fail(s.compactionFailure(err))
 	}
 
 	if len(redirects) != len(pending.refs) {
-		return result, s.compactionFailure(errors.Join(base.ErrCorrupt, errors.New("open batch compaction reference was not copied")))
+		return fail(s.compactionFailure(errors.Join(base.ErrCorrupt, errors.New("open batch compaction reference was not copied"))))
 	}
 	if err = s.rewriteOpenBatchCompactionRefs(ctx, pending.batches, redirects); err != nil {
-		return result, s.compactionFailure(err)
+		return fail(s.compactionFailure(err))
 	}
-	if err = s.publishCompactionOutputs(ctx, inputs, outputs, pendingOrigins, false, &result.Relocation); err != nil {
-		return result, s.compactionFailure(err)
+	work.state = state
+	work.pendingOrigins = pendingOrigins
+	return work, nil
+}
+
+func (s *Store) publishCompactionRelocations(ctx context.Context, work *segmentCompactionWork) error {
+	if work == nil || len(work.state.Inputs) == 0 {
+		return base.ErrInvalidConfig
 	}
-	heavyRelease()
-	heavyHeld = false
-	proofs, err := s.checkpointAndProveRetirements(ctx, inputs, result.Relocation.LastCommitSeq)
+	return s.publishCompactionOutputs(ctx, work.state.Inputs, work.state.Outputs, work.pendingOrigins, false, &work.result.Relocation)
+}
+
+func (s *Store) finishCompactionRetirement(ctx context.Context, work *segmentCompactionWork, proofs []SegmentRetirementProof) error {
+	if work == nil || len(work.state.Inputs) == 0 {
+		return fmt.Errorf("finish compaction work=%t inputs=%d: %w", work != nil, func() int {
+			if work == nil {
+				return 0
+			}
+			return len(work.state.Inputs)
+		}(), base.ErrInvalidConfig)
+	}
+	inputs := work.state.Inputs
+	result := &work.result
+	installed, err := s.installCompactionRetirement(inputs, proofs)
 	if err != nil {
-		return result, s.compactionFailure(err)
+		work.space.complete(false)
+		return s.compactionFailure(err)
 	}
-	result.Proofs = proofs
+	work.state.Phase = compactionstate.PhaseInputsRetired
+	if err = compactionstate.Update(s.core.root, work.state); err != nil {
+		work.space.complete(false)
+		return s.compactionFailure(err)
+	}
+	if err = s.core.compactionLog.FinalizeCompactionRetirement(ctx, inputs, installed.Generation); err != nil {
+		work.space.complete(false)
+		return s.compactionFailure(err)
+	}
+	if err = compactionstate.Remove(s.core.root); err != nil {
+		work.space.complete(false)
+		return s.compactionFailure(err)
+	}
+	result.Proofs = append([]SegmentRetirementProof(nil), proofs...)
 	if len(proofs) != 0 {
 		result.Proof = proofs[0]
 	}
-	heavyRelease, err = s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
-	if err != nil {
-		return result, s.compactionFailure(err)
-	}
-	heavyHeld = true
-	installed, err := s.installCompactionRetirement(inputs, proofs)
-	if err != nil {
-		return result, s.compactionFailure(err)
-	}
-	state.Phase = compactionstate.PhaseInputsRetired
-	if err = compactionstate.Update(s.core.root, state); err != nil {
-		return result, s.compactionFailure(err)
-	}
-	if err = s.core.compactionLog.FinalizeCompactionRetirement(ctx, inputs, installed.Generation); err != nil {
-		return result, s.compactionFailure(err)
-	}
-	if err = compactionstate.Remove(s.core.root); err != nil {
-		return result, s.compactionFailure(err)
-	}
-	space.complete(true)
-	return result, nil
+	work.space.complete(true)
+	return nil
 }
 
 func (s *Store) reserveCompactionOutputIDs(inputs []recordlog.SegmentSummary, count uint32) (storecatalog.Manifest, []recordlog.SegmentID, error) {
@@ -774,6 +675,24 @@ func (s *Store) checkpointAndProveRetirements(ctx context.Context, inputs []reco
 	return nil, errors.Join(base.ErrConflict, errCheckpointStatsStale)
 }
 
+// proveCompactionRetirements performs only the post-checkpoint proof phase.
+// The Scheduler owns checkpoint dependencies and calls this after the
+// Checkpoint worker completes, so Segment workers never schedule recursively.
+func (s *Store) proveCompactionRetirements(inputs []recordlog.SegmentSummary, end model.CommitSeq) ([]SegmentRetirementProof, bool, error) {
+	proofs := make([]SegmentRetirementProof, 0, len(inputs))
+	for _, input := range inputs {
+		proof, err := s.proveCompactionRetirement(input.SegmentID, end)
+		if errors.Is(err, errCheckpointStatsStale) {
+			return nil, true, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		proofs = append(proofs, proof)
+	}
+	return proofs, false, nil
+}
+
 func (s *Store) recordCompactionMetrics(started time.Time, result SegmentCompactionResult, err error) {
 	s.metrics.gcDurationNanos.Add(uint64(time.Since(started)))
 	if err != nil {
@@ -799,8 +718,8 @@ func (s *Store) recordCompactionMetrics(started time.Time, result SegmentCompact
 	}
 }
 
-// compactSegmentLocked is called while the scheduler owns the data
-// maintenance slot.
+// compactSegmentLocked preserves the legacy single-segment retirement fault
+// matrix. Production compaction uses segmentMaintenanceWorker phases.
 func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.SegmentID, rate uint64) (SegmentCompactionResult, error) {
 
 	relocated, err := s.relocateSegment(ctx, source, rate)
@@ -1202,9 +1121,11 @@ func (s *Store) relocateSegment(ctx context.Context, source recordlog.SegmentID,
 	return result, nil
 }
 
-// relocateWithBudgetRetry keeps transient Delta pressure out of the
-// compaction failure path. ErrBudget is returned before queue admission, so
-// retrying the same durable BatchID and proposal after a checkpoint is safe.
+// relocateWithBudgetRetry keeps transient Delta pressure out of foreground
+// relocation calls. Inside a maintenance worker it returns a typed dependency
+// signal instead: the Scheduler runs Checkpoint and resumes the owning phase.
+// ErrBudget is returned before Coordinator queue admission, so reconstruction
+// of the proposal after that dependency is safe.
 func (s *Store) relocateWithBudgetRetry(ctx context.Context, relocation coordinator.Relocation) (coordinator.RelocationResult, error) {
 	for {
 		result, err := s.core.commits.Relocate(ctx, relocation)
@@ -1214,8 +1135,27 @@ func (s *Store) relocateWithBudgetRetry(ctx context.Context, relocation coordina
 			}
 			return result, err
 		}
+		if maintenanceWorkerRunning(ctx) {
+			return coordinator.RelocationResult{}, checkpointDependencyError{generation: result.DeltaPressureGeneration()}
+		}
 		if err := s.awaitCheckpointPressure(ctx, result.DeltaPressureGeneration(), false); err != nil {
 			return coordinator.RelocationResult{}, err
 		}
 	}
+}
+
+type maintenanceWorkerContextKey struct{}
+type checkpointDependencyError struct{ generation uint64 }
+
+func (e checkpointDependencyError) Error() string { return "maintenance checkpoint dependency" }
+func maintenanceWorkerRunning(ctx context.Context) bool {
+	running, _ := ctx.Value(maintenanceWorkerContextKey{}).(bool)
+	return running
+}
+func checkpointDependency(err error) (uint64, bool) {
+	var dependency checkpointDependencyError
+	if !errors.As(err, &dependency) {
+		return 0, false
+	}
+	return dependency.generation, true
 }

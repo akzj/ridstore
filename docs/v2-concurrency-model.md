@@ -34,8 +34,7 @@ Checkpoint / GC
 | `storeState.mu` | lifecycle, fault, open/status registry and recovery snapshot | no | brief state transitions; allocator I/O occurs after unlock |
 | `mutationAdmission.mu` | drains `Record append -> Batch mutation visible` before retirement proof | yes; read side covers one Put append | Put-like calls only; write side is released before Segment scan |
 | `checkpointRuntime.captureMu` | Checkpoint cut/freeze; Mapping-GC durable publish plus runtime Root owner switch | yes, only for Mapping-GC publication | Checkpoint capture and Mapping-GC publication, never foreground data I/O |
-| `checkpointRuntime.requestMu` | checkpoint waiter aggregation and stop state | no | request enqueue/dequeue only |
-| `MaintenanceScheduler` actor | priority/FIFO queue, coalescing, cancellation and atomic resource grants | no | maintenance workers only; never foreground Get/Put/Commit |
+| `MaintenanceScheduler` actor | typed request queue, priority/FIFO, coalescing, dependencies, phase transitions, timers, cancellation and atomic resource grants | no | maintenance workers only; never foreground Get/Put/Commit |
 | `PublishCoordinator.mu` | all durable Catalog generation transitions and PublishedState update | yes | metadata publishers and Segment rotation, not reads or non-rotating writes |
 | `activeOps` + `closing` under `storeState.mu` | Close admission and drain | no lock is held while draining | new operations after Close begins |
 
@@ -43,9 +42,13 @@ Checkpoint / GC
 timer remains alive until admitted operations drain, then Close cancels and drains Scheduler workers before closing storage files.
 
 Scheduler resources are `heavyIO`, `mappingWriter`, and `recoveryProtocol`. Checkpoint has highest priority and acquires
-`mappingWriter`; it deliberately does not wait behind a long, non-preemptible Segment copy. Segment GC holds `recoveryProtocol`, acquires `heavyIO` only for copy/retire phases, and
-releases it before synchronously requesting Checkpoint. Mapping rebuild holds `recoveryProtocol`; its long COW scan does
-not hold `mappingWriter`, so Checkpoint can advance concurrently and the Mapping result is rejected/retried if stale.
+`mappingWriter`; it deliberately does not wait behind a long, non-preemptible Segment copy. Segment GC holds `recoveryProtocol`, acquires `heavyIO` only for copy/publish/retire phases, and
+returns a Checkpoint dependency transition after releasing `heavyIO`. Mapping rebuild holds `recoveryProtocol`; its long COW scan does
+not hold `mappingWriter`. Its short durable publication phase explicitly acquires `mappingWriter`; cleanup and reader drain release it again.
+
+Periodic Checkpoint and automatic GC timers belong to the Scheduler actor. Checkpoint pressure, explicit Checkpoint calls,
+and Segment/Mapping dependencies all coalesce as the same typed request. No maintenance worker calls the Scheduler or
+waits synchronously for another worker.
 
 ## 3. Coordinator and Mapping
 

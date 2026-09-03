@@ -293,12 +293,12 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	initialPublished := catalog.Snapshot()
 	publisher.publish(initialPublished)
 	store.maintenance.gcStability.sample(initialPublished, store.maintenance.gcNow())
-	store.startCheckpointWorker()
 	if pendingCompaction != nil {
 		if err := store.resumeCompaction(ctx, *pendingCompaction); err != nil {
 			return nil, errors.Join(base.ErrRecoveryRequired, err, store.Close())
 		}
 	}
+	store.startCheckpointWorker()
 	if store.maintenance.config.Enabled && !store.maintenance.config.DisableMappingGC {
 		store.startMappingUsageSurvey()
 	}

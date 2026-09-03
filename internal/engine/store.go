@@ -145,11 +145,8 @@ type maintenanceRuntime struct {
 	gcStability            gcStability
 	scheduler              *MaintenanceScheduler
 	config                 MaintenanceConfig
-	autoSegmentRunning     atomic.Bool
-	autoMappingRunning     atomic.Bool
 	lastMappingGCUnixNano  atomic.Int64
 	mappingUsage           atomic.Pointer[mappingUsage]
-	mappingSurveyRunning   atomic.Bool
 }
 
 type mappingUsage struct {
@@ -201,7 +198,7 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 	if err != nil {
 		return nil, err
 	}
-	return &Store{
+	store := &Store{
 		state: storeState{
 			limits: config.Batch, maxOpen: config.MaxOpenBatches, open: make(map[model.BatchID]*Batch),
 			statuses: make(map[model.BatchID]statusEntry), statusRetention: config.StatusRetention, notify: make(chan struct{}),
@@ -212,9 +209,10 @@ func New(log Log, current *mapping.Persistent, ids, batches *idalloc.Allocator, 
 		maintenance: maintenanceRuntime{
 			maxRelocationBytes:     config.Batch.MaxBatchBytes,
 			maxRelocationMutations: (config.Commit.MaxGroupPayload - uint64(recordcodec.CommitGroupHeadSize+recordcodec.DescriptorHeadSize)) / uint64(recordcodec.MutationSize),
-			scheduler:              newMaintenanceScheduler(),
 		},
-	}, nil
+	}
+	store.maintenance.scheduler = newMaintenanceScheduler(store)
+	return store, nil
 }
 
 func (s *Store) Status(ctx context.Context, id model.BatchID) (BatchStatus, error) {

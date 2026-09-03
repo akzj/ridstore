@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
-	"github.com/akzj/ridstore/internal/mapstore"
 )
 
 func (s *Store) scheduleAutomaticMaintenance() {
@@ -14,36 +13,15 @@ func (s *Store) scheduleAutomaticMaintenance() {
 	if !config.Enabled {
 		return
 	}
-	if !config.DisableSegmentGC && s.maintenance.autoSegmentRunning.CompareAndSwap(false, true) {
-		go func() {
-			defer s.maintenance.autoSegmentRunning.Store(false)
-			_, _, err := s.CompactNextSegment(context.Background(), config.SegmentPolicy)
-			if err != nil && !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, base.ErrInsufficientSpace) {
-				s.metrics.maintenanceAutomaticFailed.Add(1)
-			}
-		}()
+	if !config.DisableSegmentGC {
+		if err := s.maintenance.scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceSegmentNextRequest, policy: normalizeCompactionPolicy(config.SegmentPolicy), automatic: true}); err != nil && !errors.Is(err, base.ErrClosed) {
+			s.metrics.maintenanceAutomaticFailed.Add(1)
+		}
 	}
-	if !config.DisableMappingGC && s.maintenance.autoMappingRunning.CompareAndSwap(false, true) {
-		go func() {
-			defer s.maintenance.autoMappingRunning.Store(false)
-			needed, err := s.mappingGCNeeded(context.Background(), config)
-			if err != nil {
-				if !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, base.ErrConflict) && !errors.Is(err, mapstore.ErrRecoveryRequired) {
-					s.metrics.maintenanceAutomaticFailed.Add(1)
-				}
-				return
-			}
-			if !needed {
-				return
-			}
-			if err := s.CompactMapping(context.Background()); err != nil {
-				if !errors.Is(err, base.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, base.ErrConflict) {
-					s.metrics.maintenanceAutomaticFailed.Add(1)
-				}
-				return
-			}
-			s.maintenance.lastMappingGCUnixNano.Store(s.maintenanceNow().UnixNano())
-		}()
+	if !config.DisableMappingGC {
+		if err := s.maintenance.scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceMappingGCRequest, automatic: true}); err != nil && !errors.Is(err, base.ErrClosed) {
+			s.metrics.maintenanceAutomaticFailed.Add(1)
+		}
 	}
 }
 
@@ -69,51 +47,11 @@ func (s *Store) mappingGCNeeded(ctx context.Context, config MaintenanceConfig) (
 }
 
 func (s *Store) surveyMappingUsage(ctx context.Context) (*mappingUsage, error) {
-	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
-		key: "mapping-survey", priority: maintenancePriorityMapping,
-		resources: maintenanceHeavyIO | maintenanceRecoveryProtocol, preemptible: true,
-		run: func(runCtx context.Context) error {
-			published := s.PublishedState()
-			if published == nil {
-				return base.ErrInvalidConfig
-			}
-			view, err := s.core.mapping.CheckpointView()
-			if err != nil {
-				return err
-			}
-			if view.Root() != published.MappingRoot || view.Covered() != published.CoveredCommit {
-				return base.ErrConflict
-			}
-			reachable, err := view.ReachableBytes(runCtx)
-			if err != nil {
-				return err
-			}
-			snapshot := s.core.publisher.SnapshotMapStore()
-			if snapshot.Generation != published.Generation || snapshot.Root != published.MappingRoot {
-				return base.ErrConflict
-			}
-			report, err := mapstore.VerifyFiles(runCtx, s.core.root, snapshot)
-			if err != nil {
-				return err
-			}
-			if current := s.PublishedState(); current == nil || current.Generation != published.Generation || current.MappingRoot != published.MappingRoot {
-				return base.ErrConflict
-			}
-			if reachable > report.PhysicalBytes {
-				return base.ErrCorrupt
-			}
-			usage := &mappingUsage{generation: published.Generation, root: published.MappingRoot, physicalBytes: report.PhysicalBytes, reachableBytes: reachable}
-			s.maintenance.mappingUsage.Store(usage)
-			s.metrics.mappingSurveyPhysicalBytes.Store(report.PhysicalBytes)
-			s.metrics.mappingSurveyReachableBytes.Store(reachable)
-			s.metrics.mappingSurveyGeneration.Store(published.Generation)
-			return nil
-		},
-	})
+	result, err := s.maintenance.scheduler.Submit(ctx, maintenanceRequest{kind: maintenanceMappingSurveyRequest})
 	if err != nil {
 		return nil, err
 	}
-	usage := s.maintenance.mappingUsage.Load()
+	usage := result.usage
 	if usage == nil {
 		return nil, base.ErrConflict
 	}
@@ -121,17 +59,7 @@ func (s *Store) surveyMappingUsage(ctx context.Context) (*mappingUsage, error) {
 }
 
 func (s *Store) startMappingUsageSurvey() {
-	if !s.maintenance.mappingSurveyRunning.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		defer s.maintenance.mappingSurveyRunning.Store(false)
-		if err := s.beginOperation(); err != nil {
-			return
-		}
-		defer s.endOperation()
-		_, _ = s.surveyMappingUsage(context.Background())
-	}()
+	_ = s.maintenance.scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceMappingSurveyRequest})
 }
 
 func (s *Store) maintenanceNow() time.Time {

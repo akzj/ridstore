@@ -92,7 +92,11 @@ func TestAutomaticMaintenanceSubmitsSegmentWorker(t *testing.T) {
 	before := store.Metrics().MaintenanceRequested
 	store.scheduleAutomaticMaintenance()
 	deadline := time.Now().Add(2 * time.Second)
-	for store.maintenance.autoSegmentRunning.Load() {
+	for {
+		metrics := store.Metrics()
+		if metrics.MaintenanceRequested > before && metrics.MaintenanceQueued == 0 && metrics.MaintenanceRunning == 0 {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("automatic Segment worker did not finish")
 		}
@@ -467,20 +471,19 @@ func TestCheckpointPressureWaitersShareOneGeneration(t *testing.T) {
 	}
 
 	const waiterCount = 8
+	coalescedBefore := store.Metrics().MaintenanceCoalesced
 	done := make(chan error, waiterCount)
 	for index := 0; index < waiterCount; index++ {
 		go func() { done <- store.awaitCheckpointPressure(context.Background(), generation, false) }()
 	}
 	deadline = time.Now().Add(2 * time.Second)
 	for {
-		store.checkpoints.requestMu.Lock()
-		queued := len(store.checkpoints.waiters)
-		store.checkpoints.requestMu.Unlock()
-		if queued == waiterCount {
+		queued := store.Metrics().MaintenanceCoalesced - coalescedBefore
+		if queued >= waiterCount {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("queued waiters=%d", queued)
+			t.Fatalf("coalesced waiters=%d", queued)
 		}
 		time.Sleep(time.Millisecond)
 	}

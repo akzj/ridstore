@@ -108,6 +108,7 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
+	coalescedBefore := store.Metrics().MaintenanceCoalesced
 	go func() {
 		_, relocateErr := store.relocateWithBudgetRetry(context.Background(), coordinator.Relocation{
 			BatchID: model.BatchID(rawBatchID), LogicalPayloadBytes: 4,
@@ -117,9 +118,7 @@ func TestRelocationWaitsForCheckpointUnderDeltaHardPressure(t *testing.T) {
 	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		store.checkpoints.requestMu.Lock()
-		waiting := len(store.checkpoints.waiters) != 0
-		store.checkpoints.requestMu.Unlock()
+		waiting := store.Metrics().MaintenanceCoalesced > coalescedBefore
 		if waiting {
 			break
 		}
