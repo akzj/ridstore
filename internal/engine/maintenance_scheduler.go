@@ -170,8 +170,6 @@ func (m *MaintenanceScheduler) submit(ctx context.Context, spec maintenanceJobSp
 		}
 	case <-m.closedCh:
 		return base.ErrClosed
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 	select {
 	case err := <-waiter.result:
@@ -235,6 +233,8 @@ func (m *MaintenanceScheduler) run() {
 				}
 			}
 			if best < 0 {
+				m.queued.Store(uint64(len(pending)))
+				m.running.Store(uint64(len(active)))
 				return
 			}
 			job := pending[best]
@@ -312,7 +312,7 @@ func (m *MaintenanceScheduler) run() {
 			}
 			delete(job.waiters, cancellation.waiterID)
 			delete(job.nextWaiters, cancellation.waiterID)
-			if len(job.waiters) == 0 && !job.background {
+			if len(job.waiters) == 0 && len(job.nextWaiters) == 0 && !job.background && !job.nextBackground {
 				if _, running := active[job.id]; running {
 					job.cancel()
 				} else {

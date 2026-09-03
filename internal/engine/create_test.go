@@ -54,6 +54,23 @@ func TestCreateBuildsUsableExclusiveStore(t *testing.T) {
 	}
 }
 
+func TestCreateNormalizesAutomaticMaintenanceAgainstSegmentSize(t *testing.T) {
+	config := testCreateConfig()
+	config.Runtime.Maintenance.Enabled = true
+	config.Runtime.Maintenance.Interval = time.Hour
+	store, err := Create(context.Background(), filepath.Join(t.TempDir(), "store"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	maintenance := store.maintenance.config
+	if maintenance.SegmentPolicy.MinReclaimableBytes != config.HardLimits.SegmentSize/4 ||
+		maintenance.MappingMinReclaimableBytes != config.HardLimits.SegmentSize ||
+		maintenance.SegmentPolicy.MinReclaimableRatioBasis != 2_500 || maintenance.MappingMinReclaimableRatioBasis != 5_000 {
+		t.Fatalf("maintenance=%+v", maintenance)
+	}
+}
+
 func TestOpenRejectsIncompleteInitializationAndCreateResumes(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
