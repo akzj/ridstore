@@ -95,18 +95,21 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 	}
 	defer s.endOperation()
 
-	release, err := s.acquireDataMaintenance(ctx)
-	if err != nil {
-		return SegmentRelocationResult{}, err
-	}
-	defer release()
-	heavyRelease, err := s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
-	if err != nil {
-		return SegmentRelocationResult{}, err
-	}
-	defer heavyRelease()
-	rate := s.maintenance.gcBytesPerSecond.Load()
-	return s.relocateSegment(ctx, source, rate)
+	var result SegmentRelocationResult
+	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
+		key: s.maintenance.scheduler.uniqueKey("segment-relocate"), priority: maintenancePrioritySegment,
+		resources: maintenanceRecoveryProtocol,
+		run: func(runCtx context.Context) error {
+			heavyRelease, err := s.maintenance.scheduler.acquire(runCtx, maintenancePrioritySegment, maintenanceHeavyIO)
+			if err != nil {
+				return err
+			}
+			defer heavyRelease()
+			result, err = s.relocateSegment(runCtx, source, s.maintenance.gcBytesPerSecond.Load())
+			return err
+		},
+	})
+	return result, err
 }
 
 // PrepareSegmentRetirement relocates current live records, checkpoints every
@@ -127,22 +130,25 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 	}
 	defer s.endOperation()
 
-	release, err := s.acquireDataMaintenance(ctx)
-	if err != nil {
-		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
-	}
-	defer release()
-	heavyRelease, err := s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
-	if err != nil {
-		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
-	}
-	rate := s.maintenance.gcBytesPerSecond.Load()
-	relocated, err := s.relocateSegment(ctx, source, rate)
-	heavyRelease()
-	if err != nil {
-		return SegmentRetirementProof{}, relocated, err
-	}
-	proof, err := s.checkpointAndProveRetirement(ctx, source, relocated.LastCommitSeq)
+	var proof SegmentRetirementProof
+	var relocated SegmentRelocationResult
+	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
+		key: s.maintenance.scheduler.uniqueKey("segment-prepare"), priority: maintenancePrioritySegment,
+		resources: maintenanceRecoveryProtocol,
+		run: func(runCtx context.Context) error {
+			heavyRelease, err := s.maintenance.scheduler.acquire(runCtx, maintenancePrioritySegment, maintenanceHeavyIO)
+			if err != nil {
+				return err
+			}
+			relocated, err = s.relocateSegment(runCtx, source, s.maintenance.gcBytesPerSecond.Load())
+			heavyRelease()
+			if err != nil {
+				return err
+			}
+			proof, err = s.checkpointAndProveRetirement(runCtx, source, relocated.LastCommitSeq)
+			return err
+		},
+	})
 	return proof, relocated, err
 }
 
@@ -164,21 +170,24 @@ func (s *Store) CompactSegment(ctx context.Context, source recordlog.SegmentID) 
 		return SegmentCompactionResult{}, err
 	}
 	defer s.endOperation()
-	release, err := s.acquireDataMaintenance(ctx)
-	if err != nil {
-		return SegmentCompactionResult{}, err
-	}
-	defer release()
-	rate := s.maintenance.gcBytesPerSecond.Load()
-	s.metrics.gcStarted.Add(1)
-	started := time.Now()
-	manifest := s.catalogSnapshot()
-	index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool { return manifest.SealedDataSegments[i].SegmentID >= source })
-	if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source || recordlog.IsCompactionSegment(source) {
-		return SegmentCompactionResult{}, recordlog.ErrSegmentMissing
-	}
-	result, err := s.compactSegmentsLocked(ctx, []recordlog.SegmentSummary{manifest.SealedDataSegments[index]}, rate)
-	s.recordCompactionMetrics(started, result, err)
+	var result SegmentCompactionResult
+	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
+		key: s.maintenance.scheduler.uniqueKey("segment-compact"), priority: maintenancePrioritySegment,
+		resources: maintenanceRecoveryProtocol,
+		run: func(runCtx context.Context) error {
+			s.metrics.gcStarted.Add(1)
+			started := time.Now()
+			manifest := s.catalogSnapshot()
+			index := sort.Search(len(manifest.SealedDataSegments), func(i int) bool { return manifest.SealedDataSegments[i].SegmentID >= source })
+			if index == len(manifest.SealedDataSegments) || manifest.SealedDataSegments[index].SegmentID != source || recordlog.IsCompactionSegment(source) {
+				return recordlog.ErrSegmentMissing
+			}
+			var runErr error
+			result, runErr = s.compactSegmentsLocked(runCtx, []recordlog.SegmentSummary{manifest.SealedDataSegments[index]}, s.maintenance.gcBytesPerSecond.Load())
+			s.recordCompactionMetrics(started, result, runErr)
+			return runErr
+		},
+	})
 	return result, err
 }
 
@@ -201,11 +210,21 @@ func (s *Store) CompactNextSegment(ctx context.Context, policy CompactionPolicy)
 		return NextSegmentCompactionResult{}, false, err
 	}
 	defer s.endOperation()
-	release, err := s.acquireDataMaintenance(ctx)
-	if err != nil {
-		return NextSegmentCompactionResult{}, false, err
-	}
-	defer release()
+	var result NextSegmentCompactionResult
+	var found bool
+	err := s.maintenance.scheduler.submit(ctx, maintenanceJobSpec{
+		key: s.maintenance.scheduler.uniqueKey("segment-next"), priority: maintenancePrioritySegment,
+		resources: maintenanceRecoveryProtocol,
+		run: func(runCtx context.Context) error {
+			var runErr error
+			result, found, runErr = s.compactNextSegmentScheduled(runCtx, policy)
+			return runErr
+		},
+	})
+	return result, found, err
+}
+
+func (s *Store) compactNextSegmentScheduled(ctx context.Context, policy CompactionPolicy) (NextSegmentCompactionResult, bool, error) {
 	rate := s.maintenance.gcBytesPerSecond.Load()
 	selectCandidate := func() (SegmentCompactionCandidate, bool, error) {
 		published := s.PublishedState()

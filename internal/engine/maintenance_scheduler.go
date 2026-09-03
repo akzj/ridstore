@@ -131,6 +131,10 @@ func formatMaintenanceID(id uint64) string {
 	return string(raw[:])
 }
 
+func (m *MaintenanceScheduler) uniqueKey(prefix string) string {
+	return prefix + "/" + formatMaintenanceID(m.leaseID.Add(1))
+}
+
 func newMaintenanceScheduler() *MaintenanceScheduler {
 	m := &MaintenanceScheduler{
 		submitCh: make(chan maintenanceSubmit),

@@ -734,13 +734,6 @@ func (s *Store) releaseSlot() {
 	s.state.mu.Unlock()
 }
 
-func (s *Store) acquireDataMaintenance(ctx context.Context) (func(), error) {
-	if s.maintenance.scheduler == nil {
-		return nil, base.ErrInvalidConfig
-	}
-	return s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceRecoveryProtocol)
-}
-
 type Batch struct {
 	store *Store
 	inner *transaction.Batch
