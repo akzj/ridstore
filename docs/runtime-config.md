@@ -45,6 +45,11 @@ runtime 包含 RecordLog queue/buffer、Commit group、Mapping cache、Checkpoin
 | SpaceCheckInterval | 100 ms |
 | CheckpointInterval | 30 s |
 
+自动维护通过 `RuntimeConfig.Maintenance.Enabled` 显式启用，默认关闭。启用后的默认调度周期为 30s；
+Segment GC 要求至少回收 `SegmentSize/4` 且 25%，稳定 2 轮、年龄 1m、最多 4 个相邻输入；Mapping GC
+要求精确不可达 bytes 至少一个 `SegmentSize` 且占物理 Mapping bytes 的 50%，成功后 cooldown 10m。
+两类 GC 可分别禁用；显式 `CompactNextSegment` / `CompactMapping` 不受自动开关影响。
+
 这些是可运行的安全起点，不是性能承诺；基准可以改变后续默认值，但持久化 hard limits 的改变必须遵守 Open 兼容规则。
 
 ## 3. 归一化与跨字段校验
@@ -117,7 +122,7 @@ Commit admission 的短区间。`GCCommitRedirects` 和 `GCOpenRefsRedirected` �
 
 `SetGCBytesPerSecond(rate)` 原子修改后续 Data Compact 的复制速率。每次 Compact 只在创建 pacer
 时读取一次，新值不影响正在运行的 Compact；`rate == 0` 非法。暂停、时间窗、容量水位和调用频率
-属于外部 maintenance scheduler，不进入 Store 的持久化状态。
+由进程内 `MaintenanceScheduler` 管理，不进入 Store 的持久化状态。
 
 Data GC 使用两段磁盘 admission。copy 前按 source 全部物理 bytes、最坏 Relocation Descriptor、两个 rotation Segment 与 `GCMinFreeBytes` 检查空间；该上界对显式指定 Segment 和自动候选路径都成立，不依赖可能继续下降的 live estimate。copy 完成后，GC-required Checkpoint barrier 先冻结其实际 Delta layers，再按冻结 entry 数乘以每个 entry 最坏八层 Dense Mapping COW、一个 rotation Segment与 `GCMinFreeBytes` 重新检查。第二段失败时 Relocation 已是可恢复的 durable garbage/Delta，但源 Segment 和旧 checkpoint 仍保留。这样前台 Commit 可以继续运行，又不会把只按源 live 数得到的估计误称为整个 Checkpoint 上界。任一检查低于上界均返回 `ErrInsufficientSpace`。可用空间检查只是 admission signal，并不保留磁盘配额；之后每个 write/fsync 的 `ENOSPC` 仍必须原样传播并遵守对应 crash-recovery phase。
 
@@ -148,7 +153,8 @@ Commit/Checkpoint/GC 的并发增长仍可能使观察值过时，因此所有�
 ## 8. 可观测性与验收
 
 当前导出 active/frozen/reserved Delta charge、soft/hard limit、group batch/wait/fsync、GC copied/reclaimed、
-GC throttled time、GC space rejection，以及前台空间水位。Checkpoint working bytes 与独立 Delta
+GC throttled time、GC space rejection、Scheduler requested/coalesced/completed/failed/preemptions/queued/running、
+最近一次 generation-bound Mapping physical/reachable bytes，以及前台空间水位。Checkpoint working bytes 与独立 Delta
 backpressure wait time 仍属于后续可观测性收口。
 
 验收必须覆盖：所有 frozen layer 计费、reservation 取消归还、fsync 后 Publish 不被限额阻塞、Checkpoint 连续失败时内存不越 hard limit、极小/溢出/不相容配置拒绝、Open 的 hard-limit mismatch，以及低水位拒绝新 Put 但不阻塞已有 Batch Commit/Abort、Get 和 Checkpoint。

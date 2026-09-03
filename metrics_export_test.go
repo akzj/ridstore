@@ -21,7 +21,10 @@ func TestAppendMetricSamplesMapsEveryFieldInStableOrder(t *testing.T) {
 		BackgroundCheckpointRequested: 57, BackgroundCheckpointCompleted: 58, BackgroundCheckpointFailed: 59,
 		GCBytesPerSecond:      60,
 		MappingGCPublishNanos: 61, MappingGCMaxPublishNanos: 62,
-		MappingGCConflicts: 63,
+		MappingGCConflicts: 63, MappingSurveyGeneration: 64, MappingSurveyPhysicalBytes: 65,
+		MappingSurveyReachableBytes: 66, MaintenanceAutomaticFailed: 67,
+		MaintenanceRequested: 68, MaintenanceCoalesced: 69, MaintenanceCompleted: 70, MaintenanceFailed: 71,
+		MaintenancePreemptions: 72, MaintenanceQueued: 73, MaintenanceRunning: 74,
 	}
 	buffer := make([]MetricSample, 0, MetricSampleCount)
 	samples := metrics.AppendMetricSamples(buffer)

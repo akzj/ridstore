@@ -127,6 +127,11 @@ func (s *Store) Metrics() Metrics {
 		BackgroundCheckpointRequested: current.BackgroundCheckpointRequested,
 		BackgroundCheckpointCompleted: current.BackgroundCheckpointCompleted,
 		BackgroundCheckpointFailed:    current.BackgroundCheckpointFailed,
+		MappingSurveyGeneration:       current.MappingSurveyGeneration, MappingSurveyPhysicalBytes: current.MappingSurveyPhysicalBytes,
+		MappingSurveyReachableBytes: current.MappingSurveyReachableBytes, MaintenanceAutomaticFailed: current.MaintenanceAutomaticFailed,
+		MaintenanceRequested: current.MaintenanceRequested, MaintenanceCoalesced: current.MaintenanceCoalesced,
+		MaintenanceCompleted: current.MaintenanceCompleted, MaintenanceFailed: current.MaintenanceFailed,
+		MaintenancePreemptions: current.MaintenancePreemptions, MaintenanceQueued: current.MaintenanceQueued, MaintenanceRunning: current.MaintenanceRunning,
 	}
 }
 

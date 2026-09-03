@@ -59,6 +59,21 @@ type NodeBuild struct {
 	Sizes            [NodeSlots]uint32
 }
 
+// PhysicalSize returns the exact encoded bytes occupied by a verified Node.
+func (n Node) PhysicalSize() uint32 {
+	if n.Encoding == EncodingDense {
+		if n.Level == 0 {
+			return DenseLeafNodeSize
+		}
+		return DenseInternalNodeSize
+	}
+	width := uint32(8)
+	if n.Level == 0 {
+		width = 12
+	}
+	return alignNodeSize(NodeHeaderSize + SparseBitmapBytes + uint32(n.EntryCount)*width)
+}
+
 func EncodeNode(build NodeBuild) ([]byte, error) {
 	if build.NodeSeq == 0 || build.CoveredCommitSeq == 0 || !validPrefix(build.Level, build.Prefix) {
 		return nil, ErrInvalid

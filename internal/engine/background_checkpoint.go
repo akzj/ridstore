@@ -207,8 +207,17 @@ func (s *Store) runCheckpointCycle(ctx context.Context, periodic bool) {
 
 func (s *Store) runCheckpointTimer() {
 	timer := time.NewTicker(s.checkpoints.interval)
+	var maintenanceTimer *time.Ticker
+	var maintenanceC <-chan time.Time
+	if s.maintenance.config.Enabled {
+		maintenanceTimer = time.NewTicker(s.maintenance.config.Interval)
+		maintenanceC = maintenanceTimer.C
+	}
 	defer func() {
 		timer.Stop()
+		if maintenanceTimer != nil {
+			maintenanceTimer.Stop()
+		}
 		close(s.checkpoints.done)
 	}()
 	for {
@@ -218,6 +227,8 @@ func (s *Store) runCheckpointTimer() {
 		case <-timer.C:
 			s.checkpoints.periodicPending.Store(true)
 			s.wakeCheckpointWorker()
+		case <-maintenanceC:
+			s.scheduleAutomaticMaintenance()
 		}
 	}
 }

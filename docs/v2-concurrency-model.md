@@ -34,13 +34,18 @@ Checkpoint / GC
 | `storeState.mu` | lifecycle, fault, open/status registry and recovery snapshot | no | brief state transitions; allocator I/O occurs after unlock |
 | `mutationAdmission.mu` | drains `Record append -> Batch mutation visible` before retirement proof | yes; read side covers one Put append | Put-like calls only; write side is released before Segment scan |
 | `checkpointRuntime.captureMu` | Checkpoint cut/freeze; Mapping-GC durable publish plus runtime Root owner switch | yes, only for Mapping-GC publication | Checkpoint capture and Mapping-GC publication, never foreground data I/O |
-| `checkpointRuntime.requestMu` | checkpoint waiters and worker stop state | no | request enqueue/dequeue only |
-| `MaintenanceScheduler` slots | one Data maintenance and one Mapping rewrite | no | same-class background work; the two classes may overlap |
+| `checkpointRuntime.requestMu` | checkpoint waiter aggregation and stop state | no | request enqueue/dequeue only |
+| `MaintenanceScheduler` actor | priority/FIFO queue, coalescing, cancellation and atomic resource grants | no | maintenance workers only; never foreground Get/Put/Commit |
 | `PublishCoordinator.mu` | all durable Catalog generation transitions and PublishedState update | yes | metadata publishers and Segment rotation, not reads or non-rotating writes |
 | `activeOps` + `closing` under `storeState.mu` | Close admission and drain | no lock is held while draining | new operations after Close begins |
 
 `Close` does not own the checkpoint capture lock or a maintenance slot while waiting for `activeOps`; the Checkpoint
-worker remains alive until admitted waiters finish, then Close stops it before closing storage files.
+timer remains alive until admitted operations drain, then Close cancels and drains Scheduler workers before closing storage files.
+
+Scheduler resources are `heavyIO`, `mappingWriter`, and `recoveryProtocol`. Checkpoint has highest priority and atomically
+acquires `heavyIO|mappingWriter`. Segment GC holds `recoveryProtocol`, acquires `heavyIO` only for copy/retire phases, and
+releases it before synchronously requesting Checkpoint. Mapping rebuild holds `recoveryProtocol`; its long COW scan does
+not hold `mappingWriter`, so Checkpoint can advance concurrently and the Mapping result is rejected/retried if stale.
 
 ## 3. Coordinator and Mapping
 

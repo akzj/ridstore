@@ -1097,6 +1097,19 @@ func TestCompactMappingReclaimsUnreachableCheckpointNodes(t *testing.T) {
 		}
 	}
 	before := mappingPhysicalBytes(t, root)
+	needed, err := store.mappingGCNeeded(ctx, MaintenanceConfig{
+		MappingMinReclaimableBytes: 1, MappingMinReclaimableRatioBasis: 1, MappingMinInterval: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("survey Mapping amplification: %v", err)
+	}
+	if !needed {
+		t.Fatalf("survey did not detect unreachable Mapping bytes: metrics=%+v", store.Metrics())
+	}
+	survey := store.Metrics()
+	if survey.MappingSurveyGeneration == 0 || survey.MappingSurveyReachableBytes >= survey.MappingSurveyPhysicalBytes {
+		t.Fatalf("invalid survey: %+v", survey)
+	}
 	if err := store.CompactMapping(ctx); err != nil {
 		t.Fatal(err)
 	}

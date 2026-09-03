@@ -40,6 +40,18 @@ type OpenConfig struct {
 	GCBatchMutations    uint64
 	GCMinFreeBytes      uint64
 	GCBytesPerSecond    uint64
+	Maintenance         MaintenanceConfig
+}
+
+type MaintenanceConfig struct {
+	Enabled                         bool
+	Interval                        time.Duration
+	DisableSegmentGC                bool
+	DisableMappingGC                bool
+	SegmentPolicy                   CompactionPolicy
+	MappingMinReclaimableBytes      uint64
+	MappingMinReclaimableRatioBasis uint32
+	MappingMinInterval              time.Duration
 }
 
 type CreateConfig struct {
@@ -65,6 +77,7 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 		return nil, err
 	}
 	config.Runtime = normalizeGCRuntime(config.Runtime, config.HardLimits)
+	config.Runtime = normalizeMaintenanceRuntime(config.Runtime, config.HardLimits)
 	if err := validateRuntimeAgainstHard(config.Runtime, config.HardLimits); err != nil {
 		return nil, err
 	}
@@ -145,6 +158,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 		return nil, err
 	}
 	config = normalizeGCRuntime(config, manifest.HardLimits)
+	config = normalizeMaintenanceRuntime(config, manifest.HardLimits)
 	if err := validateRuntimeAgainstHard(config, manifest.HardLimits); err != nil {
 		return nil, base.ErrInvalidConfig
 	}
@@ -272,6 +286,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	store.maintenance.gcNow = time.Now
 	store.maintenance.gcWait = waitContext
 	store.checkpoints.interval = config.CheckpointInterval
+	store.maintenance.config = config.Maintenance
 	store.core.dirLock = dirLock
 	runtimeOwnsLock = true
 	store.core.identity = [16]byte(manifest.StoreUUID)
@@ -317,7 +332,9 @@ func validOpenConfig(config OpenConfig) bool {
 func validateRuntimeAgainstHard(config OpenConfig, hard storecatalog.HardLimits) error {
 	if !validOpenConfig(config) || config.StatusRetention < hard.MaxOpenBatches || config.Commit.MaxGroupPayload > hard.MaxRecordLogPayload ||
 		config.GCBatchBytes == 0 || config.GCBatchBytes > hard.MaxBatchBytes || config.GCBatchMutations == 0 ||
-		config.GCBatchMutations > hard.MaxBatchMutations || config.GCBytesPerSecond == 0 || config.GCMinFreeBytes > config.WriteStopFreeBytes {
+		config.GCBatchMutations > hard.MaxBatchMutations || config.GCBytesPerSecond == 0 || config.GCMinFreeBytes > config.WriteStopFreeBytes ||
+		config.Maintenance.Enabled && (config.Maintenance.Interval <= 0 || config.Maintenance.MappingMinInterval <= 0 ||
+			config.Maintenance.MappingMinReclaimableRatioBasis > compactionRatioScale || config.Maintenance.SegmentPolicy.MinReclaimableRatioBasis > compactionRatioScale) {
 		return base.ErrInvalidConfig
 	}
 	descriptor, err := recordcodec.DescriptorSize(hard.MaxBatchMutations)
@@ -325,6 +342,40 @@ func validateRuntimeAgainstHard(config OpenConfig, hard storecatalog.HardLimits)
 		return base.ErrInvalidConfig
 	}
 	return nil
+}
+
+func normalizeMaintenanceRuntime(config OpenConfig, hard storecatalog.HardLimits) OpenConfig {
+	if !config.Maintenance.Enabled {
+		return config
+	}
+	if config.Maintenance.Interval == 0 {
+		config.Maintenance.Interval = 30 * time.Second
+	}
+	if config.Maintenance.SegmentPolicy.MinReclaimableBytes == 0 {
+		config.Maintenance.SegmentPolicy.MinReclaimableBytes = hard.SegmentSize / 4
+	}
+	if config.Maintenance.SegmentPolicy.MinReclaimableRatioBasis == 0 {
+		config.Maintenance.SegmentPolicy.MinReclaimableRatioBasis = 2_500
+	}
+	if config.Maintenance.SegmentPolicy.MinStableRounds == 0 {
+		config.Maintenance.SegmentPolicy.MinStableRounds = 2
+	}
+	if config.Maintenance.SegmentPolicy.MinSegmentAge == 0 {
+		config.Maintenance.SegmentPolicy.MinSegmentAge = time.Minute
+	}
+	if config.Maintenance.SegmentPolicy.MaxInputSegments == 0 {
+		config.Maintenance.SegmentPolicy.MaxInputSegments = 4
+	}
+	if config.Maintenance.MappingMinReclaimableBytes == 0 {
+		config.Maintenance.MappingMinReclaimableBytes = hard.SegmentSize
+	}
+	if config.Maintenance.MappingMinReclaimableRatioBasis == 0 {
+		config.Maintenance.MappingMinReclaimableRatioBasis = 5_000
+	}
+	if config.Maintenance.MappingMinInterval == 0 {
+		config.Maintenance.MappingMinInterval = 10 * time.Minute
+	}
+	return config
 }
 
 func normalizeGCRuntime(config OpenConfig, hard storecatalog.HardLimits) OpenConfig {

@@ -100,6 +100,11 @@ func (s *Store) RelocateSegment(ctx context.Context, source recordlog.SegmentID)
 		return SegmentRelocationResult{}, err
 	}
 	defer release()
+	heavyRelease, err := s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
+	if err != nil {
+		return SegmentRelocationResult{}, err
+	}
+	defer heavyRelease()
 	rate := s.maintenance.gcBytesPerSecond.Load()
 	return s.relocateSegment(ctx, source, rate)
 }
@@ -127,8 +132,13 @@ func (s *Store) PrepareSegmentRetirement(ctx context.Context, source recordlog.S
 		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
 	}
 	defer release()
+	heavyRelease, err := s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
+	if err != nil {
+		return SegmentRetirementProof{}, SegmentRelocationResult{}, err
+	}
 	rate := s.maintenance.gcBytesPerSecond.Load()
 	relocated, err := s.relocateSegment(ctx, source, rate)
+	heavyRelease()
 	if err != nil {
 		return SegmentRetirementProof{}, relocated, err
 	}
@@ -259,6 +269,16 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	if len(inputs) == 0 || s.core.catalog == nil || s.core.compactionLog == nil {
 		return result, base.ErrInvalidConfig
 	}
+	heavyRelease, err := s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
+	if err != nil {
+		return result, err
+	}
+	heavyHeld := true
+	defer func() {
+		if heavyHeld {
+			heavyRelease()
+		}
+	}()
 	published := s.PublishedState()
 	if published == nil {
 		return result, base.ErrInvalidConfig
@@ -409,6 +429,8 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	if err = s.publishCompactionOutputs(ctx, inputs, outputs, pendingOrigins, false, &result.Relocation); err != nil {
 		return result, s.compactionFailure(err)
 	}
+	heavyRelease()
+	heavyHeld = false
 	proofs, err := s.checkpointAndProveRetirements(ctx, inputs, result.Relocation.LastCommitSeq)
 	if err != nil {
 		return result, s.compactionFailure(err)
@@ -417,6 +439,11 @@ func (s *Store) compactSegmentsLocked(ctx context.Context, inputs []recordlog.Se
 	if len(proofs) != 0 {
 		result.Proof = proofs[0]
 	}
+	heavyRelease, err = s.maintenance.scheduler.acquire(ctx, maintenancePrioritySegment, maintenanceHeavyIO)
+	if err != nil {
+		return result, s.compactionFailure(err)
+	}
+	heavyHeld = true
 	installed, err := s.installCompactionRetirement(inputs, proofs)
 	if err != nil {
 		return result, s.compactionFailure(err)

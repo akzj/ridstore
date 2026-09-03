@@ -171,6 +171,79 @@ func TestMaintenanceSchedulerSegmentCanWaitForCheckpoint(t *testing.T) {
 	}
 }
 
+func TestMaintenanceSchedulerPreemptsAndRequeuesSpeculativeJob(t *testing.T) {
+	scheduler := newMaintenanceScheduler()
+	defer scheduler.Close()
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var calls atomic.Uint64
+	lowDone := make(chan error, 1)
+	go func() {
+		lowDone <- scheduler.submit(context.Background(), maintenanceJobSpec{
+			key: "survey", priority: maintenancePriorityMapping, resources: maintenanceHeavyIO, preemptible: true,
+			run: func(ctx context.Context) error {
+				if calls.Add(1) == 1 {
+					close(firstStarted)
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				close(secondStarted)
+				return nil
+			},
+		})
+	}()
+	<-firstStarted
+	highRan := make(chan struct{})
+	if err := scheduler.submit(context.Background(), maintenanceJobSpec{
+		key: "checkpoint", priority: maintenancePriorityCheckpoint, resources: maintenanceHeavyIO,
+		run: func(context.Context) error { close(highRan); return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-highRan
+	<-secondStarted
+	if err := <-lowDone; err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.metrics().preemptions != 1 {
+		t.Fatalf("preemptions = %d", scheduler.metrics().preemptions)
+	}
+}
+
+func TestMaintenanceSchedulerRerunsActiveCheckpointRequest(t *testing.T) {
+	scheduler := newMaintenanceScheduler()
+	defer scheduler.Close()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	var calls atomic.Uint64
+	spec := maintenanceJobSpec{
+		key: "checkpoint", priority: maintenancePriorityCheckpoint, resources: maintenanceHeavyIO, rerunOnActive: true,
+		run: func(context.Context) error {
+			if calls.Add(1) == 1 {
+				close(firstStarted)
+				<-releaseFirst
+			} else {
+				close(secondDone)
+			}
+			return nil
+		},
+	}
+	if err := scheduler.submitBackground(spec); err != nil {
+		t.Fatal(err)
+	}
+	<-firstStarted
+	if err := scheduler.submitBackground(spec); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseFirst)
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("active checkpoint request was not rerun")
+	}
+}
+
 func equalStrings(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

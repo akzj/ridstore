@@ -144,6 +144,10 @@ type maintenanceRuntime struct {
 	gcWait                 func(context.Context, time.Duration) error
 	gcStability            gcStability
 	scheduler              *MaintenanceScheduler
+	config                 MaintenanceConfig
+	autoSegmentRunning     atomic.Bool
+	autoMappingRunning     atomic.Bool
+	lastMappingGCUnixNano  atomic.Int64
 }
 
 type Store struct {

@@ -353,3 +353,21 @@ func TestGroupCommitDelayDefaultsAndCanBeDisabled(t *testing.T) {
 		t.Fatalf("explicit group commit delay=%v", explicit.Commit.GroupCommitDelay)
 	}
 }
+
+func TestMaintenanceConfigIsExplicitAndDefaultsLatencyFirst(t *testing.T) {
+	disabled := (RuntimeConfig{}).engineConfig()
+	if disabled.Maintenance.Enabled {
+		t.Fatal("automatic maintenance must be opt-in")
+	}
+	enabled := (RuntimeConfig{Maintenance: MaintenanceConfig{Enabled: true}}).engineConfig()
+	if !enabled.Maintenance.Enabled || enabled.Maintenance.Interval != 30*time.Second ||
+		enabled.Maintenance.SegmentPolicy.MinReclaimableRatioBasis != 2_500 ||
+		enabled.Maintenance.SegmentPolicy.MinStableRounds != 2 || enabled.Maintenance.SegmentPolicy.MinSegmentAge != time.Minute ||
+		enabled.Maintenance.SegmentPolicy.MaxInputSegments != 4 ||
+		enabled.Maintenance.MappingMinReclaimableRatioBasis != 5_000 || enabled.Maintenance.MappingMinInterval != 10*time.Minute {
+		t.Fatalf("unexpected maintenance defaults: %+v", enabled.Maintenance)
+	}
+	if enabled.Maintenance.SegmentPolicy.MinReclaimableBytes != 0 || enabled.Maintenance.MappingMinReclaimableBytes != 0 {
+		t.Fatal("segment-sized byte defaults must be resolved after reading persistent hard limits")
+	}
+}

@@ -15,7 +15,8 @@ current logical Mapping
   -> retire the old Mapping file set
 ```
 
-第一版只提供显式 maintenance 操作，不增加后台策略。触发阈值、周期调度和限速属于后续策略层。
+显式 maintenance 操作始终可用。自动策略默认关闭；启用后 Scheduler 先执行 generation-bound 的物理文件与
+可达 Node 精确 survey，达到 bytes 与 ratio 双门槛且越过 cooldown 后才提交 Mapping GC。
 
 ## 2. 必须保持的不变量
 
@@ -153,4 +154,4 @@ trash 已删除但 marker 尚在。成功后必须通过 v2 Offline Verify，且
    partial promote/retire；staging build、marker-only、Catalog published、old files in trash、trash deleted 五个
    process-exit 恢复点；race、Offline Verify、重复 GC 与物理空间收敛测试。
 
-第一版 Mapping GC 到此闭合。自动触发阈值、后台调度和限速仍属于独立策略层，不改变本协议。
+自动触发只消费精确 survey 的缓存结果，不改变本节的 durable marker、publication 或 recovery 协议。

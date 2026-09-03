@@ -658,6 +658,17 @@ func (v CheckpointView) WalkRefs(ctx context.Context, visit func(model.ID, recor
 	return v.tree.WalkRefs(ctx, visit)
 }
 
+func (v CheckpointView) ReachableBytes(ctx context.Context) (uint64, error) {
+	if v.owner == nil || v.rootOwner == nil || v.tree == nil {
+		return 0, ErrInvalid
+	}
+	if !v.pin() {
+		return 0, ErrStalePlan
+	}
+	defer v.owner.releaseRoot(v.rootOwner)
+	return v.tree.ReachableBytes(ctx)
+}
+
 func (v CheckpointView) pin() bool {
 	v.owner.mu.RLock()
 	defer v.owner.mu.RUnlock()

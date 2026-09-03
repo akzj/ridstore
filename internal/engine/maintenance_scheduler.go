@@ -77,13 +77,15 @@ type maintenanceDone struct {
 // priority, coalescing, cancellation, and resource allocation. Job bodies run
 // outside the actor so a Segment worker may synchronously request a Checkpoint.
 type MaintenanceScheduler struct {
-	submitCh chan maintenanceSubmit
-	cancelCh chan maintenanceCancel
-	doneCh   chan maintenanceDone
-	closeCh  chan struct{}
-	closedCh chan struct{}
-	once     sync.Once
-	leaseID  atomic.Uint64
+	submitCh                                             chan maintenanceSubmit
+	cancelCh                                             chan maintenanceCancel
+	doneCh                                               chan maintenanceDone
+	closeCh                                              chan struct{}
+	closedCh                                             chan struct{}
+	once                                                 sync.Once
+	leaseID                                              atomic.Uint64
+	requested, coalesced, completed, failed, preemptions atomic.Uint64
+	queued, running                                      atomic.Uint64
 }
 
 // acquire grants a phase lease through the same actor used by whole jobs. It
@@ -241,6 +243,8 @@ func (m *MaintenanceScheduler) run() {
 			ctx, cancel := context.WithCancel(context.Background())
 			job.cancel = cancel
 			active[job.id] = job
+			m.queued.Store(uint64(len(pending)))
+			m.running.Store(uint64(len(active)))
 			go func() { m.doneCh <- maintenanceDone{jobID: job.id, err: job.spec.run(ctx)} }()
 		}
 	}
@@ -254,7 +258,11 @@ func (m *MaintenanceScheduler) run() {
 				request.accepted <- base.ErrClosed
 				continue
 			}
+			m.requested.Add(1)
 			job := byKey[request.spec.key]
+			if job != nil {
+				m.coalesced.Add(1)
+			}
 			running := job != nil && active[job.id] != nil
 			if job == nil {
 				nextJobID++
@@ -262,6 +270,7 @@ func (m *MaintenanceScheduler) run() {
 				job = &maintenanceJob{id: nextJobID, sequence: sequence, spec: request.spec, waiters: make(map[uint64]maintenanceWaiter)}
 				byKey[request.spec.key] = job
 				pending = append(pending, job)
+				m.queued.Store(uint64(len(pending)))
 			}
 			if running && request.spec.rerunOnActive {
 				job.rerun = true
@@ -288,6 +297,9 @@ func (m *MaintenanceScheduler) run() {
 			}
 			for _, running := range active {
 				if request.spec.priority > running.spec.priority && running.spec.preemptible && request.spec.resources&running.spec.resources != 0 {
+					if !running.preempted {
+						m.preemptions.Add(1)
+					}
 					running.preempted = true
 					running.cancel()
 				}
@@ -305,6 +317,7 @@ func (m *MaintenanceScheduler) run() {
 					job.cancel()
 				} else {
 					pending = removeMaintenanceJob(pending, job.id)
+					m.queued.Store(uint64(len(pending)))
 					delete(byKey, job.spec.key)
 				}
 			}
@@ -314,6 +327,7 @@ func (m *MaintenanceScheduler) run() {
 				continue
 			}
 			delete(active, job.id)
+			m.running.Store(uint64(len(active)))
 			leased &^= job.spec.resources
 			job.cancel()
 			job.cancel = nil
@@ -346,6 +360,11 @@ func (m *MaintenanceScheduler) run() {
 				finishWaiters(job, done.err)
 				finishWaiters(&maintenanceJob{waiters: job.nextWaiters}, done.err)
 				delete(byKey, job.spec.key)
+				if done.err == nil {
+					m.completed.Add(1)
+				} else {
+					m.failed.Add(1)
+				}
 			}
 			dispatch()
 		case <-m.closeCh:
@@ -356,10 +375,25 @@ func (m *MaintenanceScheduler) run() {
 				delete(byKey, job.spec.key)
 			}
 			pending = nil
+			m.queued.Store(0)
 			for _, job := range active {
 				job.cancel()
 			}
 		}
+	}
+}
+
+type maintenanceSchedulerMetrics struct {
+	requested, coalesced, completed, failed, preemptions, queued, running uint64
+}
+
+func (m *MaintenanceScheduler) metrics() maintenanceSchedulerMetrics {
+	if m == nil {
+		return maintenanceSchedulerMetrics{}
+	}
+	return maintenanceSchedulerMetrics{
+		requested: m.requested.Load(), coalesced: m.coalesced.Load(), completed: m.completed.Load(), failed: m.failed.Load(),
+		preemptions: m.preemptions.Load(), queued: m.queued.Load(), running: m.running.Load(),
 	}
 }
 

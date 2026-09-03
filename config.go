@@ -63,6 +63,20 @@ type RuntimeConfig struct {
 	// and builds its required checkpoint. GCBytesPerSecond bounds copy rate.
 	GCMinFreeBytes   uint64
 	GCBytesPerSecond uint64
+	Maintenance      MaintenanceConfig
+}
+
+// MaintenanceConfig enables periodic Scheduler decisions. Explicit
+// Checkpoint and compaction APIs remain available when it is disabled.
+type MaintenanceConfig struct {
+	Enabled                         bool
+	Interval                        time.Duration
+	DisableSegmentGC                bool
+	DisableMappingGC                bool
+	SegmentPolicy                   CompactionPolicy
+	MappingMinReclaimableBytes      uint64
+	MappingMinReclaimableRatioBasis uint32
+	MappingMinInterval              time.Duration
 }
 
 type CreateConfig struct {
@@ -174,6 +188,29 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 	if c.CheckpointInterval == 0 {
 		c.CheckpointInterval = 30 * time.Second
 	}
+	if c.Maintenance.Enabled {
+		if c.Maintenance.Interval == 0 {
+			c.Maintenance.Interval = 30 * time.Second
+		}
+		if c.Maintenance.SegmentPolicy.MinReclaimableRatioBasis == 0 {
+			c.Maintenance.SegmentPolicy.MinReclaimableRatioBasis = 2_500
+		}
+		if c.Maintenance.SegmentPolicy.MinStableRounds == 0 {
+			c.Maintenance.SegmentPolicy.MinStableRounds = 2
+		}
+		if c.Maintenance.SegmentPolicy.MinSegmentAge == 0 {
+			c.Maintenance.SegmentPolicy.MinSegmentAge = time.Minute
+		}
+		if c.Maintenance.SegmentPolicy.MaxInputSegments == 0 {
+			c.Maintenance.SegmentPolicy.MaxInputSegments = 4
+		}
+		if c.Maintenance.MappingMinReclaimableRatioBasis == 0 {
+			c.Maintenance.MappingMinReclaimableRatioBasis = 5_000
+		}
+		if c.Maintenance.MappingMinInterval == 0 {
+			c.Maintenance.MappingMinInterval = 10 * time.Minute
+		}
+	}
 	return engine.OpenConfig{
 		RecordLog:         recordlog.Config{MaxQueuedBytes: c.MaxQueuedBytes, QueueCapacity: c.AppendQueueCapacity, BufferBytes: c.AppendBufferBytes, BufferRecords: c.AppendBufferRecords},
 		Commit:            coordinator.Config{QueueCapacity: c.CommitQueueCapacity, MaxGroupBatches: c.MaxGroupBatches, MaxGroupPayload: c.MaxGroupPayload, GroupCommitDelay: c.GroupCommitDelay},
@@ -184,5 +221,18 @@ func (c RuntimeConfig) engineConfig() engine.OpenConfig {
 		CheckpointInterval: c.CheckpointInterval,
 		GCBatchBytes:       c.GCBatchBytes, GCBatchMutations: c.GCBatchMutations,
 		GCMinFreeBytes: c.GCMinFreeBytes, GCBytesPerSecond: c.GCBytesPerSecond,
+		Maintenance: engine.MaintenanceConfig{
+			Enabled: c.Maintenance.Enabled, Interval: c.Maintenance.Interval,
+			DisableSegmentGC: c.Maintenance.DisableSegmentGC, DisableMappingGC: c.Maintenance.DisableMappingGC,
+			SegmentPolicy: engine.CompactionPolicy{
+				MinReclaimableBytes: c.Maintenance.SegmentPolicy.MinReclaimableBytes, MinReclaimableRatioBasis: c.Maintenance.SegmentPolicy.MinReclaimableRatioBasis,
+				MinStableRounds: c.Maintenance.SegmentPolicy.MinStableRounds, MaxDeathBytesPerCommit: c.Maintenance.SegmentPolicy.MaxDeathBytesPerCommit,
+				MaxDeathBytesPerSecond: c.Maintenance.SegmentPolicy.MaxDeathBytesPerSecond, MinSegmentAge: c.Maintenance.SegmentPolicy.MinSegmentAge,
+				MaxInputSegments: c.Maintenance.SegmentPolicy.MaxInputSegments, BypassCooldown: c.Maintenance.SegmentPolicy.BypassCooldown,
+			},
+			MappingMinReclaimableBytes:      c.Maintenance.MappingMinReclaimableBytes,
+			MappingMinReclaimableRatioBasis: c.Maintenance.MappingMinReclaimableRatioBasis,
+			MappingMinInterval:              c.Maintenance.MappingMinInterval,
+		},
 	}
 }
