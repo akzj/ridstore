@@ -749,31 +749,36 @@ func TestConcurrentCommitCheckpointAndClose(t *testing.T) {
 	}
 
 	start := make(chan struct{})
-	errorsByOperation := make(chan error, 3)
+	type operationError struct {
+		name string
+		err  error
+	}
+	errorsByOperation := make(chan operationError, 3)
 	var workers sync.WaitGroup
 	workers.Add(3)
 	go func() {
 		defer workers.Done()
 		<-start
 		_, err := batch.Commit(context.Background())
-		errorsByOperation <- err
+		errorsByOperation <- operationError{name: "commit", err: err}
 	}()
 	go func() {
 		defer workers.Done()
 		<-start
-		errorsByOperation <- store.Checkpoint(context.Background())
+		errorsByOperation <- operationError{name: "checkpoint", err: store.Checkpoint(context.Background())}
 	}()
 	go func() {
 		defer workers.Done()
 		<-start
-		errorsByOperation <- store.Close()
+		errorsByOperation <- operationError{name: "close", err: store.Close()}
 	}()
 	close(start)
 	workers.Wait()
 	close(errorsByOperation)
-	for err := range errorsByOperation {
-		if err != nil && !errors.Is(err, base.ErrClosed) && !errors.Is(err, base.ErrBatchClosed) {
-			t.Fatalf("concurrent operation err=%v", err)
+	for result := range errorsByOperation {
+		if result.err != nil && !errors.Is(result.err, context.Canceled) &&
+			!errors.Is(result.err, base.ErrClosed) && !errors.Is(result.err, base.ErrBatchClosed) {
+			t.Fatalf("concurrent %s err=%v", result.name, result.err)
 		}
 	}
 }

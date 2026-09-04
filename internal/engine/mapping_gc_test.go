@@ -149,6 +149,71 @@ func TestCompactMappingPromotesGenerationOutsideCaptureLock(t *testing.T) {
 	}
 }
 
+func TestCompactMappingPreemptionRollsBackAndRestarts(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "store")
+	config := testCreateConfig()
+	created, err := Create(ctx, root, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := createMappingGCRecord(t, ctx, created, "preemption-safe")
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	promoteEntered := make(chan struct{})
+	releasePromote := make(chan struct{})
+	var blocked atomic.Bool
+	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+		if point == mapstore.FaultBeforeGCPromoteSync && blocked.CompareAndSwap(false, true) {
+			close(promoteEntered)
+			<-releasePromote
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- store.CompactMapping(ctx) }()
+	<-promoteEntered
+	checkpointDone := make(chan error, 1)
+	go func() { checkpointDone <- store.Checkpoint(ctx) }()
+
+	deadline := time.Now().Add(time.Second)
+	preempted := false
+	for store.Metrics().MaintenancePreemptions == 0 {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	preempted = store.Metrics().MaintenancePreemptions != 0
+	close(releasePromote)
+	if err := <-checkpointDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-compactDone; err != nil {
+		t.Fatal(err)
+	}
+	if !preempted {
+		t.Fatal("Checkpoint did not preempt Mapping generation promotion")
+	}
+	if _, found, err := mapgcstate.Load(root); err != nil || found {
+		t.Fatalf("marker found=%v err=%v", found, err)
+	}
+	if _, err := os.Stat(mapgcstate.StagingRoot(root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging remains: %v", err)
+	}
+	record, err := store.Get(ctx, id)
+	if err != nil || string(record.Value) != "preemption-safe" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
 func TestCompactMappingSpaceAdmissionRejectsBeforeStaging(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "store")

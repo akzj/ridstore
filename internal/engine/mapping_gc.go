@@ -212,11 +212,17 @@ func (s *Store) prepareMappingGC(ctx context.Context) (work *mappingGCWork, err 
 	return work, nil
 }
 
-func (s *Store) publishMappingGC(work *mappingGCWork) (err error) {
+func (s *Store) publishMappingGC(ctx context.Context, work *mappingGCWork) (err error) {
 	if work == nil {
 		return base.ErrInvalidConfig
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fail := func(cause error) error { work.space.complete(false); return cause }
+	if err := ctx.Err(); err != nil {
+		return fail(s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root)))
+	}
 	oldSet := mappingGCFileSet(work.manifest.SealedMapSegments, work.manifest.ActiveMapSegmentID, work.manifest.NextMapSegmentID, work.manifest.MappingRoot)
 	rollback := func() error {
 		cleanup := mapstore.RollbackGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook)
@@ -241,7 +247,13 @@ func (s *Store) publishMappingGC(work *mappingGCWork) (err error) {
 		}
 		return fail(s.mappingGCPrepublishFailure(err, cleanup))
 	}
+	if err := ctx.Err(); err != nil {
+		return fail(s.mappingGCPrepublishFailure(err, rollback()))
+	}
 	if err := mapstore.PromoteGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook); err != nil {
+		return fail(s.mappingGCPrepublishFailure(err, rollback()))
+	}
+	if err := ctx.Err(); err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, rollback()))
 	}
 

@@ -347,7 +347,7 @@ func (w *mappingGCMaintenanceWorker) Run(ctx context.Context, phase maintenanceP
 		}
 		return maintenanceTransition{next: maintenancePhasePublish, retain: maintenanceRecoveryProtocol}
 	case maintenancePhasePublish:
-		if err := w.store.publishMappingGC(w.work); err != nil {
+		if err := w.store.publishMappingGC(ctx, w.work); err != nil {
 			if w.request.automatic && !expectedAutomaticMaintenanceError(err) {
 				w.store.metrics.maintenanceAutomaticFailed.Add(1)
 			}
