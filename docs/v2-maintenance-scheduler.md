@@ -55,6 +55,11 @@ Checkpoint: doing so can delay the operation that releases their own
 dependency. Automatic Checkpoint, Segment GC, Mapping GC, and survey requests
 use stable coalescing keys, so timer bursts do not grow the queue.
 
+Preemption cancels the running Mapping phase and restarts a fresh worker at
+`Start`; it never resumes the canceled phase with private work that cleanup may
+already have discarded. Joined cancellation plus cleanup failure is terminal,
+not a successful preemption restart.
+
 Explicit Segment requests are intentionally independent and remain attached to
 caller contexts; cancellation removes their waiter and cancels otherwise
 unowned work. The Scheduler currently does not impose a second arbitrary queue

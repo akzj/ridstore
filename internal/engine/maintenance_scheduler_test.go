@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -309,9 +310,72 @@ func TestCheckpointConflictRetryDelayIsCapped(t *testing.T) {
 	}
 }
 
-func TestCheckpointConflictIncludesTransientMappingStaleness(t *testing.T) {
-	if !checkpointConflict(mapping.ErrStalePlan) {
-		t.Fatal("Mapping stale plan must be retried by the checkpoint worker")
+func TestCheckpointConflictRequiresExplicitRetryClassification(t *testing.T) {
+	if checkpointConflict(mapping.ErrStalePlan) {
+		t.Fatal("unclassified Mapping staleness must not be retried")
+	}
+	if checkpointConflict(errors.Join(base.ErrReadOnly, mapping.ErrStalePlan)) {
+		t.Fatal("post-publication Mapping staleness must remain terminal")
+	}
+	if !checkpointConflict(retryCheckpointConflict(mapping.ErrStalePlan)) {
+		t.Fatal("explicitly classified Mapping staleness must be retried")
+	}
+}
+
+func TestMaintenanceSchedulerPreemptionRestartsWorkerAtStart(t *testing.T) {
+	publishStarted := make(chan struct{})
+	restarted := make(chan maintenancePhase, 1)
+	var initialStart atomic.Bool
+	factory := fakeMaintenanceFactory{newWorker: func(request maintenanceRequest) maintenanceWorker {
+		if request.kind == maintenanceCheckpointRequest {
+			return &fakeMaintenanceWorker{
+				resources: func(maintenancePhase) maintenanceResource { return maintenanceMappingWriter },
+				run: func(context.Context, maintenancePhase, maintenanceResult) maintenanceTransition {
+					return maintenanceTransition{done: true}
+				},
+			}
+		}
+		return &fakeMaintenanceWorker{
+			resources: func(maintenancePhase) maintenanceResource { return maintenanceMappingWriter },
+			run: func(ctx context.Context, phase maintenancePhase, _ maintenanceResult) maintenanceTransition {
+				if phase == maintenancePhaseStart && initialStart.CompareAndSwap(false, true) {
+					return maintenanceTransition{next: maintenancePhasePublish}
+				}
+				if phase == maintenancePhaseStart {
+					restarted <- phase
+					return maintenanceTransition{done: true}
+				}
+				close(publishStarted)
+				<-ctx.Done()
+				return maintenanceTransition{done: true, err: ctx.Err()}
+			},
+		}
+	}}
+	scheduler := newMaintenanceScheduler(context.Background(), factory)
+	defer scheduler.Close()
+	if err := scheduler.SubmitBackground(maintenanceRequest{kind: maintenanceMappingGCRequest}); err != nil {
+		t.Fatal(err)
+	}
+	<-publishStarted
+	if _, err := scheduler.Submit(context.Background(), maintenanceRequest{kind: maintenanceCheckpointRequest}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case phase := <-restarted:
+		if phase != maintenancePhaseStart {
+			t.Fatalf("restarted phase=%v want start", phase)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("preempted Mapping worker was not restarted")
+	}
+}
+
+func TestOnlyContextCanceledRejectsJoinedCleanupFailure(t *testing.T) {
+	if !onlyContextCanceled(fmt.Errorf("worker stopped: %w", context.Canceled)) {
+		t.Fatal("wrapped cancellation was not recognized")
+	}
+	if onlyContextCanceled(errors.Join(context.Canceled, errors.New("cleanup failed"))) {
+		t.Fatal("cleanup failure was mistaken for pure cancellation")
 	}
 }
 

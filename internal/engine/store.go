@@ -480,6 +480,9 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 	updateAtomicMax(&s.metrics.checkpointMaxCaptureNanos, captureDuration)
 	s.checkpoints.captureMu.Unlock()
 	if err != nil {
+		if errors.Is(err, base.ErrConflict) || errors.Is(err, mapping.ErrStalePlan) {
+			return retryCheckpointConflict(err)
+		}
 		return err
 	}
 	var reservation *spaceReservation
@@ -574,7 +577,11 @@ func (s *Store) finishCheckpoint(ctx context.Context, work checkpointWork) error
 		}
 	}()
 	abort := func(cause error) error {
-		return errors.Join(cause, s.core.mapping.AbortCheckpoint(frozen))
+		abortErr := s.core.mapping.AbortCheckpoint(frozen)
+		if abortErr == nil && (errors.Is(cause, base.ErrConflict) || errors.Is(cause, mapping.ErrStalePlan) || errors.Is(cause, storecatalog.ErrConflict)) {
+			return retryCheckpointConflict(cause)
+		}
+		return errors.Join(cause, abortErr)
 	}
 	candidate, err := s.core.mapping.BuildCheckpoint(frozen)
 	if err != nil {

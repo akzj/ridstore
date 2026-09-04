@@ -549,8 +549,22 @@ func (m *MaintenanceScheduler) run() {
 			leased &^= job.held &^ transition.retain
 			job.held = transition.retain
 			leased |= job.held
-			if job.preempted && errors.Is(transition.err, context.Canceled) && !closing {
+			if job.preempted && onlyContextCanceled(transition.err) && !closing {
 				job.preempted = false
+				worker, workerErr := m.factory.NewMaintenanceWorker(job.request)
+				if workerErr != nil {
+					complete(job, maintenanceCompletion{err: workerErr})
+					removeJob(job)
+					dispatch()
+					continue
+				}
+				// Preemption is a restart boundary, not a phase retry. A phase may
+				// have rolled back or discarded its private work before returning
+				// context.Canceled, so resuming the same worker and phase can reuse
+				// invalid state.
+				job.worker = worker
+				job.phase = maintenancePhaseStart
+				job.dependencyResult = maintenanceResult{}
 				sequence++
 				job.sequence = sequence
 				queueJob(job)
@@ -720,6 +734,30 @@ func validateMaintenanceTransition(transition maintenanceTransition, owned maint
 		}
 	}
 	return nil
+}
+
+func onlyContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if joined, ok := err.(multiUnwrapper); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !onlyContextCanceled(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	type unwrapper interface{ Unwrap() error }
+	if wrapped, ok := err.(unwrapper); ok {
+		return onlyContextCanceled(wrapped.Unwrap())
+	}
+	return err == context.Canceled
 }
 
 func removeMaintenanceJob(jobs []*maintenanceJob, id uint64) []*maintenanceJob {

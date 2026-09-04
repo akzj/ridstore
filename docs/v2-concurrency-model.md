@@ -67,9 +67,9 @@ MapStore close and retirement wait on the returned reader-drain channel outside 
 
 Checkpoint COW construction is optimistic. If Data maintenance or Mapping rewrite advances an incompatible Catalog
 dimension before publication, the worker aborts the frozen plan, releases `mappingWriter`, and lets the Scheduler retry
-with exponential backoff capped at 64ms until success or caller/lifecycle cancellation. Generation conflicts are scheduling events and never enter the fail-closed path;
-transient Mapping plan staleness during capture follows the same retry path. Non-conflict publication failures retain the
-existing fail-closed semantics. Mapping GC similarly holds the capture lock through
+with exponential backoff capped at 64ms until success or caller/lifecycle cancellation. Only explicitly classified
+pre-publication conflicts take this path; Mapping installation failures after durable Catalog publication remain
+fail-closed. Mapping GC similarly holds the capture lock through
 durable Catalog publication and the runtime Root/MapStore switch, then releases it before waiting for old readers and
 retiring the old generation.
 

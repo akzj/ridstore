@@ -184,14 +184,35 @@ func (s *Store) prepareMappingGC(ctx context.Context) (work *mappingGCWork, err 
 	if err != nil {
 		return cleanupWriter(err)
 	}
-	s.metrics.mappingGCVerifyNanos.Add(uint64(time.Since(verifyStarted)))
 	if err = writer.Close(); err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root)))
 	}
+	staged := snapshotFromState(work.manifest.Generation, [16]byte(work.manifest.StoreUUID), uint32(work.manifest.HardLimits.SegmentSize),
+		work.generation.Covered, mapgcstate.FileSet{Sealed: work.generation.SealedSegments, Active: work.generation.ActiveSegment,
+			Next: work.generation.NextSegment, Root: work.generation.Root})
+	reader, report, err := mapstore.OpenVerifiedGeneration(ctx, work.staging, staged)
+	if err == nil {
+		var tree *radix.Tree
+		tree, err = radix.OpenReadOnly(reader, work.generation.Root, work.generation.Covered, s.maintenance.mappingCacheBytes)
+		if err == nil {
+			err = tree.Walk(ctx, func(model.ID, recordlog.VAddr) error { return nil })
+		}
+	}
+	if reader != nil {
+		err = errors.Join(err, reader.Close())
+	}
+	s.metrics.mappingGCVerifyNanos.Add(uint64(time.Since(verifyStarted)))
+	if err != nil || work.reachable > report.PhysicalBytes {
+		if err == nil {
+			err = base.ErrCorrupt
+		}
+		return fail(s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root)))
+	}
+	work.physical = report.PhysicalBytes
 	return work, nil
 }
 
-func (s *Store) publishMappingGC(ctx context.Context, work *mappingGCWork) (err error) {
+func (s *Store) publishMappingGC(work *mappingGCWork) (err error) {
 	if work == nil {
 		return base.ErrInvalidConfig
 	}
@@ -223,27 +244,6 @@ func (s *Store) publishMappingGC(ctx context.Context, work *mappingGCWork) (err 
 	if err := mapstore.PromoteGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook); err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, rollback()))
 	}
-	preflightStarted := time.Now()
-	snapshot := snapshotFromState(work.state.BaseGeneration, work.state.StoreID, work.state.SegmentSize, work.state.Covered, work.state.New)
-	reader, report, err := mapstore.OpenVerifiedGeneration(ctx, s.core.root, snapshot)
-	if err == nil {
-		var tree *radix.Tree
-		tree, err = radix.OpenReadOnly(reader, work.generation.Root, work.generation.Covered, s.maintenance.mappingCacheBytes)
-		if err == nil {
-			err = tree.Walk(ctx, func(model.ID, recordlog.VAddr) error { return nil })
-		}
-	}
-	if reader != nil {
-		err = errors.Join(err, reader.Close())
-	}
-	s.metrics.mappingGCVerifyNanos.Add(uint64(time.Since(preflightStarted)))
-	if err != nil || work.reachable > report.PhysicalBytes {
-		if err == nil {
-			err = base.ErrCorrupt
-		}
-		return fail(s.mappingGCPrepublishFailure(err, rollback()))
-	}
-	work.physical = report.PhysicalBytes
 
 	publisherCalled := false
 	commitErr := func() error {

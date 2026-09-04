@@ -47,8 +47,9 @@ Maintenance Scheduler 合并同类 Mapping GC 请求，并按阶段分配 `heavy
 元数据并冻结 Delta；正常 Checkpoint 在允许新 Commit 进入下一层 active Delta 的情况下安装 immutable Root。
 全量 Root 遍历、generation 构建和校验均不持有 admission fence 或 checkpoint capture lock。
 
-最终阶段先在 `mappingWriter + recoveryProtocol` 资源保护下、capture lock 外安装 recovery marker、提升并
-完整验证新 generation；随后只在 capture lock 内重新校验计划、durable publish Catalog，并连续切换运行时
+Copy 阶段在 staging 内完成完整物理与 Radix preflight，不占用 `mappingWriter`；最终阶段在
+`mappingWriter + recoveryProtocol` 资源保护下安装 recovery marker、提升已验证 generation，随后只在
+capture lock 内重新校验计划、durable publish Catalog，并连续切换运行时
 Root 与 MapStore owner。Catalog 可见与 runtime owner switch 之间不得释放 capture lock。完成这两个可见性
 切面后立即释放锁；旧 reader drain、旧 Store close、旧 generation retire、staging/marker cleanup 均在锁外
 执行。marker 恢复协议允许 cleanup 期间新的 Checkpoint 推进 Catalog generation，但 Mapping file-set 必须
@@ -56,9 +57,9 @@ Root 与 MapStore owner。Catalog 可见与 runtime owner switch 之间不得释
 
 重建期间的新 Commit 留在 active Delta。GC 发布物理等价的新 Root 时不再暂停 Commit；Mapping epoch
 使跨切换的 resolve 重试，Root owner reader ref 使旧文件延迟到旧 reader 清零后关闭。这样
-O(live IDs) 遍历、promotion、Manifest fsync 和旧文件 retirement 都不会形成 Store 级数据面停顿；其中只有
-Manifest fsync、Root 打开与 runtime owner switch 会短暂推迟另一轮 Checkpoint capture，promotion、完整
-generation preflight、reader drain 与 retirement 不会。
+O(live IDs) 遍历、完整 generation preflight 和旧文件 retirement 都不会形成 Store 级数据面停顿；其中只有
+marker/promotion、Manifest fsync、Root 打开与 runtime owner switch 会短暂占用 `mappingWriter`，reader drain
+与 retirement 不会。
 
 ## 4. 有界全量重建
 
