@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
@@ -54,7 +55,7 @@ func (w *checkpointMaintenanceWorker) Run(ctx context.Context, _ maintenancePhas
 }
 
 func checkpointConflict(err error) bool {
-	return errors.Is(err, base.ErrConflict) || errors.Is(err, storecatalog.ErrConflict)
+	return errors.Is(err, base.ErrConflict) || errors.Is(err, mapping.ErrStalePlan) || errors.Is(err, storecatalog.ErrConflict)
 }
 
 func checkpointConflictRetryDelay(attempt uint8) time.Duration {

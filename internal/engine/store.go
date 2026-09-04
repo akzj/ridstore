@@ -461,7 +461,7 @@ func (s *Store) executeCheckpoint(ctx context.Context, gcAdmission bool) (err er
 	var work checkpointWork
 	for captureAttempts := 0; ; captureAttempts++ {
 		work, err = s.prepareCheckpoint(ctx)
-		if errors.Is(err, base.ErrConflict) {
+		if errors.Is(err, base.ErrConflict) || errors.Is(err, mapping.ErrStalePlan) {
 			s.metrics.checkpointCaptureConflicts.Add(1)
 		}
 		if !errors.Is(err, base.ErrConflict) || captureAttempts >= 8 {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/mapping"
 )
 
 type fakeMaintenanceFactory struct {
@@ -305,6 +306,12 @@ func TestCheckpointConflictRetryDelayIsCapped(t *testing.T) {
 		if got := checkpointConflictRetryDelay(test.attempt); got != test.want {
 			t.Fatalf("attempt=%d delay=%v want=%v", test.attempt, got, test.want)
 		}
+	}
+}
+
+func TestCheckpointConflictIncludesTransientMappingStaleness(t *testing.T) {
+	if !checkpointConflict(mapping.ErrStalePlan) {
+		t.Fatal("Mapping stale plan must be retried by the checkpoint worker")
 	}
 }
 
