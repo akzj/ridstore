@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/akzj/ridstore/internal/dirsync"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
@@ -338,7 +339,7 @@ func syncDir(path string) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(dirsync.Flush(dir), dir.Close())
 }
 
 func allZero(src []byte) bool {

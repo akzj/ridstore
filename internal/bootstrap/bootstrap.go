@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/dirsync"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -336,7 +337,7 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(dirsync.Flush(dir), dir.Close())
 }
 
 func hit(hook FaultHook, point FaultPoint) error {

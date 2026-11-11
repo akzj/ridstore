@@ -1,3 +1,20 @@
+// Package filelock implements the writer lease that guards one ridstore
+// directory.
+//
+// Exactly one process may hold the lease at a time. The lease lives in the
+// kernel, not in the LOCK file's contents, so a crashed writer cannot leave the
+// store permanently locked: the operating system releases the lease when the
+// holding process exits, including after a hard kill.
+//
+// This file holds the platform-neutral checks and the Lock type. How a lease is
+// opened and taken lives in filelock_unix.go and filelock_windows.go; both
+// implementations must preserve the same observable semantics:
+//
+//   - the store directory must be a real directory, not a symlink;
+//   - LOCK must be a regular file reached without following a symlink, so a
+//     symlinked or otherwise non-regular LOCK reports base.ErrCorrupt;
+//   - the lease is exclusive and non-blocking, so losing the race reports
+//     base.ErrLocked instead of waiting for the holder.
 package filelock
 
 import (
@@ -6,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 
 	"github.com/akzj/ridstore/internal/base"
 )
@@ -21,18 +37,19 @@ type Lock struct {
 	closed bool
 }
 
+// Acquire takes the writer lease, creating LOCK when it is missing.
 func Acquire(dir string) (*Lock, error) {
-	return acquire(dir, syscall.O_RDWR|syscall.O_CREAT)
+	return acquire(dir, true)
 }
 
 // AcquireExisting obtains the writer lease without creating or opening LOCK
 // for writing. Offline read-only tools use it so a malformed store missing
 // LOCK remains byte-for-byte unchanged.
 func AcquireExisting(dir string) (*Lock, error) {
-	return acquire(dir, syscall.O_RDONLY)
+	return acquire(dir, false)
 }
 
-func acquire(dir string, accessFlags int) (*Lock, error) {
+func acquire(dir string, create bool) (*Lock, error) {
 	info, err := os.Lstat(dir)
 	if err != nil {
 		return nil, err
@@ -40,33 +57,8 @@ func acquire(dir string, accessFlags int) (*Lock, error) {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("ridstore directory is not a real directory: %s: %w", dir, base.ErrInvalidConfig)
 	}
-	path := filepath.Join(dir, FileName)
-	fd, err := syscall.Open(path, accessFlags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	file, err := openLockFile(filepath.Join(dir, FileName), create)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("LOCK must not be a symlink: %w", base.ErrCorrupt)
-		}
-		return nil, err
-	}
-	file := os.NewFile(uintptr(fd), path)
-	if file == nil {
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("open LOCK file")
-	}
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(fd, &stat); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
-		_ = file.Close()
-		return nil, fmt.Errorf("LOCK is not a regular file: %w", base.ErrCorrupt)
-	}
-	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = file.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, base.ErrLocked
-		}
 		return nil, err
 	}
 	return &Lock{file: file}, nil
@@ -82,7 +74,8 @@ func (l *Lock) Close() error {
 		return nil
 	}
 	l.closed = true
-	unlockErr := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	unlockErr := unlockFile(l.file)
 	closeErr := l.file.Close()
+	l.file = nil
 	return errors.Join(unlockErr, closeErr)
 }

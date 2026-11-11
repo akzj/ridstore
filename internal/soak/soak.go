@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/akzj/ridstore"
@@ -30,6 +29,15 @@ type Options struct {
 	MaintenanceBatches                      uint64
 	LiveRecords, BatchMutations, ValueBytes int
 	Seed, SegmentSize                       int64
+}
+
+// fsIdentity describes the filesystem backing a soak run, recorded so a later
+// reader can tell two runs apart by where they actually wrote. It is filled by
+// measure_unix.go; platforms without POSIX statfs report ErrUnsupported.
+type fsIdentity struct {
+	Type      int64
+	BlockSize int64
+	Device    int64
 }
 
 type Start struct {
@@ -477,24 +485,16 @@ func fileState(root string) (result fileStateSample, resultErr error) {
 
 func startRecord(opts Options, started time.Time) (Start, error) {
 	parent := filepath.Dir(opts.Dir)
-	var fs syscall.Statfs_t
-	if err := syscall.Statfs(parent, &fs); err != nil {
-		return Start{}, err
-	}
-	info, err := os.Stat(parent)
+	fs, err := filesystemStat(parent)
 	if err != nil {
 		return Start{}, err
-	}
-	var device int64
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		device = int64(stat.Dev)
 	}
 	kernel, err := os.ReadFile("/proc/sys/kernel/osrelease")
 	kernelRelease := runtime.GOOS
 	if err == nil {
 		kernelRelease = strings.TrimSpace(string(kernel))
 	}
-	return Start{Type: "start", StartedAt: started, GitCommit: opts.GitCommit, GitDirty: opts.GitDirty, GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, KernelRelease: kernelRelease, FilesystemType: int64(fs.Type), FilesystemBlockSize: int64(fs.Bsize), Device: device, DurationNanos: int64(opts.Duration), SampleIntervalNanos: int64(opts.SampleInterval), MaintenanceIntervalNanos: int64(opts.MaintenanceInterval), MaintenanceBatches: opts.MaintenanceBatches, LiveRecords: opts.LiveRecords, BatchMutations: opts.BatchMutations, ValueBytes: opts.ValueBytes, Seed: opts.Seed, SegmentSize: opts.SegmentSize}, nil
+	return Start{Type: "start", StartedAt: started, GitCommit: opts.GitCommit, GitDirty: opts.GitDirty, GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, KernelRelease: kernelRelease, FilesystemType: fs.Type, FilesystemBlockSize: fs.BlockSize, Device: fs.Device, DurationNanos: int64(opts.Duration), SampleIntervalNanos: int64(opts.SampleInterval), MaintenanceIntervalNanos: int64(opts.MaintenanceInterval), MaintenanceBatches: opts.MaintenanceBatches, LiveRecords: opts.LiveRecords, BatchMutations: opts.BatchMutations, ValueBytes: opts.ValueBytes, Seed: opts.Seed, SegmentSize: opts.SegmentSize}, nil
 }
 
 func diskUsage(root string) (logical, allocated uint64, resultErr error) {
@@ -510,34 +510,10 @@ func diskUsage(root string) (logical, allocated uint64, resultErr error) {
 			return err
 		}
 		logical += uint64(info.Size())
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			allocated += uint64(stat.Blocks) * 512
+		if size, ok := allocatedFor(info); ok {
+			allocated += size
 		}
 		return nil
 	})
 	return logical, allocated, err
-}
-
-func countFDs() int {
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return -1
-	}
-	return len(entries)
-}
-
-func rssBytes() uint64 {
-	data, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return 0
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		return 0
-	}
-	pages, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0
-	}
-	return pages * uint64(os.Getpagesize())
 }

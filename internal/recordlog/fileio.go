@@ -5,6 +5,9 @@ import (
 	"io"
 	"io/fs"
 	"os"
+
+	"github.com/akzj/ridstore/internal/dirsync"
+	"github.com/akzj/ridstore/internal/fileutil"
 )
 
 // fileHandle and fileBackend keep fault injection below the RecordLog API.
@@ -32,9 +35,9 @@ type fileBackend interface {
 
 type osFileBackend struct{}
 
-func (osFileBackend) open(name string) (fileHandle, error) { return os.Open(name) }
+func (osFileBackend) open(name string) (fileHandle, error) { return fileutil.Open(name) }
 func (osFileBackend) openFile(name string, flag int, mode fs.FileMode) (fileHandle, error) {
-	return os.OpenFile(name, flag, mode)
+	return fileutil.OpenFile(name, flag, mode)
 }
 func (osFileBackend) mkdir(name string, mode fs.FileMode) error { return os.Mkdir(name, mode) }
 func (osFileBackend) stat(name string) (fs.FileInfo, error)     { return os.Stat(name) }
@@ -46,7 +49,7 @@ func (b osFileBackend) syncDir(path string) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(dirsync.Flush(dir), dir.Close())
 }
 
 func writeFullAt(writer io.WriterAt, value []byte, offset int64) (int, error) {

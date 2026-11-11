@@ -494,7 +494,7 @@ func TestRetireFaultAfterCatalogRemovalPoisonsLog(t *testing.T) {
 func TestCleanupRetiredSegmentRejectsSymlinkTrashDirectory(t *testing.T) {
 	root := prepareSealedRetirementFile(t)
 	if err := os.Symlink("records", filepath.Join(root, "trash")); err != nil {
-		t.Fatal(err)
+		t.Skipf("host cannot create symlinks (needs SeCreateSymbolicLinkPrivilege or Developer Mode): %v", err)
 	}
 	if err := CleanupRetiredSegment(root, 1, 9); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("cleanup err=%v", err)

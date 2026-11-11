@@ -219,9 +219,12 @@ Linux 上根包公开 `Backup(ctx, BackupConfig)` 和 `Restore(ctx, RestoreConfi
 Manifest、其引用的 RecordLog/Mapping 文件和带 CRC 的 `BACKUP-v2` 元数据。
 
 Restore 只接受严格白名单、size/SHA-256 全匹配且可通过 v2 Exact Verify 的 artifact，并通过同父目录
-`RENAME_NOREPLACE` 原子发布到不存在的目标。两者的 verification budget 可显式配置，零值使用 Verify
-默认值。Restore 按字节保留 StoreUUID/RecordLogID，因此是灾难恢复而不是 Clone；原目录和任一恢复目录
-不得同时作为 writer。非 Linux 平台在无法提供原子 no-replace directory rename 时返回 `ErrUnsupported`。
+原子 no-replace rename 发布到不存在的目标：Linux 使用 `renameat2(RENAME_NOREPLACE)`，macOS 使用
+`renamex_np(RENAME_EXCL)`，Windows 使用不带 `MOVEFILE_REPLACE_EXISTING` 的 `MoveFileEx`。artifact 内的
+路径是始终以 `/` 分隔的归档路径，不随创建或读取它的平台变化。两者的 verification budget 可显式配置，
+零值使用 Verify 默认值。Restore 按字节保留 StoreUUID/RecordLogID，因此是灾难恢复而不是 Clone；原目录
+和任一恢复目录不得同时作为 writer。没有原子 no-replace directory rename 原语的平台返回 `ErrUnsupported`，
+不会退化成 check-then-rename。
 
 ## 15. 生命周期与关闭
 

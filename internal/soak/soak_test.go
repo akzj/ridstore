@@ -15,6 +15,9 @@ import (
 func TestShortRunValidatesHarnessWithoutClaimingLongSoak(t *testing.T) {
 	var output bytes.Buffer
 	summary, err := Run(context.Background(), testOptions(t), &output)
+	if errors.Is(err, ridstore.ErrUnsupported) {
+		t.Skipf("soak harness is a POSIX measurement tool and refuses to start here: %v", err)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +60,9 @@ func TestCanceledRunClosesStoreAndLeavesExactEvidence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
 	defer cancel()
 	_, err := Run(ctx, opts, &output)
+	if errors.Is(err, ridstore.ErrUnsupported) {
+		t.Skipf("soak harness is a POSIX measurement tool and refuses to start here: %v", err)
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v", err)
 	}

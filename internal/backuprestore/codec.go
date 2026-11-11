@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
-	"path/filepath"
+	"path"
 	"sort"
 	"strings"
 )
@@ -139,7 +139,12 @@ func DecodeMetadata(encoded []byte) (Metadata, error) {
 	return metadata, nil
 }
 
-func validRelativePath(path string) bool {
-	return path != "" && path != "." && !filepath.IsAbs(path) && filepath.Clean(path) == path &&
-		!strings.HasPrefix(path, ".."+string(filepath.Separator)) && !strings.Contains(path, "\\") && !strings.ContainsRune(path, 0)
+// validRelativePath validates an artifact path. Paths inside a backup artifact
+// are archive paths, not host paths: they always use "/" regardless of the
+// platform the artifact is created or read on, so they are checked with the
+// slash-based path package rather than with filepath (whose Clean would rewrite
+// "records/x" into "records\x" on Windows).
+func validRelativePath(p string) bool {
+	return p != "" && p != "." && !path.IsAbs(p) && path.Clean(p) == p &&
+		!strings.HasPrefix(p, "../") && !strings.Contains(p, "\\") && !strings.ContainsRune(p, 0)
 }

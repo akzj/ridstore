@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/akzj/ridstore/internal/fileutil"
 	"github.com/akzj/ridstore/internal/model"
 )
 
@@ -111,7 +112,7 @@ func resumeSeal(root string, header SegmentHeader, rootAddr model.MapAddr, summa
 	if !activeExists {
 		return nil, errors.Join(ErrCorrupt, activeErr, sealedErr)
 	}
-	file, err := os.OpenFile(activePath, os.O_RDWR, 0)
+	file, err := fileutil.OpenFile(activePath, os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +206,7 @@ func createActive(root string, header SegmentHeader, hook FaultHook) (*segmentFi
 	}
 	creatingPath := filepath.Join(dir, creatingName(header.SegmentID))
 	activePath := filepath.Join(dir, activeName(header.SegmentID))
-	file, err := os.OpenFile(creatingPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	file, err := fileutil.OpenFile(creatingPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}

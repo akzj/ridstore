@@ -215,7 +215,7 @@ func TestPublicRestoreRejectsIncompleteAndSymlinkArtifacts(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := os.Symlink(filepath.Join(config.Dir, "records", filepath.Base(files[0])), files[0]); err != nil {
-					t.Fatal(err)
+					t.Skipf("host cannot create symlinks (needs SeCreateSymbolicLinkPrivilege or Developer Mode): %v", err)
 				}
 			}
 			destination := filepath.Join(root, "restored")

@@ -934,7 +934,12 @@ func TestMetricsObserveUserCommitPipelineAndConflict(t *testing.T) {
 	if metrics.CommitQueued != 2 || metrics.CommitGroups != 1 || metrics.GroupBatches != 1 || metrics.Conflicts != 1 {
 		t.Fatalf("metrics=%+v", metrics)
 	}
+	// Windows' monotonic clock advances in steps (typically 100ns), so a stage
+	// that finishes faster than one tick legitimately reports zero. Only
+	// require non-zero stage durations when the host clock can resolve them.
 	if metrics.QueueWaitNanos == 0 || metrics.ValidationNanos == 0 || metrics.WriteSyncNanos == 0 || metrics.PublishNanos == 0 {
-		t.Fatalf("missing duration metrics: %+v", metrics)
+		if step := clockStep(); step <= time.Nanosecond {
+			t.Fatalf("missing duration metrics (clock step %v): %+v", step, metrics)
+		}
 	}
 }

@@ -248,9 +248,15 @@ func TestMaintenanceSchedulerRecordsPhaseTimingAndRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := scheduler.metrics()
-	if metrics.retries != 1 || metrics.queueWaitNanos == 0 || metrics.maxQueueWaitNanos == 0 ||
-		metrics.runNanos == 0 || metrics.maxRunNanos == 0 || metrics.invariantViolations != 0 {
+	if metrics.retries != 1 || metrics.invariantViolations != 0 {
 		t.Fatalf("metrics=%+v", metrics)
+	}
+	// Windows' monotonic clock advances in steps (typically 100ns), so work that
+	// finishes faster than one tick legitimately reports zero durations.
+	if metrics.queueWaitNanos == 0 || metrics.maxQueueWaitNanos == 0 || metrics.runNanos == 0 || metrics.maxRunNanos == 0 {
+		if step := clockStep(); step <= time.Nanosecond {
+			t.Fatalf("missing duration metrics (clock step %v): %+v", step, metrics)
+		}
 	}
 }
 

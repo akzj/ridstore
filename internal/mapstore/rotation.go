@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/akzj/ridstore/internal/fileutil"
 	"github.com/akzj/ridstore/internal/model"
 )
 
@@ -90,7 +91,7 @@ func installRotationJournal(root string, journal rotationJournal, hook FaultHook
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(rotationTempPath(root), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	file, err := fileutil.OpenFile(rotationTempPath(root), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

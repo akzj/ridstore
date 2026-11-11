@@ -3,6 +3,8 @@ package backuprestore
 import (
 	"io/fs"
 	"os"
+
+	"github.com/akzj/ridstore/internal/fileutil"
 )
 
 // fileBackend keeps durable filesystem operations injectable without changing
@@ -32,9 +34,9 @@ type osFileBackend struct{}
 
 func (osFileBackend) lstat(path string) (fs.FileInfo, error)     { return os.Lstat(path) }
 func (osFileBackend) readDir(path string) ([]os.DirEntry, error) { return os.ReadDir(path) }
-func (osFileBackend) open(path string) (fileHandle, error)       { return os.Open(path) }
+func (osFileBackend) open(path string) (fileHandle, error)       { return fileutil.Open(path) }
 func (osFileBackend) openFile(path string, flag int, mode fs.FileMode) (fileHandle, error) {
-	return os.OpenFile(path, flag, mode)
+	return fileutil.OpenFile(path, flag, mode)
 }
 func (osFileBackend) mkdir(path string, mode fs.FileMode) error { return os.Mkdir(path, mode) }
 func (osFileBackend) mkdirTemp(directory, pattern string) (string, error) {

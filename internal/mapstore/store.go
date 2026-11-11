@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/akzj/ridstore/internal/dirsync"
+	"github.com/akzj/ridstore/internal/fileutil"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
 )
@@ -50,7 +52,7 @@ func CreateInitialSegment(root string, storeID StoreID, segmentSize uint32) erro
 	}
 	creating := filepath.Join(dir, creatingName(1))
 	active := filepath.Join(dir, activeName(1))
-	file, err := os.OpenFile(creating, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	file, err := fileutil.OpenFile(creating, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -507,7 +509,7 @@ func creatingName(id model.MapSegmentID) string { return fmt.Sprintf("map-%010d.
 
 func openSealed(root string, expected SegmentHeader, expectedRef SegmentRef) (*segmentFile, error) {
 	path := filepath.Join(root, mappingDirectory, sealedName(expected.SegmentID))
-	file, err := os.Open(path)
+	file, err := fileutil.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -537,7 +539,7 @@ func openSealed(root string, expected SegmentHeader, expectedRef SegmentRef) (*s
 
 func openActive(root string, expected SegmentHeader, rootAddr model.MapAddr, hook FaultHook) (*segmentFile, bool, error) {
 	path := filepath.Join(root, mappingDirectory, activeName(expected.SegmentID))
-	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	file, err := fileutil.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, false, err
 	}
@@ -662,5 +664,5 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(dirsync.Flush(dir), dir.Close())
 }

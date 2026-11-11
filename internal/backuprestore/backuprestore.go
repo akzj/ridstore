@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/dirsync"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/verifier"
@@ -299,17 +301,20 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 	return report, nil
 }
 
+// manifestPaths returns the artifact-relative paths a backup must contain.
+// These are archive paths, so they are built with slash semantics and stay
+// identical on every platform the artifact may be read on.
 func manifestPaths(manifest storecatalog.Manifest) []string {
 	paths := make([]string, 0, 3+len(manifest.SealedDataSegments)+len(manifest.SealedMapSegments))
 	paths = append(paths, fmt.Sprintf("MANIFEST-v2-%d", manifest.Generation&1))
 	for _, segment := range manifest.SealedDataSegments {
-		paths = append(paths, filepath.Join("records", fmt.Sprintf("record-%010d.sealed", segment.SegmentID)))
+		paths = append(paths, path.Join("records", fmt.Sprintf("record-%010d.sealed", segment.SegmentID)))
 	}
-	paths = append(paths, filepath.Join("records", fmt.Sprintf("record-%010d.active", manifest.ActiveDataSegmentID)))
+	paths = append(paths, path.Join("records", fmt.Sprintf("record-%010d.active", manifest.ActiveDataSegmentID)))
 	for _, segment := range manifest.SealedMapSegments {
-		paths = append(paths, filepath.Join("mapping-v2", fmt.Sprintf("map-%010d.sealed", segment.SegmentID)))
+		paths = append(paths, path.Join("mapping-v2", fmt.Sprintf("map-%010d.sealed", segment.SegmentID)))
 	}
-	paths = append(paths, filepath.Join("mapping-v2", fmt.Sprintf("map-%010d.active", manifest.ActiveMapSegmentID)))
+	paths = append(paths, path.Join("mapping-v2", fmt.Sprintf("map-%010d.active", manifest.ActiveMapSegmentID)))
 	sort.Strings(paths)
 	return paths
 }
@@ -342,6 +347,8 @@ func readMetadata(files fileBackend, root string) (metadata Metadata, resultErr 
 	return DecodeMetadata(encoded)
 }
 
+const artifactSeparator = "/"
+
 func validateArtifact(ctx context.Context, files fileBackend, root string, metadata Metadata) error {
 	if _, err := files.lstat(filepath.Join(root, IncompleteName)); err == nil {
 		return errInvalid
@@ -358,7 +365,7 @@ func validateArtifact(ctx context.Context, files fileBackend, root string, metad
 	}
 	manifestCount := 0
 	for path := range expected {
-		parts := strings.Split(path, string(filepath.Separator))
+		parts := strings.Split(path, artifactSeparator)
 		switch {
 		case len(parts) == 1 && strings.HasPrefix(parts[0], "MANIFEST-v2-"):
 			manifestCount++
@@ -408,7 +415,7 @@ func requireArtifactFiles(files fileBackend, payload string, expected map[string
 	}
 	wantRoot := map[string]bool{"records": true, "mapping-v2": true}
 	for path := range expected {
-		if !strings.Contains(path, string(filepath.Separator)) {
+		if !strings.Contains(path, artifactSeparator) {
 			wantRoot[path] = false
 		}
 	}
@@ -417,7 +424,7 @@ func requireArtifactFiles(files fileBackend, payload string, expected map[string
 	}
 	for _, directory := range []string{"records", "mapping-v2"} {
 		want := make(map[string]bool)
-		prefix := directory + string(filepath.Separator)
+		prefix := directory + artifactSeparator
 		for path := range expected {
 			if strings.HasPrefix(path, prefix) {
 				want[strings.TrimPrefix(path, prefix)] = false
@@ -652,7 +659,7 @@ func syncDirectory(files fileBackend, path string) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(directory.Sync(), directory.Close())
+	return errors.Join(dirsync.Flush(directory), directory.Close())
 }
 
 func publish(files fileBackend, staging, destination string, hook FaultHook, before, after FaultPoint) error {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/compactionstate"
+	"github.com/akzj/ridstore/internal/dirsync"
 	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapping"
@@ -400,5 +401,5 @@ func syncEngineDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(dirsync.Flush(dir), dir.Close())
 }

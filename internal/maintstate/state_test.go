@@ -70,7 +70,7 @@ func TestLoadRejectsSymlinkTemp(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("target", filepath.Join(dir, tempName)); err != nil {
-		t.Fatal(err)
+		t.Skipf("host cannot create symlinks (needs SeCreateSymbolicLinkPrivilege or Developer Mode): %v", err)
 	}
 	if _, _, err := Load(root); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("err=%v", err)
@@ -188,7 +188,7 @@ func TestLoadRejectsSymlinkMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("target", Path(root)); err != nil {
-		t.Fatal(err)
+		t.Skipf("host cannot create symlinks (needs SeCreateSymbolicLinkPrivilege or Developer Mode): %v", err)
 	}
 	if _, _, err := Load(root); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("err=%v", err)

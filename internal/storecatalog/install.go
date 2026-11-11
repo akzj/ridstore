@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/akzj/ridstore/internal/dirsync"
 )
 
 type FaultPoint string
@@ -82,7 +84,7 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 	if err := hit(hook, FaultBeforeManifestDirSync); err != nil {
 		return errors.Join(err, dir.Close())
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(dirsync.Flush(dir), dir.Close())
 }
 
 func Load(root string) (Manifest, error) {
@@ -292,5 +294,5 @@ func syncManifestDir(root string, hook FaultHook, point FaultPoint) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(dirsync.Flush(dir), dir.Close())
 }
