@@ -39,7 +39,7 @@ func TestCheckpointCatalogFailureRecoversFromAuthoritativeManifest(t *testing.T)
 				}
 				return nil
 			}
-			store, err := open(context.Background(), root, config, openFaultHooks{catalog: hook})
+			store, err := openWithHooks(t, context.Background(), root, config, openFaultHooks{catalog: hook})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -88,7 +88,7 @@ func TestCheckpointMapStoreFailureKeepsOldManifestRecoverable(t *testing.T) {
 		t.Run(string(point), func(t *testing.T) {
 			root, config := prepareCheckpointStore(t)
 			injected := errors.New("injected mapstore failure")
-			store, err := open(context.Background(), root, config, openFaultHooks{mapStore: func(got mapstore.FaultPoint) error {
+			store, err := openWithHooks(t, context.Background(), root, config, openFaultHooks{mapStore: func(got mapstore.FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -153,7 +153,7 @@ func TestBackgroundCheckpointFailureFailsStoreClosed(t *testing.T) {
 
 	injected := errors.New("injected background checkpoint failure")
 	var armed atomic.Bool
-	store, err = open(context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err = openWithHooks(t, context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if armed.Load() && point == mapstore.FaultBeforeAppendWrite {
 			return injected
 		}
@@ -210,7 +210,7 @@ func TestBackgroundCheckpointPreservesPressureAfterFreeze(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var armed, blocked atomic.Bool
-	store, err := open(context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if armed.Load() && point == mapstore.FaultBeforeAppendWrite && blocked.CompareAndSwap(false, true) {
 			close(started)
 			<-release
@@ -282,7 +282,7 @@ func TestCheckpointRetriesConcurrentMaintenancePublication(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var armed, blocked atomic.Bool
-	store, err := open(context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, context.Background(), root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if armed.Load() && point == mapstore.FaultBeforeAppendWrite && blocked.CompareAndSwap(false, true) {
 			close(started)
 			<-release
@@ -348,7 +348,7 @@ func TestCommitSyncFailureIsResolvedByFreshOpen(t *testing.T) {
 	root, config := prepareCheckpointStore(t)
 	injected := errors.New("injected recordlog sync failure")
 	var armed atomic.Bool
-	store, err := open(context.Background(), root, config, openFaultHooks{recordLog: func(point recordlog.FaultPoint) error {
+	store, err := openWithHooks(t, context.Background(), root, config, openFaultHooks{recordLog: func(point recordlog.FaultPoint) error {
 		if armed.Load() && point == recordlog.FaultBeforeDataSync {
 			return injected
 		}
@@ -416,7 +416,7 @@ func TestCommitSyncFailureWithPartialRecordRecoversAsAborted(t *testing.T) {
 	root, config := prepareCheckpointStore(t)
 	injected := errors.New("injected recordlog sync failure")
 	var armed atomic.Bool
-	store, err := open(context.Background(), root, config, openFaultHooks{recordLog: func(point recordlog.FaultPoint) error {
+	store, err := openWithHooks(t, context.Background(), root, config, openFaultHooks{recordLog: func(point recordlog.FaultPoint) error {
 		if armed.Load() && point == recordlog.FaultBeforeDataSync {
 			return injected
 		}
@@ -626,7 +626,7 @@ func prepareCheckpointStore(t *testing.T) (string, OpenConfig) {
 		ActiveMapSegmentID: 1, NextMapSegmentID: 2,
 		ReplayStart: replayStart, ReservedIDHigh: 1, ReservedBatchIDHigh: 1, IssuedBatchIDHighAtCut: 1,
 	}
-	if err := storecatalog.Install(root, manifest, nil); err != nil {
+	if err := storecatalog.Install(root, manifest); err != nil {
 		t.Fatal(err)
 	}
 	return root, OpenConfig{

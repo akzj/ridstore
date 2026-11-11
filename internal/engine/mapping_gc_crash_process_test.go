@@ -114,7 +114,7 @@ func TestMappingGCCrashHelper(t *testing.T) {
 			return nil
 		},
 	}
-	store, err := open(context.Background(), os.Getenv(mappingGCCrashRootEnv), testCreateConfig().Runtime, hooks)
+	store, err := openWithHooks(t, context.Background(), os.Getenv(mappingGCCrashRootEnv), testCreateConfig().Runtime, hooks)
 	if err != nil {
 		t.Fatal(err)
 	}

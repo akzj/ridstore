@@ -4,19 +4,35 @@ import (
 	"errors"
 	"os"
 	"testing"
+
+	"github.com/akzj/ridstore/internal/fault"
 )
+
+func installWithHook(t *testing.T, root string, manifest Manifest, hook FaultHook) error {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return Install(root, manifest)
+}
+
+func loadRecoveringWithHook(t *testing.T, root string, hook FaultHook) (Manifest, error) {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return LoadRecovering(root)
+}
 
 func TestInstallAndLoadNewestManifest(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	first := testManifest()
-	if err := Install(root, first, nil); err != nil {
+	if err := Install(root, first); err != nil {
 		t.Fatal(err)
 	}
 	second := first.Clone()
 	second.Generation = 2
 	second.ReservedIDHigh++
-	if err := Install(root, second, nil); err != nil {
+	if err := Install(root, second); err != nil {
 		t.Fatal(err)
 	}
 	got, err := Load(root)
@@ -26,16 +42,15 @@ func TestInstallAndLoadNewestManifest(t *testing.T) {
 }
 
 func TestFailedInstallLeavesPreviousManifestAuthoritative(t *testing.T) {
-	t.Parallel()
 	root := t.TempDir()
 	first := testManifest()
-	if err := Install(root, first, nil); err != nil {
+	if err := Install(root, first); err != nil {
 		t.Fatal(err)
 	}
 	second := first.Clone()
 	second.Generation = 2
 	wantErr := errors.New("injected")
-	err := Install(root, second, func(point FaultPoint) error {
+	err := installWithHook(t, root, second, func(point FaultPoint) error {
 		if point == FaultBeforeManifestRename {
 			return wantErr
 		}
@@ -56,13 +71,13 @@ func TestFailedInstallLeavesPreviousManifestAuthoritative(t *testing.T) {
 func TestLoadRecoveringRemovesUnpublishedManifestTemp(t *testing.T) {
 	root := t.TempDir()
 	manifest := testManifest()
-	if err := Install(root, manifest, nil); err != nil {
+	if err := Install(root, manifest); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(manifestTempPath(root, 0), []byte("unpublished"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := LoadRecovering(root, nil)
+	got, err := LoadRecovering(root)
 	if err != nil || got.Generation != manifest.Generation {
 		t.Fatalf("generation=%d err=%v", got.Generation, err)
 	}
@@ -77,13 +92,13 @@ func TestLoadRecoveringRemovesUnpublishedManifestTemp(t *testing.T) {
 func TestLoadRecoveringRejectsUnsafeManifestTemp(t *testing.T) {
 	root := t.TempDir()
 	manifest := testManifest()
-	if err := Install(root, manifest, nil); err != nil {
+	if err := Install(root, manifest); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(manifestTempPath(root, 0), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadRecovering(root, nil); !errors.Is(err, ErrCorrupt) {
+	if _, err := LoadRecovering(root); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("recover err=%v", err)
 	}
 }
@@ -93,14 +108,14 @@ func TestLoadRecoveringCleanupFaultsConvergeOnRetry(t *testing.T) {
 		t.Run(string(point), func(t *testing.T) {
 			root := t.TempDir()
 			manifest := testManifest()
-			if err := Install(root, manifest, nil); err != nil {
+			if err := Install(root, manifest); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(manifestTempPath(root, 0), []byte("unpublished"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			injected := errors.New("injected")
-			if _, err := LoadRecovering(root, func(got FaultPoint) error {
+			if _, err := loadRecoveringWithHook(t, root, func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -108,7 +123,7 @@ func TestLoadRecoveringCleanupFaultsConvergeOnRetry(t *testing.T) {
 			}); !errors.Is(err, injected) {
 				t.Fatalf("recover err=%v", err)
 			}
-			if _, err := LoadRecovering(root, nil); err != nil {
+			if _, err := LoadRecovering(root); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := LoadStrict(root); err != nil {

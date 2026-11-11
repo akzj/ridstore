@@ -25,10 +25,10 @@ func TestManagerDrivesMapStoreRotation(t *testing.T) {
 	manifest.HardLimits.MaxBatchMutations = 4
 	manifest.HardLimits.MaxBatchConditions = 4
 	manifest.HardLimits.MaxRecordLogPayload = 4096
-	if err := Install(root, manifest, nil); err != nil {
+	if err := Install(root, manifest); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(root, manifest, nil)
+	manager, err := NewManager(root, manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,10 +66,10 @@ func TestManagerInstallsTypedUpdates(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	initial := testManifest()
-	if err := Install(root, initial, nil); err != nil {
+	if err := Install(root, initial); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(root, initial, nil)
+	manager, err := NewManager(root, initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,10 +110,10 @@ func TestInstallCheckpointRebasesAcrossDataRotation(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	initial := testManifest()
-	if err := Install(root, initial, nil); err != nil {
+	if err := Install(root, initial); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(root, initial, nil)
+	manager, err := NewManager(root, initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestInstallCheckpointRejectsDataRetireRebase(t *testing.T) {
 	initial.MappingRoot = 0
 	initial.MappingEntryCount = 0
 	initial.SegmentStats = nil
-	manager, err := NewManager(t.TempDir(), initial, nil)
+	manager, err := NewManager(t.TempDir(), initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestInstallCheckpointRejectsDataRetireRebase(t *testing.T) {
 func TestInstallCheckpointRejectsNonRotationRebase(t *testing.T) {
 	t.Parallel()
 	initial := testManifest()
-	manager, err := NewManager(t.TempDir(), initial, nil)
+	manager, err := NewManager(t.TempDir(), initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,10 +211,10 @@ func TestInstallMappingRewriteChangesOnlyMappingFileSet(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	initial := testManifest()
-	if err := Install(root, initial, nil); err != nil {
+	if err := Install(root, initial); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(root, initial, nil)
+	manager, err := NewManager(root, initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,10 +246,10 @@ func TestInstallMappingRewriteRebasesAcrossDataRotation(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	initial := testManifest()
-	if err := Install(root, initial, nil); err != nil {
+	if err := Install(root, initial); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(root, initial, nil)
+	manager, err := NewManager(root, initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestInstallMappingRewriteRejectsStaleCutAndNonContiguousGeneration(t *testi
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			initial := testManifest()
-			manager, err := NewManager(t.TempDir(), initial, nil)
+			manager, err := NewManager(t.TempDir(), initial)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -323,10 +323,10 @@ func TestDataRetireRequiresExactZeroLiveStats(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	initial := testManifest()
-	if err := Install(root, initial, nil); err != nil {
+	if err := Install(root, initial); err != nil {
 		t.Fatal(err)
 	}
-	manager, _ := NewManager(root, initial, nil)
+	manager, _ := NewManager(root, initial)
 	_, err := manager.InstallDataRetire(1, DataRetire{Source: initial.SealedDataSegments[0], CoveredCommitSeq: 0, ReplayStart: initial.ReplayStart})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("err=%v", err)
@@ -340,10 +340,10 @@ func TestDataRetireAcceptsMissingSparseStatsEntryAsZero(t *testing.T) {
 	initial.MappingRoot = 0
 	initial.MappingEntryCount = 0
 	initial.SegmentStats = nil
-	if err := Install(root, initial, nil); err != nil {
+	if err := Install(root, initial); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(root, initial, nil)
+	manager, err := NewManager(root, initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,10 +359,10 @@ func TestManagerImplementsRecordLogCatalogPort(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	initial := testManifest()
-	if err := Install(root, initial, nil); err != nil {
+	if err := Install(root, initial); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(root, initial, nil)
+	manager, err := NewManager(root, initial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestRemoveRecordLogSegmentRebasesAcrossDataRotation(t *testing.T) {
 	initial.MappingRoot = 0
 	initial.MappingEntryCount = 0
 	initial.SegmentStats = nil
-	manager, err := NewManager(t.TempDir(), initial, nil)
+	manager, err := NewManager(t.TempDir(), initial)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -27,12 +27,12 @@ func TestCompactMarkerPublicationBoundary(t *testing.T) {
 			store, source, id, _, _ := relocationFixture(t)
 			root := store.core.root
 			injected := errors.New("injected marker install failure")
-			store.maintenance.stateHook = func(got maintstate.FaultPoint) error {
+			installHook(t, func(got maintstate.FaultPoint) error {
 				if got == test.point {
 					return injected
 				}
 				return nil
-			}
+			})
 			_, err := store.compactSegmentLocked(context.Background(), source, store.maintenance.gcBytesPerSecond.Load())
 			if !errors.Is(err, injected) || errors.Is(err, base.ErrRecoveryRequired) != test.recoveryRequired {
 				t.Fatalf("compact err=%v recoveryRequired=%v", err, test.recoveryRequired)
@@ -58,7 +58,7 @@ func TestCompactMarkerPublicationBoundary(t *testing.T) {
 func TestCompactRetirementCASRejectsGenerationChangeAfterMarker(t *testing.T) {
 	store, source, _, _, _ := relocationFixture(t)
 	advanced := false
-	store.maintenance.stateHook = func(point maintstate.FaultPoint) error {
+	installHook(t, func(point maintstate.FaultPoint) error {
 		if point != maintstate.FaultBeforeJournalDirSync || advanced {
 			return nil
 		}
@@ -66,7 +66,7 @@ func TestCompactRetirementCASRejectsGenerationChangeAfterMarker(t *testing.T) {
 		manifest := store.catalogSnapshot()
 		_, _, err := store.core.publisher.ReserveCompactionSegments(manifest.Generation, 1)
 		return err
-	}
+	})
 	if _, err := store.compactSegmentLocked(context.Background(), source, store.maintenance.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrConflict) || errors.Is(err, base.ErrRecoveryRequired) {
 		t.Fatalf("compact err=%v", err)
 	}
@@ -91,12 +91,12 @@ func TestCompactMarkerRemovalFailureRecovers(t *testing.T) {
 	store, source, id, _, _ := relocationFixture(t)
 	root := store.core.root
 	injected := errors.New("injected marker removal failure")
-	store.maintenance.stateHook = func(got maintstate.FaultPoint) error {
+	installHook(t, func(got maintstate.FaultPoint) error {
 		if got == maintstate.FaultBeforeMarkerRemove {
 			return injected
 		}
 		return nil
-	}
+	})
 	if _, err := store.compactSegmentLocked(context.Background(), source, store.maintenance.gcBytesPerSecond.Load()); !errors.Is(err, base.ErrRecoveryRequired) || !errors.Is(err, injected) {
 		t.Fatalf("compact err=%v", err)
 	}
@@ -132,7 +132,7 @@ func TestOpenRetriesEveryRetiredSegmentCleanupBoundary(t *testing.T) {
 		t.Run(string(point), func(t *testing.T) {
 			root, source, id := prepareCatalogRemovedRetirement(t)
 			injected := errors.New("injected physical cleanup failure")
-			if _, err := open(context.Background(), root, relocationConfig().Runtime, openFaultHooks{recordLog: func(got recordlog.FaultPoint) error {
+			if _, err := openWithHooks(t, context.Background(), root, relocationConfig().Runtime, openFaultHooks{recordLog: func(got recordlog.FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -158,7 +158,7 @@ func TestOpenRetriesEveryRetiredSegmentCleanupBoundary(t *testing.T) {
 func TestOpenRetriesMaintenanceMarkerRemoval(t *testing.T) {
 	root, source, id := prepareCatalogRemovedRetirement(t)
 	injected := errors.New("injected marker removal failure")
-	if _, err := open(context.Background(), root, relocationConfig().Runtime, openFaultHooks{maintenance: func(got maintstate.FaultPoint) error {
+	if _, err := openWithHooks(t, context.Background(), root, relocationConfig().Runtime, openFaultHooks{maintenance: func(got maintstate.FaultPoint) error {
 		if got == maintstate.FaultBeforeMarkerRemove {
 			return injected
 		}

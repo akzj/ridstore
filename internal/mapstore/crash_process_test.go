@@ -65,13 +65,13 @@ func TestMapStoreRotationCrashHelper(t *testing.T) {
 		BaseGeneration: state.Generation, StoreID: state.StoreID, SegmentSize: state.SegmentSize,
 		Old: store.active.summary, NewActive: 2, NextSegment: 3,
 	}
-	if err := installRotationJournal(root, journal, nil); err != nil {
+	if err := installRotationJournal(root, journal); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv(mapCrashPhaseEnv) == "journal" {
 		return
 	}
-	sealed, err := sealActive(root, store.active, journal.Old, nil)
+	sealed, err := sealActive(root, store.active, journal.Old)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestMapStoreRotationCrashHelper(t *testing.T) {
 	if err := sealed.file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := createActive(root, state.headerFor(2), nil); err != nil {
+	if _, err := createActive(root, state.headerFor(2)); err != nil {
 		t.Fatal(err)
 	}
 }

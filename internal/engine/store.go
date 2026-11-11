@@ -13,8 +13,6 @@ import (
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
-	"github.com/akzj/ridstore/internal/maintstate"
-	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
@@ -121,14 +119,10 @@ type storeCore struct {
 	identity      [16]byte
 }
 
-// maintenanceRuntime owns replaceable maintenance policy, fault injection,
-// scheduling, and stability state. It is separate from the durable components
-// in storeCore so background policy cannot be mistaken for persisted state.
+// maintenanceRuntime owns replaceable maintenance policy, scheduling, and
+// stability state. It is separate from the durable components in storeCore so
+// background policy cannot be mistaken for persisted state.
 type maintenanceRuntime struct {
-	stateHook     maintstate.FaultHook
-	mapStoreHook  mapstore.FaultHook
-	mappingGCHook mapgcstate.FaultHook
-
 	maxStats               uint64
 	mappingCacheBytes      uint64
 	maxRelocationBytes     uint64

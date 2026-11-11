@@ -122,7 +122,7 @@ func TestCompactMappingPromotesGenerationOutsideCaptureLock(t *testing.T) {
 	observed := make(chan bool, 1)
 	var store *Store
 	var checked atomic.Bool
-	store, err = open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err = openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if point == mapstore.FaultBeforeGCPromoteSync && checked.CompareAndSwap(false, true) {
 			acquired := store.checkpoints.captureMu.TryLock()
 			if acquired {
@@ -165,7 +165,7 @@ func TestCompactMappingPreemptionRollsBackAndRestarts(t *testing.T) {
 	promoteEntered := make(chan struct{})
 	releasePromote := make(chan struct{})
 	var blocked atomic.Bool
-	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if point == mapstore.FaultBeforeGCPromoteSync && blocked.CompareAndSwap(false, true) {
 			close(promoteEntered)
 			<-releasePromote
@@ -294,7 +294,7 @@ func TestCompactMappingPromotionFailureRollsBackAndFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	injected := errors.New("promote failed")
-	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if point == mapstore.FaultBeforeGCPromoteRename {
 			return injected
 		}
@@ -356,7 +356,7 @@ func TestCompactMappingPostPublishFailureRecoversOnOpen(t *testing.T) {
 			if err := created.Close(); err != nil {
 				t.Fatal(err)
 			}
-			store, err := open(ctx, root, config.Runtime, test.hooks)
+			store, err := openWithHooks(t, ctx, root, config.Runtime, test.hooks)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -402,7 +402,7 @@ func TestCompactMappingDoesNotBlockDataOperationsDuringGenerationPromotion(t *te
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if point == mapstore.FaultBeforeGCPromoteRename {
 			once.Do(func() { close(entered) })
 			<-release
@@ -481,7 +481,7 @@ func TestCompactMappingAllowsCommitDuringRebuildAndPreservesDelta(t *testing.T) 
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if point == mapstore.FaultBeforeAppendWrite {
 			once.Do(func() {
 				close(entered)
@@ -548,7 +548,7 @@ func TestCompactMappingAllowsDataRotationDuringRebuild(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if point == mapstore.FaultBeforeAppendWrite {
 			once.Do(func() {
 				close(entered)
@@ -610,7 +610,7 @@ func TestCompactMappingAllowsCheckpointDuringRebuild(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(releaseRebuild) }) }
 	checkpointWrite := make(chan struct{})
 	var appendWrites atomic.Uint64
-	store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+	store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 		if point != mapstore.FaultBeforeAppendWrite {
 			return nil
 		}
@@ -914,7 +914,7 @@ func TestCompactMappingRuntimeFaultMatrixConvergesOnFreshOpen(t *testing.T) {
 				t.Fatal(err)
 			}
 			injected := errors.New("injected mapping gc fault")
-			store, err := open(ctx, root, config.Runtime, test.hooks(injected))
+			store, err := openWithHooks(t, ctx, root, config.Runtime, test.hooks(injected))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -970,7 +970,7 @@ func TestCompactMappingRollbackFailureRetainsRecoveryMarker(t *testing.T) {
 			}
 			promoteErr := errors.New("promote sync failed")
 			rollbackErr := errors.New("rollback failed")
-			store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+			store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 				switch point {
 				case mapstore.FaultBeforeGCPromoteSync:
 					return promoteErr
@@ -1018,7 +1018,7 @@ func TestCompactMappingPartialMultiFileOperationsRecover(t *testing.T) {
 			root, config, id := createMultiFileMappingFixture(t, ctx)
 			injected := errors.New("second file failed")
 			calls := 0
-			store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
+			store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(point mapstore.FaultPoint) error {
 				target := mapstore.FaultBeforeGCPromoteRename
 				if phase == "retire" {
 					target = mapstore.FaultBeforeGCRetireRename
@@ -1069,7 +1069,7 @@ func TestCompactMappingGenerationRotationFaultsRecover(t *testing.T) {
 			ctx := context.Background()
 			root, config, id := createMultiFileMappingFixture(t, ctx)
 			injected := errors.New("generation rotation failed")
-			store, err := open(ctx, root, config.Runtime, openFaultHooks{mapStore: func(got mapstore.FaultPoint) error {
+			store, err := openWithHooks(t, ctx, root, config.Runtime, openFaultHooks{mapStore: func(got mapstore.FaultPoint) error {
 				if got == point {
 					return injected
 				}

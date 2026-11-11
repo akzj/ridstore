@@ -8,7 +8,37 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/akzj/ridstore/internal/fault"
 )
+
+func openWithHook(t *testing.T, root string, cfg Config, catalog CatalogPort, hook FaultHook) (*Log, error) {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	t.Cleanup(func() { fault.SetHook(previous) })
+	return Open(root, cfg, catalog)
+}
+
+func cleanupWithHook(t *testing.T, root string, id SegmentID, generation uint64, hook FaultHook) error {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return CleanupRetiredSegment(root, id, generation)
+}
+
+func installJournalWithHook(t *testing.T, root string, journal rotationJournal, files fileBackend, hook FaultHook) error {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return installRotationJournal(root, journal, files)
+}
+
+func createWithHook(t *testing.T, root string, header SegmentHeader, files fileBackend, hook segmentFaultHook) (*activeSegment, error) {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return createActiveSegment(root, header, files)
+}
 
 type memoryCatalog struct {
 	mu         sync.Mutex
@@ -166,7 +196,7 @@ func (b barrierRenameBackend) rename(oldPath, newPath string) error {
 func TestRotationPreparesSealedAndActiveFilesConcurrently(t *testing.T) {
 	root := t.TempDir()
 	state := initialCatalog(16<<10, 8<<10)
-	old, err := createActiveSegment(root, state.headerFor(1), nil, nil)
+	old, err := createActiveSegment(root, state.headerFor(1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +311,7 @@ func catalogPublishedRotation(t *testing.T) (*Log, *segmentRegistry, *sealedSegm
 	t.Helper()
 	root := t.TempDir()
 	state := initialCatalog(16<<10, 8<<10)
-	old, err := createActiveSegment(root, state.headerFor(1), nil, nil)
+	old, err := createActiveSegment(root, state.headerFor(1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +324,7 @@ func catalogPublishedRotation(t *testing.T) (*Log, *segmentRegistry, *sealedSegm
 	if err != nil {
 		t.Fatal(err)
 	}
-	active, err := createActiveSegment(root, state.headerFor(2), nil, nil)
+	active, err := createActiveSegment(root, state.headerFor(2), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +338,7 @@ func catalogPublishedRotation(t *testing.T) (*Log, *segmentRegistry, *sealedSegm
 func TestRecoverPreparedRotationWithPartialFooter(t *testing.T) {
 	root := t.TempDir()
 	state := initialCatalog(1024, 512)
-	active, err := createActiveSegment(root, state.headerFor(1), nil, nil)
+	active, err := createActiveSegment(root, state.headerFor(1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +351,7 @@ func TestRecoverPreparedRotationWithPartialFooter(t *testing.T) {
 		BaseGeneration: 1, LogID: state.LogID, SegmentSize: state.SegmentSize,
 		Old: summary, NewActive: 2, NextSegmentID: 3,
 	}
-	if err := installRotationJournal(root, journal, osFileBackend{}, nil); err != nil {
+	if err := installRotationJournal(root, journal, osFileBackend{}); err != nil {
 		t.Fatal(err)
 	}
 	footer, err := EncodeSegmentFooter(SegmentFooter{SegmentID: 1, DataEnd: summary.ValidEnd, FirstAddr: summary.FirstAddr, LastAddr: summary.LastAddr, RecordCount: summary.RecordCount})
@@ -335,7 +365,7 @@ func TestRecoverPreparedRotationWithPartialFooter(t *testing.T) {
 		t.Fatal(err)
 	}
 	catalog := &memoryCatalog{state: state}
-	recovered, err := recoverRotation(root, catalog, state, osFileBackend{}, nil)
+	recovered, err := recoverRotation(root, catalog, state, osFileBackend{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +459,7 @@ func TestRetiredSegmentCleanupFaultsConvergeOnRetry(t *testing.T) {
 		t.Run(string(point), func(t *testing.T) {
 			root := prepareSealedRetirementFile(t)
 			injected := errors.New("injected retirement failure")
-			err := CleanupRetiredSegmentWithFaultHook(root, 1, 9, func(got FaultPoint) error {
+			err := cleanupWithHook(t, root, 1, 9, func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -460,7 +490,7 @@ func TestRetireFaultAfterCatalogRemovalPoisonsLog(t *testing.T) {
 	}
 	catalog := &memoryCatalog{state: state}
 	injected := errors.New("injected retire failure")
-	log, err := OpenWithFaultHook(root, testLogConfig(), catalog, func(got FaultPoint) error {
+	log, err := openWithHook(t, root, testLogConfig(), catalog, func(got FaultPoint) error {
 		if got == FaultBeforeRetireRename {
 			return injected
 		}

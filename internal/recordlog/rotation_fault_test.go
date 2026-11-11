@@ -38,7 +38,7 @@ func TestRuntimeRotationFaultsConvergeFromDurableEvidence(t *testing.T) {
 			}
 			catalog := &memoryCatalog{state: state}
 			injected := errors.New("injected rotation failure")
-			log, err := OpenWithFaultHook(root, testLogConfig(), catalog, func(point FaultPoint) error {
+			log, err := openWithHook(t, root, testLogConfig(), catalog, func(point FaultPoint) error {
 				if point == test.point {
 					return injected
 				}
@@ -85,7 +85,7 @@ func TestRotationSyncsPreparedFooterBeforePublishingJournal(t *testing.T) {
 	}
 	injected := errors.New("stop before journal write")
 	var order []FaultPoint
-	log, err := OpenWithFaultHook(root, testLogConfig(), &memoryCatalog{state: state}, func(point FaultPoint) error {
+	log, err := openWithHook(t, root, testLogConfig(), &memoryCatalog{state: state}, func(point FaultPoint) error {
 		if point == FaultBeforeDataSync || point == FaultBeforeFooterSync || point == FaultBeforeJournalWrite {
 			order = append(order, point)
 		}
@@ -165,7 +165,7 @@ func TestRotationRecoveryFailureIsRetryable(t *testing.T) {
 		t.Run(string(point), func(t *testing.T) {
 			root, catalog, first := prepareRecordRotationJournal(t)
 			injected := errors.New("injected recovery failure")
-			if _, err := OpenWithFaultHook(root, testLogConfig(), catalog, func(got FaultPoint) error {
+			if _, err := openWithHook(t, root, testLogConfig(), catalog, func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -204,7 +204,7 @@ func TestUnpublishedRotationTempCleanupIsRetryable(t *testing.T) {
 				Old: SegmentSummary{SegmentID: 1, ValidEnd: SegmentHeaderSize}, NewActive: 2, NextSegmentID: 3,
 			}
 			stopPublish := errors.New("leave journal temp")
-			if err := installRotationJournal(root, journal, osFileBackend{}, func(got FaultPoint) error {
+			if err := installJournalWithHook(t, root, journal, osFileBackend{}, func(got FaultPoint) error {
 				if got == FaultBeforeJournalRename {
 					return stopPublish
 				}
@@ -213,7 +213,7 @@ func TestUnpublishedRotationTempCleanupIsRetryable(t *testing.T) {
 				t.Fatalf("install err=%v", err)
 			}
 			injected := errors.New("cleanup failure")
-			if _, err := OpenWithFaultHook(root, testLogConfig(), catalog, func(got FaultPoint) error {
+			if _, err := openWithHook(t, root, testLogConfig(), catalog, func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -261,7 +261,7 @@ func prepareRecordRotationJournal(t *testing.T) (string, *memoryCatalog, AppendR
 		},
 		NewActive: 2, NextSegmentID: 3,
 	}
-	if err := installRotationJournal(root, journal, osFileBackend{}, nil); err != nil {
+	if err := installRotationJournal(root, journal, osFileBackend{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := log.Close(); err != nil {

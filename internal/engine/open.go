@@ -11,8 +11,6 @@ import (
 	"github.com/akzj/ridstore/internal/coordinator"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/idalloc"
-	"github.com/akzj/ridstore/internal/maintstate"
-	"github.com/akzj/ridstore/internal/mapgcstate"
 	"github.com/akzj/ridstore/internal/mapping"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
@@ -60,10 +58,10 @@ type CreateConfig struct {
 }
 
 func Create(ctx context.Context, root string, config CreateConfig) (*Store, error) {
-	return create(ctx, root, config, nil, nil)
+	return create(ctx, root, config)
 }
 
-func create(ctx context.Context, root string, config CreateConfig, bootstrapHook bootstrap.FaultHook, catalogHook storecatalog.FaultHook) (*Store, error) {
+func create(ctx context.Context, root string, config CreateConfig) (*Store, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -94,10 +92,10 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 	fail := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, dirLock.Close())
 	}
-	if _, err := bootstrap.Initialize(root, config.HardLimits, bootstrapHook); err != nil {
+	if _, err := bootstrap.Initialize(root, config.HardLimits); err != nil {
 		return fail(err)
 	}
-	store, err := openLocked(ctx, root, config.Runtime, openFaultHooks{catalog: catalogHook}, dirLock)
+	store, err := openLocked(ctx, root, config.Runtime, dirLock)
 	if err != nil {
 		return nil, err
 	}
@@ -108,18 +106,10 @@ func create(ctx context.Context, root string, config CreateConfig, bootstrapHook
 // opens the persistent Mapping root first and replays only the RecordLog tail
 // after the Manifest cut into that same runtime Mapping.
 func Open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
-	return open(ctx, root, config, openFaultHooks{})
+	return open(ctx, root, config)
 }
 
-type openFaultHooks struct {
-	catalog     storecatalog.FaultHook
-	mapStore    mapstore.FaultHook
-	recordLog   recordlog.FaultHook
-	maintenance maintstate.FaultHook
-	mapGC       mapgcstate.FaultHook
-}
-
-func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks) (*Store, error) {
+func open(ctx context.Context, root string, config OpenConfig) (*Store, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -139,14 +129,14 @@ func open(ctx context.Context, root string, config OpenConfig, hooks openFaultHo
 	if err := bootstrap.RequireReady(root); err != nil {
 		return failLock(err)
 	}
-	store, err := openLocked(ctx, root, config, hooks, dirLock)
+	store, err := openLocked(ctx, root, config, dirLock)
 	if err != nil {
 		return nil, err
 	}
 	return store, nil
 }
 
-func openLocked(ctx context.Context, root string, config OpenConfig, hooks openFaultHooks, dirLock *filelock.Lock) (opened *Store, resultErr error) {
+func openLocked(ctx context.Context, root string, config OpenConfig, dirLock *filelock.Lock) (opened *Store, resultErr error) {
 	runtimeOwnsLock := false
 	defer func() {
 		if resultErr != nil && !runtimeOwnsLock {
@@ -162,14 +152,14 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	if err := validateRuntimeAgainstHard(config, manifest.HardLimits); err != nil {
 		return nil, base.ErrInvalidConfig
 	}
-	catalog, err := storecatalog.OpenManager(root, hooks.catalog)
+	catalog, err := storecatalog.OpenManager(root)
 	if err != nil {
 		return nil, err
 	}
-	if err := recoverMappingGC(ctx, root, catalog, hooks.mapGC, hooks.mapStore); err != nil {
+	if err := recoverMappingGC(ctx, root, catalog); err != nil {
 		return nil, err
 	}
-	if err := recoverMaintenance(root, catalog, hooks.maintenance, hooks.recordLog); err != nil {
+	if err := recoverMaintenance(root, catalog); err != nil {
 		return nil, err
 	}
 	pendingCompaction, err := recoverCompactionBeforeOpen(root, catalog)
@@ -178,14 +168,14 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 	}
 	publisher := newPublishCoordinator(catalog)
 	publisher.publish(catalog.Snapshot())
-	log, err := recordlog.OpenWithFaultHook(root, config.RecordLog, publisher, hooks.recordLog)
+	log, err := recordlog.Open(root, config.RecordLog, publisher)
 	if err != nil {
 		return nil, err
 	}
 	failLog := func(cause error) (*Store, error) {
 		return nil, errors.Join(cause, log.Close())
 	}
-	physicalMapping, err := mapstore.OpenWithFaultHook(root, publisher, hooks.mapStore)
+	physicalMapping, err := mapstore.Open(root, publisher)
 	if err != nil {
 		return failLog(err)
 	}
@@ -261,9 +251,7 @@ func openLocked(ctx context.Context, root string, config OpenConfig, hooks openF
 		store.core.space = newSpaceGate(root, config.WriteStopFreeBytes, config.SpaceCheckInterval, filesystemAvailable)
 		store.core.userAppender = &spaceAppender{next: log, gate: store.core.space}
 	}
-	store.maintenance.stateHook = hooks.maintenance
-	store.maintenance.mapStoreHook = hooks.mapStore
-	store.maintenance.mappingGCHook = hooks.mapGC
+
 	for _, id := range recovered.StatusOrder {
 		status := recovered.Statuses[id]
 		state := BatchStateAborted

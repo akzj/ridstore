@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/akzj/ridstore/internal/dirsync"
+	"github.com/akzj/ridstore/internal/fault"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/recordlog"
 	"github.com/akzj/ridstore/internal/storecatalog"
@@ -30,8 +31,8 @@ var (
 	ErrActive  = errors.New("maintstate: operation already active")
 )
 
-type FaultPoint string
-type FaultHook func(FaultPoint) error
+type FaultPoint = fault.Point
+type FaultHook = fault.Hook
 
 const (
 	FaultBeforeTempRemove     FaultPoint = "maintstate.before-temp-remove"
@@ -113,12 +114,6 @@ func Decode(src []byte) (State, error) {
 }
 
 func Install(root string, state State) error {
-	return InstallWithFaultHook(root, state, nil)
-}
-
-// InstallWithFaultHook is the testable form of Install. Fault hooks model
-// process-visible durable boundaries; they are not a storage extension point.
-func InstallWithFaultHook(root string, state State, hook FaultHook) error {
 	if root == "" {
 		return ErrInvalid
 	}
@@ -136,26 +131,26 @@ func InstallWithFaultHook(root string, state State, hook FaultHook) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	removed, err := removeIfRegular(temp, hook, FaultBeforeTempRemove)
+	removed, err := removeIfRegular(temp, FaultBeforeTempRemove)
 	if err != nil {
 		return err
 	}
 	if removed {
-		if err := hit(hook, FaultBeforeCleanupDirSync); err != nil {
+		if err := hit(FaultBeforeCleanupDirSync); err != nil {
 			return err
 		}
 		if err := syncDir(dir); err != nil {
 			return err
 		}
 	}
-	if err := hit(hook, FaultBeforeTempCreate); err != nil {
+	if err := hit(FaultBeforeTempCreate); err != nil {
 		return err
 	}
 	file, err := os.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	if err := hit(hook, FaultBeforeWrite); err != nil {
+	if err := hit(FaultBeforeWrite); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if n, writeErr := file.Write(encoded[:]); writeErr != nil || n != len(encoded) {
@@ -164,45 +159,41 @@ func InstallWithFaultHook(root string, state State, hook FaultHook) error {
 		}
 		return errors.Join(writeErr, file.Close())
 	}
-	if err := hit(hook, FaultBeforeFileSync); err != nil {
+	if err := hit(FaultBeforeFileSync); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := file.Sync(); err != nil {
 		return errors.Join(err, file.Close())
 	}
-	if err := hit(hook, FaultBeforeFileClose); err != nil {
+	if err := hit(FaultBeforeFileClose); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := hit(hook, FaultBeforePublishRename); err != nil {
+	if err := hit(FaultBeforePublishRename); err != nil {
 		return err
 	}
 	if err := os.Rename(temp, final); err != nil {
 		return err
 	}
-	if err := hit(hook, FaultBeforeJournalDirSync); err != nil {
+	if err := hit(FaultBeforeJournalDirSync); err != nil {
 		return err
 	}
 	return syncDir(dir)
 }
 
 func Load(root string) (State, bool, error) {
-	return LoadWithFaultHook(root, nil)
-}
-
-func LoadWithFaultHook(root string, hook FaultHook) (State, bool, error) {
 	if root == "" {
 		return State{}, false, ErrInvalid
 	}
 	dir := filepath.Join(root, "journal")
-	removed, err := removeIfRegular(filepath.Join(dir, tempName), hook, FaultBeforeTempRemove)
+	removed, err := removeIfRegular(filepath.Join(dir, tempName), FaultBeforeTempRemove)
 	if err != nil {
 		return State{}, false, err
 	}
 	if removed {
-		if err := hit(hook, FaultBeforeCleanupDirSync); err != nil {
+		if err := hit(FaultBeforeCleanupDirSync); err != nil {
 			return State{}, false, err
 		}
 		if err := syncDir(dir); err != nil {
@@ -229,26 +220,22 @@ func LoadWithFaultHook(root string, hook FaultHook) (State, bool, error) {
 }
 
 func Remove(root string) error {
-	return RemoveWithFaultHook(root, nil)
-}
-
-func RemoveWithFaultHook(root string, hook FaultHook) error {
 	if root == "" {
 		return ErrInvalid
 	}
 	dir := filepath.Join(root, "journal")
-	removedFinal, err := removeIfRegular(filepath.Join(dir, journalName), hook, FaultBeforeMarkerRemove)
+	removedFinal, err := removeIfRegular(filepath.Join(dir, journalName), FaultBeforeMarkerRemove)
 	if err != nil {
 		return err
 	}
-	removedTemp, err := removeIfRegular(filepath.Join(dir, tempName), hook, FaultBeforeTempRemove)
+	removedTemp, err := removeIfRegular(filepath.Join(dir, tempName), FaultBeforeTempRemove)
 	if err != nil {
 		return err
 	}
 	if !removedFinal && !removedTemp {
 		return nil
 	}
-	if err := hit(hook, FaultBeforeCleanupDirSync); err != nil {
+	if err := hit(FaultBeforeCleanupDirSync); err != nil {
 		return err
 	}
 	return syncDir(dir)
@@ -289,7 +276,7 @@ func validate(state State) error {
 	return nil
 }
 
-func removeIfRegular(path string, hook FaultHook, point FaultPoint) (bool, error) {
+func removeIfRegular(path string, point FaultPoint) (bool, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -300,7 +287,7 @@ func removeIfRegular(path string, hook FaultHook, point FaultPoint) (bool, error
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return false, ErrCorrupt
 	}
-	if err := hit(hook, point); err != nil {
+	if err := hit(point); err != nil {
 		return false, err
 	}
 	if err := os.Remove(path); err != nil {
@@ -309,11 +296,8 @@ func removeIfRegular(path string, hook FaultHook, point FaultPoint) (bool, error
 	return true, nil
 }
 
-func hit(hook FaultHook, point FaultPoint) error {
-	if hook == nil {
-		return nil
-	}
-	return hook(point)
+func hit(point FaultPoint) error {
+	return fault.Hit(point)
 }
 
 func ensureJournalDir(root, dir string) error {

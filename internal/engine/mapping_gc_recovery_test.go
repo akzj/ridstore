@@ -74,7 +74,7 @@ func TestMappingGCRecoveryFaultsConvergeOnRetry(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			root, config, state := prepareMappingGCRecovery(t, test.published)
 			injected := errors.New("injected")
-			if _, err := open(context.Background(), root, config, openFaultHooks{mapStore: func(got mapstore.FaultPoint) error {
+			if _, err := openWithHooks(t, context.Background(), root, config, openFaultHooks{mapStore: func(got mapstore.FaultPoint) error {
 				if got == test.point {
 					return injected
 				}
@@ -99,7 +99,7 @@ func TestMappingGCMarkerRemovalFaultConvergesOnRetry(t *testing.T) {
 		t.Run(map[bool]string{false: "rollback", true: "retire"}[published], func(t *testing.T) {
 			root, config, state := prepareMappingGCRecovery(t, published)
 			injected := errors.New("injected")
-			if _, err := open(context.Background(), root, config, openFaultHooks{mapGC: func(got mapgcstate.FaultPoint) error {
+			if _, err := openWithHooks(t, context.Background(), root, config, openFaultHooks{mapGC: func(got mapgcstate.FaultPoint) error {
 				if got == mapgcstate.FaultBeforeMarkerRemove {
 					return injected
 				}
@@ -123,7 +123,7 @@ func TestMappingGCMarkerDirectorySyncFaultConvergesOnRetry(t *testing.T) {
 	root, config, state := prepareMappingGCRecovery(t, true)
 	injected := errors.New("injected")
 	calls := 0
-	if _, err := open(context.Background(), root, config, openFaultHooks{mapGC: func(got mapgcstate.FaultPoint) error {
+	if _, err := openWithHooks(t, context.Background(), root, config, openFaultHooks{mapGC: func(got mapgcstate.FaultPoint) error {
 		if got == mapgcstate.FaultBeforeCleanupDirSync {
 			calls++
 			if calls == 2 {
@@ -210,7 +210,7 @@ func prepareMappingGCRecovery(t *testing.T, publish bool) (string, OpenConfig, m
 	if err := os.Mkdir(staging, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writer, err := mapstore.CreateGenerationWriter(staging, mapstore.StoreID(manifest.StoreUUID), uint32(manifest.HardLimits.SegmentSize), manifest.NextMapSegmentID, nil)
+	writer, err := mapstore.CreateGenerationWriter(staging, mapstore.StoreID(manifest.StoreUUID), uint32(manifest.HardLimits.SegmentSize), manifest.NextMapSegmentID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,14 +227,14 @@ func prepareMappingGCRecovery(t *testing.T, publish bool) (string, OpenConfig, m
 		Old: mapgcFileSet(manifest.SealedMapSegments, manifest.ActiveMapSegmentID, manifest.NextMapSegmentID, manifest.MappingRoot),
 		New: mapgcstate.FileSet{Sealed: generation.SealedSegments, Active: generation.ActiveSegment, Next: generation.NextSegment, Root: generation.Root},
 	}
-	if err := mapgcstate.Install(root, state, nil); err != nil {
+	if err := mapgcstate.Install(root, state); err != nil {
 		t.Fatal(err)
 	}
-	if err := mapstore.PromoteGeneration(root, staging, generation, nil); err != nil {
+	if err := mapstore.PromoteGeneration(root, staging, generation); err != nil {
 		t.Fatal(err)
 	}
 	if publish {
-		manager, err := storecatalog.OpenManager(root, nil)
+		manager, err := storecatalog.OpenManager(root)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -250,7 +250,7 @@ func prepareMappingGCRecovery(t *testing.T, publish bool) (string, OpenConfig, m
 
 func rotateDataOutsideEngine(t *testing.T, root string, config OpenConfig) {
 	t.Helper()
-	manager, err := storecatalog.OpenManager(root, nil)
+	manager, err := storecatalog.OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/dirsync"
+	"github.com/akzj/ridstore/internal/fault"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/recordlog"
@@ -23,7 +24,7 @@ const (
 	maxMarkerBytes = 4096
 )
 
-type FaultPoint string
+type FaultPoint = fault.Point
 
 const (
 	FaultBeforeMarkerWrite   FaultPoint = "bootstrap.before-marker-write"
@@ -37,7 +38,7 @@ const (
 	FaultBeforeFinalDirSync  FaultPoint = "bootstrap.before-final-dir-sync"
 )
 
-type FaultHook func(FaultPoint) error
+type FaultHook = fault.Hook
 
 func ValidateHardLimits(hard storecatalog.HardLimits) error {
 	replayStart, _ := recordlog.NewLogPos(1, recordlog.SegmentHeaderSize)
@@ -76,7 +77,7 @@ func EnsureRoot(root string) error {
 // Initialize creates or resumes a v2 store while the caller holds the
 // directory lock. The marker payload is the exact generation-1 Manifest, so
 // recovery has no second copy of identity or hard-limit semantics.
-func Initialize(root string, hard storecatalog.HardLimits, hook FaultHook) (storecatalog.Manifest, error) {
+func Initialize(root string, hard storecatalog.HardLimits) (storecatalog.Manifest, error) {
 	marker, found, err := loadMarker(root)
 	if err != nil {
 		return storecatalog.Manifest{}, err
@@ -97,13 +98,13 @@ func Initialize(root string, hard storecatalog.HardLimits, hook FaultHook) (stor
 		if err != nil {
 			return storecatalog.Manifest{}, err
 		}
-		if err := installMarker(root, marker, hook); err != nil {
+		if err := installMarker(root, marker); err != nil {
 			return storecatalog.Manifest{}, err
 		}
 	} else if marker.HardLimits != hard {
 		return storecatalog.Manifest{}, base.ErrConfigMismatch
 	}
-	return resume(root, marker, hook)
+	return resume(root, marker)
 }
 
 // RequireReady prevents Open from treating a published Manifest as usable
@@ -162,25 +163,25 @@ func initialManifest(hard storecatalog.HardLimits) (storecatalog.Manifest, error
 	return manifest, nil
 }
 
-func resume(root string, want storecatalog.Manifest, hook FaultHook) (storecatalog.Manifest, error) {
-	if err := hit(hook, FaultBeforeDataSegment); err != nil {
+func resume(root string, want storecatalog.Manifest) (storecatalog.Manifest, error) {
+	if err := hit(FaultBeforeDataSegment); err != nil {
 		return storecatalog.Manifest{}, err
 	}
 	if err := recordlog.EnsureInitialSegment(root, want.RecordLogID, uint32(want.HardLimits.SegmentSize)); err != nil {
 		return storecatalog.Manifest{}, err
 	}
-	if err := hit(hook, FaultBeforeMapSegment); err != nil {
+	if err := hit(FaultBeforeMapSegment); err != nil {
 		return storecatalog.Manifest{}, err
 	}
 	if err := mapstore.EnsureInitialSegment(root, mapstore.StoreID(want.StoreUUID), uint32(want.HardLimits.SegmentSize)); err != nil {
 		return storecatalog.Manifest{}, err
 	}
-	if err := hit(hook, FaultBeforeManifest); err != nil {
+	if err := hit(FaultBeforeManifest); err != nil {
 		return storecatalog.Manifest{}, err
 	}
 	got, err := storecatalog.Load(root)
 	if errors.Is(err, os.ErrNotExist) {
-		if err := storecatalog.Install(root, want, nil); err != nil {
+		if err := storecatalog.Install(root, want); err != nil {
 			return storecatalog.Manifest{}, err
 		}
 		got, err = storecatalog.Load(root)
@@ -193,7 +194,7 @@ func resume(root string, want storecatalog.Manifest, hook FaultHook) (storecatal
 	if encodeErr != nil || gotEncodeErr != nil || !bytes.Equal(gotBytes, wantBytes) {
 		return storecatalog.Manifest{}, fmt.Errorf("initial manifest differs from marker: %w", errors.Join(base.ErrCorrupt, encodeErr, gotEncodeErr))
 	}
-	if err := hit(hook, FaultBeforeMarkerRemove); err != nil {
+	if err := hit(FaultBeforeMarkerRemove); err != nil {
 		return storecatalog.Manifest{}, err
 	}
 	if err := os.Remove(filepath.Join(root, MarkerName)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -202,7 +203,7 @@ func resume(root string, want storecatalog.Manifest, hook FaultHook) (storecatal
 	if err := removeMarkerTemp(root); err != nil {
 		return storecatalog.Manifest{}, err
 	}
-	if err := hit(hook, FaultBeforeFinalDirSync); err != nil {
+	if err := hit(FaultBeforeFinalDirSync); err != nil {
 		return storecatalog.Manifest{}, err
 	}
 	if err := syncDirectory(root); err != nil {
@@ -211,7 +212,7 @@ func resume(root string, want storecatalog.Manifest, hook FaultHook) (storecatal
 	return got, nil
 }
 
-func installMarker(root string, manifest storecatalog.Manifest, hook FaultHook) error {
+func installMarker(root string, manifest storecatalog.Manifest) error {
 	encoded, err := storecatalog.Encode(manifest)
 	if err != nil {
 		return err
@@ -223,13 +224,13 @@ func installMarker(root string, manifest storecatalog.Manifest, hook FaultHook) 
 		return err
 	}
 	fail := func(cause error) error { return errors.Join(cause, file.Close()) }
-	if err := hit(hook, FaultBeforeMarkerWrite); err != nil {
+	if err := hit(FaultBeforeMarkerWrite); err != nil {
 		return fail(err)
 	}
 	if err := writeFull(file, encoded); err != nil {
 		return fail(err)
 	}
-	if err := hit(hook, FaultBeforeMarkerSync); err != nil {
+	if err := hit(FaultBeforeMarkerSync); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -238,13 +239,13 @@ func installMarker(root string, manifest storecatalog.Manifest, hook FaultHook) 
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := hit(hook, FaultBeforeMarkerRename); err != nil {
+	if err := hit(FaultBeforeMarkerRename); err != nil {
 		return err
 	}
 	if err := os.Rename(temp, marker); err != nil {
 		return err
 	}
-	if err := hit(hook, FaultBeforeMarkerDirSync); err != nil {
+	if err := hit(FaultBeforeMarkerDirSync); err != nil {
 		return err
 	}
 	return syncDirectory(root)
@@ -340,9 +341,6 @@ func syncDirectory(path string) error {
 	return errors.Join(dirsync.Flush(dir), dir.Close())
 }
 
-func hit(hook FaultHook, point FaultPoint) error {
-	if hook == nil {
-		return nil
-	}
-	return hook(point)
+func hit(point FaultPoint) error {
+	return fault.Hit(point)
 }

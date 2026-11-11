@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	"github.com/akzj/ridstore/internal/fault"
 	"time"
 )
 
@@ -26,7 +28,7 @@ func testRotate(root string, registry *segmentRegistry) rotateActive {
 		nextHeader := old.header
 		nextHeader.PreviousSegment = old.header.SegmentID
 		nextHeader.SegmentID++
-		next, err := createActiveSegment(root, nextHeader, nil, nil)
+		next, err := createActiveSegment(root, nextHeader, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -40,7 +42,11 @@ func testRotate(root string, registry *segmentRegistry) rotateActive {
 func openTestLog(t *testing.T, header SegmentHeader, hook segmentFaultHook) (*Log, string) {
 	t.Helper()
 	root := t.TempDir()
-	active, err := createActiveSegment(root, header, nil, hook)
+	if hook != nil {
+		previous := fault.SetHook(hook)
+		t.Cleanup(func() { fault.SetHook(previous) })
+	}
+	active, err := createActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +98,7 @@ func TestLogAppendReadScanAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, repaired, err := openActiveSegment(root, header, nil, nil)
+	recovered, repaired, err := openActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +114,7 @@ func TestLogRotatesBeforeAssigningAddress(t *testing.T) {
 	header := testSegmentHeader(1, 0)
 	header.SegmentSize = 512
 	root := t.TempDir()
-	active, err := createActiveSegment(root, header, nil, nil)
+	active, err := createActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +216,7 @@ func newUnstartedTestLog(cfg Config, maxPayload uint32, active *activeSegment, r
 
 func TestWriterNaturallyGroupsQueuedSyncRequests(t *testing.T) {
 	root := t.TempDir()
-	active, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	active, err := createActiveSegment(root, testSegmentHeader(1, 0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +261,7 @@ func TestWriterNaturallyGroupsQueuedSyncRequests(t *testing.T) {
 
 func TestWriterRejectsCanceledAcceptedRequestBeforeReservation(t *testing.T) {
 	root := t.TempDir()
-	active, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	active, err := createActiveSegment(root, testSegmentHeader(1, 0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

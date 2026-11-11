@@ -112,12 +112,13 @@ func TestOpenRejectsIncompleteInitializationAndCreateResumes(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	config := testCreateConfig()
 	stop := errors.New("stop before mapping segment")
-	_, err := create(context.Background(), root, config, func(point bootstrap.FaultPoint) error {
+	installHook(t, func(point bootstrap.FaultPoint) error {
 		if point == bootstrap.FaultBeforeMapSegment {
 			return stop
 		}
 		return nil
-	}, nil)
+	})
+	_, err := create(context.Background(), root, config)
 	if !errors.Is(err, stop) {
 		t.Fatalf("create err=%v", err)
 	}

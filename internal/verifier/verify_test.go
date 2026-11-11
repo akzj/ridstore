@@ -235,7 +235,7 @@ func TestVerifyRejectsCheckpointSegmentStatsMismatch(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := storecatalog.OpenManager(config.Dir, nil)
+	manager, err := storecatalog.OpenManager(config.Dir)
 	if err != nil {
 		t.Fatal(err)
 	}

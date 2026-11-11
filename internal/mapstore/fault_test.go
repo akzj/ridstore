@@ -7,8 +7,29 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/fault"
 	"github.com/akzj/ridstore/internal/recordlog"
 )
+
+func openWithHook(t *testing.T, root string, catalog CatalogPort, hook FaultHook) (*Store, error) {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	t.Cleanup(func() { fault.SetHook(previous) })
+	return Open(root, catalog)
+}
+
+func setHook(t *testing.T, hook FaultHook) {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	t.Cleanup(func() { fault.SetHook(previous) })
+}
+
+func installJournalWithHook(t *testing.T, root string, journal rotationJournal, hook FaultHook) error {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return installRotationJournal(root, journal)
+}
 
 func TestCheckpointWriterFaultsPoisonRuntimeAndFreshOpenRecovers(t *testing.T) {
 	causes := []error{syscall.EIO, syscall.ENOSPC, syscall.EACCES}
@@ -22,7 +43,7 @@ func TestCheckpointWriterFaultsPoisonRuntimeAndFreshOpenRecovers(t *testing.T) {
 					t.Fatal(err)
 				}
 				catalog := &staticCatalog{state: state}
-				store, err := OpenWithFaultHook(root, catalog, func(got FaultPoint) error {
+				store, err := openWithHook(t, root, catalog, func(got FaultPoint) error {
 					if got == point {
 						return cause
 					}
@@ -104,7 +125,7 @@ func TestActiveTailRepairFaultsRemainRetryable(t *testing.T) {
 				t.Fatal(err)
 			}
 			injected := errors.New("tail repair failure")
-			if _, err := OpenWithFaultHook(root, catalog, func(got FaultPoint) error {
+			if _, err := openWithHook(t, root, catalog, func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}

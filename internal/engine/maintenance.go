@@ -15,8 +15,8 @@ import (
 // before RecordLog opens files. Catalog membership selects the only safe
 // direction: present rolls the unstarted retire back; absent finishes physical
 // cleanup.
-func recoverMaintenance(root string, catalog *storecatalog.Manager, maintenanceHook maintstate.FaultHook, recordLogHook recordlog.FaultHook) error {
-	state, found, err := maintstate.LoadWithFaultHook(root, maintenanceHook)
+func recoverMaintenance(root string, catalog *storecatalog.Manager) error {
+	state, found, err := maintstate.Load(root)
 	if errors.Is(err, maintstate.ErrCorrupt) {
 		return errors.Join(base.ErrCorrupt, err)
 	}
@@ -36,14 +36,14 @@ func recoverMaintenance(root string, catalog *storecatalog.Manager, maintenanceH
 			manifest.CoveredCommitSeq < state.CoveredCommitSeq || manifest.ReplayStart.Compare(state.ReplayStart) < 0 {
 			return errors.Join(base.ErrCorrupt, errors.New("maintenance rollback evidence mismatch"))
 		}
-		return maintstate.RemoveWithFaultHook(root, maintenanceHook)
+		return maintstate.Remove(root)
 	}
 	if state.BaseGeneration == math.MaxUint64 || manifest.Generation <= state.BaseGeneration ||
 		manifest.CoveredCommitSeq < state.CoveredCommitSeq || manifest.ReplayStart.Compare(state.ReplayStart) < 0 {
 		return errors.Join(base.ErrCorrupt, errors.New("maintenance completion generation mismatch"))
 	}
-	if err := recordlog.CleanupRetiredSegmentWithFaultHook(root, state.Source.SegmentID, manifest.Generation, recordLogHook); err != nil {
+	if err := recordlog.CleanupRetiredSegment(root, state.Source.SegmentID, manifest.Generation); err != nil {
 		return err
 	}
-	return maintstate.RemoveWithFaultHook(root, maintenanceHook)
+	return maintstate.Remove(root)
 }

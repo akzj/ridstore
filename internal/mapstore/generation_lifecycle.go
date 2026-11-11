@@ -13,7 +13,7 @@ import (
 // PromoteGeneration moves every file in an isolated generation into the
 // canonical Mapping directory. It is idempotent across partial rename and
 // directory-sync failures; Catalog publication must happen only after success.
-func PromoteGeneration(root, stagingRoot string, generation Generation, hook FaultHook) error {
+func PromoteGeneration(root, stagingRoot string, generation Generation) error {
 	if root == "" || stagingRoot == "" || root == stagingRoot || !validGeneration(generation) {
 		return ErrInvalid
 	}
@@ -39,7 +39,7 @@ func PromoteGeneration(root, stagingRoot string, generation Generation, hook Fau
 			return ErrCorrupt
 		}
 		if sourceExists {
-			if err := hitFault(hook, FaultBeforeGCPromoteRename); err != nil {
+			if err := hitFault(FaultBeforeGCPromoteRename); err != nil {
 				return err
 			}
 			if err := os.Rename(source, destination); err != nil {
@@ -47,7 +47,7 @@ func PromoteGeneration(root, stagingRoot string, generation Generation, hook Fau
 			}
 		}
 	}
-	if err := hitFault(hook, FaultBeforeGCPromoteSync); err != nil {
+	if err := hitFault(FaultBeforeGCPromoteSync); err != nil {
 		return err
 	}
 	return errors.Join(syncDirectory(staging), syncDirectory(canonical))
@@ -56,7 +56,7 @@ func PromoteGeneration(root, stagingRoot string, generation Generation, hook Fau
 // RollbackGeneration removes an unpublished generation from both staging and
 // canonical locations. Segment IDs are never reused, so the marker-provided
 // generation identifies the only files this operation may remove.
-func RollbackGeneration(root, stagingRoot string, generation Generation, hook FaultHook) error {
+func RollbackGeneration(root, stagingRoot string, generation Generation) error {
 	if root == "" || stagingRoot == "" || !validGeneration(generation) {
 		return ErrInvalid
 	}
@@ -64,14 +64,14 @@ func RollbackGeneration(root, stagingRoot string, generation Generation, hook Fa
 	staging := filepath.Join(stagingRoot, mappingDirectory)
 	for _, dir := range []string{canonical, staging} {
 		for _, name := range generationNames(generation) {
-			if _, err := removeGenerationFile(filepath.Join(dir, name), hook, FaultBeforeGCRollbackRemove); err != nil {
+			if _, err := removeGenerationFile(filepath.Join(dir, name), FaultBeforeGCRollbackRemove); err != nil {
 				return err
 			}
 		}
 		if exists, err := directoryExists(dir); err != nil {
 			return err
 		} else if exists {
-			if err := hitFault(hook, FaultBeforeGCRollbackSync); err != nil {
+			if err := hitFault(FaultBeforeGCRollbackSync); err != nil {
 				return err
 			}
 			if err := syncDirectory(dir); err != nil {
@@ -84,7 +84,7 @@ func RollbackGeneration(root, stagingRoot string, generation Generation, hook Fa
 
 // RetireGeneration durably moves an old published file set through trash and
 // unlinks it. The new generation must already be verified and authoritative.
-func RetireGeneration(root string, generation Generation, catalogGeneration uint64, hook FaultHook) error {
+func RetireGeneration(root string, generation Generation, catalogGeneration uint64) error {
 	if root == "" || catalogGeneration == 0 || !validGeneration(generation) {
 		return ErrInvalid
 	}
@@ -111,7 +111,7 @@ func RetireGeneration(root string, generation Generation, catalogGeneration uint
 			return ErrCorrupt
 		}
 		if sourceExists {
-			if err := hitFault(hook, FaultBeforeGCRetireRename); err != nil {
+			if err := hitFault(FaultBeforeGCRetireRename); err != nil {
 				return err
 			}
 			if err := os.Rename(source, destination); err != nil {
@@ -119,7 +119,7 @@ func RetireGeneration(root string, generation Generation, catalogGeneration uint
 			}
 		}
 	}
-	if err := hitFault(hook, FaultBeforeGCRetireSync); err != nil {
+	if err := hitFault(FaultBeforeGCRetireSync); err != nil {
 		return err
 	}
 	if err := errors.Join(syncDirectory(canonical), syncDirectory(trash)); err != nil {
@@ -127,11 +127,11 @@ func RetireGeneration(root string, generation Generation, catalogGeneration uint
 	}
 	for _, name := range generationNames(generation) {
 		path := filepath.Join(trash, fmt.Sprintf("%s.g%d.trash", name, catalogGeneration))
-		if _, err := removeGenerationFile(path, hook, FaultBeforeGCTrashRemove); err != nil {
+		if _, err := removeGenerationFile(path, FaultBeforeGCTrashRemove); err != nil {
 			return err
 		}
 	}
-	if err := hitFault(hook, FaultBeforeGCTrashSync); err != nil {
+	if err := hitFault(FaultBeforeGCTrashSync); err != nil {
 		return err
 	}
 	return syncDirectory(trash)
@@ -223,12 +223,12 @@ func requireDirectory(path string) (string, error) {
 	return path, nil
 }
 
-func removeGenerationFile(path string, hook FaultHook, point FaultPoint) (bool, error) {
+func removeGenerationFile(path string, point FaultPoint) (bool, error) {
 	exists, err := regularExists(path)
 	if err != nil || !exists {
 		return false, err
 	}
-	if err := hitFault(hook, point); err != nil {
+	if err := hitFault(point); err != nil {
 		return false, err
 	}
 	return true, os.Remove(path)

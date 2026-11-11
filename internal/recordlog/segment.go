@@ -6,11 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/akzj/ridstore/internal/fault"
 )
 
 const recordsDirectory = "records"
 
-type segmentFaultPoint string
+type segmentFaultPoint = fault.Point
 
 const (
 	faultBeforeHeaderWrite    segmentFaultPoint = "recordlog.segment.before-header-write"
@@ -39,7 +41,7 @@ const (
 	faultBeforeTrashRootSync  segmentFaultPoint = "recordlog.retire.before-trash-root-sync"
 )
 
-type segmentFaultHook func(segmentFaultPoint) error
+type segmentFaultHook = fault.Hook
 
 // FaultPoint and FaultHook expose RecordLog's physical fault boundaries to
 // higher-level package tests without changing the production Open path.
@@ -107,7 +109,6 @@ type activeSegment struct {
 	sealed      bool
 	transferred bool
 	files       fileBackend
-	hook        segmentFaultHook
 }
 
 type sealedSegment struct {
@@ -148,7 +149,7 @@ func ensureRecordsDirectory(root string, files fileBackend) (string, error) {
 	return dir, nil
 }
 
-func createActiveSegment(root string, header SegmentHeader, files fileBackend, hook segmentFaultHook) (*activeSegment, error) {
+func createActiveSegment(root string, header SegmentHeader, files fileBackend) (*activeSegment, error) {
 	if files == nil {
 		files = osFileBackend{}
 	}
@@ -169,34 +170,34 @@ func createActiveSegment(root string, header SegmentHeader, files fileBackend, h
 	fail := func(cause error) (*activeSegment, error) {
 		return nil, errors.Join(cause, file.Close())
 	}
-	if err := hitSegmentFault(hook, faultBeforeHeaderWrite); err != nil {
+	if err := hitSegmentFault(faultBeforeHeaderWrite); err != nil {
 		return fail(err)
 	}
 	if _, err := writeFullAt(file, encoded[:], 0); err != nil {
 		return fail(err)
 	}
-	if err := hitSegmentFault(hook, faultBeforeHeaderSync); err != nil {
+	if err := hitSegmentFault(faultBeforeHeaderSync); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {
 		return fail(err)
 	}
-	if err := hitSegmentFault(hook, faultBeforeCreateRename); err != nil {
+	if err := hitSegmentFault(faultBeforeCreateRename); err != nil {
 		return fail(err)
 	}
 	if err := files.rename(creatingPath, activePath); err != nil {
 		return fail(err)
 	}
-	if err := hitSegmentFault(hook, faultBeforeCreateDirSync); err != nil {
+	if err := hitSegmentFault(faultBeforeCreateDirSync); err != nil {
 		return fail(err)
 	}
 	if err := files.syncDir(dir); err != nil {
 		return fail(err)
 	}
-	return &activeSegment{file: file, path: activePath, header: header, end: SegmentHeaderSize, files: files, hook: hook}, nil
+	return &activeSegment{file: file, path: activePath, header: header, end: SegmentHeaderSize, files: files}, nil
 }
 
-func openActiveSegment(root string, expected SegmentHeader, files fileBackend, hook segmentFaultHook) (*activeSegment, bool, error) {
+func openActiveSegment(root string, expected SegmentHeader, files fileBackend) (*activeSegment, bool, error) {
 	if files == nil {
 		files = osFileBackend{}
 	}
@@ -214,13 +215,13 @@ func openActiveSegment(root string, expected SegmentHeader, files fileBackend, h
 		return fail(err)
 	}
 	if repaired {
-		if err := hitSegmentFault(hook, faultBeforeTailTruncate); err != nil {
+		if err := hitSegmentFault(faultBeforeTailTruncate); err != nil {
 			return fail(err)
 		}
 		if err := file.Truncate(int64(metadata.ValidEnd)); err != nil {
 			return fail(err)
 		}
-		if err := hitSegmentFault(hook, faultBeforeTailSync); err != nil {
+		if err := hitSegmentFault(faultBeforeTailSync); err != nil {
 			return fail(err)
 		}
 		if err := file.Sync(); err != nil {
@@ -230,7 +231,7 @@ func openActiveSegment(root string, expected SegmentHeader, files fileBackend, h
 	return &activeSegment{
 		file: file, path: path, header: expected, end: metadata.ValidEnd,
 		first: metadata.FirstAddr, last: metadata.LastAddr, records: metadata.RecordCount,
-		files: files, hook: hook,
+		files: files,
 	}, repaired, nil
 }
 
@@ -371,7 +372,7 @@ func (s *activeSegment) appendEncoded(encoded []byte, records []recordExtent) (i
 		return 0, fmt.Errorf("encoded append size: %w", ErrCorrupt)
 	}
 	s.mu.RUnlock()
-	if err := hitSegmentFault(s.hook, faultBeforeAppendWrite); err != nil {
+	if err := hitSegmentFault(faultBeforeAppendWrite); err != nil {
 		return 0, err
 	}
 	written, err := writeFullAt(file, encoded, int64(startOffset))
@@ -404,7 +405,7 @@ func (s *activeSegment) sync() error {
 	}
 	file := s.file
 	s.mu.RUnlock()
-	if err := hitSegmentFault(s.hook, faultBeforeDataSync); err != nil {
+	if err := hitSegmentFault(faultBeforeDataSync); err != nil {
 		return err
 	}
 	return file.Sync()
@@ -448,13 +449,13 @@ func (s *activeSegment) prepareSeal() (SegmentSummary, error) {
 	if err != nil {
 		return SegmentSummary{}, err
 	}
-	if err := hitSegmentFault(s.hook, faultBeforeFooterWrite); err != nil {
+	if err := hitSegmentFault(faultBeforeFooterWrite); err != nil {
 		return SegmentSummary{}, err
 	}
 	if _, err := writeFullAt(file, footer[:], int64(summary.ValidEnd)); err != nil {
 		return SegmentSummary{}, err
 	}
-	if err := hitSegmentFault(s.hook, faultBeforeFooterSync); err != nil {
+	if err := hitSegmentFault(faultBeforeFooterSync); err != nil {
 		return SegmentSummary{}, err
 	}
 	if err := file.Sync(); err != nil {
@@ -475,13 +476,13 @@ func (s *activeSegment) publishPreparedSeal(expected SegmentSummary) (*sealedSeg
 	s.mu.RUnlock()
 	dir := filepath.Dir(path)
 	destination := filepath.Join(dir, sealedSegmentName(header.SegmentID))
-	if err := hitSegmentFault(s.hook, faultBeforeSealRename); err != nil {
+	if err := hitSegmentFault(faultBeforeSealRename); err != nil {
 		return nil, SegmentSummary{}, err
 	}
 	if err := s.files.rename(path, destination); err != nil {
 		return nil, SegmentSummary{}, err
 	}
-	if err := hitSegmentFault(s.hook, faultBeforeSealDirSync); err != nil {
+	if err := hitSegmentFault(faultBeforeSealDirSync); err != nil {
 		return nil, SegmentSummary{}, err
 	}
 	if err := s.files.syncDir(dir); err != nil {
@@ -705,9 +706,6 @@ func (s *sealedSegment) close() error {
 	return err
 }
 
-func hitSegmentFault(hook segmentFaultHook, point segmentFaultPoint) error {
-	if hook == nil {
-		return nil
-	}
-	return hook(point)
+func hitSegmentFault(point segmentFaultPoint) error {
+	return fault.Hit(point)
 }

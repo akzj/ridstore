@@ -54,7 +54,7 @@ func TestOpenCompletesPreparedRotation(t *testing.T) {
 				BaseGeneration: state.Generation, StoreID: state.StoreID, SegmentSize: state.SegmentSize,
 				Old: store.active.summary, NewActive: 2, NextSegment: 3,
 			}
-			if err := installRotationJournal(root, journal, nil); err != nil {
+			if err := installRotationJournal(root, journal); err != nil {
 				t.Fatal(err)
 			}
 			if err := store.Close(); err != nil {
@@ -117,17 +117,17 @@ func TestOpenAcceptsCatalogCommittedRotationAndRemovesJournal(t *testing.T) {
 		BaseGeneration: state.Generation, StoreID: state.StoreID, SegmentSize: state.SegmentSize,
 		Old: store.active.summary, NewActive: 2, NextSegment: 3,
 	}
-	if err := installRotationJournal(root, journal, nil); err != nil {
+	if err := installRotationJournal(root, journal); err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := sealActive(root, store.active, journal.Old, nil)
+	sealed, err := sealActive(root, store.active, journal.Old)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := sealed.file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	active, err := createActive(root, state.headerFor(2), nil)
+	active, err := createActive(root, state.headerFor(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestRuntimeRotationFaultsConvergeFromDurableEvidence(t *testing.T) {
 			}
 			catalog := &staticCatalog{state: state}
 			injected := errors.New("injected rotation failure")
-			store, err := OpenWithFaultHook(root, catalog, func(point FaultPoint) error {
+			store, err := openWithHook(t, root, catalog, func(point FaultPoint) error {
 				if point == test.point {
 					return injected
 				}
@@ -274,7 +274,7 @@ func TestRotationRecoveryFailureIsRetryable(t *testing.T) {
 		t.Run(string(point), func(t *testing.T) {
 			root, catalog, first := prepareRotationJournal(t)
 			injected := errors.New("injected recovery failure")
-			if _, err := OpenWithFaultHook(root, catalog, func(got FaultPoint) error {
+			if _, err := openWithHook(t, root, catalog, func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -319,7 +319,7 @@ func TestUnpublishedRotationTempCleanupIsRetryable(t *testing.T) {
 				Old: store.active.summary, NewActive: 2, NextSegment: 3,
 			}
 			stopPublish := errors.New("leave journal temp")
-			if err := installRotationJournal(root, journal, func(got FaultPoint) error {
+			if err := installJournalWithHook(t, root, journal, func(got FaultPoint) error {
 				if got == FaultBeforeJournalRename {
 					return stopPublish
 				}
@@ -331,7 +331,7 @@ func TestUnpublishedRotationTempCleanupIsRetryable(t *testing.T) {
 				t.Fatal(err)
 			}
 			injected := errors.New("cleanup failure")
-			if _, err := OpenWithFaultHook(root, catalog, func(got FaultPoint) error {
+			if _, err := openWithHook(t, root, catalog, func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -372,7 +372,7 @@ func prepareRotationJournal(t *testing.T) (string, *staticCatalog, model.MapAddr
 		BaseGeneration: state.Generation, StoreID: state.StoreID, SegmentSize: state.SegmentSize,
 		Old: store.active.summary, NewActive: 2, NextSegment: 3,
 	}
-	if err := installRotationJournal(root, journal, nil); err != nil {
+	if err := installRotationJournal(root, journal); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

@@ -86,7 +86,7 @@ func rotationTempPath(root string) string {
 	return filepath.Join(root, mappingDirectory, "ROTATION.tmp")
 }
 
-func installRotationJournal(root string, journal rotationJournal, hook FaultHook) error {
+func installRotationJournal(root string, journal rotationJournal) error {
 	encoded, err := encodeRotationJournal(journal)
 	if err != nil {
 		return err
@@ -95,13 +95,13 @@ func installRotationJournal(root string, journal rotationJournal, hook FaultHook
 	if err != nil {
 		return err
 	}
-	if err := hitFault(hook, FaultBeforeJournalWrite); err != nil {
+	if err := hitFault(FaultBeforeJournalWrite); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := writeFullAt(file, encoded[:], 0); err != nil {
 		return errors.Join(err, file.Close())
 	}
-	if err := hitFault(hook, FaultBeforeJournalSync); err != nil {
+	if err := hitFault(FaultBeforeJournalSync); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := file.Sync(); err != nil {
@@ -110,22 +110,22 @@ func installRotationJournal(root string, journal rotationJournal, hook FaultHook
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := hitFault(hook, FaultBeforeJournalRename); err != nil {
+	if err := hitFault(FaultBeforeJournalRename); err != nil {
 		return err
 	}
 	if err := os.Rename(rotationTempPath(root), rotationPath(root)); err != nil {
 		return err
 	}
-	if err := hitFault(hook, FaultBeforeJournalDirSync); err != nil {
+	if err := hitFault(FaultBeforeJournalDirSync); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Join(root, mappingDirectory))
 }
 
-func loadRotationJournal(root string, hook FaultHook) (rotationJournal, bool, error) {
+func loadRotationJournal(root string) (rotationJournal, bool, error) {
 	value, err := os.ReadFile(rotationPath(root))
 	if errors.Is(err, os.ErrNotExist) {
-		if err := removeRotationTemp(root, hook); err != nil {
+		if err := removeRotationTemp(root); err != nil {
 			return rotationJournal{}, false, err
 		}
 		// A previous cleanup may have removed the journal but failed its
@@ -140,13 +140,13 @@ func loadRotationJournal(root string, hook FaultHook) (rotationJournal, bool, er
 	return j, err == nil, err
 }
 
-func removeRotationTemp(root string, hook FaultHook) error {
+func removeRotationTemp(root string) error {
 	if _, err := os.Lstat(rotationTempPath(root)); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	if err := hitFault(hook, FaultBeforeJournalRemove); err != nil {
+	if err := hitFault(FaultBeforeJournalRemove); err != nil {
 		return err
 	}
 	err := os.Remove(rotationTempPath(root))
@@ -156,13 +156,13 @@ func removeRotationTemp(root string, hook FaultHook) error {
 	if err != nil {
 		return err
 	}
-	if err := hitFault(hook, FaultBeforeCleanupDirSync); err != nil {
+	if err := hitFault(FaultBeforeCleanupDirSync); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Join(root, mappingDirectory))
 }
 
-func removeRotationJournal(root string, hook FaultHook) error {
+func removeRotationJournal(root string) error {
 	exists := false
 	for _, path := range []string{rotationPath(root), rotationTempPath(root)} {
 		if _, err := os.Lstat(path); err == nil {
@@ -172,7 +172,7 @@ func removeRotationJournal(root string, hook FaultHook) error {
 		}
 	}
 	if exists {
-		if err := hitFault(hook, FaultBeforeJournalRemove); err != nil {
+		if err := hitFault(FaultBeforeJournalRemove); err != nil {
 			return err
 		}
 	}
@@ -183,7 +183,7 @@ func removeRotationJournal(root string, hook FaultHook) error {
 		return err
 	}
 	if exists {
-		if err := hitFault(hook, FaultBeforeCleanupDirSync); err != nil {
+		if err := hitFault(FaultBeforeCleanupDirSync); err != nil {
 			return err
 		}
 	}

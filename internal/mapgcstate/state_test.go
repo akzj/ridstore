@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/fault"
+
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 )
@@ -33,7 +35,7 @@ func TestStateRoundTrip(t *testing.T) {
 func TestInstallLoadRemove(t *testing.T) {
 	root := t.TempDir()
 	want := testState(t)
-	if err := Install(root, want, nil); err != nil {
+	if err := Install(root, want); err != nil {
 		t.Fatal(err)
 	}
 	if found, err := RecoveryArtifacts(root); err != nil || !found {
@@ -43,7 +45,7 @@ func TestInstallLoadRemove(t *testing.T) {
 	if err != nil || !found || !reflect.DeepEqual(got, want) {
 		t.Fatalf("got=%+v found=%v err=%v", got, found, err)
 	}
-	if err := Remove(root, nil); err != nil {
+	if err := Remove(root); err != nil {
 		t.Fatal(err)
 	}
 	if found, err := RecoveryArtifacts(root); err != nil || found {
@@ -54,7 +56,7 @@ func TestInstallLoadRemove(t *testing.T) {
 func TestLoadCleansUnpublishedTemp(t *testing.T) {
 	root := t.TempDir()
 	injected := errors.New("stop before publish")
-	err := Install(root, testState(t), func(point FaultPoint) error {
+	err := installWithHook(t, root, testState(t), func(point FaultPoint) error {
 		if point == FaultBeforePublishRename {
 			return injected
 		}
@@ -98,7 +100,7 @@ func TestInstallFaultBoundariesRemainRecoverable(t *testing.T) {
 	} {
 		t.Run(string(point), func(t *testing.T) {
 			root := t.TempDir()
-			err := Install(root, testState(t), func(got FaultPoint) error {
+			err := installWithHook(t, root, testState(t), func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -124,11 +126,11 @@ func TestInstallFaultBoundariesRemainRecoverable(t *testing.T) {
 
 func TestRemoveFaultKeepsPublishedMarker(t *testing.T) {
 	root := t.TempDir()
-	if err := Install(root, testState(t), nil); err != nil {
+	if err := Install(root, testState(t)); err != nil {
 		t.Fatal(err)
 	}
 	injected := errors.New("injected")
-	if err := Remove(root, func(point FaultPoint) error {
+	if err := removeWithHook(t, root, func(point FaultPoint) error {
 		if point == FaultBeforeMarkerRemove {
 			return injected
 		}
@@ -162,4 +164,18 @@ func testState(t *testing.T) State {
 			Active: 4, Next: 5, Root: newRoot,
 		},
 	}
+}
+
+func installWithHook(t *testing.T, root string, state State, hook FaultHook) error {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return Install(root, state)
+}
+
+func removeWithHook(t *testing.T, root string, hook FaultHook) error {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return Remove(root)
 }

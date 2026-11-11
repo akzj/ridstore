@@ -733,7 +733,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		BaseGeneration: proof.ManifestGeneration, CoveredCommitSeq: proof.CoveredCommitSeq,
 		ReplayStart: manifest.ReplayStart, Source: proof.Source,
 	}
-	if err := maintstate.InstallWithFaultHook(s.core.root, state, s.maintenance.stateHook); err != nil {
+	if err := maintstate.Install(s.core.root, state); err != nil {
 		_, markerVisible, loadErr := maintstate.Load(s.core.root)
 		if loadErr != nil || markerVisible {
 			recoveryErr := errors.Join(base.ErrRecoveryRequired, err, loadErr)
@@ -751,7 +751,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		}
 		current := s.catalogSnapshot()
 		if current.Generation >= manifest.Generation && containsSealedSegment(current, proof.Source) {
-			cleanupErr := maintstate.RemoveWithFaultHook(s.core.root, s.maintenance.stateHook)
+			cleanupErr := maintstate.Remove(s.core.root)
 			if cleanupErr == nil {
 				return result, err
 			}
@@ -768,7 +768,7 @@ func (s *Store) compactSegmentLocked(ctx context.Context, source recordlog.Segme
 		s.setFault(recoveryErr)
 		return result, recoveryErr
 	}
-	if err := maintstate.RemoveWithFaultHook(s.core.root, s.maintenance.stateHook); err != nil {
+	if err := maintstate.Remove(s.core.root); err != nil {
 		recoveryErr := errors.Join(base.ErrRecoveryRequired, err)
 		s.setFault(recoveryErr)
 		return result, recoveryErr

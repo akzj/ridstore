@@ -317,10 +317,10 @@ func TestRealRecordLogRoundTrip(t *testing.T) {
 		ActiveMapSegmentID: 1, NextMapSegmentID: 2,
 		ReplayStart: replayStart, ReservedIDHigh: 1, ReservedBatchIDHigh: 1, IssuedBatchIDHighAtCut: 1,
 	}
-	if err := storecatalog.Install(root, manifest, nil); err != nil {
+	if err := storecatalog.Install(root, manifest); err != nil {
 		t.Fatal(err)
 	}
-	catalog, err := storecatalog.NewManager(root, manifest, nil)
+	catalog, err := storecatalog.NewManager(root, manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestOpenReplaysIntoPersistentMapping(t *testing.T) {
 		ActiveMapSegmentID: 1, NextMapSegmentID: 2,
 		ReplayStart: replayStart, ReservedIDHigh: 1, ReservedBatchIDHigh: 1, IssuedBatchIDHighAtCut: 1,
 	}
-	if err := storecatalog.Install(root, manifest, nil); err != nil {
+	if err := storecatalog.Install(root, manifest); err != nil {
 		t.Fatal(err)
 	}
 	config := OpenConfig{

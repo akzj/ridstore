@@ -7,16 +7,24 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/fault"
 	"github.com/akzj/ridstore/internal/mapstore"
 	"github.com/akzj/ridstore/internal/model"
 	"github.com/akzj/ridstore/internal/radix"
 	"github.com/akzj/ridstore/internal/recordlog"
 )
 
+func promoteWithHook(t *testing.T, root, staging string, generation mapstore.Generation, hook mapstore.FaultHook) error {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return mapstore.PromoteGeneration(root, staging, generation)
+}
+
 func TestGenerationWriterBuildsIndependentVerifiedFileSet(t *testing.T) {
 	root := t.TempDir()
 	storeID := mapstore.StoreID{1}
-	writer, err := mapstore.CreateGenerationWriter(root, storeID, 8192, 17, nil)
+	writer, err := mapstore.CreateGenerationWriter(root, storeID, 8192, 17)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +92,7 @@ func TestGenerationWriterBuildsIndependentVerifiedFileSet(t *testing.T) {
 
 func TestGenerationWriterFinishesEmptyMapping(t *testing.T) {
 	root := t.TempDir()
-	writer, err := mapstore.CreateGenerationWriter(root, mapstore.StoreID{1}, 8192, 2, nil)
+	writer, err := mapstore.CreateGenerationWriter(root, mapstore.StoreID{1}, 8192, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +119,7 @@ func TestGenerationWriterFinishesEmptyMapping(t *testing.T) {
 func TestOpenVerifiedGenerationAllowsRetiringFilesToCoexist(t *testing.T) {
 	root := t.TempDir()
 	storeID := mapstore.StoreID{1}
-	writer, err := mapstore.CreateGenerationWriter(root, storeID, 8192, 2, nil)
+	writer, err := mapstore.CreateGenerationWriter(root, storeID, 8192, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +178,7 @@ func TestPromoteGenerationFaultsConvergeOnRetry(t *testing.T) {
 				t.Fatal(err)
 			}
 			storeID := mapstore.StoreID{1}
-			writer, err := mapstore.CreateGenerationWriter(staging, storeID, 8192, 2, nil)
+			writer, err := mapstore.CreateGenerationWriter(staging, storeID, 8192, 2)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -204,7 +212,7 @@ func TestPromoteGenerationFaultsConvergeOnRetry(t *testing.T) {
 			}
 			injected := errors.New("injected")
 			calls := 0
-			if err := mapstore.PromoteGeneration(root, staging, generation, func(got mapstore.FaultPoint) error {
+			if err := promoteWithHook(t, root, staging, generation, func(got mapstore.FaultPoint) error {
 				if got == point {
 					calls++
 				}
@@ -215,7 +223,7 @@ func TestPromoteGenerationFaultsConvergeOnRetry(t *testing.T) {
 			}); !errors.Is(err, injected) {
 				t.Fatalf("promote err=%v", err)
 			}
-			if err := mapstore.PromoteGeneration(root, staging, generation, nil); err != nil {
+			if err := mapstore.PromoteGeneration(root, staging, generation); err != nil {
 				t.Fatal(err)
 			}
 			snapshot := mapstore.CatalogSnapshot{

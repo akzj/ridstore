@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/akzj/ridstore/internal/fault"
 	"time"
 )
 
@@ -71,7 +73,7 @@ func (f *blockingReadFile) ReadAt(value []byte, offset int64) (int, error) {
 
 func TestActiveSegmentAppendDoesNotWaitForReadIO(t *testing.T) {
 	root := t.TempDir()
-	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +151,7 @@ func appendTestRecordsWithoutFatal(segment *activeSegment, payload []byte, done 
 
 func TestActiveSegmentReadDoesNotWaitForAppendIO(t *testing.T) {
 	root := t.TempDir()
-	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +167,7 @@ func TestActiveSegmentReadDoesNotWaitForAppendIO(t *testing.T) {
 		}
 	}()
 	var once sync.Once
-	segment.hook = func(point segmentFaultPoint) error {
+	previous := fault.SetHook(func(point segmentFaultPoint) error {
 		if point == faultBeforeAppendWrite {
 			once.Do(func() {
 				close(reached)
@@ -173,7 +175,8 @@ func TestActiveSegmentReadDoesNotWaitForAppendIO(t *testing.T) {
 			})
 		}
 		return nil
-	}
+	})
+	defer fault.SetHook(previous)
 	payload := []byte("second")
 	physical, err := PhysicalRecordSize(uint64(len(payload)))
 	if err != nil {
@@ -226,7 +229,7 @@ func TestActiveSegmentReadDoesNotWaitForAppendIO(t *testing.T) {
 
 func TestActiveSegmentReadDoesNotWaitForSealIO(t *testing.T) {
 	root := t.TempDir()
-	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	segment, err := createActiveSegment(root, testSegmentHeader(1, 0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +243,7 @@ func TestActiveSegmentReadDoesNotWaitForSealIO(t *testing.T) {
 		}
 	}()
 	var once sync.Once
-	segment.hook = func(point segmentFaultPoint) error {
+	previous := fault.SetHook(func(point segmentFaultPoint) error {
 		if point == faultBeforeFooterSync {
 			once.Do(func() {
 				close(reached)
@@ -248,7 +251,8 @@ func TestActiveSegmentReadDoesNotWaitForSealIO(t *testing.T) {
 			})
 		}
 		return nil
-	}
+	})
+	defer fault.SetHook(previous)
 	type sealResult struct {
 		sealed *sealedSegment
 		err    error
@@ -299,7 +303,7 @@ func TestActiveSegmentReadDoesNotWaitForSealIO(t *testing.T) {
 func TestActiveSegmentRecoversOnlyIncompleteTail(t *testing.T) {
 	root := t.TempDir()
 	header := testSegmentHeader(1, 0)
-	segment, err := createActiveSegment(root, header, nil, nil)
+	segment, err := createActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +329,7 @@ func TestActiveSegmentRecoversOnlyIncompleteTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, repaired, err := openActiveSegment(root, header, nil, nil)
+	recovered, repaired, err := openActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +358,7 @@ func TestActiveSegmentRecoversOnlyIncompleteTail(t *testing.T) {
 func TestActiveSegmentRepairsUnpublishedPreparedFooter(t *testing.T) {
 	root := t.TempDir()
 	header := testSegmentHeader(1, 0)
-	segment, err := createActiveSegment(root, header, nil, nil)
+	segment, err := createActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +377,7 @@ func TestActiveSegmentRepairsUnpublishedPreparedFooter(t *testing.T) {
 	if err := segment.close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, repaired, err := openActiveSegment(root, header, nil, nil)
+	reopened, repaired, err := openActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +397,7 @@ func TestActiveSegmentRepairsUnpublishedPreparedFooter(t *testing.T) {
 func TestActiveSegmentRejectsCompleteCorruptRecord(t *testing.T) {
 	root := t.TempDir()
 	header := testSegmentHeader(1, 0)
-	segment, err := createActiveSegment(root, header, nil, nil)
+	segment, err := createActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +411,7 @@ func TestActiveSegmentRejectsCompleteCorruptRecord(t *testing.T) {
 	if err := segment.close(); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = openActiveSegment(root, header, nil, nil)
+	_, _, err = openActiveSegment(root, header, nil)
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("error=%v", err)
 	}
@@ -416,7 +420,7 @@ func TestActiveSegmentRejectsCompleteCorruptRecord(t *testing.T) {
 func TestSealAndOpenRequireExactSummary(t *testing.T) {
 	root := t.TempDir()
 	header := testSegmentHeader(4, 3)
-	active, err := createActiveSegment(root, header, nil, nil)
+	active, err := createActiveSegment(root, header, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +477,7 @@ func TestSegmentFaultBoundaries(t *testing.T) {
 	} {
 		t.Run(string(point), func(t *testing.T) {
 			root := t.TempDir()
-			_, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, func(got segmentFaultPoint) error {
+			_, err := createWithHook(t, root, testSegmentHeader(1, 0), nil, func(got segmentFaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -518,7 +522,7 @@ func TestWriteFullAtHandlesPartialAndZeroWrites(t *testing.T) {
 func TestRegistryRetirementWaitsForReaderPins(t *testing.T) {
 	root := t.TempDir()
 	firstHeader := testSegmentHeader(1, 0)
-	first, err := createActiveSegment(root, firstHeader, nil, nil)
+	first, err := createActiveSegment(root, firstHeader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +531,7 @@ func TestRegistryRetirementWaitsForReaderPins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	active, err := createActiveSegment(root, testSegmentHeader(2, 1), nil, nil)
+	active, err := createActiveSegment(root, testSegmentHeader(2, 1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +581,7 @@ func TestRegistryRetirementWaitsForReaderPins(t *testing.T) {
 
 func TestRegistryRotationPreservesExistingPin(t *testing.T) {
 	root := t.TempDir()
-	old, err := createActiveSegment(root, testSegmentHeader(1, 0), nil, nil)
+	old, err := createActiveSegment(root, testSegmentHeader(1, 0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +598,7 @@ func TestRegistryRotationPreservesExistingPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	active, err := createActiveSegment(root, testSegmentHeader(2, 1), nil, nil)
+	active, err := createActiveSegment(root, testSegmentHeader(2, 1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

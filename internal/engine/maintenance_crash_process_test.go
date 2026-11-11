@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/fault"
 	"github.com/akzj/ridstore/internal/maintstate"
 	"github.com/akzj/ridstore/internal/recordlog"
 )
@@ -90,12 +91,14 @@ func TestMaintenanceCrashHelper(t *testing.T) {
 	}
 	if phase == "trash" {
 		stop := errors.New("stop before trash unlink")
-		err := recordlog.CleanupRetiredSegmentWithFaultHook(root, proof.Source.SegmentID, manifest.Generation, func(point recordlog.FaultPoint) error {
+		previous := fault.SetHook(func(point recordlog.FaultPoint) error {
 			if point == recordlog.FaultBeforeTrashRemove {
 				return stop
 			}
 			return nil
 		})
+		err := recordlog.CleanupRetiredSegment(root, proof.Source.SegmentID, manifest.Generation)
+		fault.SetHook(previous)
 		if !errors.Is(err, stop) {
 			t.Fatalf("cleanup err=%v", err)
 		}

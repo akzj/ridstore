@@ -8,9 +8,10 @@ import (
 	"path/filepath"
 
 	"github.com/akzj/ridstore/internal/dirsync"
+	"github.com/akzj/ridstore/internal/fault"
 )
 
-type FaultPoint string
+type FaultPoint = fault.Point
 
 const (
 	FaultBeforeManifestWrite   FaultPoint = "storecatalog.before-write"
@@ -21,7 +22,7 @@ const (
 	FaultBeforeTempDirSync     FaultPoint = "storecatalog.before-temp-dir-sync"
 )
 
-type FaultHook func(FaultPoint) error
+type FaultHook = fault.Hook
 
 func manifestSlotPath(root string, slot uint64) string {
 	return filepath.Join(root, fmt.Sprintf("MANIFEST-v2-%d", slot))
@@ -31,7 +32,7 @@ func manifestTempPath(root string, slot uint64) string {
 	return manifestSlotPath(root, slot) + ".tmp"
 }
 
-func Install(root string, manifest Manifest, hook FaultHook) error {
+func Install(root string, manifest Manifest) error {
 	if root == "" {
 		return ErrInvalid
 	}
@@ -42,12 +43,12 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 	slot := manifest.Generation & 1
 	tempPath := manifestTempPath(root, slot)
 	finalPath := manifestSlotPath(root, slot)
-	removed, err := removeManifestTemp(tempPath, hook)
+	removed, err := removeManifestTemp(tempPath)
 	if err != nil {
 		return err
 	}
 	if removed {
-		if err := syncManifestDir(root, hook, FaultBeforeTempDirSync); err != nil {
+		if err := syncManifestDir(root, FaultBeforeTempDirSync); err != nil {
 			return err
 		}
 	}
@@ -56,13 +57,13 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 		return err
 	}
 	fail := func(cause error) error { return errors.Join(cause, file.Close()) }
-	if err := hit(hook, FaultBeforeManifestWrite); err != nil {
+	if err := hit(FaultBeforeManifestWrite); err != nil {
 		return fail(err)
 	}
 	if _, err := writeFull(file, encoded); err != nil {
 		return fail(err)
 	}
-	if err := hit(hook, FaultBeforeManifestSync); err != nil {
+	if err := hit(FaultBeforeManifestSync); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -71,7 +72,7 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := hit(hook, FaultBeforeManifestRename); err != nil {
+	if err := hit(FaultBeforeManifestRename); err != nil {
 		return err
 	}
 	if err := os.Rename(tempPath, finalPath); err != nil {
@@ -81,7 +82,7 @@ func Install(root string, manifest Manifest, hook FaultHook) error {
 	if err != nil {
 		return err
 	}
-	if err := hit(hook, FaultBeforeManifestDirSync); err != nil {
+	if err := hit(FaultBeforeManifestDirSync); err != nil {
 		return errors.Join(err, dir.Close())
 	}
 	return errors.Join(dirsync.Flush(dir), dir.Close())
@@ -94,13 +95,13 @@ func Load(root string) (Manifest, error) {
 // LoadRecovering loads the authoritative Manifest and removes unpublished
 // regular temp slots left by an interrupted install. Callers must hold the
 // directory lease so cleanup cannot race another writer.
-func LoadRecovering(root string, hook FaultHook) (Manifest, error) {
+func LoadRecovering(root string) (Manifest, error) {
 	manifest, err := Load(root)
 	if err != nil {
 		return Manifest{}, err
 	}
 	for slot := uint64(0); slot < 2; slot++ {
-		_, err := removeManifestTemp(manifestTempPath(root, slot), hook)
+		_, err := removeManifestTemp(manifestTempPath(root, slot))
 		if err != nil {
 			return Manifest{}, err
 		}
@@ -108,7 +109,7 @@ func LoadRecovering(root string, hook FaultHook) (Manifest, error) {
 	// Always sync: a prior process may have removed a temp slot and then
 	// observed an uncertain directory-sync result. Absence alone does not prove
 	// that deletion durable.
-	if err := syncManifestDir(root, hook, FaultBeforeTempDirSync); err != nil {
+	if err := syncManifestDir(root, FaultBeforeTempDirSync); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil
@@ -262,14 +263,11 @@ func writeFull(writer io.Writer, value []byte) (int, error) {
 	return written, nil
 }
 
-func hit(hook FaultHook, point FaultPoint) error {
-	if hook == nil {
-		return nil
-	}
-	return hook(point)
+func hit(point FaultPoint) error {
+	return fault.Hit(point)
 }
 
-func removeManifestTemp(path string, hook FaultHook) (bool, error) {
+func removeManifestTemp(path string) (bool, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -280,14 +278,14 @@ func removeManifestTemp(path string, hook FaultHook) (bool, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return false, ErrCorrupt
 	}
-	if err := hit(hook, FaultBeforeTempRemove); err != nil {
+	if err := hit(FaultBeforeTempRemove); err != nil {
 		return false, err
 	}
 	return true, os.Remove(path)
 }
 
-func syncManifestDir(root string, hook FaultHook, point FaultPoint) error {
-	if err := hit(hook, point); err != nil {
+func syncManifestDir(root string, point FaultPoint) error {
+	if err := hit(point); err != nil {
 		return err
 	}
 	dir, err := os.Open(root)

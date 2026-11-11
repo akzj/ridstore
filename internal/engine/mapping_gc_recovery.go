@@ -16,8 +16,8 @@ import (
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
 
-func recoverMappingGC(ctx context.Context, root string, catalog *storecatalog.Manager, stateHook mapgcstate.FaultHook, mapHook mapstore.FaultHook) error {
-	state, found, err := mapgcstate.LoadWithFaultHook(root, stateHook)
+func recoverMappingGC(ctx context.Context, root string, catalog *storecatalog.Manager) error {
+	state, found, err := mapgcstate.Load(root)
 	if errors.Is(err, mapgcstate.ErrCorrupt) {
 		return errors.Join(base.ErrCorrupt, err)
 	}
@@ -55,10 +55,10 @@ func recoverMappingGC(ctx context.Context, root string, catalog *storecatalog.Ma
 	newMatches := state.BaseGeneration != math.MaxUint64 && manifest.Generation > state.BaseGeneration && manifestMatchesMappingSet(manifest, state.New)
 	staging := mapgcstate.StagingRoot(root)
 	if oldMatches {
-		if err := mapstore.RollbackGeneration(root, staging, generationFromState(state.New, state.Covered), mapHook); err != nil {
+		if err := mapstore.RollbackGeneration(root, staging, generationFromState(state.New, state.Covered)); err != nil {
 			return classifyMappingGCRecovery(err)
 		}
-		return mapgcstate.Remove(root, stateHook)
+		return mapgcstate.Remove(root)
 	}
 	if !newMatches {
 		return errors.Join(base.ErrCorrupt, errors.New("mapping gc catalog does not match old or new generation"))
@@ -82,13 +82,13 @@ func recoverMappingGC(ctx context.Context, root string, catalog *storecatalog.Ma
 	if err != nil {
 		return classifyMappingGCRecovery(err)
 	}
-	if err := mapstore.RetireGeneration(root, generationFromState(state.Old, state.Covered), manifest.Generation, mapHook); err != nil {
+	if err := mapstore.RetireGeneration(root, generationFromState(state.Old, state.Covered), manifest.Generation); err != nil {
 		return classifyMappingGCRecovery(err)
 	}
 	if err := mapstore.RemoveGenerationStaging(root, staging); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return mapgcstate.Remove(root, stateHook)
+	return mapgcstate.Remove(root)
 }
 
 func classifyMappingGCRecovery(err error) error {

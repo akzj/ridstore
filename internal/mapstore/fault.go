@@ -1,6 +1,8 @@
 package mapstore
 
-type FaultPoint string
+import "github.com/akzj/ridstore/internal/fault"
+
+type FaultPoint = fault.Point
 
 const (
 	FaultBeforeRead             FaultPoint = "mapstore.before-read"
@@ -32,11 +34,8 @@ const (
 	FaultBeforeGCTrashSync      FaultPoint = "mapstore.gc.before-trash-sync"
 )
 
-type FaultHook func(FaultPoint) error
+type FaultHook = fault.Hook
 
-func hitFault(hook FaultHook, point FaultPoint) error {
-	if hook == nil {
-		return nil
-	}
-	return hook(point)
+func hitFault(point FaultPoint) error {
+	return fault.Hit(point)
 }

@@ -10,9 +10,16 @@ import (
 	ridstore "github.com/akzj/ridstore"
 	"github.com/akzj/ridstore/internal/backuprestore"
 	"github.com/akzj/ridstore/internal/base"
+	"github.com/akzj/ridstore/internal/fault"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/verifier"
 )
+
+func withHook(t *testing.T, hook backuprestore.FaultHook) {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	t.Cleanup(func() { fault.SetHook(previous) })
+}
 
 func TestBackupFaultsDoNotPublishPartialArtifacts(t *testing.T) {
 	root := t.TempDir()
@@ -36,14 +43,14 @@ func TestBackupFaultsDoNotPublishPartialArtifacts(t *testing.T) {
 	for _, point := range points {
 		t.Run(string(point), func(t *testing.T) {
 			destination := filepath.Join(root, "backup-"+safeName(string(point)))
+			withHook(t, func(got backuprestore.FaultPoint) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			})
 			_, err := backuprestore.Backup(context.Background(), backuprestore.Config{
 				SourceDir: source, DestDir: destination, Verify: verifyConfig(),
-				Hook: func(got backuprestore.FaultPoint) error {
-					if got == point {
-						return injected
-					}
-					return nil
-				},
 			})
 			if !errors.Is(err, injected) {
 				t.Fatalf("err=%v", err)
@@ -60,14 +67,14 @@ func TestBackupPostRenameFaultLeavesCompleteArtifact(t *testing.T) {
 	source := createClosedStore(t, filepath.Join(root, "source"))
 	artifact := filepath.Join(root, "backup")
 	injected := errors.New("publication uncertain")
+	withHook(t, func(point backuprestore.FaultPoint) error {
+		if point == backuprestore.FaultBackupAfterPublish {
+			return injected
+		}
+		return nil
+	})
 	_, err := backuprestore.Backup(context.Background(), backuprestore.Config{
 		SourceDir: source, DestDir: artifact, Verify: verifyConfig(),
-		Hook: func(point backuprestore.FaultPoint) error {
-			if point == backuprestore.FaultBackupAfterPublish {
-				return injected
-			}
-			return nil
-		},
 	})
 	if !errors.Is(err, injected) {
 		t.Fatalf("err=%v", err)
@@ -100,14 +107,14 @@ func TestRestoreFaultsDoNotPublishPartialStores(t *testing.T) {
 	for _, point := range points {
 		t.Run(string(point), func(t *testing.T) {
 			destination := filepath.Join(root, "restore-"+safeName(string(point)))
+			withHook(t, func(got backuprestore.FaultPoint) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			})
 			_, err := backuprestore.Restore(context.Background(), backuprestore.Config{
 				SourceDir: artifact, DestDir: destination, Verify: verifyConfig(),
-				Hook: func(got backuprestore.FaultPoint) error {
-					if got == point {
-						return injected
-					}
-					return nil
-				},
 			})
 			if !errors.Is(err, injected) {
 				t.Fatalf("err=%v", err)
@@ -128,14 +135,14 @@ func TestRestorePostRenameFaultLeavesExactStore(t *testing.T) {
 	}
 	destination := filepath.Join(root, "restored")
 	injected := errors.New("publication uncertain")
+	withHook(t, func(point backuprestore.FaultPoint) error {
+		if point == backuprestore.FaultRestoreAfterPublish {
+			return injected
+		}
+		return nil
+	})
 	_, err := backuprestore.Restore(context.Background(), backuprestore.Config{
 		SourceDir: artifact, DestDir: destination, Verify: verifyConfig(),
-		Hook: func(point backuprestore.FaultPoint) error {
-			if point == backuprestore.FaultRestoreAfterPublish {
-				return injected
-			}
-			return nil
-		},
 	})
 	if !errors.Is(err, injected) {
 		t.Fatalf("err=%v", err)
@@ -149,17 +156,17 @@ func TestPublicationNeverReplacesRacingDestination(t *testing.T) {
 	root := t.TempDir()
 	source := createClosedStore(t, filepath.Join(root, "source"))
 	destination := filepath.Join(root, "backup")
+	withHook(t, func(point backuprestore.FaultPoint) error {
+		if point != backuprestore.FaultBackupBeforePublish {
+			return nil
+		}
+		if err := os.Mkdir(destination, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(destination, "keep"), []byte("keep"), 0o600)
+	})
 	_, err := backuprestore.Backup(context.Background(), backuprestore.Config{
 		SourceDir: source, DestDir: destination, Verify: verifyConfig(),
-		Hook: func(point backuprestore.FaultPoint) error {
-			if point != backuprestore.FaultBackupBeforePublish {
-				return nil
-			}
-			if err := os.Mkdir(destination, 0o700); err != nil {
-				return err
-			}
-			return os.WriteFile(filepath.Join(destination, "keep"), []byte("keep"), 0o600)
-		},
 	})
 	if !errors.Is(err, ridstore.ErrAlreadyExists) {
 		t.Fatalf("err=%v", err)
@@ -173,22 +180,22 @@ func TestBackupKeepsSourceLeaseThroughPublication(t *testing.T) {
 	root := t.TempDir()
 	source := createClosedStore(t, filepath.Join(root, "source"))
 	checked := false
+	withHook(t, func(point backuprestore.FaultPoint) error {
+		if point != backuprestore.FaultBackupBeforePublish {
+			return nil
+		}
+		checked = true
+		lock, err := filelock.AcquireExisting(source)
+		if lock != nil {
+			_ = lock.Close()
+		}
+		if !errors.Is(err, base.ErrLocked) {
+			return errors.New("source lease was released before publication")
+		}
+		return nil
+	})
 	_, err := backuprestore.Backup(context.Background(), backuprestore.Config{
 		SourceDir: source, DestDir: filepath.Join(root, "backup"), Verify: verifyConfig(),
-		Hook: func(point backuprestore.FaultPoint) error {
-			if point != backuprestore.FaultBackupBeforePublish {
-				return nil
-			}
-			checked = true
-			lock, err := filelock.AcquireExisting(source)
-			if lock != nil {
-				_ = lock.Close()
-			}
-			if !errors.Is(err, base.ErrLocked) {
-				return errors.New("source lease was released before publication")
-			}
-			return nil
-		},
 	})
 	if err != nil {
 		t.Fatal(err)

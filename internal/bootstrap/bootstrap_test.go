@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/akzj/ridstore/internal/fault"
+
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/storecatalog"
 )
@@ -26,7 +28,7 @@ func TestInitializationResumesAtEveryDurablePhase(t *testing.T) {
 		t.Run(string(point), func(t *testing.T) {
 			root := t.TempDir()
 			injected := errors.New("injected initialization failure")
-			_, err := Initialize(root, testHardLimits(), func(got FaultPoint) error {
+			_, err := initializeWithHook(t, root, testHardLimits(), func(got FaultPoint) error {
 				if got == point {
 					return injected
 				}
@@ -35,7 +37,7 @@ func TestInitializationResumesAtEveryDurablePhase(t *testing.T) {
 			if !errors.Is(err, injected) {
 				t.Fatalf("initial create err=%v", err)
 			}
-			manifest, err := Initialize(root, testHardLimits(), nil)
+			manifest, err := Initialize(root, testHardLimits())
 			if err != nil {
 				t.Fatalf("resume: %v", err)
 			}
@@ -53,7 +55,7 @@ func TestInitializationResumesAtEveryDurablePhase(t *testing.T) {
 func TestFinalDirectorySyncFailureLeavesOpenableStore(t *testing.T) {
 	root := t.TempDir()
 	injected := errors.New("injected final directory sync failure")
-	_, err := Initialize(root, testHardLimits(), func(point FaultPoint) error {
+	_, err := initializeWithHook(t, root, testHardLimits(), func(point FaultPoint) error {
 		if point == FaultBeforeFinalDirSync {
 			return injected
 		}
@@ -73,7 +75,7 @@ func TestFinalDirectorySyncFailureLeavesOpenableStore(t *testing.T) {
 func TestInitializationKeepsIdentityAndRejectsConfigChange(t *testing.T) {
 	root := t.TempDir()
 	stop := errors.New("stop after marker")
-	_, err := Initialize(root, testHardLimits(), func(point FaultPoint) error {
+	_, err := initializeWithHook(t, root, testHardLimits(), func(point FaultPoint) error {
 		if point == FaultBeforeDataSegment {
 			return stop
 		}
@@ -88,14 +90,14 @@ func TestInitializationKeepsIdentityAndRejectsConfigChange(t *testing.T) {
 	}
 	different := testHardLimits()
 	different.MaxValueSize--
-	if _, err := Initialize(root, different, nil); !errors.Is(err, base.ErrConfigMismatch) {
+	if _, err := Initialize(root, different); !errors.Is(err, base.ErrConfigMismatch) {
 		t.Fatalf("config mismatch err=%v", err)
 	}
-	resumed, err := Initialize(root, testHardLimits(), nil)
+	resumed, err := Initialize(root, testHardLimits())
 	if err != nil || resumed.StoreUUID != marker.StoreUUID || resumed.RecordLogID != marker.RecordLogID {
 		t.Fatalf("resumed=%+v marker=%+v err=%v", resumed, marker, err)
 	}
-	if _, err := Initialize(root, testHardLimits(), nil); !errors.Is(err, base.ErrAlreadyExists) {
+	if _, err := Initialize(root, testHardLimits()); !errors.Is(err, base.ErrAlreadyExists) {
 		t.Fatalf("duplicate create err=%v", err)
 	}
 }
@@ -103,7 +105,7 @@ func TestInitializationKeepsIdentityAndRejectsConfigChange(t *testing.T) {
 func TestInitializationDiscardsUnpublishedCreatingFiles(t *testing.T) {
 	root := t.TempDir()
 	stop := errors.New("stop after marker")
-	_, err := Initialize(root, testHardLimits(), func(point FaultPoint) error {
+	_, err := initializeWithHook(t, root, testHardLimits(), func(point FaultPoint) error {
 		if point == FaultBeforeDataSegment {
 			return stop
 		}
@@ -124,7 +126,7 @@ func TestInitializationDiscardsUnpublishedCreatingFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "mapping-v2", "map-0000000001.creating"), []byte("torn"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Initialize(root, testHardLimits(), nil); err != nil {
+	if _, err := Initialize(root, testHardLimits()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -135,4 +137,11 @@ func testHardLimits() storecatalog.HardLimits {
 		MaxBatchMutations: 16, MaxBatchConditions: 16, MaxOpenBatches: 4,
 		MaxRecordLogPayload: 64 << 10, IDReserveSize: 16, BatchIDReserveSize: 16,
 	}
+}
+
+func initializeWithHook(t *testing.T, root string, hard storecatalog.HardLimits, hook FaultHook) (storecatalog.Manifest, error) {
+	t.Helper()
+	previous := fault.SetHook(hook)
+	defer fault.SetHook(previous)
+	return Initialize(root, hard)
 }

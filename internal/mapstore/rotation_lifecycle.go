@@ -9,9 +9,9 @@ import (
 	"github.com/akzj/ridstore/internal/model"
 )
 
-func recoverRotation(root string, catalog CatalogPort, hook FaultHook) (CatalogSnapshot, error) {
+func recoverRotation(root string, catalog CatalogPort) (CatalogSnapshot, error) {
 	state := catalog.SnapshotMapStore()
-	journal, found, err := loadRotationJournal(root, hook)
+	journal, found, err := loadRotationJournal(root)
 	if err != nil || !found {
 		return state, err
 	}
@@ -19,10 +19,10 @@ func recoverRotation(root string, catalog CatalogPort, hook FaultHook) (CatalogS
 		return CatalogSnapshot{}, ErrCorrupt
 	}
 	if committedRotation(state, journal) {
-		if err := verifyCommittedRotationFiles(root, state, journal, hook); err != nil {
+		if err := verifyCommittedRotationFiles(root, state, journal); err != nil {
 			return CatalogSnapshot{}, err
 		}
-		if err := removeRotationJournal(root, hook); err != nil {
+		if err := removeRotationJournal(root); err != nil {
 			return CatalogSnapshot{}, err
 		}
 		return state, nil
@@ -30,14 +30,14 @@ func recoverRotation(root string, catalog CatalogPort, hook FaultHook) (CatalogS
 	if state.ActiveSegment != journal.Old.SegmentID || state.NextSegment != journal.NewActive {
 		return CatalogSnapshot{}, ErrCorrupt
 	}
-	sealed, err := resumeSeal(root, state.headerFor(journal.Old.SegmentID), state.Root, journal.Old, hook)
+	sealed, err := resumeSeal(root, state.headerFor(journal.Old.SegmentID), state.Root, journal.Old)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
 	if err := sealed.file.Close(); err != nil {
 		return CatalogSnapshot{}, err
 	}
-	active, err := ensureNewActive(root, state.headerFor(journal.NewActive), hook)
+	active, err := ensureNewActive(root, state.headerFor(journal.NewActive))
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
@@ -48,7 +48,7 @@ func recoverRotation(root string, catalog CatalogPort, hook FaultHook) (CatalogS
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	if err := removeRotationJournal(root, hook); err != nil {
+	if err := removeRotationJournal(root); err != nil {
 		return CatalogSnapshot{}, err
 	}
 	return installed, nil
@@ -80,7 +80,7 @@ func installCatalogRotation(catalog CatalogPort, state CatalogSnapshot, journal 
 	return CatalogSnapshot{}, ErrPoisoned
 }
 
-func verifyCommittedRotationFiles(root string, state CatalogSnapshot, journal rotationJournal, hook FaultHook) error {
+func verifyCommittedRotationFiles(root string, state CatalogSnapshot, journal rotationJournal) error {
 	sealed, err := openSealed(root, state.headerFor(journal.Old.SegmentID), SegmentRef{SegmentID: journal.Old.SegmentID, ValidEnd: journal.Old.ValidEnd})
 	if err != nil {
 		return err
@@ -88,14 +88,14 @@ func verifyCommittedRotationFiles(root string, state CatalogSnapshot, journal ro
 	if err := sealed.file.Close(); err != nil {
 		return err
 	}
-	active, _, err := openActive(root, state.headerFor(journal.NewActive), state.Root, hook)
+	active, _, err := openActive(root, state.headerFor(journal.NewActive), state.Root)
 	if err != nil {
 		return err
 	}
 	return active.file.Close()
 }
 
-func resumeSeal(root string, header SegmentHeader, rootAddr model.MapAddr, summary SegmentSummary, hook FaultHook) (*segmentFile, error) {
+func resumeSeal(root string, header SegmentHeader, rootAddr model.MapAddr, summary SegmentSummary) (*segmentFile, error) {
 	dir := filepath.Join(root, mappingDirectory)
 	activePath := filepath.Join(dir, activeName(header.SegmentID))
 	sealedPath := filepath.Join(dir, sealedName(header.SegmentID))
@@ -129,7 +129,7 @@ func resumeSeal(root string, header SegmentHeader, rootAddr model.MapAddr, summa
 		return fail(errors.Join(ErrCorrupt, err))
 	}
 	if info.Size() != int64(summary.ValidEnd+SegmentFooterSize) {
-		if err := hitFault(hook, FaultBeforeFooterWrite); err != nil {
+		if err := hitFault(FaultBeforeFooterWrite); err != nil {
 			return fail(err)
 		}
 		if err := file.Truncate(int64(summary.ValidEnd)); err != nil {
@@ -149,7 +149,7 @@ func resumeSeal(root string, header SegmentHeader, rootAddr model.MapAddr, summa
 			return fail(errors.Join(ErrCorrupt, err))
 		}
 	}
-	if err := hitFault(hook, FaultBeforeFooterSync); err != nil {
+	if err := hitFault(FaultBeforeFooterSync); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -158,13 +158,13 @@ func resumeSeal(root string, header SegmentHeader, rootAddr model.MapAddr, summa
 	if err := file.Close(); err != nil {
 		return nil, err
 	}
-	if err := hitFault(hook, FaultBeforeSealRename); err != nil {
+	if err := hitFault(FaultBeforeSealRename); err != nil {
 		return nil, err
 	}
 	if err := os.Rename(activePath, sealedPath); err != nil {
 		return nil, err
 	}
-	if err := hitFault(hook, FaultBeforeSealDirSync); err != nil {
+	if err := hitFault(FaultBeforeSealDirSync); err != nil {
 		return nil, err
 	}
 	if err := syncDirectory(dir); err != nil {
@@ -173,11 +173,11 @@ func resumeSeal(root string, header SegmentHeader, rootAddr model.MapAddr, summa
 	return openSealed(root, header, SegmentRef{SegmentID: summary.SegmentID, ValidEnd: summary.ValidEnd})
 }
 
-func ensureNewActive(root string, header SegmentHeader, hook FaultHook) (*segmentFile, error) {
+func ensureNewActive(root string, header SegmentHeader) (*segmentFile, error) {
 	dir := filepath.Join(root, mappingDirectory)
 	activePath := filepath.Join(dir, activeName(header.SegmentID))
 	if _, err := os.Stat(activePath); err == nil {
-		active, repaired, err := openActive(root, header, 0, hook)
+		active, repaired, err := openActive(root, header, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -192,10 +192,10 @@ func ensureNewActive(root string, header SegmentHeader, hook FaultHook) (*segmen
 	if err := os.Remove(filepath.Join(dir, creatingName(header.SegmentID))); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	return createActive(root, header, hook)
+	return createActive(root, header)
 }
 
-func createActive(root string, header SegmentHeader, hook FaultHook) (*segmentFile, error) {
+func createActive(root string, header SegmentHeader) (*segmentFile, error) {
 	encoded, err := EncodeSegmentHeader(header)
 	if err != nil {
 		return nil, err
@@ -211,25 +211,25 @@ func createActive(root string, header SegmentHeader, hook FaultHook) (*segmentFi
 		return nil, err
 	}
 	fail := func(cause error) (*segmentFile, error) { return nil, errors.Join(cause, file.Close()) }
-	if err := hitFault(hook, FaultBeforeHeaderWrite); err != nil {
+	if err := hitFault(FaultBeforeHeaderWrite); err != nil {
 		return fail(err)
 	}
 	if err := writeFullAt(file, encoded[:], 0); err != nil {
 		return fail(err)
 	}
-	if err := hitFault(hook, FaultBeforeHeaderSync); err != nil {
+	if err := hitFault(FaultBeforeHeaderSync); err != nil {
 		return fail(err)
 	}
 	if err := file.Sync(); err != nil {
 		return fail(err)
 	}
-	if err := hitFault(hook, FaultBeforeCreateRename); err != nil {
+	if err := hitFault(FaultBeforeCreateRename); err != nil {
 		return fail(err)
 	}
 	if err := os.Rename(creatingPath, activePath); err != nil {
 		return fail(err)
 	}
-	if err := hitFault(hook, FaultBeforeCreateDirSync); err != nil {
+	if err := hitFault(FaultBeforeCreateDirSync); err != nil {
 		return fail(err)
 	}
 	if err := syncDirectory(dir); err != nil {
@@ -238,7 +238,7 @@ func createActive(root string, header SegmentHeader, hook FaultHook) (*segmentFi
 	return &segmentFile{file: file, header: header, summary: SegmentSummary{SegmentID: header.SegmentID, ValidEnd: SegmentHeaderSize}}, nil
 }
 
-func sealActive(root string, active *segmentFile, expected SegmentSummary, hook FaultHook) (*segmentFile, error) {
+func sealActive(root string, active *segmentFile, expected SegmentSummary) (*segmentFile, error) {
 	if active == nil || active.summary != expected || expected.NodeCount == 0 {
 		return nil, ErrInvalid
 	}
@@ -246,26 +246,26 @@ func sealActive(root string, active *segmentFile, expected SegmentSummary, hook 
 	if err != nil {
 		return nil, err
 	}
-	if err := hitFault(hook, FaultBeforeFooterWrite); err != nil {
+	if err := hitFault(FaultBeforeFooterWrite); err != nil {
 		return nil, err
 	}
 	if err := writeFullAt(active.file, footer[:], int64(expected.ValidEnd)); err != nil {
 		return nil, err
 	}
-	if err := hitFault(hook, FaultBeforeFooterSync); err != nil {
+	if err := hitFault(FaultBeforeFooterSync); err != nil {
 		return nil, err
 	}
 	if err := active.file.Sync(); err != nil {
 		return nil, err
 	}
 	dir := filepath.Join(root, mappingDirectory)
-	if err := hitFault(hook, FaultBeforeSealRename); err != nil {
+	if err := hitFault(FaultBeforeSealRename); err != nil {
 		return nil, err
 	}
 	if err := os.Rename(filepath.Join(dir, activeName(expected.SegmentID)), filepath.Join(dir, sealedName(expected.SegmentID))); err != nil {
 		return nil, err
 	}
-	if err := hitFault(hook, FaultBeforeSealDirSync); err != nil {
+	if err := hitFault(FaultBeforeSealDirSync); err != nil {
 		return nil, err
 	}
 	if err := syncDirectory(dir); err != nil {

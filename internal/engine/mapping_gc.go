@@ -125,7 +125,7 @@ func (s *Store) prepareMappingGC(ctx context.Context) (work *mappingGCWork, err 
 	if err = syncEngineDirectory(s.core.root); err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root)))
 	}
-	writer, err := mapstore.CreateGenerationWriter(work.staging, mapstore.StoreID(manifest.StoreUUID), uint32(manifest.HardLimits.SegmentSize), manifest.NextMapSegmentID, s.maintenance.mapStoreHook)
+	writer, err := mapstore.CreateGenerationWriter(work.staging, mapstore.StoreID(manifest.StoreUUID), uint32(manifest.HardLimits.SegmentSize), manifest.NextMapSegmentID)
 	if err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, discardMappingGCStaging(s.core.root)))
 	}
@@ -226,9 +226,9 @@ func (s *Store) publishMappingGC(ctx context.Context, work *mappingGCWork) (err 
 	}
 	oldSet := mappingGCFileSet(work.manifest.SealedMapSegments, work.manifest.ActiveMapSegmentID, work.manifest.NextMapSegmentID, work.manifest.MappingRoot)
 	rollback := func() error {
-		cleanup := mapstore.RollbackGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook)
+		cleanup := mapstore.RollbackGeneration(s.core.root, work.staging, work.generation)
 		if cleanup == nil {
-			cleanup = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
+			cleanup = mapgcstate.Remove(s.core.root)
 		}
 		return cleanup
 	}
@@ -241,17 +241,17 @@ func (s *Store) publishMappingGC(ctx context.Context, work *mappingGCWork) (err 
 		SegmentSize: uint32(latest.HardLimits.SegmentSize), Covered: latest.CoveredCommitSeq, Old: oldSet,
 		New: mapgcstate.FileSet{Sealed: work.generation.SealedSegments, Active: work.generation.ActiveSegment,
 			Next: work.generation.NextSegment, Root: work.generation.Root}}
-	if err := mapgcstate.Install(s.core.root, work.state, s.maintenance.mappingGCHook); err != nil {
+	if err := mapgcstate.Install(s.core.root, work.state); err != nil {
 		cleanup := discardMappingGCStaging(s.core.root)
 		if cleanup == nil {
-			cleanup = mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook)
+			cleanup = mapgcstate.Remove(s.core.root)
 		}
 		return fail(s.mappingGCPrepublishFailure(err, cleanup))
 	}
 	if err := ctx.Err(); err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, rollback()))
 	}
-	if err := mapstore.PromoteGeneration(s.core.root, work.staging, work.generation, s.maintenance.mapStoreHook); err != nil {
+	if err := mapstore.PromoteGeneration(s.core.root, work.staging, work.generation); err != nil {
 		return fail(s.mappingGCPrepublishFailure(err, rollback()))
 	}
 	if err := ctx.Err(); err != nil {
@@ -289,7 +289,7 @@ func (s *Store) publishMappingGC(ctx context.Context, work *mappingGCWork) (err 
 		if err != nil {
 			return err
 		}
-		newStore, err := mapstore.OpenWithFaultHook(s.core.root, s.core.publisher, s.maintenance.mapStoreHook)
+		newStore, err := mapstore.Open(s.core.root, s.core.publisher)
 		if err != nil {
 			return err
 		}
@@ -338,13 +338,13 @@ func (s *Store) cleanupMappingGC(work *mappingGCWork) error {
 	if err := work.oldStore.Close(); err != nil {
 		return fail(err)
 	}
-	if err := mapstore.RetireGeneration(s.core.root, generationFromState(work.state.Old, work.state.Covered), work.installed.Generation, s.maintenance.mapStoreHook); err != nil {
+	if err := mapstore.RetireGeneration(s.core.root, generationFromState(work.state.Old, work.state.Covered), work.installed.Generation); err != nil {
 		return fail(err)
 	}
 	if err := mapstore.RemoveGenerationStaging(s.core.root, work.staging); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fail(err)
 	}
-	if err := mapgcstate.Remove(s.core.root, s.maintenance.mappingGCHook); err != nil {
+	if err := mapgcstate.Remove(s.core.root); err != nil {
 		return fail(err)
 	}
 	work.space.complete(true)

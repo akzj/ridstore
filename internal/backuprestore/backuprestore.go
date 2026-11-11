@@ -16,6 +16,7 @@ import (
 
 	"github.com/akzj/ridstore/internal/base"
 	"github.com/akzj/ridstore/internal/dirsync"
+	"github.com/akzj/ridstore/internal/fault"
 	"github.com/akzj/ridstore/internal/filelock"
 	"github.com/akzj/ridstore/internal/storecatalog"
 	"github.com/akzj/ridstore/internal/verifier"
@@ -25,13 +26,12 @@ type Config struct {
 	SourceDir string
 	DestDir   string
 	Verify    verifier.Config
-	Hook      FaultHook
 	files     fileBackend
 }
 
-type FaultPoint string
+type FaultPoint = fault.Point
 
-type FaultHook func(FaultPoint) error
+type FaultHook = fault.Hook
 
 const (
 	FaultBackupBeforeStaging       FaultPoint = "backup.before-staging"
@@ -96,7 +96,7 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 		return report, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lease.Close()) }()
-	if err := hit(config.Hook, FaultBackupBeforeSourceVerify); err != nil {
+	if err := hit(FaultBackupBeforeSourceVerify); err != nil {
 		return report, err
 	}
 	verified, err := verifier.VerifyHeld(ctx, config.SourceDir, config.Verify)
@@ -111,7 +111,7 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 		return report, base.ErrCorrupt
 	}
 	paths := manifestPaths(manifest)
-	if err := hit(config.Hook, FaultBackupBeforeStaging); err != nil {
+	if err := hit(FaultBackupBeforeStaging); err != nil {
 		return report, err
 	}
 	staging, err := makeStaging(files, config.DestDir, "backup")
@@ -127,7 +127,7 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 	if err := createBackupLayout(files, staging); err != nil {
 		return report, err
 	}
-	if err := hit(config.Hook, FaultBackupAfterIncomplete); err != nil {
+	if err := hit(FaultBackupAfterIncomplete); err != nil {
 		return report, err
 	}
 	entries := make([]Entry, 0, len(paths))
@@ -135,7 +135,7 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
-		entry, err := copyAndHash(ctx, files, filepath.Join(config.SourceDir, relative), filepath.Join(staging, PayloadDirectory, relative), relative, config.Hook,
+		entry, err := copyAndHash(ctx, files, filepath.Join(config.SourceDir, relative), filepath.Join(staging, PayloadDirectory, relative), relative,
 			FaultBackupBeforeFileCreate, FaultBackupBeforeFileWrite, FaultBackupBeforeFileSync)
 		if err != nil {
 			return report, err
@@ -143,14 +143,14 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 		entries = append(entries, entry)
 		report.Bytes += entry.Size
 	}
-	if err := hit(config.Hook, FaultBackupAfterPayload); err != nil {
+	if err := hit(FaultBackupAfterPayload); err != nil {
 		return report, err
 	}
 	payload := filepath.Join(staging, PayloadDirectory)
 	if err := createLock(files, payload); err != nil {
 		return report, err
 	}
-	if err := hit(config.Hook, FaultBackupBeforePayloadVerify); err != nil {
+	if err := hit(FaultBackupBeforePayloadVerify); err != nil {
 		return report, err
 	}
 	payloadReport, err := verifier.Verify(ctx, payload, config.Verify)
@@ -161,7 +161,7 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 	if payloadReport.Stage != verifier.StageExact || payloadReport.ManifestGeneration != manifest.Generation || payloadReport.StoreID != manifest.StoreUUID {
 		return report, base.ErrCorrupt
 	}
-	if err := hit(config.Hook, FaultBackupAfterVerify); err != nil {
+	if err := hit(FaultBackupAfterVerify); err != nil {
 		return report, err
 	}
 	metadata := Metadata{
@@ -172,25 +172,25 @@ func Backup(ctx context.Context, config Config) (report Report, resultErr error)
 	if err != nil {
 		return report, classify(err)
 	}
-	if err := hit(config.Hook, FaultBackupBeforeMetadata); err != nil {
+	if err := hit(FaultBackupBeforeMetadata); err != nil {
 		return report, err
 	}
 	if err := writeSync(files, filepath.Join(staging, MetadataName), encoded, 0o600); err != nil {
 		return report, err
 	}
-	if err := hit(config.Hook, FaultBackupAfterMetadata); err != nil {
+	if err := hit(FaultBackupAfterMetadata); err != nil {
 		return report, err
 	}
 	if err := syncBackupTree(files, staging); err != nil {
 		return report, err
 	}
-	if err := hit(config.Hook, FaultBackupBeforeMarkerRemove); err != nil {
+	if err := hit(FaultBackupBeforeMarkerRemove); err != nil {
 		return report, err
 	}
 	if err := removeAndSync(files, filepath.Join(staging, IncompleteName), staging); err != nil {
 		return report, err
 	}
-	if err := publish(files, staging, config.DestDir, config.Hook, FaultBackupBeforePublish, FaultBackupAfterPublish); err != nil {
+	if err := publish(files, staging, config.DestDir, FaultBackupBeforePublish, FaultBackupAfterPublish); err != nil {
 		return report, err
 	}
 	published = true
@@ -233,7 +233,7 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 	if err := validateArtifact(ctx, files, config.SourceDir, metadata); err != nil {
 		return report, classify(err)
 	}
-	if err := hit(config.Hook, FaultRestoreBeforeStaging); err != nil {
+	if err := hit(FaultRestoreBeforeStaging); err != nil {
 		return report, err
 	}
 	staging, err := makeStaging(files, config.DestDir, "restore")
@@ -253,7 +253,7 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
-		got, err := copyAndHash(ctx, files, filepath.Join(config.SourceDir, PayloadDirectory, entry.Path), filepath.Join(staging, entry.Path), entry.Path, config.Hook,
+		got, err := copyAndHash(ctx, files, filepath.Join(config.SourceDir, PayloadDirectory, entry.Path), filepath.Join(staging, entry.Path), entry.Path,
 			FaultRestoreBeforeFileCreate, FaultRestoreBeforeFileWrite, FaultRestoreBeforeFileSync)
 		if err != nil {
 			return report, err
@@ -263,7 +263,7 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 		}
 		report.Bytes += entry.Size
 	}
-	if err := hit(config.Hook, FaultRestoreAfterPayload); err != nil {
+	if err := hit(FaultRestoreAfterPayload); err != nil {
 		return report, err
 	}
 	if err := createLock(files, staging); err != nil {
@@ -272,7 +272,7 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 	if err := syncStoreTree(files, staging); err != nil {
 		return report, err
 	}
-	if err := hit(config.Hook, FaultRestoreBeforeVerify); err != nil {
+	if err := hit(FaultRestoreBeforeVerify); err != nil {
 		return report, err
 	}
 	verified, err := verifier.Verify(ctx, staging, config.Verify)
@@ -282,16 +282,16 @@ func Restore(ctx context.Context, config Config) (report Report, resultErr error
 	if verified.Stage != verifier.StageExact || verified.StoreID != metadata.StoreID || verified.ManifestGeneration != metadata.ManifestGeneration {
 		return report, base.ErrCorrupt
 	}
-	if err := hit(config.Hook, FaultRestoreAfterVerify); err != nil {
+	if err := hit(FaultRestoreAfterVerify); err != nil {
 		return report, err
 	}
-	if err := hit(config.Hook, FaultRestoreBeforeMarkerRemove); err != nil {
+	if err := hit(FaultRestoreBeforeMarkerRemove); err != nil {
 		return report, err
 	}
 	if err := removeAndSync(files, filepath.Join(staging, RestoreIncompleteName), staging); err != nil {
 		return report, err
 	}
-	if err := publish(files, staging, config.DestDir, config.Hook, FaultRestoreBeforePublish, FaultRestoreAfterPublish); err != nil {
+	if err := publish(files, staging, config.DestDir, FaultRestoreBeforePublish, FaultRestoreAfterPublish); err != nil {
 		return report, err
 	}
 	published = true
@@ -503,7 +503,7 @@ func makeStaging(files fileBackend, destination, operation string) (string, erro
 	return staging, nil
 }
 
-func copyAndHash(ctx context.Context, files fileBackend, source, destination, relative string, hook FaultHook, beforeCreate, beforeWrite, beforeSync FaultPoint) (entry Entry, resultErr error) {
+func copyAndHash(ctx context.Context, files fileBackend, source, destination, relative string, beforeCreate, beforeWrite, beforeSync FaultPoint) (entry Entry, resultErr error) {
 	info, err := files.lstat(source)
 	if err != nil {
 		return entry, err
@@ -520,7 +520,7 @@ func copyAndHash(ctx context.Context, files fileBackend, source, destination, re
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) || opened.Size() < 0 {
 		return entry, errors.Join(errInvalid, err)
 	}
-	if err := hit(hook, beforeCreate); err != nil {
+	if err := hit(beforeCreate); err != nil {
 		return entry, err
 	}
 	output, err := files.openFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -529,7 +529,7 @@ func copyAndHash(ctx context.Context, files fileBackend, source, destination, re
 	}
 	fail := func(cause error) (Entry, error) { return Entry{}, errors.Join(cause, output.Close()) }
 	hash := sha256.New()
-	if err := hit(hook, beforeWrite); err != nil {
+	if err := hit(beforeWrite); err != nil {
 		return fail(err)
 	}
 	written, err := copyWithContext(ctx, io.MultiWriter(output, hash), input)
@@ -539,7 +539,7 @@ func copyAndHash(ctx context.Context, files fileBackend, source, destination, re
 	if written < 0 || uint64(written) != uint64(info.Size()) {
 		return fail(errInvalid)
 	}
-	if err := hit(hook, beforeSync); err != nil {
+	if err := hit(beforeSync); err != nil {
 		return fail(err)
 	}
 	if err := output.Sync(); err != nil {
@@ -662,27 +662,24 @@ func syncDirectory(files fileBackend, path string) error {
 	return errors.Join(dirsync.Flush(directory), directory.Close())
 }
 
-func publish(files fileBackend, staging, destination string, hook FaultHook, before, after FaultPoint) error {
+func publish(files fileBackend, staging, destination string, before, after FaultPoint) error {
 	if err := requireAbsent(files, destination); err != nil {
 		return err
 	}
-	if err := hit(hook, before); err != nil {
+	if err := hit(before); err != nil {
 		return err
 	}
 	if err := files.renameNoReplace(staging, destination); err != nil {
 		return err
 	}
-	if err := hit(hook, after); err != nil {
+	if err := hit(after); err != nil {
 		return err
 	}
 	return syncDirectory(files, filepath.Dir(destination))
 }
 
-func hit(hook FaultHook, point FaultPoint) error {
-	if hook == nil {
-		return nil
-	}
-	return hook(point)
+func hit(point FaultPoint) error {
+	return fault.Hit(point)
 }
 
 func requireAbsent(files fileBackend, path string) error {

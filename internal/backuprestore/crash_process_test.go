@@ -11,6 +11,7 @@ import (
 
 	ridstore "github.com/akzj/ridstore"
 	"github.com/akzj/ridstore/internal/backuprestore"
+	"github.com/akzj/ridstore/internal/fault"
 )
 
 const crashExitCode = 77
@@ -74,13 +75,14 @@ func runCrashChild(mode string) {
 		SourceDir: os.Getenv("RIDSTORE_BACKUP_CRASH_SOURCE"),
 		DestDir:   os.Getenv("RIDSTORE_BACKUP_CRASH_DEST"),
 		Verify:    verifyConfig(),
-		Hook: func(got backuprestore.FaultPoint) error {
-			if got == point {
-				os.Exit(crashExitCode)
-			}
-			return nil
-		},
 	}
+	previous := fault.SetHook(func(got backuprestore.FaultPoint) error {
+		if got == point {
+			os.Exit(crashExitCode)
+		}
+		return nil
+	})
+	defer fault.SetHook(previous)
 	var err error
 	if mode == "backup" {
 		_, err = backuprestore.Backup(context.Background(), config)

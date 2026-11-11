@@ -44,7 +44,7 @@ func TestRecordLogRotationCrashHelper(t *testing.T) {
 	}
 	root := os.Getenv(crashRootEnv)
 	state := initialCatalog(1024, 512)
-	active, err := createActiveSegment(root, state.headerFor(1), nil, nil)
+	active, err := createActiveSegment(root, state.headerFor(1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestRecordLogRotationCrashHelper(t *testing.T) {
 		BaseGeneration: 1, LogID: state.LogID, SegmentSize: state.SegmentSize,
 		Old: active.summary(), NewActive: 2, NextSegmentID: 3,
 	}
-	if err := installRotationJournal(root, journal, osFileBackend{}, nil); err != nil {
+	if err := installRotationJournal(root, journal, osFileBackend{}); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv(crashPhaseEnv) == "journal" {
@@ -68,7 +68,7 @@ func TestRecordLogRotationCrashHelper(t *testing.T) {
 	if os.Getenv(crashPhaseEnv) == "sealed" {
 		return
 	}
-	created, err := createActiveSegment(root, state.headerFor(2), nil, nil)
+	created, err := createActiveSegment(root, state.headerFor(2), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

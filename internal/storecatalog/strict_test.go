@@ -9,12 +9,12 @@ import (
 func TestLoadStrictRejectsCorruptInactiveSlot(t *testing.T) {
 	root := t.TempDir()
 	first := testManifest()
-	if err := Install(root, first, nil); err != nil {
+	if err := Install(root, first); err != nil {
 		t.Fatal(err)
 	}
 	second := first.Clone()
 	second.Generation++
-	if err := Install(root, second, nil); err != nil {
+	if err := Install(root, second); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(manifestSlotPath(root, first.Generation&1), []byte("broken"), 0o600); err != nil {
@@ -31,7 +31,7 @@ func TestLoadStrictRejectsCorruptInactiveSlot(t *testing.T) {
 func TestLoadStrictRejectsManifestTemp(t *testing.T) {
 	root := t.TempDir()
 	manifest := testManifest()
-	if err := Install(root, manifest, nil); err != nil {
+	if err := Install(root, manifest); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(manifestTempPath(root, 0), nil, 0o600); err != nil {

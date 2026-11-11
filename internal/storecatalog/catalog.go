@@ -19,25 +19,24 @@ type Manager struct {
 	mu      sync.Mutex
 	root    string
 	current Manifest
-	hook    FaultHook
 }
 
-func OpenManager(root string, hook FaultHook) (*Manager, error) {
-	manifest, err := LoadRecovering(root, hook)
+func OpenManager(root string) (*Manager, error) {
+	manifest, err := LoadRecovering(root)
 	if err != nil {
 		return nil, err
 	}
-	return NewManager(root, manifest, hook)
+	return NewManager(root, manifest)
 }
 
-func NewManager(root string, current Manifest, hook FaultHook) (*Manager, error) {
+func NewManager(root string, current Manifest) (*Manager, error) {
 	if root == "" {
 		return nil, ErrInvalid
 	}
 	if err := Validate(current); err != nil {
 		return nil, err
 	}
-	return &Manager{root: root, current: current.Clone(), hook: hook}, nil
+	return &Manager{root: root, current: current.Clone()}, nil
 }
 
 func (m *Manager) Snapshot() Manifest {
@@ -119,7 +118,7 @@ func (m *Manager) RemoveRecordLogSegment(minimumGeneration uint64, sealed record
 	if err := Validate(next); err != nil {
 		return recordlog.CatalogSnapshot{}, err
 	}
-	if err := Install(m.root, next, m.hook); err != nil {
+	if err := Install(m.root, next); err != nil {
 		return recordlog.CatalogSnapshot{}, err
 	}
 	m.current = next.Clone()
@@ -172,7 +171,7 @@ func (m *Manager) ReserveCompactionSegments(expect uint64, count uint32) (Manife
 	if err := Validate(next); err != nil {
 		return Manifest{}, nil, err
 	}
-	if err := Install(m.root, next, m.hook); err != nil {
+	if err := Install(m.root, next); err != nil {
 		return Manifest{}, nil, err
 	}
 	m.current = next.Clone()
@@ -260,7 +259,7 @@ func (m *Manager) InstallMappingRewrite(base Manifest, update MappingRewrite) (M
 	if err := Validate(next); err != nil {
 		return Manifest{}, err
 	}
-	if err := Install(m.root, next, m.hook); err != nil {
+	if err := Install(m.root, next); err != nil {
 		return Manifest{}, err
 	}
 	m.current = next.Clone()
@@ -309,7 +308,7 @@ func (m *Manager) InstallCheckpoint(base Manifest, update Checkpoint) (Manifest,
 	if err := Validate(next); err != nil {
 		return Manifest{}, err
 	}
-	if err := Install(m.root, next, m.hook); err != nil {
+	if err := Install(m.root, next); err != nil {
 		return Manifest{}, err
 	}
 	m.current = next.Clone()
@@ -506,7 +505,7 @@ func (m *Manager) install(expect uint64, mutate func(*Manifest) error) (Manifest
 	if err := Validate(next); err != nil {
 		return Manifest{}, err
 	}
-	if err := Install(m.root, next, m.hook); err != nil {
+	if err := Install(m.root, next); err != nil {
 		return Manifest{}, err
 	}
 	m.current = next.Clone()

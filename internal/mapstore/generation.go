@@ -40,7 +40,7 @@ type GenerationWriter struct {
 	poisoned    bool
 }
 
-func CreateGenerationWriter(root string, storeID StoreID, segmentSize uint32, firstSegment model.MapSegmentID, hook FaultHook) (*GenerationWriter, error) {
+func CreateGenerationWriter(root string, storeID StoreID, segmentSize uint32, firstSegment model.MapSegmentID) (*GenerationWriter, error) {
 	if root == "" || firstSegment == 0 || firstSegment == model.MapSegmentID(math.MaxUint32) || !validSegmentHeader(SegmentHeader{
 		StoreID: storeID, SegmentID: firstSegment, PreviousSegment: firstSegment - 1, SegmentSize: segmentSize,
 	}) {
@@ -53,13 +53,13 @@ func CreateGenerationWriter(root string, storeID StoreID, segmentSize uint32, fi
 	}
 	active, err := createActive(root, SegmentHeader{
 		StoreID: storeID, SegmentID: firstSegment, PreviousSegment: firstSegment - 1, SegmentSize: segmentSize,
-	}, hook)
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &GenerationWriter{
 		root: root, storeID: storeID, segmentSize: segmentSize, active: active,
-		sealed: make(map[model.MapSegmentID]*segmentFile), nextSegment: firstSegment + 1, nextSeq: 1, hook: hook,
+		sealed: make(map[model.MapSegmentID]*segmentFile), nextSegment: firstSegment + 1, nextSeq: 1,
 	}, nil
 }
 
@@ -104,7 +104,7 @@ func (w *GenerationWriter) appendBuild(build NodeBuild) (model.MapAddr, error) {
 		}
 	}
 	offset := w.active.summary.ValidEnd
-	if err := hitFault(w.hook, FaultBeforeAppendWrite); err != nil {
+	if err := hitFault(FaultBeforeAppendWrite); err != nil {
 		w.poisoned = true
 		return 0, errors.Join(ErrPoisoned, err)
 	}
@@ -162,7 +162,7 @@ func (w *GenerationWriter) Finish(root model.MapAddr, covered model.CommitSeq) (
 			return Generation{}, errors.Join(ErrCorrupt, err)
 		}
 	}
-	if err := hitFault(w.hook, FaultBeforeSync); err != nil {
+	if err := hitFault(FaultBeforeSync); err != nil {
 		w.poisoned = true
 		return Generation{}, errors.Join(ErrPoisoned, err)
 	}
@@ -206,14 +206,14 @@ func (w *GenerationWriter) rotateLocked() error {
 	if w.nextSegment == 0 || w.nextSegment == model.MapSegmentID(math.MaxUint32) {
 		return ErrFull
 	}
-	sealed, err := sealActive(w.root, w.active, w.active.summary, w.hook)
+	sealed, err := sealActive(w.root, w.active, w.active.summary)
 	if err != nil {
 		return err
 	}
 	ref := SegmentRef{SegmentID: sealed.header.SegmentID, ValidEnd: sealed.summary.ValidEnd}
 	active, err := createActive(w.root, SegmentHeader{
 		StoreID: w.storeID, SegmentID: w.nextSegment, PreviousSegment: w.nextSegment - 1, SegmentSize: w.segmentSize,
-	}, w.hook)
+	})
 	if err != nil {
 		_ = sealed.file.Close()
 		return err

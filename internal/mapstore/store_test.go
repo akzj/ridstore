@@ -119,7 +119,7 @@ func TestStoreReadDoesNotWaitForNodeAppendIO(t *testing.T) {
 		}
 	}()
 	var once sync.Once
-	store.hook = func(point FaultPoint) error {
+	setHook(t, func(point FaultPoint) error {
 		if point == FaultBeforeAppendWrite {
 			once.Do(func() {
 				close(reached)
@@ -127,7 +127,7 @@ func TestStoreReadDoesNotWaitForNodeAppendIO(t *testing.T) {
 			})
 		}
 		return nil
-	}
+	})
 	appendDone := make(chan error, 1)
 	go func() {
 		_, appendErr := store.AppendLeaf(1, 2, testLeafRefs(slots))
@@ -183,7 +183,7 @@ func TestStoreReadDoesNotWaitForRotationIO(t *testing.T) {
 		}
 	}()
 	var once sync.Once
-	store.hook = func(point FaultPoint) error {
+	setHook(t, func(point FaultPoint) error {
 		if point == FaultBeforeFooterSync {
 			once.Do(func() {
 				close(reached)
@@ -191,7 +191,7 @@ func TestStoreReadDoesNotWaitForRotationIO(t *testing.T) {
 			})
 		}
 		return nil
-	}
+	})
 	appendDone := make(chan error, 1)
 	go func() {
 		_, appendErr := store.Append(1, 1, 2, denseSlots(t))
@@ -250,7 +250,7 @@ func TestStoreAppendDoesNotWaitForReadIO(t *testing.T) {
 		}
 	}()
 	var once sync.Once
-	store.hook = func(point FaultPoint) error {
+	setHook(t, func(point FaultPoint) error {
 		if point == FaultBeforeRead {
 			once.Do(func() {
 				close(reached)
@@ -258,7 +258,7 @@ func TestStoreAppendDoesNotWaitForReadIO(t *testing.T) {
 			})
 		}
 		return nil
-	}
+	})
 	readDone := make(chan error, 1)
 	go func() {
 		_, readErr := store.Read(first)
@@ -316,7 +316,7 @@ func TestStoreCloseWaitsForReadIO(t *testing.T) {
 		}
 	}()
 	var once sync.Once
-	store.hook = func(point FaultPoint) error {
+	setHook(t, func(point FaultPoint) error {
 		if point == FaultBeforeRead {
 			once.Do(func() {
 				close(reached)
@@ -324,7 +324,7 @@ func TestStoreCloseWaitsForReadIO(t *testing.T) {
 			})
 		}
 		return nil
-	}
+	})
 	readDone := make(chan error, 1)
 	go func() {
 		_, readErr := store.Read(first)

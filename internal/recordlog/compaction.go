@@ -91,7 +91,7 @@ func (w *CompactionWriter) rotate() error {
 	w.used++
 	snapshot := w.log.catalog.SnapshotRecordLog()
 	header := SegmentHeader{LogID: snapshot.LogID, SegmentID: id, PreviousSegment: id - 1, SegmentSize: snapshot.SegmentSize}
-	active, err := createActiveSegment(w.log.root, header, w.log.files, w.log.hook)
+	active, err := createActiveSegment(w.log.root, header, w.log.files)
 	if err != nil {
 		return err
 	}
